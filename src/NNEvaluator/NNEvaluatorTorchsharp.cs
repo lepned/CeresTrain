@@ -329,12 +329,11 @@ namespace CeresTrain.NNEvaluators
       }
       
       MGPosition[] mgPos;
-      byte[] squareBytesAll;
-      byte[] moveBytesAll;
+      byte[] squareBytesAll = new byte[TPGRecord.BYTES_PER_SQUARE_RECORD * 64 * positions.NumPos];
 
       TPGRecordConverter.ConvertPositionsToRawSquareBytes(positions, IncludeHistory, positions.Moves, LastMovePliesEnabled,
                                                           OptionsTorchsharp.QNegativeBlunders, OptionsTorchsharp.QPositiveBlunders,
-                                                          out mgPos, out squareBytesAll, legalMoveIndicesBuffer);
+                                                          out mgPos, squareBytesAll, legalMoveIndicesBuffer);
 #if DEBUG
       lastPosition = lastPositionStatic = positions.PositionsBuffer.Span[0];
 

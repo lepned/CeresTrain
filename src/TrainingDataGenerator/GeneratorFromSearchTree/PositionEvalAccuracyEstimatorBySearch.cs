@@ -29,6 +29,7 @@ using Ceres.Chess.NetEvaluation.Batch;
 
 using Ceres.MCTS.Params;
 using Ceres.MCTS.MTCSNodes;
+using Ceres.MCTS.GameEngines;
 using Ceres.Features.GameEngines;
 using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NNEvaluators.Ceres.TPG;

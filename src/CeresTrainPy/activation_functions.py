@@ -45,9 +45,23 @@ class Swish(torch.nn.Module):
   """
   def __init__(self):
       super().__init__()
-      
+
   def forward(self, x: torch.Tensor) -> torch.Tensor:
       return x * torch.sigmoid(x)
+
+
+
+class ReLUSquared(torch.nn.Module):
+  """
+  ReLUSquared activation function.
+  Applies ReLU then squares the result element-wise:
+  ReLUSquared(x) = ReLU(x)^2
+  """
+  def __init__(self):
+      super().__init__()
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+      return torch.nn.functional.relu(x).pow(2)
 
 
 

@@ -148,11 +148,14 @@ def save_model(NAME : str,
       if True and fabric.is_global_zero:
         try:
           SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + ".onnx")
-          head_output_names = ['policy', 'value', 'mlh', 'unc', 'value2', 
+          # Output tensor previously named 'prior_state', same as the input — which is
+          # an invalid ONNX graph (tensor can't be both named input and named output).
+          # Rename the output tensor to 'prior_state_out' so the model is loadable.
+          head_output_names = ['policy', 'value', 'mlh', 'unc', 'value2',
                                'q_deviation_lower', 'q_deviation_upper',
-                               'uncertainty_policy', 'action', 'prior_state', 
+                               'uncertainty_policy', 'action', 'prior_state_out',
                                'action_uncertainty']
-          output_axes = {'squares' : {0 : 'batch_size'},    
+          output_axes = {'squares' : {0 : 'batch_size'},
                           'policy' : {0 : 'batch_size'},
                           'value' : {0 : 'batch_size'},
                           'mlh' : {0 : 'batch_size'},
@@ -162,11 +165,16 @@ def save_model(NAME : str,
                           'q_deviation_upper' : {0 : 'batch_size'},
                           'uncertainty_policy': {0 : 'batch_size'},
                           'action': {0 : 'batch_size'},
+                          'prior_state_out': {0 : 'batch_size'},
                           'prior_state': {0 : 'batch_size'},
                           'action_uncertainty': {0 : 'batch_size'},
                           }
-          sample_inputs = (torch.rand(256, 64, 137).to(convert_type).to(model_nocompile.device), 
-                            torch.rand(256, 64, config.NetDef_PriorStateDim).to(convert_type).to(model_nocompile.device))
+          # Export an FP32 ONNX first, then convert the entire graph (weights + IO)
+          # to FP16 via onnxconverter-common below. Keeping the initial export FP32
+          # avoids mixed-type MatMul errors that occur when inputs are declared FP16
+          # while internal weights are still FP32.
+          sample_inputs = (torch.rand(256, 64, 137).to(torch.float32).to(model_nocompile.device),
+                            torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(model_nocompile.device))
           torch.onnx.export(model_nocompile,
                             (sample_inputs[0], sample_inputs[1]),
                             SAVE_FULL_NAME,
@@ -174,19 +182,38 @@ def save_model(NAME : str,
                             export_params=True,
                             opset_version=17, # Pytorch 2.3 maximum supported opset version 17
                             input_names = ['squares', 'prior_state'], # if config.NetDef_PriorStateDim > 0 else ['squares'],
-                            output_names = head_output_names, 
+                            output_names = head_output_names,
                             dynamic_axes=output_axes)
           print('INFO: ONNX_FILENAME', SAVE_FULL_NAME)
 
           if True:
-            SAVE_FULL_NAME_16 = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_fp16_" + num_pos + ".onnx")
-            # Make a 16 bit version
-            from onnxmltools.utils.float16_converter import convert_float_to_float16
-            from onnxmltools.utils import load_model, save_model
-            onnx_model = load_model(SAVE_FULL_NAME)
-            onnx_model_16 = convert_float_to_float16(onnx_model)
-            save_model(onnx_model_16, SAVE_FULL_NAME_16)
-            print ('INFO: ONNX16_FILENAME', SAVE_FULL_NAME_16)
+            # Convert the whole graph (weights + IO tensors) to FP16 and overwrite
+            # the primary ONNX file. Ceres expects FP16 nets when running on GPU.
+            # Module location moved between library versions — prefer onnxconverter-common
+            # (the actively maintained one), fall back to the older onnxmltools path.
+            try:
+              from onnxconverter_common.float16 import convert_float_to_float16
+            except ImportError:
+              from onnxmltools.utils.float16_converter import convert_float_to_float16
+            import onnx as _onnx
+            onnx_model = _onnx.load(SAVE_FULL_NAME)
+            # Lower min_positive_val from the default 1e-7: that default floors all
+            # smaller-magnitude weights up to 1e-7, which catastrophically corrupts
+            # well-trained models whose fine-tuned weights are often below 1e-7.
+            # 1e-10 preserves the full FP16 representable range (subnormals ~6e-8,
+            # below which hardware returns 0, which is the correct behavior).
+            onnx_model_16 = convert_float_to_float16(
+                onnx_model, keep_io_types=False,
+                min_positive_val=1e-10, max_finite_val=1e4)
+            # Embed weights inline in the .onnx file (same as production Ceres nets
+            # like C3-768-30-pre3-I8.onnx). Our nets are well under the 2 GB protobuf
+            # limit so no external data file is needed.
+            _onnx.save(onnx_model_16, SAVE_FULL_NAME)
+            # Clean up any leftover external-data sidecar from a previous export.
+            _data_path = SAVE_FULL_NAME + ".data"
+            if os.path.exists(_data_path):
+              os.remove(_data_path)
+            print('INFO: ONNX_FP16_CONVERSION_APPLIED', SAVE_FULL_NAME)
 
         except Exception as e:
           print(f"Warning: torch.onnx.export save failed, skipping. Exception details: {e}")       

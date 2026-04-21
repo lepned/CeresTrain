@@ -118,10 +118,13 @@ namespace CeresTrain.TrainCommands
         if (hostConfig.HostName == null) // local PyTorch
         {
           // Run locally.
-          ConfigTraining adjustedConfig = TrainingHelpers.AdjustAndLoadConfig(configBaseName, piecesStr, devices);
+          ConfigTraining adjustedConfig = TrainingHelpers.AdjustAndLoadConfig(configBaseName, piecesStr, devices, tpgDir: tpgDir);
 
           adjustedConfig = adjustedConfig with { OptConfig = adjustedConfig.OptConfig with { NumTrainingPositions = numPos ?? adjustedConfig.OptConfig.NumTrainingPositions },
-            DataConfig = adjustedConfig.DataConfig with { TrainingFilesDirectory = tpgDir ?? adjustedConfig.DataConfig.TrainingFilesDirectory } };
+            DataConfig = adjustedConfig.DataConfig with {
+              TrainingFilesDirectory = tpgDir ?? adjustedConfig.DataConfig.TrainingFilesDirectory,
+              SourceType = tpgDir != null ? ConfigData.DataSourceType.DirectFromTPG : adjustedConfig.DataConfig.SourceType,
+            } };
           result = CeresTrainLauncher.RunLocalCSharp(configID, piecesStr, in adjustedConfig, trainingStatusTable);
         }
         else

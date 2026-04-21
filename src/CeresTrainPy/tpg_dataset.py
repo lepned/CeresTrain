@@ -136,7 +136,9 @@ class TPGDataset(Dataset):
   def item_generator(self):
     DTYPE = np.float32
     BATCH_SIZE = self.batch_size
-    BYTES_PER_POS = 9250 # fixed size of record structure (TPGRecord.TOTAL_BYTES)
+    # Fixed size of TPGRecord (V2 format with USE_V2_TPG_RECORD=true):
+    # 9250 (original) + 2*64 (two PlyBinPerSquare64 arrays) = 9378
+    BYTES_PER_POS = 9378
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
@@ -172,7 +174,9 @@ class TPGDataset(Dataset):
               if (self.wdl_smoothing == 0.5):
                 assert 1==2, "wdl_smoothing == 0.5 not supported"
 
-              # Read sequence of fields (see TPGRecord.cs)
+              # Layout matches the V2 TPGRecord struct in TPGRecord.cs
+              # (LayoutKind.Sequential, Pack=1, USE_V2_TPG_RECORD=true).
+              # Total = 9378 bytes per record.
 
               wdl_nondeblundered = np.ascontiguousarray(this_batch[:, offset : offset + 3*4]).view(dtype=np.float32).reshape(-1, 3)
               offset+= 3 * 4
@@ -180,10 +184,9 @@ class TPGDataset(Dataset):
                 wdl_nondeblundered = np.matmul(wdl_nondeblundered, wdl_smoothing_transform)
 
               wdl_deblundered = np.ascontiguousarray(this_batch[:, offset : offset + 3*4]).view(dtype=np.float32).reshape(-1, 3)
+              offset+= 3 * 4
               if (self.wdl_smoothing > 0):
                 wdl_deblundered = np.matmul(wdl_deblundered, wdl_smoothing_transform)
-
-              offset+= 3 * 4
 
               wdl_q = np.ascontiguousarray(this_batch[:, offset : offset + 3*4]).view(dtype=np.float32).reshape(-1, 3)
               offset+= 3 * 4
@@ -192,10 +195,17 @@ class TPGDataset(Dataset):
 
               played_q_suboptimality = np.ascontiguousarray(this_batch[:, offset : offset + 1*4]).view(dtype=np.float32).reshape(-1, 1)
               offset+= 1 * 4
-           
-              #ply_next_square_move = np.ascontiguousarray(this_batch[:, offset : offset + 64 * 1]).view(dtype=np.byte).reshape(-1, 64).astype(DTYPE)
-              offset+= 56
 
+              # IsWhiteToMove (1 byte) + Unused1 (1 byte) + PUNIMSelf (1 byte) + PUNIMOpponent (1 byte)
+              # + UnusedArray[42] (42 bytes). Skipped — not currently consumed by trainer.
+              offset+= 4 + 42
+
+              # NumSearchNodes (int32), RefModel1NumNodes/Value (2x float16), RefModel1BestMove (ushort).
+              # Skipped — reference-model fields not consumed by trainer.
+              offset+= 4 + 2 + 2 + 2
+
+              # KLDPolicy (float32): KL divergence between policy head and search visits.
+              # Reused as the "uncertainty_policy" value for back-compat with trainer consumers.
               uncertainty_policy = np.ascontiguousarray(this_batch[:, offset : offset + 1*4]).view(dtype=np.float32).reshape(-1, 1)
               uncertainty_policy = np.abs(uncertainty_policy)
               offset+= 1 * 4
@@ -205,6 +215,7 @@ class TPGDataset(Dataset):
               mlh = mlh / 100.
               offset+= 1 * 4
 
+              # DeltaQVersusV (float32): serves as the "uncertainty" value for back-compat.
               uncertainty = np.ascontiguousarray(this_batch[:, offset : offset + 1*4]).view(dtype=np.float32).reshape(-1, 1)
               uncertainty = np.abs(uncertainty)
               offset+= 1 * 4
@@ -216,12 +227,16 @@ class TPGDataset(Dataset):
 
               policy_index_in_parent = np.ascontiguousarray(this_batch[:, offset : offset + 1*2]).view(dtype=np.int16).reshape(-1, 1)
               offset+= 1 * 2
- 
+
+              # Two PlyBinPerSquare64 arrays (each 64 bytes): PlyUntilSquareChangePiece + PlyUntilSquarePieceCapture.
+              # Skipped — currently unused by trainer.
+              offset+= 64 + 64
+
               policies_indices = np.ascontiguousarray(this_batch[:, offset : offset + MAX_MOVES*2]).view(dtype=np.int16).reshape(-1, MAX_MOVES)
               # much faster, but tries to reinitialize CUDA and fails:
               #   policies = torch.from_numpy(np.ascontiguousarray(this_batch[:, offset : offset + 1858*2]).view(dtype=np.float16)).cuda().reshape(-1,1858)
               offset+= MAX_MOVES * 2
-              
+
               policies_values = np.ascontiguousarray(this_batch[:, offset : offset + MAX_MOVES*2]).view(dtype=np.float16).reshape(-1, MAX_MOVES)
               offset+= MAX_MOVES * 2
 
@@ -231,7 +246,7 @@ class TPGDataset(Dataset):
               squares = np.divide(squares, DIVISOR).astype(DTYPE)
               offset+= 64 * SIZE_SQUARE
 
-              assert(offset == BYTES_PER_POS)
+              assert offset == BYTES_PER_POS, f"Layout mismatch: offset={offset} expected={BYTES_PER_POS}"
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty, 
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,

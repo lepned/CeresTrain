@@ -22,8 +22,8 @@ using Ceres.Chess;
 using Ceres.Chess.NetEvaluation.Batch;
 using Ceres.Chess.NNEvaluators;
 using Ceres.Chess.NNEvaluators.Defs;
-using Ceres.Features.GameEngines;
-using Ceres.Features.Players;
+using Ceres.MCTS.GameEngines;
+using Ceres.Chess.GameEngines;
 using Ceres.Features.Suites;
 using Ceres.Features.Tournaments;
 

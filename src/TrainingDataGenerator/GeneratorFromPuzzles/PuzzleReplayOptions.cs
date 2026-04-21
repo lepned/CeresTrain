@@ -1,0 +1,132 @@
+#region License notice
+
+/*
+  This file is part of the CeresTrain project at https://github.com/dje-dev/cerestrain.
+  Copyright (C) 2023- by David Elliott and the CeresTrain Authors.
+
+  Ceres is free software under the terms of the GNU General Public License v3.0.
+  You should have received a copy of the GNU General Public License
+  along with CeresTrain. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#endregion
+
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
+{
+  /// <summary>
+  /// Configuration for a single end-to-end puzzle action-replay run (mine -> label -> TPG).
+  /// </summary>
+  public sealed class PuzzleReplayOptions
+  {
+    public string LichessCsvPath { get; set; }
+
+    public string NetSpec { get; set; }
+
+    public string Device { get; set; } = "GPU:0";
+
+    public int MinRating { get; set; } = 1800;
+    public int MaxRating { get; set; } = 3200;
+
+    public string ThemeIncludeAny { get; set; }
+    public string ThemeExcludeAny { get; set; }
+
+    public int MaxPuzzlesToRead { get; set; } = int.MaxValue;
+
+    /// <summary>
+    /// If &gt; 0, randomly sub-samples this many hard records before labeling.
+    /// Useful for controlling label-stage wall time without re-mining.
+    /// </summary>
+    public int MaxRecordsToLabel { get; set; } = 0;
+
+    /// <summary>Seed for reproducible sub-sampling (used only when MaxRecordsToLabel &gt; 0).</summary>
+    public int LabelSubsampleSeed { get; set; } = 42;
+
+    /// <summary>
+    /// If true, the label stage reads puzzle positions directly from the Lichess CSV
+    /// (expanding each puzzle to all solver-to-move positions) instead of from hard.jsonl.
+    /// Used when training a specialist from scratch on ALL puzzles, not just adversarial
+    /// ones against a specific student. Mining step is skipped when this is true.
+    /// </summary>
+    public bool SkipMining { get; set; } = false;
+
+    /// <summary>
+    /// If true and existing labeled.jsonl / rejected.jsonl files are found in OutDir,
+    /// resume labeling by skipping any input already represented (keyed on PuzzleId+FEN).
+    /// Output files are opened in append mode. Safe to use on interrupted runs.
+    /// </summary>
+    public bool ResumeFromCheckpoint { get; set; } = false;
+
+    /// <summary>
+    /// If &gt; 0, limits the number of records read from labeled.jsonl during eval-labeled.
+    /// Useful for quick smoke tests. 0 = evaluate all records.
+    /// </summary>
+    public int MaxEvalRecords { get; set; } = 0;
+
+    /// <summary>
+    /// If true, eval-labeled only processes puzzle-starting positions (where PriorUciMoves
+    /// contains exactly the setup move) — matches EB's test setup that evaluates the first
+    /// solver move of each puzzle.
+    /// </summary>
+    public bool EvalStartingPositionsOnly { get; set; } = false;
+
+    /// <summary>
+    /// Optional rating-bin thresholds used to oversample harder puzzles during TPG generation.
+    /// N thresholds define N+1 bins: (-∞, T0), [T0, T1), ..., [T_{N-1}, +∞).
+    /// Each bin's multiplicity comes from RatingBinWeights at the matching index.
+    /// Null or empty = no stratification (every record emitted exactly once).
+    /// Example: Thresholds=[1400,1800,2200,2600], Weights=[1,1,3,8,16].
+    /// </summary>
+    public int[] RatingBinThresholds { get; set; }
+
+    /// <summary>
+    /// Parallel to RatingBinThresholds — one more entry than Thresholds.
+    /// Weight N means each record in that bin is written N times into the TPG.
+    /// Null or empty = no stratification.
+    /// </summary>
+    public int[] RatingBinWeights { get; set; }
+
+    public int TeacherNodes { get; set; } = 100;
+    public int MineBatchSize { get; set; } = 512;
+    public int TeacherWorkerThreads { get; set; } = 4;
+
+    public string OutDir { get; set; }
+
+    [JsonIgnore]
+    public string HardJsonlPath => Path.Combine(OutDir, "hard.jsonl");
+
+    [JsonIgnore]
+    public string LabeledJsonlPath => Path.Combine(OutDir, "labeled.jsonl");
+
+    [JsonIgnore]
+    public string RejectedJsonlPath => Path.Combine(OutDir, "rejected.jsonl");
+
+    [JsonIgnore]
+    public string TpgOutDir => Path.Combine(OutDir, "tpg");
+
+    public static PuzzleReplayOptions Load(string jsonPath)
+    {
+      string json = File.ReadAllText(jsonPath);
+      return JsonSerializer.Deserialize<PuzzleReplayOptions>(json,
+        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+    }
+
+    public void Validate()
+    {
+      if (string.IsNullOrWhiteSpace(LichessCsvPath) || !File.Exists(LichessCsvPath))
+        throw new ArgumentException("LichessCsvPath missing or not found: " + LichessCsvPath);
+      if (string.IsNullOrWhiteSpace(NetSpec))
+        throw new ArgumentException("NetSpec is required");
+      if (string.IsNullOrWhiteSpace(OutDir))
+        throw new ArgumentException("OutDir is required");
+      if (MinRating < 0 || MaxRating < MinRating)
+        throw new ArgumentException($"Invalid rating range [{MinRating},{MaxRating}]");
+      if (TeacherNodes < 1) throw new ArgumentException("TeacherNodes must be >= 1");
+      Directory.CreateDirectory(OutDir);
+    }
+  }
+}

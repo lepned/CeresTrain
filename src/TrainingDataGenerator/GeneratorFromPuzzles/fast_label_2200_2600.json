@@ -1,0 +1,21 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+
+  "MinRating": 2200,
+  "MaxRating": 2600,
+  "ThemeIncludeAny": null,
+  "ThemeExcludeAny": null,
+  "MaxPuzzlesToRead": 10000000,
+
+  "ResumeFromCheckpoint": true,
+
+  "OutDir": "C:/Dev/Chess/Puzzles/fast_label_2200_2600",
+
+  "_comment": "NetSpec/Device/TeacherNodes are unused by fast-label but PuzzleReplayOptions.Validate requires NetSpec. Any string works.",
+  "NetSpec": "unused",
+  "Device": "unused",
+  "TeacherNodes": 0,
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+  "MaxRecordsToLabel": 0
+}

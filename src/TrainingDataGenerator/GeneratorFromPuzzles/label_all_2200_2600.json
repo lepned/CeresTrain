@@ -1,0 +1,21 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+  "NetSpec": "C:/Dev/Chess/Networks/CeresNet/C3-384-12-I8.onnx|CUDAGRAPHS=false",
+  "Device": "GPU:0",
+
+  "MinRating": 2200,
+  "MaxRating": 2600,
+  "ThemeIncludeAny": null,
+  "ThemeExcludeAny": null,
+  "MaxPuzzlesToRead": 10000000,
+
+  "SkipMining": true,
+  "ResumeFromCheckpoint": true,
+
+  "MaxRecordsToLabel": 0,
+  "TeacherNodes": 100,
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+
+  "OutDir": "C:/Dev/Chess/Puzzles/label_all_2200_2600"
+}

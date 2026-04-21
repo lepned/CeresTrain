@@ -1,0 +1,15 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+  "NetSpec": "C:/Dev/Chess/Networks/CeresNet/lepdev_puzzle_py_smoke_5000192.onnx|CUDAGRAPHS=false",
+  "Device": "GPU:0",
+  "MinRating": 2000,
+  "MaxRating": 3000,
+  "ThemeIncludeAny": null,
+  "ThemeExcludeAny": null,
+  "MaxPuzzlesToRead": 10000,
+  "MaxRecordsToLabel": 0,
+  "TeacherNodes": 200,
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+  "OutDir": "C:/Dev/Chess/Puzzles/eval_specialist_v1"
+}

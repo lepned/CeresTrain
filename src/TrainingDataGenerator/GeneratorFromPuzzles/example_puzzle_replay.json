@@ -1,0 +1,19 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+  "NetSpec": "C:/Dev/Chess/Networks/CeresNet/C3-384-12-I8.onnx|CUDAGRAPHS=false",
+  "Device": "GPU:0#TensorRTNative",
+
+  "MinRating": 2000,
+  "MaxRating": 3000,
+  "ThemeIncludeAny": null,
+  "ThemeExcludeAny": null,
+  "MaxPuzzlesToRead": 10000000,
+  "MaxRecordsToLabel": 0,
+
+  "TeacherNodes": 200,
+  "_comment_teacher_note": "Using C3-384-12 as teacher for speed; mining was done with this net too, so hard records ARE student-mismatched-against-Lichess from 384's perspective.",
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+
+  "OutDir": "C:/Dev/Chess/Puzzles/scaled_mine_001"
+}

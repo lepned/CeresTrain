@@ -24,6 +24,7 @@ using CeresTrain.Examples;
 using CeresTrain.UserSettings;
 using CeresTrain.CeresTrainDefaults;
 using CeresTrain.Tasks;
+using CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles;
 
 #endregion
 
@@ -70,6 +71,14 @@ namespace CeresTrain.TrainCommands
     static Command generateTPGCommand;
     static Command convertTARToPackedZSTCommand;
 
+    static Option<string> puzzleConfigOption;
+    static Command minePuzzlesCommand;
+    static Command labelPuzzlesCommand;
+    static Command puzzlesToTPGCommand;
+    static Command puzzleReplayCommand;
+    static Command evalLabeledCommand;
+    static Command fastLabelCommand;
+
     /// <summary>
     /// Starts a console session for CeresTrain, reading command line arguments and executing the appropriate command.
     /// </summary>
@@ -96,7 +105,8 @@ namespace CeresTrain.TrainCommands
       searchLimitOptionDefaultBV = new Option<string>("--search-limit", () => "bv", "Search limit to use (e.g. BV for best value).") { IsRequired = false };
       searchLimitOption = new Option<string>("--search-limit", () => null, "Search limit to use if tournament is to be r.") { IsRequired = false };
       epdOrPgnFnOption = new Option<string>("--pos-fn", "EPD or PGN file name used to source positions") { IsRequired = false };
-      epdOrPgnOutputFileNameOption = new Option<string>("--pos-out-fn", "Name of PGN or EPD file from which to extract positions") { IsRequired = true };    
+      epdOrPgnOutputFileNameOption = new Option<string>("--pos-out-fn", "Name of PGN or EPD file from which to extract positions") { IsRequired = true };
+      puzzleConfigOption = new Option<string>("--puzzle-config", "Path to PuzzleReplayOptions JSON file") { IsRequired = true };
 
       // Add commands
       initCommand = new Command("init", "Initializes new config with default values.                     [config]") { configOption };
@@ -112,6 +122,13 @@ namespace CeresTrain.TrainCommands
       generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets]") { tarDirOption, tpgDirOption, numTPGSetsOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
 
+      minePuzzlesCommand = new Command("mine-puzzles", "Mine hard Lichess puzzles at nodes=1.                           [puzzle-config]") { puzzleConfigOption };
+      labelPuzzlesCommand = new Command("label-puzzles", "Teacher-label hard puzzles via MCGS search.                     [puzzle-config]") { puzzleConfigOption };
+      puzzlesToTPGCommand = new Command("puzzles-to-tpg", "Convert labeled puzzles to TPG training shards.                 [puzzle-config]") { puzzleConfigOption };
+      puzzleReplayCommand = new Command("puzzle-replay", "Run full puzzle replay pipeline (mine + label + tpg).           [puzzle-config]") { puzzleConfigOption };
+      evalLabeledCommand = new Command("eval-labeled", "Evaluate a trained net on the training set (labeled.jsonl).     [puzzle-config]") { puzzleConfigOption };
+      fastLabelCommand = new Command("label-fast", "Direct-label puzzles from Lichess CSV (no NN search, theme-WDL). [puzzle-config]") { puzzleConfigOption };
+
       rootCommand.AddCommand(initCommand);
       rootCommand.AddCommand(infoCommand);
       rootCommand.AddCommand(trainCommand);
@@ -124,6 +141,12 @@ namespace CeresTrain.TrainCommands
       rootCommand.AddCommand(generateEndgameTPGCommand);
       rootCommand.AddCommand(generateTPGCommand);
       rootCommand.AddCommand(convertTARToPackedZSTCommand);
+      rootCommand.AddCommand(minePuzzlesCommand);
+      rootCommand.AddCommand(labelPuzzlesCommand);
+      rootCommand.AddCommand(puzzlesToTPGCommand);
+      rootCommand.AddCommand(puzzleReplayCommand);
+      rootCommand.AddCommand(evalLabeledCommand);
+      rootCommand.AddCommand(fastLabelCommand);
 
       InstallCommandHandlers();
 
@@ -225,6 +248,42 @@ namespace CeresTrain.TrainCommands
         SearchLimit searchLimit = searchLimitSpec == null ? default : SearchLimitSpecificationString.Parse(searchLimitSpec);
         CeresTrainCommands.ProcessEvalLC0Command(piecesStr, netID, numPos, epdOrPgnFN, searchLimit, verbose);
       }, piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption);
+
+      minePuzzlesCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleMiner.Run(opts);
+      }, puzzleConfigOption);
+
+      labelPuzzlesCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleTeacherLabeler.Run(opts);
+      }, puzzleConfigOption);
+
+      puzzlesToTPGCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleToTPGGenerator.Run(opts);
+      }, puzzleConfigOption);
+
+      puzzleReplayCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleReplayPipeline.Run(opts);
+      }, puzzleConfigOption);
+
+      evalLabeledCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleEvalOnLabeled.Run(opts);
+      }, puzzleConfigOption);
+
+      fastLabelCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleFastLabeler.Run(opts);
+      }, puzzleConfigOption);
     }
 
   }
