@@ -56,11 +56,15 @@ def save_model(NAME : str,
 
   with torch.no_grad():
 
-    # If running in LoRA fine-tuning mode, only sage the LoRA weights file
+    # If running in LoRA fine-tuning mode, first save the LoRA weights binary
+    # (for potential use merging into a different base), then continue on to do
+    # the normal ONNX export. The LoRA forward (base + alpha/sqrt(r) * A @ B @ x)
+    # will be captured by torch.onnx.export's tracing and constant-folded so the
+    # resulting ONNX contains the merged weights.
     if config.Opt_LoRARankDivisor > 0:
-      SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + ".lora_" + num_pos + '.bin')
-      collect_and_save_lora_parameters(model_nocompile, SAVE_FULL_NAME)
-      return
+      SAVE_FULL_NAME_LORA_BIN = os.path.join(OUTPUTS_DIR, 'nets', NAME + ".lora_" + num_pos + '.bin')
+      collect_and_save_lora_parameters(model_nocompile, SAVE_FULL_NAME_LORA_BIN)
+      # Fall through and also produce a merged .onnx below.
 
     convert_type = model_nocompile.dtype
     model_nocompile.eval()
@@ -175,15 +179,40 @@ def save_model(NAME : str,
           # while internal weights are still FP32.
           sample_inputs = (torch.rand(256, 64, 137).to(torch.float32).to(model_nocompile.device),
                             torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(model_nocompile.device))
-          torch.onnx.export(model_nocompile,
-                            (sample_inputs[0], sample_inputs[1]),
+          # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
+          # only calls setTensorAddress on inputNames[0] — additional inputs are
+          # never bound, causing enqueueV3 to fail with "Address is not set for
+          # input tensor <name>". To stay compatible with that single-input
+          # assumption, when PriorStateDim==0 we wrap the model so only `squares`
+          # is an ONNX input; the zero prior_state is constructed internally.
+          if config.NetDef_PriorStateDim == 0:
+            import torch.nn as _nn
+            class _SquaresOnlyWrapper(_nn.Module):
+              def __init__(self, inner, prior_state_dim):
+                super().__init__(); self.inner = inner; self.prior_state_dim = prior_state_dim
+              def forward(self, squares):
+                ps = torch.zeros(squares.shape[0], 64, self.prior_state_dim,
+                                 dtype=squares.dtype, device=squares.device)
+                return self.inner(squares, ps)
+            _export_model = _SquaresOnlyWrapper(model_nocompile, config.NetDef_PriorStateDim).eval()
+            _export_inputs = (sample_inputs[0],)
+            _input_names = ['squares']
+            _output_axes_single = {k: v for k, v in output_axes.items() if k != 'prior_state'}
+          else:
+            _export_model = model_nocompile
+            _export_inputs = (sample_inputs[0], sample_inputs[1])
+            _input_names = ['squares', 'prior_state']
+            _output_axes_single = output_axes
+
+          torch.onnx.export(_export_model,
+                            _export_inputs,
                             SAVE_FULL_NAME,
                             do_constant_folding=True,
                             export_params=True,
                             opset_version=17, # Pytorch 2.3 maximum supported opset version 17
-                            input_names = ['squares', 'prior_state'], # if config.NetDef_PriorStateDim > 0 else ['squares'],
+                            input_names = _input_names,
                             output_names = head_output_names,
-                            dynamic_axes=output_axes)
+                            dynamic_axes=_output_axes_single)
           print('INFO: ONNX_FILENAME', SAVE_FULL_NAME)
 
           if True:

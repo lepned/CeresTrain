@@ -78,6 +78,9 @@ namespace CeresTrain.TrainCommands
     static Command puzzleReplayCommand;
     static Command evalLabeledCommand;
     static Command fastLabelCommand;
+    static Command enrichValueCommand;
+    static Command teacherValueCommand;
+    static Command teacherChildrenCommand;
 
     /// <summary>
     /// Starts a console session for CeresTrain, reading command line arguments and executing the appropriate command.
@@ -128,6 +131,9 @@ namespace CeresTrain.TrainCommands
       puzzleReplayCommand = new Command("puzzle-replay", "Run full puzzle replay pipeline (mine + label + tpg).           [puzzle-config]") { puzzleConfigOption };
       evalLabeledCommand = new Command("eval-labeled", "Evaluate a trained net on the training set (labeled.jsonl).     [puzzle-config]") { puzzleConfigOption };
       fastLabelCommand = new Command("label-fast", "Direct-label puzzles from Lichess CSV (no NN search, theme-WDL). [puzzle-config]") { puzzleConfigOption };
+      enrichValueCommand = new Command("enrich-value-labels", "Enrich labeled.jsonl with opp-to-move + counterfactual + pre-blunder records. [puzzle-config]") { puzzleConfigOption };
+      teacherValueCommand = new Command("teacher-value-label", "Stage 3: teacher-label per-position WDL via NNEvaluator (NetSpec in config). [puzzle-config]") { puzzleConfigOption };
+      teacherChildrenCommand = new Command("teacher-label-children", "Emit one OppDefence record per Standard with teacher WDL on child position. [puzzle-config]") { puzzleConfigOption };
 
       rootCommand.AddCommand(initCommand);
       rootCommand.AddCommand(infoCommand);
@@ -147,6 +153,9 @@ namespace CeresTrain.TrainCommands
       rootCommand.AddCommand(puzzleReplayCommand);
       rootCommand.AddCommand(evalLabeledCommand);
       rootCommand.AddCommand(fastLabelCommand);
+      rootCommand.AddCommand(enrichValueCommand);
+      rootCommand.AddCommand(teacherValueCommand);
+      rootCommand.AddCommand(teacherChildrenCommand);
 
       InstallCommandHandlers();
 
@@ -283,6 +292,29 @@ namespace CeresTrain.TrainCommands
       {
         PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
         PuzzleFastLabeler.Run(opts);
+      }, puzzleConfigOption);
+
+      enrichValueCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string inputPath = opts.LabeledJsonlPath;
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_enriched.jsonl");
+        PuzzleValueEnricher.Run(opts, inputPath, outputPath);
+      }, puzzleConfigOption);
+
+      teacherValueCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_teacher.jsonl");
+        PuzzleValueLabeler.Run(opts, outputPath);
+      }, puzzleConfigOption);
+
+      teacherChildrenCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string inputPath = opts.LabeledJsonlPath;
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_teacher_plus.jsonl");
+        PuzzleValueLabelerChildren.Run(opts, inputPath, outputPath);
       }, puzzleConfigOption);
     }
 

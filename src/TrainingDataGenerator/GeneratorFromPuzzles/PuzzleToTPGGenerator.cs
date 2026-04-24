@@ -164,7 +164,23 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
 
       MGPosition mgPos = pos.ToMGPosition;
 
-      if (rec.TeacherPolicy == null || rec.TeacherPolicy.Count == 0) return false;
+      // A record is "value-only" if it has no policy target (no SolutionUci,
+      // no TeacherPolicy). In that case we emit it with an all-zero policy
+      // target so training-time policy loss is zero for that record, while the
+      // value head still learns from TeacherW/D/L. Standard and OppDefence
+      // records both carry policy targets (OppDefence's policy = opp's puzzle
+      // defence move) and go through the full policy+value path.
+      bool hasPolicy = rec.TeacherPolicy != null && rec.TeacherPolicy.Count > 0
+                       && !string.IsNullOrEmpty(rec.SolutionUci);
+
+      // A Standard record is required to have a policy target; if it doesn't,
+      // reject it (data corruption / legacy format).
+      if (rec.Kind == PuzzlePositionKind.Standard && !hasPolicy) return false;
+
+      if (!hasPolicy)
+      {
+        return TryBuildValueOnly(rec, in pos, in mgPos, out etp, out targetInfo);
+      }
 
       // Build dict of teacher-visited move-index → visit-fraction
       Dictionary<int, float> visitedIdxToProb = new Dictionary<int, float>(rec.TeacherPolicy.Count);
@@ -274,6 +290,74 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       // Leaving them at 0 created a train/inference skew: model trained seeing all zeros
       // for these byte positions while Ceres at inference populates 0.03, giving the
       // model inputs it never saw during training.
+      const float DEFAULT_Q_BLUNDER = 0.03f;
+      targetInfo.ForwardSumPositiveBlunders = DEFAULT_Q_BLUNDER;
+      targetInfo.ForwardSumNegativeBlunders = DEFAULT_Q_BLUNDER;
+
+      return true;
+    }
+
+
+    /// <summary>
+    /// Emits a value-only TPG record: WDL target set, policy target all zeros so
+    /// training policy loss evaluates to 0 on these records. Used for non-Standard
+    /// record kinds (OppDefence, SolverAfterInferiorOpp, PreBlunder).
+    /// </summary>
+    static bool TryBuildValueOnly(LabeledPuzzleRecord rec, in Position pos, in MGPosition mgPos,
+                                  out EncodedTrainingPosition etp,
+                                  out TPGTrainingTargetNonPolicyInfo targetInfo)
+    {
+      etp = default;
+      targetInfo = default;
+
+      float w = Clamp01(rec.TeacherW);
+      float l = Clamp01(rec.TeacherL);
+      float d = Math.Max(0f, 1f - w - l);
+      float q = w - l;
+
+      // Build the encoded position from replayed real history, same as Standard path.
+      EncodedPositionWithHistory newPosHistory = default;
+      Span<Position> history = BuildHistorySpan(rec, in pos);
+      const bool FILL_MISSING = true;
+      newPosHistory.SetFromSequentialPositions(history, FILL_MISSING);
+
+      // All-zero policy target: target.greater(0) is all False during training,
+      // so cross-entropy loss on policy = 0 and the policy head gets no gradient
+      // contribution from this record.
+      EncodedPolicyVector epv = default;  // default struct is all zeros.
+
+      float m = 0;
+      // Since there's no "best move" here, set playedIndex/bestIndex to 0 (any
+      // valid index works; loss/accuracy paths don't consume these for value-only
+      // records since target has no peak).
+      EncodedPositionEvalMiscInfoV6 trainingMiscInfo = new(
+        invarianceInfo: LC0_INVARIANCE_INFO, depResult: default,
+        rootQ: q, bestQ: q, rootD: d, bestD: d,
+        rootM: m, bestM: m, pliesLeft: m,
+        resultQ: q, resultD: d,
+        playedQ: q, playedD: d, playedM: m,
+        originalQ: q, originalD: d, originalM: m,
+        numVisits: rec.TeacherNodes,
+        playedIndex: 0, bestIndex: 0,
+        kldPolicy: default, unused2: default);
+
+      EncodedTrainingPositionMiscInfo miscInfoAll = new(newPosHistory.MiscInfo.InfoPosition, trainingMiscInfo);
+      newPosHistory.SetMiscInfo(miscInfoAll);
+
+      etp = new EncodedTrainingPosition(LC0_DATA_VERSION, LC0_INPUT_FORMAT, newPosHistory, epv);
+
+      targetInfo.BestWDL = (w, d, l);
+      targetInfo.ResultDeblunderedWDL = (w, d, l);
+      targetInfo.ResultNonDeblunderedWDL = (w, d, l);
+      // Source = ActionHeadDummyMove is the existing sentinel that tells
+      // TrainingPositionWriter to skip policy-validity checks for this record.
+      // TPGTrainingTargetNonPolicyInfo.Source is a C# writer-side marker; the
+      // Python training side (tpg_dataset.py) does not read it, so value-head
+      // learning from TeacherW/D/L proceeds normally while the policy loss on
+      // these records is zero (target.greater(0) is all False).
+      targetInfo.Source = TPGTrainingTargetNonPolicyInfo.TargetSourceInfo.ActionHeadDummyMove;
+      targetInfo.NumSearchNodes = rec.TeacherNodes;
+      targetInfo.MLH = 0;
       const float DEFAULT_Q_BLUNDER = 0.03f;
       targetInfo.ForwardSumPositiveBlunders = DEFAULT_Q_BLUNDER;
       targetInfo.ForwardSumNegativeBlunders = DEFAULT_Q_BLUNDER;

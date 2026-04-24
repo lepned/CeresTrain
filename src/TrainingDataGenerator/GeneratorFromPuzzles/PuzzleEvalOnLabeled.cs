@@ -45,6 +45,11 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       Stopwatch sw = Stopwatch.StartNew();
 
       IEnumerable<LabeledPuzzleRecord> source = JsonlIO.Read<LabeledPuzzleRecord>(opts.LabeledJsonlPath);
+      // Eval-labeled is a POLICY metric — only meaningful on Standard records
+      // (solver-to-move positions with a known Lichess solution). Skip any
+      // enrichment kinds that may be present in the input file.
+      source = System.Linq.Enumerable.Where(source,
+        r => r.Kind == PuzzlePositionKind.Standard && !string.IsNullOrEmpty(r.SolutionUci));
       if (opts.MinRating > 0 || opts.MaxRating < int.MaxValue)
         source = System.Linq.Enumerable.Where(source, r => r.Rating >= opts.MinRating && r.Rating <= opts.MaxRating);
       if (opts.EvalStartingPositionsOnly)

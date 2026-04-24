@@ -46,6 +46,34 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
 
 
   /// <summary>
+  /// Classifies what kind of training signal a record carries. Determines how
+  /// PuzzleToTPGGenerator interprets the value/policy targets.
+  ///
+  /// Standard: solver-to-move position in the puzzle line. Value = theme WDL,
+  ///           policy = one-hot Lichess solution.
+  /// OppDefence: opp-to-move position in the puzzle line (after solver played).
+  ///             Value = flipped theme (opp losing), policy = opp's best defence
+  ///             (the actual puzzle move).
+  /// SolverAfterInferiorOpp: solver-to-move position after opp played a non-
+  ///             puzzle move. Value = theme shifted up (solver winning more).
+  ///             No policy target — we don't know the best continuation here.
+  /// PreBlunder: position BEFORE the blunder move (CSV start FEN). Blunderer
+  ///             to move. Value = balanced (assume roughly equal). No policy
+  ///             target.
+  /// </summary>
+  public enum PuzzlePositionKind
+  {
+    Standard = 0,
+    OppDefence = 1,
+    /// <summary>Deprecated — used in v1 enrichment. Records have fabricated "shifted-up" theme WDL.</summary>
+    SolverAfterInferiorOpp = 2,
+    PreBlunder = 3,
+    /// <summary>v2 enrichment: opp-to-move after solver played a non-puzzle move. WDL derived from Lichess's unique-winning guarantee.</summary>
+    OppAfterInferiorSolver = 4,
+  }
+
+
+  /// <summary>
   /// One teacher-labeled training position. Emitted only when the teacher's
   /// top move agrees with the Lichess solution (filter policy).
   /// </summary>
@@ -56,6 +84,13 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
     public string SolutionUci { get; set; }
     public int Rating { get; set; }
     public string Themes { get; set; }
+
+    /// <summary>
+    /// Identifies the training-signal semantics of this record. Defaults to
+    /// Standard for backward compatibility with records emitted before
+    /// multi-sided value enrichment existed.
+    /// </summary>
+    public PuzzlePositionKind Kind { get; set; } = PuzzlePositionKind.Standard;
 
     /// <summary>CSV start FEN (before the setup move). Needed to rebuild real history for training.</summary>
     public string StartFen { get; set; }

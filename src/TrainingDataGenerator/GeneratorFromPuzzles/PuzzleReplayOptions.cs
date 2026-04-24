@@ -99,8 +99,17 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
     [JsonIgnore]
     public string HardJsonlPath => Path.Combine(OutDir, "hard.jsonl");
 
+    /// <summary>
+    /// Optional override for the labeled JSONL input path used by puzzles-to-tpg
+    /// and eval-labeled. When null, defaults to &lt;OutDir&gt;/labeled.jsonl.
+    /// Set to e.g. "labeled_enriched.jsonl" to use the multi-sided value-enriched
+    /// file produced by `enrich-value-labels`.
+    /// </summary>
+    public string LabeledJsonlFileName { get; set; }
+
     [JsonIgnore]
-    public string LabeledJsonlPath => Path.Combine(OutDir, "labeled.jsonl");
+    public string LabeledJsonlPath =>
+      Path.Combine(OutDir, string.IsNullOrWhiteSpace(LabeledJsonlFileName) ? "labeled.jsonl" : LabeledJsonlFileName);
 
     [JsonIgnore]
     public string RejectedJsonlPath => Path.Combine(OutDir, "rejected.jsonl");

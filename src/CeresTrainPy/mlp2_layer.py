@@ -11,9 +11,20 @@ If not, see <http://www.gnu.org/licenses/>.
 
 # End of License Notice
 
+import os
 import torch
 from activation_functions import to_activation
 from rms_norm import RMSNorm
+from lora import LoRALinear
+
+# When CERES_LORA_TRANSFORMER_RANK_DIV env var is set to a non-zero integer N,
+# wrap this layer's primary Linears with LoRALinear(rank_divisor=N). This extends
+# LoRA from head layers (applied in ceres_net.py Head) into the transformer body,
+# giving the fine-tune adapter access to the MLP weights that head-only LoRA
+# can't reach. Unset / 0 = standard behavior (no LoRA on transformer MLP).
+def _maybe_wrap_lora(layer):
+    n = int(os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0") or "0")
+    return LoRALinear(layer, n, True) if n > 0 else layer
 
 # An intuitive explanation of why biases are important can be found in 
 # the YouTube video "How might LLMs store facts" by 3Blue1Brown (at about 9:00).
@@ -50,8 +61,8 @@ class MLP2Layer(torch.nn.Module):
         self.mlpGlobalReduce = torch.nn.Linear(mlpGlobalDim, model_dim // MLP_GLOBAL_DIVISOR, bias=USE_BIAS)
         self.mlpGlobalLN = torch.nn.LayerNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS) if norm_type == 'LayerNorm' else RMSNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS)
 
-      self.linear1 = torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS)
-      self.linear2 = torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS)
+      self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS))
+      self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS))
       if activation_type == 'SwiGLU':
         self.linear3 = torch.nn.Linear(model_dim, ffn_inner_dim, bias=False) 
 

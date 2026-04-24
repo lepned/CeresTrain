@@ -465,18 +465,26 @@ def Train():
           if torch.all(param == 0):  # Check if all elements in the tensor are zero
             print(f"Note: layer {name} has all zero values. This is expected only for LoRA layers.")
 
-    if config.Opt_LoRARankDivisor == 0:
-      optimizer.load_state_dict(loaded["optimizer"])
-    else:
-      # Special logic to deal with missing LoRA optimizer parameters in the checkpoint 
-      loaded_optimizer_state = loaded["optimizer"]
-      current_param_groups = optimizer.param_groups
-      loaded_param_groups = loaded_optimizer_state["param_groups"]
+    # Unified optimizer-resume path:
+    #   - If the loaded optimizer dict's param_groups match the current optimizer, a
+    #     normal load_state_dict works.
+    #   - If not (e.g. resuming from a reconstructed checkpoint whose optimizer state
+    #     was built on a different model, or LoRA), substitute current param_groups
+    #     and load only the 'state' portion (fresh if empty).
+    loaded_optimizer_state = loaded["optimizer"]
+    current_param_groups = optimizer.param_groups
+    loaded_param_groups = loaded_optimizer_state.get("param_groups", [])
 
-      # Adjust loaded state to match current optimizer
-      if len(current_param_groups) != len(loaded_param_groups):
-        loaded_optimizer_state["param_groups"] = current_param_groups
-      optimizer.load_state_dict(loaded_optimizer_state)
+    groups_match = (len(current_param_groups) == len(loaded_param_groups)
+                    and all(len(cg["params"]) == len(lg["params"])
+                            for cg, lg in zip(current_param_groups, loaded_param_groups)))
+    if not groups_match:
+      print(f"[checkpoint-resume] optimizer param_groups mismatch "
+            f"(current={len(current_param_groups)} vs loaded={len(loaded_param_groups)}) — "
+            f"substituting current groups, starting optimizer state fresh")
+      loaded_optimizer_state["param_groups"] = current_param_groups
+      loaded_optimizer_state["state"] = {}
+    optimizer.load_state_dict(loaded_optimizer_state)
     
     
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
@@ -651,7 +659,7 @@ def Train():
     num_batches = num_pos // BATCH_SIZE
 
     # emit output files including checkpoint if specified interval passed
-    if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos > 10_000_000):
+    if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions):
       num_batches_between_checkpoints = config.Opt_CheckpointFrequencyNumPositions // BATCH_SIZE
       if num_batches % num_batches_between_checkpoints == 0:
         save_checkpoint(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, str(num_pos))

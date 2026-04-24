@@ -231,7 +231,7 @@ class CeresNet(pl.LightningModule):
     if isinstance(squares, list):
       # when saving/restoring from ONNX the input will appear as a list instead of sequence of arguments
       squares = squares[0]
-      
+
     flow = squares
 
     # save a copy of the qblunders (2 bytes) for later use in value 2 head (only)

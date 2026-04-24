@@ -11,6 +11,7 @@ If not, see <http://www.gnu.org/licenses/>.
 
 # End of License Notice
 
+import os
 import math
 import numpy as np
 
@@ -20,6 +21,14 @@ from einops import einsum, rearrange, repeat
 from rms_norm import RMSNorm
 
 from activation_functions import Swish, ReLUSquared
+from lora import LoRALinear
+
+# When CERES_LORA_TRANSFORMER_RANK_DIV env var is set to a non-zero integer N,
+# wrap this layer's primary Linears with LoRALinear(rank_divisor=N). Extends
+# LoRA from head layers into transformer-body attention projections.
+def _maybe_wrap_lora(layer):
+    n = int(os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0") or "0")
+    return LoRALinear(layer, n, True) if n > 0 else layer
 
 class LinearWrapper:
   def __init__(self, linear_layer):
@@ -116,14 +125,14 @@ class DotProductAttention(torch.nn.Module):
 
     # Fused Q, K, and V linear projection for improved efficiency.
     self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
-    self.qkv = torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS)
-    self.W_h = torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output)
+    self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS))
+    self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output))
 
     if self.use_nonlinear_attention:
       self.qkvLN = torch.nn.LayerNorm(self.d_model * self.attention_multiplier) if norm_type == 'LayerNorm' else RMSNorm(self.d_model * self.attention_multiplier)
-      self.q2 = torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS)
-      self.k2 = torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS)
-      self.v2 = torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS)
+      self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
+      self.k2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
+      self.v2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
 
     if self.use_qk_norm:
       # extra layernorm for enahnced training stability
