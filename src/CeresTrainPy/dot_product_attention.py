@@ -23,11 +23,14 @@ from rms_norm import RMSNorm
 from activation_functions import Swish, ReLUSquared
 from lora import LoRALinear
 
-# When CERES_LORA_TRANSFORMER_RANK_DIV env var is set to a non-zero integer N,
-# wrap this layer's primary Linears with LoRALinear(rank_divisor=N). Extends
-# LoRA from head layers into transformer-body attention projections.
+# Attention-LoRA gate. Reads CERES_LORA_ATTN_RANK_DIV first (specific knob),
+# falls back to CERES_LORA_TRANSFORMER_RANK_DIV (legacy unified knob) for
+# backward compatibility. Allows attention-only transformer-LoRA experiments
+# (combine with CERES_LORA_FFN_RANK_DIV=0 in mlp2_layer.py).
 def _maybe_wrap_lora(layer):
-    n = int(os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0") or "0")
+    n_attn  = os.environ.get("CERES_LORA_ATTN_RANK_DIV")
+    n_legacy = os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0")
+    n = int((n_attn if n_attn is not None else n_legacy) or "0")
     return LoRALinear(layer, n, True) if n > 0 else layer
 
 class LinearWrapper:

@@ -120,32 +120,47 @@ class CeresNet(pl.LightningModule):
     self.HEAD_IN_SIZE = 64 * (self.HEAD_PREMAP_PER_SQUARE // HEAD_SHARED_LINEAR_DIV)
     self.headSharedLinear = nn.Linear(64 * self.HEAD_PREMAP_PER_SQUARE, self.HEAD_IN_SIZE)
 
-    self.policy_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, config.Opt_LoRARankDivisor)
-    
+    # When restrict_pv flag is set, only policy_head and value_head get LoRA
+    # adapters; all other heads use rank_div=0 (standard Linear, frozen base).
+    # Aligns with "minimal-intervention" recipe: most labels match orig output,
+    # so only policy + value heads need adaptable capacity.
+    _lora_rd = config.Opt_LoRARankDivisor
+    _restrict_pv = bool(getattr(config, 'Opt_LoRARestrictPolicyValueOnly', False))
+    _restrict_v  = bool(getattr(config, 'Opt_LoRARestrictValueOnly', False))
+    # When _restrict_v is set, ONLY the value head gets LoRA adapters; policy
+    # and all other heads use rank_div=0. Combined with
+    # CERES_LORA_TRANSFORMER_RANK_DIV=0 and LossPolicyMultiplier=0, this isolates
+    # value-head fine-tuning: only value_head.* layers receive any gradient.
+    _pol_rd   = 0 if _restrict_v else _lora_rd
+    _val_rd   = _lora_rd
+    _other_rd = 0 if (_restrict_pv or _restrict_v) else _lora_rd
+
+    self.policy_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _pol_rd)
+
     if self.prior_state_dim > 0:
-      self.state_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 64*self.prior_state_dim, config.Opt_LoRARankDivisor)
+      self.state_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 64*self.prior_state_dim, _other_rd)
 
     if action_loss_weight > 0:
-      self.action_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858 * 3, config.Opt_LoRARankDivisor)
+      self.action_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858 * 3, _other_rd)
 
     if action_uncertainty_loss_weight > 0:
-      self.action_uncertainty_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, config.Opt_LoRARankDivisor)
+      self.action_uncertainty_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _other_rd)
 
-    self.value_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, config.Opt_LoRARankDivisor)
-    self.unc_head = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, config.Opt_LoRARankDivisor)
+    self.value_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, _val_rd)
+    self.unc_head = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
     if self.value2_loss_weight > 0:
-      self.value2_head = Head(self.Activation, 2 + self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, config.Opt_LoRARankDivisor) 
+      self.value2_head = Head(self.Activation, 2 + self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, _other_rd)
 
     if self.uncertainty_policy_weight > 0:
-      self.unc_policy = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, config.Opt_LoRARankDivisor)
-    
-    if moves_left_loss_weight > 0:
-      self.mlh_head = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, config.Opt_LoRARankDivisor)
+      self.unc_policy = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
-    if q_deviation_loss_weight > 0:      
-      self.qdev_upper = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, config.Opt_LoRARankDivisor)
-      self.qdev_lower = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, config.Opt_LoRARankDivisor)
+    if moves_left_loss_weight > 0:
+      self.mlh_head = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
+
+    if q_deviation_loss_weight > 0:
+      self.qdev_upper = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
+      self.qdev_lower = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
 
 

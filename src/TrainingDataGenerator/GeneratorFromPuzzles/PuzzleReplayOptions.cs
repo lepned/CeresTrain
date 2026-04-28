@@ -29,6 +29,35 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
 
     public string Device { get; set; } = "GPU:0";
 
+    /// <summary>
+    /// Optional separate NetSpec for the action-head teacher used by `enrich-action-head`.
+    /// When null, falls back to <see cref="NetSpec"/>. The configured net MUST have an
+    /// action head (HasAction=true) — `enrich-action-head` throws otherwise.
+    /// Example: "ONNX_TRT16:C:/Dev/Chess/Networks/CeresNet/C3-768-30-pre3-I8.onnx".
+    /// </summary>
+    public string ActionNetSpec { get; set; }
+
+    /// <summary>
+    /// Optional separate Device for <see cref="ActionNetSpec"/>. When null, falls back to <see cref="Device"/>.
+    /// </summary>
+    public string ActionDevice { get; set; }
+
+    /// <summary>
+    /// `enrich-action-head`: number of non-solver legal moves to emit OAIS records for, per parent.
+    /// If a parent has fewer than this many non-solver legal moves, all are emitted.
+    /// Default 2 (lowered from 4 on 2026-04-28: OAIS records only teach
+    /// "any deviation = punished"; 2 random samples per parent gives sufficient
+    /// off-path supervision without inflating the dataset 2× for diminishing returns).
+    /// </summary>
+    public int OAISSamplesPerParent { get; set; } = 2;
+
+    /// <summary>
+    /// `enrich-action-head`: ε margin for the rank-1 nudge that forces the solver move's
+    /// action[L] to dominate the cross-move L array. Set <see cref="ActionNetSpec"/>=null
+    /// to disable action-head enrichment entirely. Default 0.03 (matches PuzzleSoftLabeler convention).
+    /// </summary>
+    public float RankOneEpsilon { get; set; } = 0.03f;
+
     public int MinRating { get; set; } = 1800;
     public int MaxRating { get; set; } = 3200;
 

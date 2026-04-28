@@ -85,6 +85,8 @@ class Configuration:
 
     # Initialize class members from config_opt
     self.Opt_LoRARankDivisor = config_opt.get('LoRARankDivisor', 0)
+    self.Opt_LoRARestrictPolicyValueOnly = config_opt.get('LoRARestrictPolicyValueOnly', False)
+    self.Opt_LoRARestrictValueOnly = config_opt.get('LoRARestrictValueOnly', False)
     self.Opt_NumTrainingPositions = config_opt.get('NumTrainingPositions', 10_000_000)
     self.Opt_BatchSizeForwardPass = config_opt.get('BatchSizeForwardPass', 2048)
     self.Opt_BatchSizeBackwardPass = config_opt.get('BatchSizeBackwardPass', 2048)

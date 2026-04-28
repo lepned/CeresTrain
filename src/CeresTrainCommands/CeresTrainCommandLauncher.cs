@@ -81,6 +81,8 @@ namespace CeresTrain.TrainCommands
     static Command enrichValueCommand;
     static Command teacherValueCommand;
     static Command teacherChildrenCommand;
+    static Command softLabelCommand;
+    static Command enrichActionCommand;
 
     /// <summary>
     /// Starts a console session for CeresTrain, reading command line arguments and executing the appropriate command.
@@ -134,6 +136,8 @@ namespace CeresTrain.TrainCommands
       enrichValueCommand = new Command("enrich-value-labels", "Enrich labeled.jsonl with opp-to-move + counterfactual + pre-blunder records. [puzzle-config]") { puzzleConfigOption };
       teacherValueCommand = new Command("teacher-value-label", "Stage 3: teacher-label per-position WDL via NNEvaluator (NetSpec in config). [puzzle-config]") { puzzleConfigOption };
       teacherChildrenCommand = new Command("teacher-label-children", "Emit one OppDefence record per Standard with teacher WDL on child position. [puzzle-config]") { puzzleConfigOption };
+      softLabelCommand = new Command("soft-label-puzzles", "Rank-1 soft-label Standard+OppDefence records using orig NN + ε margin. [puzzle-config]") { puzzleConfigOption };
+      enrichActionCommand = new Command("enrich-action-head", "Emit OppDefence + K OAIS records per Standard parent using action-head teacher (e.g. C3-768). [puzzle-config]") { puzzleConfigOption };
 
       rootCommand.AddCommand(initCommand);
       rootCommand.AddCommand(infoCommand);
@@ -156,6 +160,8 @@ namespace CeresTrain.TrainCommands
       rootCommand.AddCommand(enrichValueCommand);
       rootCommand.AddCommand(teacherValueCommand);
       rootCommand.AddCommand(teacherChildrenCommand);
+      rootCommand.AddCommand(softLabelCommand);
+      rootCommand.AddCommand(enrichActionCommand);
 
       InstallCommandHandlers();
 
@@ -315,6 +321,21 @@ namespace CeresTrain.TrainCommands
         string inputPath = opts.LabeledJsonlPath;
         string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_teacher_plus.jsonl");
         PuzzleValueLabelerChildren.Run(opts, inputPath, outputPath);
+      }, puzzleConfigOption);
+
+      softLabelCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_soft.jsonl");
+        PuzzleSoftLabeler.Run(opts, outputPath);
+      }, puzzleConfigOption);
+
+      enrichActionCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string inputPath = opts.LabeledJsonlPath;
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_action_enriched.jsonl");
+        PuzzleValueLabelerActionChildren.Run(opts, inputPath, outputPath);
       }, puzzleConfigOption);
     }
 

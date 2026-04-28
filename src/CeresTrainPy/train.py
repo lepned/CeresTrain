@@ -32,6 +32,7 @@ from rms_norm import RMSNorm
 from losses import LossCalculator
 from tpg_dataset import TPGDataset
 from config import Configuration
+import lora
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
 from utils import calc_flops
 
@@ -456,6 +457,13 @@ def Train():
 
       # Load updated state dict
       model.load_state_dict(new_state_dict, strict=False)
+
+    # PiSSA re-initialization (if enabled). MUST run after base weights are loaded.
+    # Vanilla LoRA init (lora_B=0) is already done inside LoRALinear.__init__; PiSSA
+    # overwrites it now using the SVD of the just-loaded base weight, and subtracts
+    # the rank-r approximation from the base so the model output at init is unchanged.
+    if config.Opt_LoRARankDivisor != 0 and lora.LORA_USE_PISSA:
+      lora.apply_pissa_to_model(model)
 
 
     # Check all layers for zero parameters

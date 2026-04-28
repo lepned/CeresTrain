@@ -190,8 +190,7 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         for (int i = 1; i < moves.Length; i += 2)
         {
           // i is a solver-to-move index. plyPos[i] is the solver position.
-          // priorUci for records that apply at plyPos[i+1] is moves[0..i+1] (inclusive i, exclusive i+1) — wait: prior is moves applied before reaching the NEW position.
-          // For an OppDefence at plyPos[i+1], moves applied = moves[0..=i] = the first i+1 moves.
+          // For an OppDefence at plyPos[i+1], moves applied = moves[0..=i].
           string priorForChild = string.Join(' ', moves, 0, i + 1);
           MGPosition mgChild = plyPos[i + 1];  // opp-to-move after solver's puzzle move
 
@@ -221,10 +220,55 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
             s.OppDefenceEmitted++;
           }
 
-          // No OppAfterInferiorSolver records: the simple design emits only the
-          // two authentic record kinds (Standard + OppDefence). Value-head ranking
-          // of off-path children is left to generalization; if empirical EB value
-          // is weak, add teacher-calibrated counterfactuals later.
+          // (c) OppAfterInferiorSolver — K counterfactual non-puzzle solver moves
+          //     at plyPos[i]. Justified by Lichess's Stockfish-verified uniqueness
+          //     guarantee: any move other than moves[i] is no longer winning.
+          //     Value-only (no policy target); conservative WDL from theme.
+          MGMoveList legal = new MGMoveList();
+          MGMoveGen.GenerateMoves(in plyPos[i], legal);
+          string puzzleMoveUci = moves[i];
+          List<MGMove> counterfactuals = new List<MGMove>();
+          foreach (MGMove m in legal.MovesArray.AsSpan(0, legal.NumMovesUsed))
+          {
+            if (m.MoveStr(MGMoveNotationStyle.Coordinates) == puzzleMoveUci) continue;
+            counterfactuals.Add(m);
+          }
+          for (int k = 0; k < COUNTERFACTUAL_SAMPLES_PER_POSITION && counterfactuals.Count > 0; k++)
+          {
+            MGMove cf = counterfactuals[rng.Next(counterfactuals.Count)];
+            MGPosition mgBlunderChild = plyPos[i];
+            mgBlunderChild.MakeMove(cf);
+
+            // Skip terminal blunder children (no legal replies) — TPG policy-mask
+            // construction requires at least one legal move.
+            MGMoveList bcLegal = new MGMoveList();
+            MGMoveGen.GenerateMoves(in mgBlunderChild, bcLegal);
+            if (bcLegal.NumMovesUsed == 0) continue;
+
+            string cfUci = cf.MoveStr(MGMoveNotationStyle.Coordinates);
+            string priorForBlunderChild = string.Join(' ', moves, 0, i) + " " + cfUci;
+
+            LabeledPuzzleRecord oais = new LabeledPuzzleRecord
+            {
+              PuzzleId = puzzleId,
+              FEN = mgBlunderChild.ToPosition.FEN,
+              SolutionUci = null,
+              Rating = rating,
+              Themes = themes,
+              StartFen = startFen,
+              PriorUciMoves = priorForBlunderChild,
+              Kind = PuzzlePositionKind.OppAfterInferiorSolver,
+              TeacherNodes = 0,
+              TeacherTopUci = null,
+              TeacherV = oppAfterInferiorWDL.w - oppAfterInferiorWDL.l,
+              TeacherW = oppAfterInferiorWDL.w,
+              TeacherD = oppAfterInferiorWDL.d,
+              TeacherL = oppAfterInferiorWDL.l,
+              TeacherPolicy = null,
+            };
+            JsonlIO.AppendLine(writer, oais);
+            s.OppAfterInferiorSolverEmitted++;
+          }
         }
 
         if (s.PuzzlesSeen % 50_000 == 0)

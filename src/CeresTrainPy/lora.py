@@ -21,6 +21,14 @@ from typing import Tuple, NamedTuple
 import torch
 import torch.nn as nn
 
+# PiSSA (Principal Singular values & Singular vectors Adaptation, arXiv:2404.02948).
+# Replaces vanilla LoRA's Kaiming/zero init with an SVD-based init that captures
+# the top-r principal components of the base weight in lora_A @ lora_B, and
+# subtracts that rank-r approximation from the base weight so the model output
+# at init equals the original. Both heads have non-zero gradient flow from step 1.
+# Set to True to enable; default False keeps vanilla LoRA behavior.
+LORA_USE_PISSA = False
+
 
 class LoRALinear(nn.Module):
   """
@@ -52,7 +60,7 @@ class LoRALinear(nn.Module):
     self.rank = min(original_layer.out_features, self.rank)  # Ensure rank is not greater than the output size
 
     if enable_lora:
-      # LoRA trainable parameters      
+      # LoRA trainable parameters
       # Note that the specific names "lora_A", "lora_B" and "lora_alpha" are
       # referenced elsewhere (e.g. in train.py)
       self.lora_A = nn.Parameter(torch.zeros((original_layer.out_features, self.rank)))
@@ -60,8 +68,13 @@ class LoRALinear(nn.Module):
       nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
       nn.init.zeros_(self.lora_B)
 
-      # Trainable alpha parameter
-      self.lora_alpha = nn.Parameter(torch.tensor(0.1))
+      # Trainable alpha parameter. Initialized to sqrt(rank) so the rsLoRA
+      # scaling factor (alpha/sqrt(rank)) starts at 1.0 — i.e., the adapter's
+      # effective contribution is at the same scale as a direct base-weight
+      # update. Prior default was 0.1, which gave scaling ≈ 0.016 for rank=40
+      # and meant LoRA adapters trained at ~1/60th the intended effective LR.
+      # Identity at init still holds because lora_B is zeros.
+      self.lora_alpha = nn.Parameter(torch.tensor(math.sqrt(float(self.rank))))
     else:
       self.lora_A = None
       self.lora_B = None
@@ -76,6 +89,77 @@ class LoRALinear(nn.Module):
       return self.original_layer(x) + scaling * (x @ lora_update.T)
     else:
       return self.original_layer(x)
+
+  def apply_pissa(self):
+    """Re-initialize lora_A, lora_B, lora_alpha using PiSSA (SVD of base weight).
+
+    Math: SVD W = U Σ Vᵀ. Take top-r components U_r, S_r, V_rᵀ.
+      A = U_r * sqrt(S_r),  B = sqrt(S_r) * V_rᵀ
+      lora_alpha = sqrt(rank)  ⇒  scaling factor (alpha/sqrt(rank)) = 1
+      base_weight ← W − U_r·S_r·V_rᵀ    (subtract rank-r approximation)
+    At init: base_modified + 1·A·B = (W − top_r) + top_r = W   (identity).
+    During training, A and B move along the top-r directions.
+
+    MUST be called AFTER the base checkpoint has been loaded.
+    """
+    if not self.enable_lora:
+      return
+    with torch.no_grad():
+      W = self.original_layer.weight.detach().to(torch.float32)
+      U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+      r = self.rank
+      U_r = U[:, :r]
+      S_r = S[:r]
+      Vh_r = Vh[:r, :]
+      sqrt_S = torch.sqrt(S_r)
+      A_init = U_r * sqrt_S.unsqueeze(0)            # (out, r)
+      B_init = sqrt_S.unsqueeze(1) * Vh_r           # (r, in)
+      top_r_approx = (U_r * S_r.unsqueeze(0)) @ Vh_r
+      dtype = self.original_layer.weight.dtype
+      self.lora_A.data.copy_(A_init.to(dtype))
+      self.lora_B.data.copy_(B_init.to(dtype))
+      # Set alpha = sqrt(rank) so the rsLoRA scaling alpha/sqrt(rank) = 1.
+      self.lora_alpha.data.fill_(math.sqrt(float(r)))
+      self.original_layer.weight.data.sub_(top_r_approx.to(dtype))
+
+
+def apply_pissa_to_model(model):
+  """Walk the model and apply PiSSA init to every enabled LoRALinear layer.
+
+  Skips layers where rank >= min(out_features, in_features). On those, PiSSA's
+  top-r SVD captures the full weight matrix and zeros the base, leaving the
+  layer 100% adapter-driven through a rank-saturated subspace — gradient
+  dynamics through that adapter don't track direct base-weight updates well.
+  Skipped layers keep vanilla LoRA init (lora_B=0), so they start as identity
+  and train normally. Empirically observed on small output-dim heads (e.g.
+  value_head.fcFinal 640->...->3) where this was the cause of v47's value
+  head regression.
+
+  Should be called after the base checkpoint has been loaded into the model.
+  """
+  n = 0
+  skipped = []
+  for m in model.modules():
+    if isinstance(m, LoRALinear) and m.enable_lora:
+      out_dim = m.original_layer.out_features
+      in_dim = m.original_layer.in_features
+      if m.rank >= min(out_dim, in_dim):
+        skipped.append((out_dim, in_dim, m.rank))
+        # rsLoRA-consistent scaling: vanilla init defaults alpha=0.1, giving
+        # scaling = 0.1/sqrt(r). PiSSA-initialized layers get alpha=sqrt(r) →
+        # scaling = 1.0. Without this fix the skipped layers train at ~17x
+        # smaller effective LR than the rest of the model — empirically
+        # observed in v48/v49 to leave value_head.fcFinal essentially
+        # untrained while upstream layers reoriented under PiSSA, breaking
+        # the value head's calibration. lora_B=0 is preserved, so identity
+        # at init still holds; only the post-init learning rate changes.
+        m.lora_alpha.data.fill_(math.sqrt(float(m.rank)))
+        continue
+      m.apply_pissa()
+      n += 1
+  print(f"PiSSA: re-initialized {n} LoRALinear layers using SVD of base weights.")
+  if skipped:
+    print(f"PiSSA: skipped {len(skipped)} rank-saturated layers (kept vanilla init, alpha=sqrt(r)): {skipped}")
 
 
 
