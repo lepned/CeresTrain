@@ -25,8 +25,9 @@ using Ceres.Chess.MoveGen.Converters;
 using Ceres.Chess.NNEvaluators.Defs;
 using Ceres.Chess.Positions;
 
-using Ceres.MCTS.GameEngines;
-using Ceres.MCTS.MTCSNodes;
+using Ceres.MCGS.GameEngines;
+using Ceres.MCGS.Graphs.GNodes;
+using Ceres.MCGS.Graphs.GEdges;
 
 namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
 {
@@ -120,6 +121,13 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
               SolveStepIndex = p.SolveStepIndex,
               Rating = p.Rating,
               Themes = p.Themes,
+              // Propagate real history so the teacher's MCTS search runs with the
+              // same history planes EB's UCI puzzle harness uses (`position fen ... moves ...`).
+              // Without this, the search saw bare-FEN-with-replicated-history-planes
+              // and produced different decisions on continuation positions (ply 2+),
+              // causing massive false-rejection rates.
+              StartFen = p.StartFen,
+              PriorUciMoves = p.PriorUciMoves,
               StudentTopUci = "",
               StudentV = 0f,
             };
@@ -181,7 +189,13 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         int workerID = w;
         workers[w] = Task.Run(() =>
         {
-          GameEngineCeresInProcess engine = new GameEngineCeresInProcess(
+          // Use MCGS engine (not legacy MCTS GameEngineCeresInProcess) to match the
+          // search algorithm + PathMode PositionEquivalence that Ceres.exe uses by
+          // default (verified via direct UCI test on 5 rejected positions: in-process
+          // MCTS labeler produced the same wrong move on all 5 that Ceres.exe MCGS
+          // got right). Without this, the labeler accepts ~22% of positions where
+          // Ceres.exe accepts ~87% — a >4× false-rejection rate on the same positions.
+          GameEngineCeresMCGSInProcess engine = new GameEngineCeresMCGSInProcess(
             id: "PuzzleTeacher_" + workerID,
             evaluatorDef: evalDef,
             moveImmediateIfOnlyOneMove: false);
@@ -267,7 +281,7 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
     }
 
 
-    static void LabelOne(GameEngineCeresInProcess engine, HardPuzzleRecord rec, int nodes,
+    static void LabelOne(GameEngineCeresMCGSInProcess engine, HardPuzzleRecord rec, int nodes,
                          out LabeledPuzzleRecord labeled, out string rejectReason, out string teacherTopUci)
     {
       labeled = null;
@@ -285,9 +299,38 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       }
 
       engine.ResetGame();
-      PositionWithHistory pwh = new PositionWithHistory(pos);
 
-      GameEngineSearchResultCeres result;
+      // Build PositionWithHistory using the real move sequence (StartFen + PriorUciMoves)
+      // when available. Without this, the teacher's NN sees history planes filled with
+      // current-position-replicas (or zeros), producing different policy/value evaluations
+      // than EB's UCI harness (`position fen ... moves ...`) which uses real history.
+      // The TPG generator already does this reconstruction (PuzzleToTPGGenerator.cs:248);
+      // the labeler must too for consistency. Falls back to bare-FEN if PriorUciMoves missing
+      // (legacy hard.jsonl files from before this field was populated).
+      PositionWithHistory pwh;
+      if (!string.IsNullOrEmpty(rec.StartFen) && !string.IsNullOrEmpty(rec.PriorUciMoves))
+      {
+        try
+        {
+          Position startPos = Position.FromFEN(rec.StartFen);
+          pwh = new PositionWithHistory(startPos);
+          foreach (string moveUci in rec.PriorUciMoves.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+          {
+            pwh.AppendMove(moveUci);
+          }
+        }
+        catch
+        {
+          // Fallback if history reconstruction fails for any reason.
+          pwh = new PositionWithHistory(pos);
+        }
+      }
+      else
+      {
+        pwh = new PositionWithHistory(pos);
+      }
+
+      GameEngineSearchResultCeresMCGS result;
       try
       {
         result = engine.SearchCeres(pwh, SearchLimit.NodesPerMove(nodes));
@@ -298,14 +341,14 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         return;
       }
 
-      if (result?.BestMove == null)
+      if (result?.BestMoveInfo == null)
       {
         rejectReason = "no_best_move";
         return;
       }
 
       MGPosition mgPos = pos.ToMGPosition;
-      MGMove teacherTopMG = result.BestMove.BestMove;
+      MGMove teacherTopMG = result.BestMoveMG;
       teacherTopUci = teacherTopMG == default ? "" : teacherTopMG.MoveStr(MGMoveNotationStyle.Coordinates);
 
       MGMove solutionMG;
@@ -318,11 +361,15 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         return;
       }
 
-      // Mate/forced-win exception: if the teacher's best line scores near +1 (proven mate
-      // or crushing winning position), accept even when the top move differs from Lichess.
-      // Mate-in-N positions commonly have multiple winning moves; Lichess names one.
-      const float MATE_ACCEPT_Q_THRESHOLD = 0.98f;
-      bool teacherFoundWinningLine = result.BestMove.QOfBest >= MATE_ACCEPT_Q_THRESHOLD;
+      // Forced-win exception: if the teacher's best line scores clearly winning, accept
+      // even when the top move differs from Lichess. Lichess names ONE winning move per
+      // puzzle but multiple winning moves often exist (especially mate-in-N where any of
+      // several pieces deliver mate). Threshold lowered from 0.98 to 0.70 (2026-04-30):
+      // 0.98 was rejecting many valid alternative-winning-move cases because shallow
+      // search (e.g. 400 visits) doesn't drive Q to near-1.0 even on objectively winning
+      // positions. 0.70 still requires the teacher to be confidently winning.
+      const float MATE_ACCEPT_Q_THRESHOLD = 0.70f;
+      bool teacherFoundWinningLine = result.BestMoveInfo.QOfBest >= MATE_ACCEPT_Q_THRESHOLD;
 
       if (!(teacherTopMG == solutionMG) && !teacherFoundWinningLine)
       {
@@ -330,30 +377,123 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         return;
       }
 
-      MCTSNode root = result.Search.Manager.Root;
+      // MCGS root node accessed via Search.SearchRootNode (a GNode).
+      // CRITICAL: use the SEARCH-BACKED W/L/D properties (derived from Q averaged
+      // over all visits), NOT the static NN-eval outputs (WinP/LossP/DrawP).
+      // Pre-2026-04-30 bug: we used root.WinP / root.LossP, which threw away the
+      // 200 nodes of search and saved C3's raw value-head guess. Verified by
+      // user's hand-test: search-backed Q=0.85 vs static V=0.07 on a winning
+      // tactical position — we were saving 0.07.
+      // root.W = (Q + 1 - D) / 2  with search-backed Q and D.
+      // root.L = (1 - D - Q) / 2.
+      GNode root = result.Search.SearchRootNode;
 
-      float rootW = root.WinP;
-      float rootL = root.LossP;
-      float rootD = Math.Max(0f, 1f - rootW - rootL);
+      float rootW = root.W;
+      float rootL = root.L;
+      float rootD = (float)root.D;
+
+      // Clamp + renormalize: GNode.W / GNode.L are derived as (Q+1-D)/2 and (1-D-Q)/2
+      // from search-backed Q and D. Mathematically these are >=0, but in practice
+      // floating-point rounding from MCGS aggregation across multiple parents in graph
+      // mode can produce small negative values on confident-winning positions
+      // (verified empirically: 52.7% of records had L<0 in 2600-2700 phase-1). Clamp
+      // to [0,1] and renormalize the WDL distribution to a valid probability triple
+      // before saving.
+      if (rootW < 0f) rootW = 0f;
+      if (rootL < 0f) rootL = 0f;
+      if (rootD < 0f) rootD = 0f;
+      float wdlSum = rootW + rootL + rootD;
+      if (wdlSum > 0f)
+      {
+        rootW /= wdlSum;
+        rootL /= wdlSum;
+        rootD /= wdlSum;
+      }
       float rootV = rootW - rootL;
 
+      // Enumerate root's expanded child edges to build visit-count policy distribution.
+      // MCGS uses graph edges (GEdge) instead of the MCTS ChildrenExpanded enumerable.
       List<PolicyEntry> policy = new List<PolicyEntry>();
       long totalN = 0;
-      foreach (MCTSNode child in root.ChildrenExpanded) totalN += child.N;
+      GEdge[] sortedEdges = root.NumEdgesExpanded == 0 ? null : root.EdgesSorted(node => node.N);
+      if (sortedEdges != null)
+      {
+        foreach (GEdge edge in sortedEdges)
+        {
+          if (!edge.IsExpanded) continue;
+          totalN += edge.ChildNode.N;
+        }
+      }
       if (totalN <= 0)
       {
         rejectReason = "no_visits";
         return;
       }
-      foreach (MCTSNode child in root.ChildrenExpanded)
+      foreach (GEdge edge in sortedEdges)
       {
-        if (child.N <= 0) continue;
-        MGMove moveMG = child.Annotation.PriorMoveMG;
+        if (!edge.IsExpanded) continue;
+        long childN = edge.ChildNode.N;
+        if (childN <= 0) continue;
+        // The block below remains in the loop body (was structured around `child` MCTSNode);
+        // we extract move-uci from the edge and visit fraction from childN.
+        MGMove moveMG = edge.MoveMG;
         policy.Add(new PolicyEntry
         {
-          Uci = moveMG.MoveStr(MGMoveNotationStyle.Coordinates),
-          P = (float)child.N / totalN,
+          Uci = moveMG == default ? "" : moveMG.MoveStr(MGMoveNotationStyle.Coordinates),
+          P = (float)childN / totalN,
         });
+      }
+
+      // Rank-1 nudge: ensure the Lichess solution is the unique top of the policy
+      // distribution by a small epsilon margin. Required because MCGS visit-count
+      // distributions can produce near-ties (e.g., 0.503 vs 0.497) where the wrong
+      // move accidentally gets more visits even when MCGS's chosen best-move (via
+      // Q+N criterion) matches Lichess. Also handles immediate-no-search-mate
+      // short-circuit cases where the solution may not appear in the visit-count
+      // distribution at all (TeacherTopUci=solution but visits went to other moves
+      // during root expansion). Without this nudge, the training target would
+      // teach the network to play the wrong move on those positions.
+      // Convention matches PuzzleSoftLabeler.RankOneEpsilon default (0.03).
+      const float RANK_ONE_EPSILON = 0.03f;
+      int solutionIdx = -1;
+      float maxNonSolutionP = 0f;
+      for (int i = 0; i < policy.Count; i++)
+      {
+        if (policy[i].Uci == rec.SolutionUci)
+        {
+          solutionIdx = i;
+        }
+        else if (policy[i].P > maxNonSolutionP)
+        {
+          maxNonSolutionP = policy[i].P;
+        }
+      }
+      bool needsRenormalize = false;
+      if (solutionIdx < 0)
+      {
+        // Solution missing from distribution (immediate-mate short-circuit). Add it
+        // with dominating probability so the training target points at the right move.
+        policy.Add(new PolicyEntry { Uci = rec.SolutionUci, P = maxNonSolutionP + RANK_ONE_EPSILON });
+        needsRenormalize = true;
+      }
+      else if (policy[solutionIdx].P < maxNonSolutionP + RANK_ONE_EPSILON)
+      {
+        PolicyEntry e = policy[solutionIdx];
+        policy[solutionIdx] = new PolicyEntry { Uci = e.Uci, P = maxNonSolutionP + RANK_ONE_EPSILON };
+        needsRenormalize = true;
+      }
+      if (needsRenormalize)
+      {
+        float total = 0f;
+        foreach (PolicyEntry pe in policy) total += pe.P;
+        if (total > 0f)
+        {
+          for (int i = 0; i < policy.Count; i++)
+          {
+            PolicyEntry pe = policy[i];
+            policy[i] = new PolicyEntry { Uci = pe.Uci, P = pe.P / total };
+          }
+        }
       }
 
       labeled = new LabeledPuzzleRecord

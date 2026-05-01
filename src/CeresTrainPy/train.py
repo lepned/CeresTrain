@@ -238,10 +238,32 @@ def Train():
                    q_ratio=config.Data_FractionQ)
 
 
-  if config.Opt_LoRARankDivisor > 0:
-    # Freeze all parameters except LoRA
+  # LoRA can be active via several env-var paths even when head
+  # Opt_LoRARankDivisor is 0:
+  #   - body: CERES_LORA_ATTN_RANK_DIV / CERES_LORA_FFN_RANK_DIV / CERES_LORA_TRANSFORMER_RANK_DIV
+  #   - head front-end (headPremap + headSharedLinear): CERES_LORA_HEADFRONT_RANK_DIV
+  #   - smolgen (sm1/sm2/sm3 + smolgenPrepLayer): CERES_LORA_SMOLGEN_RANK_DIV
+  # In any of these cases we must freeze all non-LoRA params, otherwise the
+  # entire orig net (~255M params) becomes trainable and a stage-1 run
+  # effectively does full fine-tune + LoRA (caused a system blackout once).
+  _body_attn_div_init  = int(os.environ.get('CERES_LORA_ATTN_RANK_DIV', '0') or 0)
+  _body_ffn_div_init   = int(os.environ.get('CERES_LORA_FFN_RANK_DIV', '0') or 0)
+  _body_legacy_init    = int(os.environ.get('CERES_LORA_TRANSFORMER_RANK_DIV', '0') or 0)
+  _headfront_div_init  = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
+  _smolgen_div_init    = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
+  _gtab_active_init    = int(os.environ.get('CERES_GTAB', '0') or 0) > 0
+  _body_lora_active_init = (_body_attn_div_init > 0 or _body_ffn_div_init > 0 or _body_legacy_init > 0
+                            or _headfront_div_init > 0 or _smolgen_div_init > 0
+                            or _gtab_active_init)
+
+  if config.Opt_LoRARankDivisor > 0 or _body_lora_active_init:
+    # Freeze all parameters except:
+    #   - LoRA (head LoRA via Opt_LoRARankDivisor and/or env-var LoRA)
+    #   - GTAB tactical adapter and gate (when CERES_GTAB=1)
     for name, param in model.named_parameters():
-      if not ("lora_A" in name or "lora_B" in name or "lora_alpha" in name):
+      keep_trainable = ("lora_A" in name or "lora_B" in name or "lora_alpha" in name
+                        or "tactical_adapter" in name or "tactical_gate" in name)
+      if not keep_trainable:
         param.requires_grad = False
    
   # Possibly compile model (as recommended by Lightning docs, comile should appear before fabric.setup).
@@ -436,7 +458,19 @@ def Train():
     # name adjustment sometimes needed for reload
     # loaded["model"] = {f'_orig_mod.{key}': value for key, value in loaded["model"].items()}
 
-    if config.Opt_LoRARankDivisor == 0:
+    # LoRA / GTAB wrapping introduces extra params not present in orig ckpt.
+    # If ANY env-var LoRA or GTAB path is active, use strict=False remap path
+    # even when head LoRA (Opt_LoRARankDivisor) is 0.
+    _body_attn_div  = int(os.environ.get('CERES_LORA_ATTN_RANK_DIV', '0') or 0)
+    _body_ffn_div   = int(os.environ.get('CERES_LORA_FFN_RANK_DIV', '0') or 0)
+    _body_legacy    = int(os.environ.get('CERES_LORA_TRANSFORMER_RANK_DIV', '0') or 0)
+    _headfront_div  = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
+    _smolgen_div    = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
+    _gtab_active    = int(os.environ.get('CERES_GTAB', '0') or 0) > 0
+    _body_lora_active = (_body_attn_div > 0 or _body_ffn_div > 0 or _body_legacy > 0
+                         or _headfront_div > 0 or _smolgen_div > 0 or _gtab_active)
+
+    if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # load checkpoint parameters, expect all to match (strict = True)
       model.load_state_dict(loaded["model"], strict = True)
     else:
@@ -450,6 +484,8 @@ def Train():
       for name, param in model.state_dict().items():
         if "lora_" in name:
           pass # not expected to be found in checkpoint, can start out empty
+        elif "tactical_adapter" in name or "tactical_gate" in name:
+          pass # GTAB modules are new — not in orig ckpt; keep their init values
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name
@@ -643,8 +679,16 @@ def Train():
 
         if config.Opt_LossActionMultiplier > 0:
           loss = (loss1 + loss2 + loss3 + loss4) / 3 # although there are 4 loss terms, the last one is typically very small so we only divide by 3
-        else:          
+        else:
           loss = (loss1 + loss2 + loss3) / 3 # only 3 boards used
+
+      # GTAB gate-sparsity regularizer: penalize unnecessary gate firing.
+      # The gate's last value was cached in the forward pass. Adding mean(g)
+      # to the loss encourages the gate to stay near 0 unless the puzzle loss
+      # gain from firing exceeds the sparsity cost. Default lambda 0.01.
+      if getattr(model, 'use_gtab', False) and getattr(model, '_last_gate_value', None) is not None:
+        _gtab_lambda = float(os.environ.get('CERES_GTAB_GATE_LAMBDA', '0.01') or 0.01)
+        loss = loss + _gtab_lambda * model._last_gate_value.mean()
 
       fabric.backward(loss)
         

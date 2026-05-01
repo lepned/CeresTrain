@@ -164,12 +164,14 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
 
       MGPosition mgPos = pos.ToMGPosition;
 
-      // A record is "value-only" if it has no policy target (no SolutionUci,
-      // no TeacherPolicy). In that case we emit it with an all-zero policy
-      // target so training-time policy loss is zero for that record, while the
-      // value head still learns from TeacherW/D/L. Standard and OppDefence
-      // records both carry policy targets (OppDefence's policy = opp's puzzle
-      // defence move) and go through the full policy+value path.
+      // A record is "value-only" if (a) it has no policy target, OR (b) it is a
+      // non-Standard kind (OppDefence, etc.). In both cases we emit with an all-zero
+      // policy target so training-time policy loss is zero, while the value head
+      // still learns from TeacherW/D/L. The OppDefence policy ("opp's puzzle defence
+      // move") is intentionally NOT used as a training signal — v203 showed it
+      // dilutes the puzzle-policy gradient (pol −7.60 pp at hard-tail). Mission
+      // is solver-side puzzle policy; OppDefence records exist purely to give the
+      // value head opp-to-move calibration coverage.
       bool hasPolicy = rec.TeacherPolicy != null && rec.TeacherPolicy.Count > 0
                        && !string.IsNullOrEmpty(rec.SolutionUci);
 
@@ -177,7 +179,7 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       // reject it (data corruption / legacy format).
       if (rec.Kind == PuzzlePositionKind.Standard && !hasPolicy) return false;
 
-      if (!hasPolicy)
+      if (!hasPolicy || rec.Kind != PuzzlePositionKind.Standard)
       {
         return TryBuildValueOnly(rec, in pos, in mgPos, out etp, out targetInfo);
       }

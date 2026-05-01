@@ -61,9 +61,9 @@ namespace CeresTrain.Tasks
     /// <param name="targetDirectoryTPGs"></param>
     /// <param name="numSetsToGenerate">number of TPG file sets to generate (each set is about 201mm positions, 16 files and circa 65gb)</param>
     /// <param name="description">description string to write to metadata file</param>
-    public static void GenerateTPG(string sourceDirectoryTARsOrZSTs, 
-                                   string targetDirectoryTPGs, 
-                                   int numSetsToGenerate, 
+    public static void GenerateTPG(string sourceDirectoryTARsOrZSTs,
+                                   string targetDirectoryTPGs,
+                                   int numSetsToGenerate,
                                    string description)
     {
       const int POSITION_SKIP_COUNT = 20;
@@ -75,6 +75,25 @@ namespace CeresTrain.Tasks
                     null,
                     positionSkipCount: POSITION_SKIP_COUNT);
       }
+    }
+
+
+    /// <summary>
+    /// Convenience entry point for small-scale TPG generation: emits exactly the
+    /// requested number of positions (one set sized to <paramref name="numPositions"/>).
+    /// Use this when the default 200M-positions-per-set output is wasteful (e.g. for
+    /// a small quiet-anchor stream of a few million positions).
+    /// </summary>
+    public static void GenerateTPGCustomSize(string sourceDirectoryTARsOrZSTs,
+                                             string targetDirectoryTPGs,
+                                             long numPositions,
+                                             string description)
+    {
+      const int POSITION_SKIP_COUNT = 20;
+      GenerateTPG(sourceDirectoryTARsOrZSTs, targetDirectoryTPGs, numPositions, DEBUG, description,
+                  (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true,
+                  null,
+                  positionSkipCount: POSITION_SKIP_COUNT);
     }
 
 

@@ -61,20 +61,20 @@ class EncoderLayer(torch.nn.Module):
     self.ffn_hidden_size = ffn_hidden_size
     
     self.ln1 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
-    self.attention = DotProductAttention(num_tokens_q, num_tokens_kv,  num_attention_heads, self.dim_per_head, norm_type, layernorm_eps, 
-                                         use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier, 
-                                         smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type, 
-                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, test)
+    self.attention = DotProductAttention(num_tokens_q, num_tokens_kv,  num_attention_heads, self.dim_per_head, norm_type, layernorm_eps,
+                                         use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier,
+                                         smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
+                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, test, layer_num=layerNum)
     if self.ffn_hidden_size > 0:
       self.ln2 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
 
     if self.dual_attention_mode in ('DualAttentionAndFFN', 'DualAttentionOnly'):
       NUM_ATTENTION2_HEADS = 8 
-      self.attention2 = DotProductAttention(hidden_size, hidden_size, NUM_ATTENTION2_HEADS, num_tokens_q//NUM_ATTENTION2_HEADS, norm_type, layernorm_eps, 
-                                           1, 0, 0, 0, None, smolgen_activation_type, False, None, None, None, None, test)
+      self.attention2 = DotProductAttention(hidden_size, hidden_size, NUM_ATTENTION2_HEADS, num_tokens_q//NUM_ATTENTION2_HEADS, norm_type, layernorm_eps,
+                                           1, 0, 0, 0, None, smolgen_activation_type, False, None, None, None, None, test, layer_num=layerNum)
       self.ln3 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
       if self.dual_attention_mode == 'DualAttentionAndFFN':
-        self.mlp2 = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False) 
+        self.mlp2 = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
         self.ln4 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
 
     if self.dropout_rate > 0:
@@ -97,7 +97,7 @@ class EncoderLayer(torch.nn.Module):
       self.moe = None
 
     if ffn_hidden_size > 0:
-      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False) 
+      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
 
 
   def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

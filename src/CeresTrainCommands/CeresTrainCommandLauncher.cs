@@ -41,6 +41,7 @@ namespace CeresTrain.TrainCommands
     static Option<string> configOption;
     static Option<long> numPosOption;
     static Option<int> numTPGSetsOption;
+    static Option<long> genTpgNumPosOption;   // gen-tpg: default 0 = use num-sets path
     static Option<string> piecesOptionRequired;
     static Option<string> piecesOptionOptional;
     static Option<string> netSpecificationOption;
@@ -83,6 +84,8 @@ namespace CeresTrain.TrainCommands
     static Command teacherChildrenCommand;
     static Command softLabelCommand;
     static Command enrichActionCommand;
+    static Command enrichOppDefenceCommand;
+    static Command oppDefDeepenSmokeCommand;
 
     /// <summary>
     /// Starts a console session for CeresTrain, reading command line arguments and executing the appropriate command.
@@ -96,6 +99,7 @@ namespace CeresTrain.TrainCommands
       configOption = new Option<string>("--config", "Configuration name") { IsRequired = true };
       numPosOption = new Option<long>("--num-pos", () => 2048, "Number of positions") { };
       numTPGSetsOption = new Option<int>("--num-tpg-sets", () => 1, "Number of sets of TPG positions to generate (~200mm positions per set)") { };
+      genTpgNumPosOption = new Option<long>("--num-pos", () => 0, "Override num-sets: emit exactly this many positions (use for small quiet-anchor streams). 0 = use num-sets.") { };
       piecesOptionRequired = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = true };
       piecesOptionOptional = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = false };
       netSpecificationOption = new Option<string>("--net-spec", "LC0 network specification in Ceres format, e.g. LC0:703810") { IsRequired = true };
@@ -124,7 +128,7 @@ namespace CeresTrain.TrainCommands
       evalLC0Command = new Command("eval-lc0", "Evaluate vs LC0 with specific pieces and network.               [pieces] [net-spec] [num-pos] [search-limit] [pos-fn] [verbose]") { piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption };
       extractPositionsCommand = new Command("extract-pos", "Generate EPD/PGN file with positions from specified PGN/EPD     [pieces] [num-pos] [pos-fn] [pos-out-fn]") { piecesOptionRequired, numPosOption, epdOrPgnFnOption, epdOrPgnOutputFileNameOption };
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
-      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets]") { tarDirOption, tpgDirOption, numTPGSetsOption };
+      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
 
       minePuzzlesCommand = new Command("mine-puzzles", "Mine hard Lichess puzzles at nodes=1.                           [puzzle-config]") { puzzleConfigOption };
@@ -138,6 +142,8 @@ namespace CeresTrain.TrainCommands
       teacherChildrenCommand = new Command("teacher-label-children", "Emit one OppDefence record per Standard with teacher WDL on child position. [puzzle-config]") { puzzleConfigOption };
       softLabelCommand = new Command("soft-label-puzzles", "Rank-1 soft-label Standard+OppDefence records using orig NN + ε margin. [puzzle-config]") { puzzleConfigOption };
       enrichActionCommand = new Command("enrich-action-head", "Emit OppDefence + K OAIS records per Standard parent using action-head teacher (e.g. C3-768). [puzzle-config]") { puzzleConfigOption };
+      enrichOppDefenceCommand = new Command("enrich-opp-defence", "Add MCGS-search-backed OppDefence records (post-solver-move positions) to labeled.jsonl. Targets the value-head opp-to-move calibration gap. [puzzle-config]") { puzzleConfigOption };
+      oppDefDeepenSmokeCommand = new Command("oppdef-deepen-smoke", "Re-search a sample of low-|Q| OppDef records at a higher node budget; report whether they resolve to sharper Q. [puzzle-config]") { puzzleConfigOption };
 
       rootCommand.AddCommand(initCommand);
       rootCommand.AddCommand(infoCommand);
@@ -162,6 +168,8 @@ namespace CeresTrain.TrainCommands
       rootCommand.AddCommand(teacherChildrenCommand);
       rootCommand.AddCommand(softLabelCommand);
       rootCommand.AddCommand(enrichActionCommand);
+      rootCommand.AddCommand(enrichOppDefenceCommand);
+      rootCommand.AddCommand(oppDefDeepenSmokeCommand);
 
       InstallCommandHandlers();
 
@@ -215,10 +223,18 @@ namespace CeresTrain.TrainCommands
       }, tarDirOption, packedZSTDirOption); 
 
 
-      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets) =>
+      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos) =>
       {
-        TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG");
-      }, tarDirOption, tpgDirOption, numTPGSetsOption);  
+        if (numPos > 0)
+        {
+          // explicit position count overrides numSets — emit exactly numPos positions
+          TPGConvertFromTAR.GenerateTPGCustomSize(sourceDir, targetDir, numPos, $"Converted using TPGConvertFromTAR.GenerateTPGCustomSize ({numPos} positions)");
+        }
+        else
+        {
+          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG");
+        }
+      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption);
 
 
       generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory) =>
@@ -336,6 +352,19 @@ namespace CeresTrain.TrainCommands
         string inputPath = opts.LabeledJsonlPath;
         string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_action_enriched.jsonl");
         PuzzleValueLabelerActionChildren.Run(opts, inputPath, outputPath);
+      }, puzzleConfigOption);
+
+      enrichOppDefenceCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        string outputPath = System.IO.Path.Combine(opts.OutDir, "labeled_with_oppdef.jsonl");
+        PuzzleOppDefenceEnricher.Run(opts, outputPath);
+      }, puzzleConfigOption);
+
+      oppDefDeepenSmokeCommand.SetHandler((configPath) =>
+      {
+        PuzzleReplayOptions opts = PuzzleReplayOptions.Load(configPath);
+        PuzzleOppDefenceDeepenSmoke.Run(opts);
       }, puzzleConfigOption);
     }
 

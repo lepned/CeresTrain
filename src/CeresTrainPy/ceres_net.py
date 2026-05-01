@@ -13,6 +13,7 @@ If not, see <http://www.gnu.org/licenses/>.
 
 # NOTE: this module is derived from: https://github.com/Rocketknight1/minimal_lczero.
 
+import os
 import math
 from multiprocessing import Value
 from typing import Tuple, NamedTuple
@@ -33,6 +34,7 @@ from mlp2_layer import MLP2Layer
 from rms_norm import RMSNorm
 from lora import LoRALinear
 from utils import DWA
+from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
 
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
 
@@ -120,6 +122,15 @@ class CeresNet(pl.LightningModule):
     self.HEAD_IN_SIZE = 64 * (self.HEAD_PREMAP_PER_SQUARE // HEAD_SHARED_LINEAR_DIV)
     self.headSharedLinear = nn.Linear(64 * self.HEAD_PREMAP_PER_SQUARE, self.HEAD_IN_SIZE)
 
+    # Optional LoRA wrap of the head front-end (the per-position vector that
+    # feeds every head). Gated by CERES_LORA_HEADFRONT_RANK_DIV — sits
+    # downstream of body, upstream of all heads. Lets fine-tunes refine what
+    # heads read without touching the body's shared feature manifold.
+    _hf_rd = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
+    if _hf_rd > 0:
+      self.headPremap = LoRALinear(self.headPremap, _hf_rd, True)
+      self.headSharedLinear = LoRALinear(self.headSharedLinear, _hf_rd, True)
+
     # When restrict_pv flag is set, only policy_head and value_head get LoRA
     # adapters; all other heads use rank_div=0 (standard Linear, frozen base).
     # Aligns with "minimal-intervention" recipe: most labels match orig output,
@@ -185,6 +196,12 @@ class CeresNet(pl.LightningModule):
     
     if SMOLGEN_PER_SQUARE_DIM > 0 and SMOLGEN_INTERMEDIATE_DIM > 0:
       self.smolgenPrepLayer = nn.Linear(SMOLGEN_INTERMEDIATE_DIM // config.NetDef_SmolgenToHeadDivisor, NUM_TOKENS_NET * NUM_TOKENS_NET)
+      # Optional LoRA wrap of the shared smolgen prep layer (gated by
+      # CERES_LORA_SMOLGEN_RANK_DIV). Per-attention sm1/sm2/sm3 are wrapped
+      # in dot_product_attention.py via the same env var.
+      _sm_rd = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
+      if _sm_rd > 0:
+        self.smolgenPrepLayer = LoRALinear(self.smolgenPrepLayer, _sm_rd, True)
     else:
       self.smolgenPrepLayer = None
 
@@ -241,6 +258,18 @@ class CeresNet(pl.LightningModule):
     if (self.denseformer):
       self.dwa_modules = torch.nn.ModuleList([DWA(n_alphas=i+2, depth=self.EMBEDDING_DIM) for i in range(self.NUM_LAYERS)])
 
+    # GTAB (Gated Tactical Adapter Branch) — optional parallel mini-transformer
+    # that contributes additively to the post-body flow, gated by a learned
+    # position classifier. Zero-init by construction: orig is recovered exactly
+    # at training step 0. See tactical_adapter.py for details.
+    self.use_gtab = gtab_enabled()
+    self.gtab_value_only = self.use_gtab and (int(os.environ.get('CERES_GTAB_VALUE_ONLY', '0') or 0) > 0)
+    if self.use_gtab:
+      self.tactical_adapter = TacticalAdapter(in_dim=self.EMBEDDING_DIM)
+      self.tactical_gate    = PositionGate(in_dim=self.EMBEDDING_DIM)
+      # Buffer for last gate activation (for sparsity loss + diagnostics).
+      self._last_gate_value = None
+
 
   def forward(self, squares: torch.Tensor, prior_state:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(squares, list):
@@ -273,12 +302,16 @@ class CeresNet(pl.LightningModule):
       append_tensor = append_tensor.reshape(squares.shape[0], NUM_TOKENS_INPUT, self.prior_state_dim)
       flow_squares = torch.cat((flow_squares, append_tensor), dim=-1)
 
-    flow = self.embedding_layer(flow_squares)     
+    flow = self.embedding_layer(flow_squares)
     flow = self.embedding_norm(flow)
-      
+
+    # GTAB reads the post-embedding flow (independent of body) so the adapter
+    # branch is structurally separate from any body distortion.
+    flow_post_embed = flow if self.use_gtab else None
+
     if self.denseformer:
       all_previous_x = [flow]
-      
+
     # Main transformer body (stack of encoder layers)
     for i in range(self.NUM_LAYERS):
       flow = self.transformer_layer[i](flow)
@@ -286,27 +319,50 @@ class CeresNet(pl.LightningModule):
       if self.denseformer:
         all_previous_x.append(flow)
         flow = self.dwa_modules[i](all_previous_x)
-      
-  
-    # Heads.
-    flattenedSquares = self.headPremap(flow)
-    flattenedSquares = flattenedSquares.reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE)
-    flattenedSquares = self.headSharedLinear(flattenedSquares)
-    
-    # Note that if these heads are not used we use a fill-in tensor (borrowed from unc or value) 
-    # to avoid None values that might be problematic in export (especially ONNX)
-    policy_out = self.policy_head(flattenedSquares)
-    value_out = self.value_head(flattenedSquares)
-    value2_out = self.value2_head(torch.cat((flattenedSquares, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
-    unc_out = self.unc_head(flattenedSquares)
-    unc_policy_out = self.unc_policy(flattenedSquares) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
-    action_out             = self.action_head(flattenedSquares).reshape(-1, 1858, 3) if self.action_loss_weight > 0 else unc_out
-    action_uncertainty_out = self.action_uncertainty_head(flattenedSquares) if self.action_uncertainty_loss_weight > 0 else unc_out
-    state_out              = self.state_head(flattenedSquares) if self.prior_state_dim > 0 else unc_out
-    moves_left_out         = self.mlh_head(flattenedSquares) if self.moves_left_loss_weight > 0 else unc_out
-    q_deviation_lower_out = self.qdev_lower(flattenedSquares) if self.q_deviation_loss_weight > 0 else unc_out
-    q_deviation_upper_out = self.qdev_upper(flattenedSquares) if self.q_deviation_loss_weight > 0 else unc_out   
+
+    # GTAB residual add: tactical adapter contributes additively to body output,
+    # gated by a learned position classifier. Adapter output is zero-init so
+    # this is a no-op at training step 0 (orig recovered exactly).
+    #
+    # Two routing modes:
+    #   - default (CERES_GTAB_VALUE_ONLY=0): adapter contributes to ALL heads
+    #     via the shared `flow` tensor. Same as v100/v101/v102.
+    #   - value-only (CERES_GTAB_VALUE_ONLY=1): adapter contributes only to
+    #     value_head and value2_head; policy and other heads read orig body
+    #     output. Two parallel passes through head front-end. Policy is
+    #     bit-identical to orig (modulo head LoRA recalibration if any).
+    if self.use_gtab:
+      flow_aux = self.tactical_adapter(flow_post_embed)   # [B, 64, dim]
+      g_x      = self.tactical_gate(flow_post_embed)      # [B, 1, 1]
+      self._last_gate_value = g_x                          # cached for sparsity loss + diagnostics
+      if self.gtab_value_only:
+        # Compute two head front-end paths.
+        flow_value  = flow + g_x * flow_aux                  # value-side: with adapter
+        flow_others = flow                                   # other-heads: orig body output
+        fS_value  = self.headSharedLinear(self.headPremap(flow_value).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+        fS_others = self.headSharedLinear(self.headPremap(flow_others).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      else:
+        flow = flow + g_x * flow_aux
+        fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+        fS_value  = fS_others
+    else:
+      fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      fS_value  = fS_others
+
+    # Heads. Policy reads fS_others (= orig in value-only mode); value reads fS_value (with adapter).
+    policy_out = self.policy_head(fS_others)
+    value_out = self.value_head(fS_value)
+    value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
+    unc_out = self.unc_head(fS_others)
+    unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
+
+    action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if self.action_loss_weight > 0 else unc_out
+    action_uncertainty_out = self.action_uncertainty_head(fS_others) if self.action_uncertainty_loss_weight > 0 else unc_out
+    state_out              = self.state_head(fS_others) if self.prior_state_dim > 0 else unc_out
+    moves_left_out         = self.mlh_head(fS_others) if self.moves_left_loss_weight > 0 else unc_out
+    q_deviation_lower_out = self.qdev_lower(fS_others) if self.q_deviation_loss_weight > 0 else unc_out
+    q_deviation_upper_out = self.qdev_upper(fS_others) if self.q_deviation_loss_weight > 0 else unc_out
 
     ret = policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower_out, q_deviation_upper_out, unc_policy_out, action_out, state_out, action_uncertainty_out
 

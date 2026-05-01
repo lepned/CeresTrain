@@ -123,6 +123,13 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
     public int MineBatchSize { get; set; } = 512;
     public int TeacherWorkerThreads { get; set; } = 4;
 
+    /// <summary>oppdef-deepen-smoke: re-search OppDef records with |TeacherV|&lt; this at DeepenNodes.</summary>
+    public float DeepenQThreshold { get; set; } = 0.2f;
+    /// <summary>oppdef-deepen-smoke: how many filtered OppDef records to re-search.</summary>
+    public int DeepenSampleN { get; set; } = 1000;
+    /// <summary>oppdef-deepen-smoke: search-node budget for the deeper re-search.</summary>
+    public int DeepenNodes { get; set; } = 400;
+
     public string OutDir { get; set; }
 
     [JsonIgnore]

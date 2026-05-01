@@ -22,11 +22,22 @@ from lora import LoRALinear
 # compatibility. Set CERES_LORA_FFN_RANK_DIV=0 to disable FFN LoRA while
 # keeping attention LoRA on (per AGZO-style attribution: FFN1 cross-layer
 # coherent perturbation is the value-damaging component).
-def _maybe_wrap_lora(layer):
+# Optional layer-range gating via CERES_LORA_LAYER_MIN / CERES_LORA_LAYER_MAX
+# (inclusive, 0-indexed). Layers outside the range receive no LoRA.
+def _maybe_wrap_lora(layer, layer_num=None):
     n_ffn  = os.environ.get("CERES_LORA_FFN_RANK_DIV")
     n_legacy = os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0")
     n = int((n_ffn if n_ffn is not None else n_legacy) or "0")
-    return LoRALinear(layer, n, True) if n > 0 else layer
+    if n <= 0:
+      return layer
+    if layer_num is not None:
+      lo = os.environ.get("CERES_LORA_LAYER_MIN")
+      hi = os.environ.get("CERES_LORA_LAYER_MAX")
+      if lo is not None and layer_num < int(lo):
+        return layer
+      if hi is not None and layer_num > int(hi):
+        return layer
+    return LoRALinear(layer, n, True)
 
 # An intuitive explanation of why biases are important can be found in 
 # the YouTube video "How might LLMs store facts" by 3Blue1Brown (at about 9:00).
@@ -38,12 +49,13 @@ MLP_GLOBAL_LN_EPS = 1e-6
 
 
 class MLP2Layer(torch.nn.Module):
-  def __init__(self, model_dim: int, ffn_inner_dim: int, out_dim : int, activation_type : str, norm_type : str, use_global : bool, use_te : bool = False) -> None:
+  def __init__(self, model_dim: int, ffn_inner_dim: int, out_dim : int, activation_type : str, norm_type : str, use_global : bool, use_te : bool = False, layer_num : int = None) -> None:
     super().__init__()
-        
+
     self.activation_type = activation_type
     self.use_te = use_te
     self.use_global = use_global
+    self.layer_num = layer_num
 
     if self.use_te:
       import transformer_engine.pytorch as te
@@ -63,10 +75,14 @@ class MLP2Layer(torch.nn.Module):
         self.mlpGlobalReduce = torch.nn.Linear(mlpGlobalDim, model_dim // MLP_GLOBAL_DIVISOR, bias=USE_BIAS)
         self.mlpGlobalLN = torch.nn.LayerNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS) if norm_type == 'LayerNorm' else RMSNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS)
 
-      self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS))
-      self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS))
+      self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS), self.layer_num)
+      self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS), self.layer_num)
       if activation_type == 'SwiGLU':
-        self.linear3 = torch.nn.Linear(model_dim, ffn_inner_dim, bias=False) 
+        # SwiGLU multiplicative gate: y = linear2(act(linear1(x)) * linear3(x))
+        # Wrap with CERES_LORA_FFN_RANK_DIV (same gate as linear1/linear2) so
+        # FFN-LoRA experiments adapt the gate too — without this, prior FFN
+        # ablations only adapted one of the two FFN paths.
+        self.linear3 = _maybe_wrap_lora(torch.nn.Linear(model_dim, ffn_inner_dim, bias=False), self.layer_num)
 
     self.activation_fn = to_activation(activation_type)
 

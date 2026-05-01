@@ -27,10 +27,30 @@ from lora import LoRALinear
 # falls back to CERES_LORA_TRANSFORMER_RANK_DIV (legacy unified knob) for
 # backward compatibility. Allows attention-only transformer-LoRA experiments
 # (combine with CERES_LORA_FFN_RANK_DIV=0 in mlp2_layer.py).
-def _maybe_wrap_lora(layer):
+# Optional layer-range gating via CERES_LORA_LAYER_MIN / CERES_LORA_LAYER_MAX
+# (inclusive, 0-indexed). Layers outside the range receive no LoRA.
+def _maybe_wrap_lora(layer, layer_num=None):
     n_attn  = os.environ.get("CERES_LORA_ATTN_RANK_DIV")
     n_legacy = os.environ.get("CERES_LORA_TRANSFORMER_RANK_DIV", "0")
     n = int((n_attn if n_attn is not None else n_legacy) or "0")
+    if n <= 0:
+      return layer
+    if layer_num is not None:
+      lo = os.environ.get("CERES_LORA_LAYER_MIN")
+      hi = os.environ.get("CERES_LORA_LAYER_MAX")
+      if lo is not None and layer_num < int(lo):
+        return layer
+      if hi is not None and layer_num > int(hi):
+        return layer
+    return LoRALinear(layer, n, True)
+
+
+# Smolgen-LoRA gate. Wraps per-attention sm1/sm2/sm3 (and the shared
+# smolgenPrepLayer in ceres_net.py) when CERES_LORA_SMOLGEN_RANK_DIV>0.
+# Not subject to LAYER_MIN/MAX gating — smolgen is a network-wide attention
+# bias mechanism, restricting it per-layer doesn't have a clean meaning.
+def _maybe_wrap_smolgen_lora(layer):
+    n = int(os.environ.get("CERES_LORA_SMOLGEN_RANK_DIV", "0") or "0")
     return LoRALinear(layer, n, True) if n > 0 else layer
 
 class LinearWrapper:
@@ -80,7 +100,8 @@ class DotProductAttention(torch.nn.Module):
                rpe_factor_shared  = None,
                use_rel_bias: bool = False,
                use_nonlinear_attention: bool = False,
-               test : bool = False) -> None:
+               test : bool = False,
+               layer_num : int = None) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -101,6 +122,7 @@ class DotProductAttention(torch.nn.Module):
     self.use_nonlinear_attention = use_nonlinear_attention  
     self.use_qk_norm = use_qk_norm
     self.softcap_cutoff = softcap_cutoff
+    self.layer_num = layer_num
 
     assert self.use_smolgen + self.use_rpe + self.use_rel_bias <= 1, "only one of smolgen, rpe, and rel bias can be enabled"
     
@@ -128,14 +150,14 @@ class DotProductAttention(torch.nn.Module):
 
     # Fused Q, K, and V linear projection for improved efficiency.
     self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
-    self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS))
-    self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output))
+    self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS), self.layer_num)
+    self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
     if self.use_nonlinear_attention:
       self.qkvLN = torch.nn.LayerNorm(self.d_model * self.attention_multiplier) if norm_type == 'LayerNorm' else RMSNorm(self.d_model * self.attention_multiplier)
-      self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
-      self.k2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
-      self.v2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS))
+      self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
+      self.k2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
+      self.v2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
 
     if self.use_qk_norm:
       # extra layernorm for enahnced training stability
@@ -165,10 +187,10 @@ class DotProductAttention(torch.nn.Module):
 
     if self.use_smolgen:
       self.wrapped_smolgen_prep_layer = LinearWrapper(smolgenPrepLayer) # wrap so shared layer is not re-registered
-      self.sm1 = torch.nn.Linear(self.d_model, smolgen_per_square_dim)
-      self.sm2 = torch.nn.Linear(num_tokens_q * smolgen_per_square_dim, smolgen_intermediate_dim)
+      self.sm1 = _maybe_wrap_smolgen_lora(torch.nn.Linear(self.d_model, smolgen_per_square_dim))
+      self.sm2 = _maybe_wrap_smolgen_lora(torch.nn.Linear(num_tokens_q * smolgen_per_square_dim, smolgen_intermediate_dim))
       self.ln1 = torch.nn.LayerNorm(smolgen_intermediate_dim) if norm_type == 'LayerNorm' else RMSNorm(smolgen_intermediate_dim, eps=layernorm_eps)
-      self.sm3 = torch.nn.Linear(smolgen_intermediate_dim, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor)
+      self.sm3 = _maybe_wrap_smolgen_lora(torch.nn.Linear(smolgen_intermediate_dim, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor))
       self.ln2 = torch.nn.LayerNorm(num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor) if norm_type == 'LayerNorm' else RMSNorm(num_attention_heads * smolgen_intermediate_dim// smolgen_head_divisor, eps=layernorm_eps)
       
 

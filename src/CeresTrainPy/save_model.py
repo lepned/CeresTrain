@@ -31,9 +31,20 @@ def save_checkpoint(NAME : str,
                state : Dict[str, Any], 
                num_pos : str):
 
-  # In LoRA mode we don't save full checkpoints
-  # Instead save_model will output just a binary file with the LoRA weights.
-  if config.Opt_LoRARankDivisor > 0:
+  # In head-LoRA-only mode we don't save full checkpoints
+  # (save_model emits the head LoRA bin instead). But when ANY env-var LoRA
+  # is active (body / head-front / smolgen), those lora_A/B/alpha params live
+  # in the model state_dict and would be lost without a full ckpt save — so
+  # we still emit the ckpt in that case.
+  _body_attn = int(os.environ.get('CERES_LORA_ATTN_RANK_DIV', '0') or 0)
+  _body_ffn  = int(os.environ.get('CERES_LORA_FFN_RANK_DIV',  '0') or 0)
+  _body_legacy = int(os.environ.get('CERES_LORA_TRANSFORMER_RANK_DIV', '0') or 0)
+  _headfront = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
+  _smolgen   = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
+  _gtab      = int(os.environ.get('CERES_GTAB', '0') or 0) > 0
+  _body_lora_active = (_body_attn > 0 or _body_ffn > 0 or _body_legacy > 0
+                       or _headfront > 0 or _smolgen > 0 or _gtab)
+  if config.Opt_LoRARankDivisor > 0 and not _body_lora_active:
     return
 
   # Save PyTorch checkpoint.
