@@ -296,7 +296,7 @@ puzzle records on RTX 5090 at 200 nodes.
 ### 4b. Stage 2: post-process (clamp + rank-1 nudge)
 
 ```bash
-python C:/Dev/Chess/CeresTrain/clamp_wdl.py \
+python C:/Users/<you>/source/repos/CeresTrain/scripts/clamp_wdl.py \
     D:/Puzzles/c3_2600_2700/labeled.jsonl \
     D:/Puzzles/c3_2600_2700/labeled_clamped.jsonl
 ```
