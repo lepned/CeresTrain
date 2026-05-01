@@ -63,6 +63,9 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       public long SkippedNoNextMove;
       public long SkippedSearchFailed;
       public double ElapsedSec;
+      public string FirstSearchExceptionType;
+      public string FirstSearchExceptionMessage;
+      public int FirstSearchExceptionAtRecord;
     }
 
 
@@ -295,8 +298,18 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       {
         result = engine.SearchCeres(pwh, SearchLimit.NodesPerMove(nodes));
       }
-      catch
+      catch (Exception ex)
       {
+        // First-occurrence diagnostic: capture exception type/message so we can
+        // tell GPU OOM from MCGS allocator exhaustion from anything else.
+        if (s.FirstSearchExceptionType == null)
+        {
+          s.FirstSearchExceptionType = ex.GetType().FullName;
+          s.FirstSearchExceptionMessage = ex.Message;
+          s.FirstSearchExceptionAtRecord = (int)s.InputRecords;
+          Console.WriteLine($"[opp-def] FIRST search exception at record {s.InputRecords}: " +
+                            $"{ex.GetType().Name}: {ex.Message}");
+        }
         s.SkippedSearchFailed++;
         return null;
       }
