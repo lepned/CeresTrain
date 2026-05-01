@@ -10,15 +10,39 @@ puzzle test harnesses.
 
 ## 0. Prerequisites
 
+### 0a. System
+
 - **Windows 10/11** with WSL2 (Ubuntu 22.04+ recommended) for the Python
   trainer, plus native Windows for the C# data-pipeline binary.
-- **NVIDIA GPU** with TensorRT support (training and labeling were validated
-  on RTX 5090; any 16+ GB GPU should work).
-- **.NET 10 SDK** (for the CeresTrain C# binary).
-- **Python 3.10+** in WSL with PyTorch 2.x + CUDA, lightning, onnx, etc.
-- **Ceres** (the engine) — built and runnable. Used by puzzle test scripts.
+- **NVIDIA GPU** with TensorRT support. Training and labeling were validated
+  on RTX 5090 (32 GB). Smaller cards work but reduce
+  `BatchSizeBackwardPass` / `BatchSizeForwardPass` in
+  `c1_640_34_ceres_opt.json` if you OOM.
+- **NVIDIA driver + CUDA Toolkit + TensorRT** versions matching your
+  PyTorch+ONNX install. The repo's TRT engine cache is bound to driver
+  major version — first run on a new machine recompiles the cache (5-7 min
+  per batch profile, ~40 min total — looks like a hang, isn't).
+
+### 0b. Toolchain
+
+- **.NET 10 SDK** (for the CeresTrain C# binary). `dotnet --version` must
+  print `10.x`.
+- **Python 3.10+** in WSL with: `torch` (2.x, CUDA-matched), `lightning`,
+  `onnx`, `onnxruntime` (CPU is fine for export), `numpy`, `zstandard`,
+  `python-chess` (for validation scripts only).
+
+### 0c. External dependencies
+
+- **Ceres** (the engine): clone <https://github.com/dje-dev/Ceres> and
+  build alongside CeresTrain. Used at training time (shared types) and by
+  the puzzle test scripts (UCI engine).
 - **Lichess puzzles CSV**: download from
-  <https://database.lichess.org/#puzzles> and place at a known path.
+  <https://database.lichess.org/#puzzles>. The pipeline expects the
+  uncompressed CSV.
+- **Syzygy tablebases** (optional but referenced by all EngineDefs and
+  puzzle test scripts under `SyzygyPath`). 3-4-5-piece is fine for puzzle
+  testing. If you don't have them, set `SyzygyPath` to an empty string in
+  the EngineDef + harness scripts.
 
 ---
 
@@ -102,8 +126,95 @@ D:/Puzzles/                                # data lives on a fast SSD
         tpg/puzzles_*.tpg_set0.zst        # TPG training shards
 ```
 
-Adjust paths to taste; `Network/CeresNet/*.onnx` and the orig checkpoint are
-distributed separately (ask repo owner).
+Adjust paths to taste.
+
+---
+
+## 3.5. Stage 0 — get the orig artifacts (REQUIRED before training)
+
+The pipeline depends on three artifacts that are NOT in this repo:
+
+| Artifact | What it is | Used by |
+|---|---|---|
+| `C3-384-12-I8.onnx` | Smaller teacher net (12 layers) | Labeling Stage 1 (fast) |
+| `C3-768-30-pre3-I8.onnx` | Larger teacher net (30 layers) | Optional sharper labeling |
+| `ckpt_c1_640_34_from_onnx_0` | Lightning checkpoint of the orig net we fine-tune | Every training run (warm-start) and every fold (`V8_BASE_CKPT`) |
+
+Get them from the repo owner (private distribution). They live under:
+
+```
+C:/Dev/Chess/Networks/CeresNet/C3-384-12-I8.onnx
+C:/Dev/Chess/Networks/CeresNet/C3-768-30-pre3-I8.onnx
+C:/Dev/Chess/Networks/CeresNet/Ceres_c1_640_34_orig_trt.onnx     # the orig itself, for puzzle-baseline tests
+C:/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0           # warm-start ckpt
+```
+
+Note: the **ONNX→Lightning checkpoint conversion** (how
+`ckpt_c1_640_34_from_onnx_0` was originally produced) is not included in
+this repo as a standalone script. The reverse path (ckpt→ONNX) lives in
+`src/CeresTrainPy/reconvert_onnx.py` and is invoked at end-of-training and
+during fold; that's what `export_v8_uint8_mish.py` uses.
+
+### 3.5a. Auto-loaded settings files
+
+Both binaries auto-load user-settings JSONs at first run:
+
+- **CeresTrain**: `C:/Users/<you>/CeresTrain.json` — initialize on first
+  run; fields cover scratch dirs and any host-specific overrides.
+- **Ceres engine**: `C:/Users/<you>/source/repos/Ceres/artifacts/release/net10.0/Ceres.json`
+  (and a copy may show up at `C:/Users/<you>/CeresTrain/Ceres.json`).
+  Holds default tablebase paths and TRT cache locations.
+
+If either binary errors with "user settings not found," run it once with
+`--help`; it'll create a default file you can edit.
+
+### 3.5b. TensorRT engine cache
+
+First load of any ONNX through `Device: GPU:0#TensorRTNative` compiles
+TRT engines for each batch profile (`[1, 8, 20, 42, 64, 88, 116, 240]` by
+default), writing them to:
+
+```
+C:/Dev/Chess/Networks/CeresNet/trt_engines/<HOST>/
+```
+
+Expect 5-7 minutes per profile on first run. Subsequent loads are <5
+seconds. If you upgrade your NVIDIA driver, delete this cache — engines
+are driver-version-bound.
+
+### 3.5c. Sanity-test the orig before training
+
+Verify the orig net loads and serves UCI before launching anything:
+
+```bash
+C:/Users/<you>/source/repos/Ceres/artifacts/release/net10.0/Ceres.exe UCI
+> setoption name Network value C:/Dev/Chess/Networks/CeresNet/Ceres_c1_640_34_orig_trt.onnx
+> setoption name Device value GPU:0#TensorRTNative
+> isready
+> position startpos
+> go nodes 100
+```
+
+You should get a `bestmove` reply within a few seconds (after the
+one-time TRT compile). If TRT compile fails, double-check CUDA/TensorRT
+versions match your PyTorch install.
+
+### 3.5d. Run the puzzle harness against orig (baseline reference)
+
+Before any fine-tune, capture the orig's puzzle metric on your machine:
+
+```bash
+# Edit C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py:
+#   - CERES = path to your Ceres.exe
+#   - CSV_PATH = path to your Lichess CSV
+#   - SyzygyPath = path to your tablebases (or "")
+#   - CONFIGS = { "orig": _cfg("...Ceres_c1_640_34_orig_trt.onnx") }
+python C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py
+```
+
+Expected (5K narrow ≥2710, RTX-class GPU): **74.44%**. If your number is
+significantly different, your TRT/driver stack is producing different
+inference outputs — fix that before fine-tuning.
 
 ---
 
@@ -296,7 +407,46 @@ head with value-only loss:
 
 Body env vars unset (no body LoRA at all). Total trainable params: ~few-K.
 
-### 5d. Driver script template
+### 5d. Full LoRA env-var reference
+
+These are read by `dot_product_attention.py`, `mlp2_layer.py`,
+`ceres_net.py`, and `save_model.py`. All default to `0` (= disabled) when
+unset.
+
+| Env var | Effect |
+|---|---|
+| `CERES_LORA_ATTN_RANK_DIV` | LoRA rank divisor for attention QKV projections in transformer body. r-div=64 → rank ≈ ModelDim/64. |
+| `CERES_LORA_FFN_RANK_DIV` | LoRA rank divisor for MLP/FFN linear layers (linear1, linear2, plus SwiGLU gate linear3) in transformer body. |
+| `CERES_LORA_TRANSFORMER_RANK_DIV` | Legacy unified knob that sets both attn and ffn at once if the specific knobs are unset. |
+| `CERES_LORA_LAYER_MIN` | Inclusive minimum layer index that body LoRA wraps (default: 0). |
+| `CERES_LORA_LAYER_MAX` | Inclusive maximum layer index that body LoRA wraps (default: NumLayers-1). |
+| `CERES_LORA_HEADFRONT_RANK_DIV` | LoRA on the shared head-front projection that feeds every head (after the body, before the heads split). |
+| `CERES_LORA_SMOLGEN_RANK_DIV` | LoRA on the smolgen prep + per-attention sm1/sm2/sm3 modules. |
+| `V8_BASE_CKPT` | (export-time only) Path to the orig Lightning checkpoint to fold the LoRA delta onto. |
+| `V8_LORA_BIN` | (export-time only) Path to the trained `lepdev_c1_640_34.lora_*.bin`. |
+| `V8_OUT` | (export-time only) Output path for the folded TRT-deployable ONNX. |
+| `V8_LORA_SKIP_PREFIX` | (export-time only) Optional prefix; LoRA modules whose names start with this prefix are skipped during fold. Used in two-stage flows where body is already folded into the ckpt and shouldn't be folded again from the bin. Typical: `transformer_layer.`. |
+
+Head LoRA (the "PV head" — policy and value heads) is controlled by the
+`opt.json` field `LoRARankDivisor` plus the boolean restrictors
+`LoRARestrictPolicyValueOnly` / `LoRARestrictValueOnly`.
+
+### 5e. Path-edit checklist (before first run on a new machine)
+
+Several paths are hardcoded across the repo. Search-and-replace these
+before training/testing on a new layout:
+
+| File | What to edit |
+|---|---|
+| `C:/Dev/Chess/CeresTrain/configs/c1_640_34_ceres_data.json` | `TrainingFilesDirectory` — your TPG dir (WSL `/mnt/...` form) |
+| `C:/Dev/Chess/CeresTrain/configs/c1_640_34_ceres_opt.json` | `CheckpointResumeFromFileName` — full path to your orig ckpt (WSL form) |
+| `C:/Dev/Chess/CeresTrain/run_v*.sh` | `LOG_DIR`, `NETS`, `ENGINE_DIR`, `ORIG_CKPT_LINUX`, `TPG_DIR_LINUX` |
+| `C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py` | `CERES` (path to Ceres.exe), `CSV_PATH` (Lichess CSV), `SyzygyPath`, `CONFIGS` (the net under test) |
+| `C:/Dev/Chess/CeresTrain/compare_policy_eb_full_line.py` | Same fields as the value harness |
+| `C:/Dev/Chess/CeresTrain/c3_*.json` (puzzle configs) | `LichessCsvPath`, `OutDir`, `NetSpec` |
+| `C:/Dev/Chess/Engines/EngineDefs/Ceres_*_*.json` | `Path` (Ceres.exe), `NetworkPath`, `Network`, `SyzygyPath` |
+
+### 5f. Driver script template
 
 The `run_v<N>.sh` scripts under `C:/Dev/Chess/CeresTrain/` chain
 config-mutation, training, fold, and puzzle tests in one shot. Copy the
