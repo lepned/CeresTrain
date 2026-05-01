@@ -242,12 +242,12 @@ versions match your PyTorch install.
 Before any fine-tune, capture the orig's puzzle metric on your machine:
 
 ```bash
-# Edit C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py:
+# Edit C:/Users/<you>/source/repos/CeresTrain/scripts/compare_value_eb_full_line.py:
 #   - CERES = path to your Ceres.exe
 #   - CSV_PATH = path to your Lichess CSV
 #   - SyzygyPath = path to your tablebases (or "")
 #   - CONFIGS = { "orig": _cfg("...Ceres_c1_640_34_orig_trt.onnx") }
-python C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py
+python C:/Users/<you>/source/repos/CeresTrain/scripts/compare_value_eb_full_line.py
 ```
 
 Expected (5K narrow ≥2710, RTX-class GPU): **74.44%**. If your number is
@@ -479,8 +479,8 @@ before training/testing on a new layout:
 | `C:/Dev/Chess/CeresTrain/configs/c1_640_34_ceres_data.json` | `TrainingFilesDirectory` — your TPG dir (WSL `/mnt/...` form) |
 | `C:/Dev/Chess/CeresTrain/configs/c1_640_34_ceres_opt.json` | `CheckpointResumeFromFileName` — full path to your orig ckpt (WSL form) |
 | `C:/Dev/Chess/CeresTrain/run_v*.sh` | `LOG_DIR`, `NETS`, `ENGINE_DIR`, `ORIG_CKPT_LINUX`, `TPG_DIR_LINUX` |
-| `C:/Dev/Chess/CeresTrain/compare_value_eb_full_line.py` | `CERES` (path to Ceres.exe), `CSV_PATH` (Lichess CSV), `SyzygyPath`, `CONFIGS` (the net under test) |
-| `C:/Dev/Chess/CeresTrain/compare_policy_eb_full_line.py` | Same fields as the value harness |
+| `scripts/compare_value_eb_full_line.py` | `CERES` (path to Ceres.exe), `CSV_PATH` (Lichess CSV), `SyzygyPath`, `CONFIGS` (the net under test) |
+| `scripts/compare_policy_eb_full_line.py` | Same fields as the value harness |
 | `C:/Dev/Chess/CeresTrain/c3_*.json` (puzzle configs) | `LichessCsvPath`, `OutDir`, `NetSpec` |
 | `C:/Dev/Chess/Engines/EngineDefs/Ceres_*_*.json` | `Path` (Ceres.exe), `NetworkPath`, `Network`, `SyzygyPath` |
 
@@ -516,7 +516,7 @@ source ~/cerestrain-env/bin/activate
 V8_BASE_CKPT=/mnt/c/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0 \
 V8_LORA_BIN=/mnt/c/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34.lora_<N>.bin \
 V8_OUT=/mnt/c/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34_v<N>_folded_trt.onnx \
-python3 /mnt/c/Dev/Chess/CeresTrain/export_v8_uint8_mish.py
+python3 /mnt/c/Users/<you>/source/repos/CeresTrain/scripts/export_v8_uint8_mish.py
 ```
 
 The output ONNX is loadable by Ceres for both EngineBattle and the puzzle
