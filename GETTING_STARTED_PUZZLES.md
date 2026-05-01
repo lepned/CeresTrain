@@ -149,11 +149,49 @@ C:/Dev/Chess/Networks/CeresNet/Ceres_c1_640_34_orig_trt.onnx     # the orig itse
 C:/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0           # warm-start ckpt
 ```
 
-Note: the **ONNX→Lightning checkpoint conversion** (how
-`ckpt_c1_640_34_from_onnx_0` was originally produced) is not included in
-this repo as a standalone script. The reverse path (ckpt→ONNX) lives in
-`src/CeresTrainPy/reconvert_onnx.py` and is invoked at end-of-training and
-during fold; that's what `export_v8_uint8_mish.py` uses.
+### Bootstrap your own orig from a public ONNX
+
+Don't have a checkpoint from the maintainer? You can build one from any
+compatible Ceres ONNX (e.g. `C1-640-34-I8.onnx` available in the public
+[Ceres-nets](https://github.com/dje-dev/Ceres-nets) repo). Two scripts under
+`scripts/onnx_bootstrap/` handle this:
+
+1. **`inspect_onnx.py`** — infer the architecture (ModelDim, NumLayers,
+   NumHeads, FFNMultiplier, NonLinearAttention, etc.) by walking the ONNX
+   graph. Use the output to populate `configs/<your-id>_ceres_net.json`.
+
+   ```bash
+   wsl.exe -- bash -lc "source ~/cerestrain-env/bin/activate && \
+       python3 /mnt/c/Users/<you>/source/repos/CeresTrain/scripts/onnx_bootstrap/inspect_onnx.py \
+         /mnt/c/Dev/Chess/Networks/CeresNet/C1-640-34-I8.onnx"
+   ```
+
+2. **`reconstruct_ckpt_from_onnx.py`** — instantiate a `CeresNet` matching
+   the architecture, walk the ONNX graph to map each initializer to its
+   PyTorch parameter (handling the bias-MatMul pair pattern AND bare
+   MatMul nodes for q2/k2/v2 under NonLinearAttention), transpose
+   anonymous matmul weights to PyTorch's `[out_features, in_features]`
+   layout, and write a fabric-compatible
+   `{'model': state_dict, 'optimizer': {...}, 'num_pos': '0'}` checkpoint.
+
+   ```bash
+   wsl.exe -- bash -lc "source ~/cerestrain-env/bin/activate && \
+       python3 /mnt/c/Users/<you>/source/repos/CeresTrain/scripts/onnx_bootstrap/reconstruct_ckpt_from_onnx.py \
+         /mnt/c/Dev/Chess/Networks/CeresNet/C1-640-34-I8.onnx \
+         c1_640_34 \
+         /mnt/c/Dev/Chess/CeresTrain"
+   # Output: /mnt/c/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0
+   ```
+
+   After running, verify forward-pass parity vs the source ONNX (the
+   script reports max abs/rel diffs on policy/value heads — should be
+   within FP16 noise). See `scripts/onnx_bootstrap/NOTES.md` for the
+   debugging history of one bug that's been fixed (NonLinearAttention's
+   bias-less q2/k2/v2 weights were initially missed).
+
+The reverse path (ckpt→ONNX) lives in `src/CeresTrainPy/reconvert_onnx.py`
+and is invoked at end-of-training and during fold; that's what
+`export_v8_uint8_mish.py` uses.
 
 ### 3.5a. Auto-loaded settings files
 
