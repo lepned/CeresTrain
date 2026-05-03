@@ -100,8 +100,8 @@ class EncoderLayer(torch.nn.Module):
       self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
 
 
-  def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    attn_output = self.attention(x, x, x, x)    
+  def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias)
     
     if (self.dropout_rate > 0):
       attn_output = self.dropout_attn(attn_output)

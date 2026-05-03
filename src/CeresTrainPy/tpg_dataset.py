@@ -61,6 +61,12 @@ def try_shuffle(file_list):
 
 MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored (TPGRecord.MAX_MOVES)
 
+# Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
+# Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
+_POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
+if _POLICY_TARGET_ALPHA > 0:
+  print(f"[tpg_dataset] policy-target sharpening: alpha = {_POLICY_TARGET_ALPHA}")
+
 
 class TPGDataset(Dataset):
   """
@@ -239,6 +245,31 @@ class TPGDataset(Dataset):
 
               policies_values = np.ascontiguousarray(this_batch[:, offset : offset + MAX_MOVES*2]).view(dtype=np.float16).reshape(-1, MAX_MOVES)
               offset+= MAX_MOVES * 2
+
+              # Optional policy-target sharpening (loss-alignment fix). When
+              # CERES_POLICY_TARGET_ALPHA > 0, mix in a one-hot on the solver
+              # move (the slot with the highest probability — guaranteed to be
+              # the Lichess-prescribed solver move per the rank-1 nudge applied
+              # at TPG generation):
+              #     target = alpha * one_hot(argmax) + (1 - alpha) * teacher
+              # alpha=0.5 puts half the policy mass directly on solver while
+              # keeping teacher's nuance among alternatives. Skipped for rows
+              # whose teacher distribution is all zero (OppDef value-only records).
+              if _POLICY_TARGET_ALPHA > 0.0:
+                row_max = policies_values.max(axis=1)        # [B]
+                active = row_max > 0                          # mask out value-only rows
+                if active.any():
+                  pv32 = policies_values.astype(np.float32)
+                  solver_slot = pv32.argmax(axis=1)           # [B]
+                  pv32[active] = pv32[active] * (1.0 - _POLICY_TARGET_ALPHA)
+                  rows_active = np.where(active)[0]
+                  pv32[rows_active, solver_slot[active]] += _POLICY_TARGET_ALPHA
+                  # Belt-and-suspenders normalization: scrub any FP16 drift in
+                  # the input distribution that survives the sharpen step.
+                  row_sum = pv32[active].sum(axis=1, keepdims=True)
+                  row_sum = np.where(row_sum > 0, row_sum, 1.0)
+                  pv32[active] = pv32[active] / row_sum
+                  policies_values = pv32.astype(np.float16)
 
               SIZE_SQUARE = 137
               squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)

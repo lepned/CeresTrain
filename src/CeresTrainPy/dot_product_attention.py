@@ -210,7 +210,7 @@ class DotProductAttention(torch.nn.Module):
     return score
 
  
-  def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor): # -> torch.Tensor, torch.Tensor:
+  def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None): # -> torch.Tensor, torch.Tensor:
     # Note that scaling could be done separately on Q and K to possibly improve stability. See:
     #   https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/118
     #scaleDivisor = 1 # math.pow(self.d_k, 0.25) # apply sqrt twice since we are dividing twice
@@ -243,6 +243,12 @@ class DotProductAttention(torch.nn.Module):
       assert self.num_tokens_q == self.num_tokens_kv, "use_smolgen requires equal number of tokens for Q and K"
       smolgen_logits_repeated = smolgen
       scores = scores + smolgen_logits_repeated
+
+    # Plan 3: chess-specific piece-relation bias. Computed once per forward by
+    # the parent network from the squares input and passed unchanged to every
+    # encoder layer's attention. Shape [B, num_heads, 64, 64], same as scores.
+    if piece_relation_bias is not None:
+      scores = scores + piece_relation_bias.to(scores.dtype)
 
     if self.softcap_cutoff > 0:
       #softcap logits for enhanced training stability
@@ -281,7 +287,8 @@ class DotProductAttention(torch.nn.Module):
     return smolgen
 
 
-  def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+  def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+              piece_relation_bias: torch.Tensor = None) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -318,10 +325,10 @@ class DotProductAttention(torch.nn.Module):
 
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
-      H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen)
+      H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias)
     else:
-      if self.use_rpe:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None)
+      if self.use_rpe or piece_relation_bias is not None:
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
       else:
         # N.B. attention softcap is not implemented on this code path!
         H_cat = torch.nn.functional.scaled_dot_product_attention(Q, K, V)

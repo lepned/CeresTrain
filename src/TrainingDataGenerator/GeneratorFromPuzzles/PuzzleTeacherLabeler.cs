@@ -503,6 +503,8 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         SolutionUci = rec.SolutionUci,
         Rating = rec.Rating,
         Themes = rec.Themes,
+        StartFen = rec.StartFen,
+        PriorUciMoves = rec.PriorUciMoves,
         TeacherNodes = nodes,
         TeacherTopUci = teacherTopUci,
         TeacherV = rootV,

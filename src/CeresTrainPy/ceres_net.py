@@ -35,6 +35,7 @@ from rms_norm import RMSNorm
 from lora import LoRALinear
 from utils import DWA
 from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
+from chess_geometry import PieceRelationBias
 
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
 
@@ -90,6 +91,11 @@ class CeresNet(pl.LightningModule):
     self.DROPOUT_RATE = config.Exec_DropoutRate
     self.EMBEDDING_DIM = config.NetDef_ModelDim
     self.NUM_LAYERS = config.NetDef_NumLayers
+    # Looped transformer: NUM_DISTINCT_LAYERS modules constructed; the body
+    # applies the full sequence LOOP_COUNT times so total depth = NUM_LAYERS.
+    # Default LoopCount=1 → distinct == NUM_LAYERS (current behaviour).
+    self.LOOP_COUNT = config.NetDef_LoopCount
+    self.NUM_DISTINCT_LAYERS = self.NUM_LAYERS // self.LOOP_COUNT
 
 
     self.TRANSFORMER_OUT_DIM = self.EMBEDDING_DIM * NUM_TOKENS_NET
@@ -240,7 +246,7 @@ class CeresNet(pl.LightningModule):
                       use_nonlinear_attention=config.NetDef_NonLinearAttention,
                       dual_attention_mode = config.NetDef_DualAttentionMode if not config.Exec_TestFlag else (config.NetDef_DualAttentionMode if i % 2 == 1 else 'None'),
                       test = config.Exec_TestFlag)
-        for i in range(self.NUM_LAYERS)])
+        for i in range(self.NUM_DISTINCT_LAYERS)])
 
     self.policy_loss_weight = policy_loss_weight
     self.value_loss_weight = value_loss_weight
@@ -257,6 +263,15 @@ class CeresNet(pl.LightningModule):
 
     if (self.denseformer):
       self.dwa_modules = torch.nn.ModuleList([DWA(n_alphas=i+2, depth=self.EMBEDDING_DIM) for i in range(self.NUM_LAYERS)])
+
+    # Plan 3: piece-relation attention bias. One shared module computes a
+    # per-position bias of shape [B, num_heads, 64, 64] from the piece-type
+    # one-hot in `squares`; the same bias is fed to every encoder layer's
+    # attention. Reuse-across-layers is intentional — piece relations are a
+    # property of the position, not of the depth of reasoning.
+    self.use_piece_relation_bias = config.NetDef_UsePieceRelationBias
+    if self.use_piece_relation_bias:
+      self.piece_relation_bias_module = PieceRelationBias(num_heads=self.NUM_HEADS)
 
     # GTAB (Gated Tactical Adapter Branch) — optional parallel mini-transformer
     # that contributes additively to the post-body flow, gated by a learned
@@ -277,6 +292,15 @@ class CeresNet(pl.LightningModule):
       squares = squares[0]
 
     flow = squares
+
+    # Plan 3: chess-specific piece-relation attention bias. Compute once per
+    # forward from the per-square 13-channel piece-type one-hot (current ply,
+    # bytes 0..12 of each square's encoding per TPGSquareRecord layout).
+    # Reused across all encoder layers to avoid re-projecting per layer.
+    piece_relation_bias_tensor = None
+    if self.use_piece_relation_bias:
+      piece_type_curr = squares[:, :, 0:13]  # [B, 64, 13]
+      piece_relation_bias_tensor = self.piece_relation_bias_module(piece_type_curr)
 
     # save a copy of the qblunders (2 bytes) for later use in value 2 head (only)
     QBLUNDER_SLICE_BEGIN = 119
@@ -312,13 +336,21 @@ class CeresNet(pl.LightningModule):
     if self.denseformer:
       all_previous_x = [flow]
 
-    # Main transformer body (stack of encoder layers)
-    for i in range(self.NUM_LAYERS):
-      flow = self.transformer_layer[i](flow)
-
-      if self.denseformer:
-        all_previous_x.append(flow)
-        flow = self.dwa_modules[i](all_previous_x)
+    # Main transformer body (stack of encoder layers).
+    # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
+    # giving total effective depth = NUM_LAYERS. Default LoopCount=1 reduces
+    # to the original "stack of NUM_LAYERS distinct layers" behaviour.
+    # DenseFormer + LoopCount>1 is not supported (DWA expects a unique module
+    # per effective layer position) — guard against it explicitly.
+    if self.denseformer and self.LOOP_COUNT != 1:
+      raise NotImplementedError("DenseFormer is not supported with LoopCount > 1.")
+    for loop_iter in range(self.LOOP_COUNT):
+      for i in range(self.NUM_DISTINCT_LAYERS):
+        flow = self.transformer_layer[i](flow, piece_relation_bias=piece_relation_bias_tensor)
+        if self.denseformer:
+          eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
+          all_previous_x.append(flow)
+          flow = self.dwa_modules[eff_idx](all_previous_x)
 
 
     # GTAB residual add: tactical adapter contributes additively to body output,

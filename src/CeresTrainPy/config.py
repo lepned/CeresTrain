@@ -125,6 +125,21 @@ class Configuration:
 
     self.NetDef_ModelDim = config_net_def.get('ModelDim', 256)
     self.NetDef_NumLayers = config_net_def.get('NumLayers', 8)
+    # Plan 3: per-position chess-specific attention bias (piece-attack patterns
+    # + static square-pair geometry). When True, a single PieceRelationBias
+    # module is constructed and its output is added to attention logits in
+    # every encoder layer. Default False reduces to baseline behaviour.
+    self.NetDef_UsePieceRelationBias = config_net_def.get('UsePieceRelationBias', False)
+    # Looped transformer: NumLayers represents the EFFECTIVE depth (number of
+    # encoder layer applications). LoopCount controls weight tying — when >1,
+    # NumLayers/LoopCount distinct EncoderLayer modules are constructed and each
+    # is applied LoopCount times in sequence. LoopCount=1 (default) is the
+    # standard untied behaviour. NumLayers must be divisible by LoopCount.
+    self.NetDef_LoopCount = config_net_def.get('LoopCount', 1)
+    if self.NetDef_NumLayers % self.NetDef_LoopCount != 0:
+      raise ValueError(
+        f"NumLayers ({self.NetDef_NumLayers}) must be divisible by LoopCount "
+        f"({self.NetDef_LoopCount}) for looped transformer.")
     self.NetDef_NumHeads = config_net_def.get('NumHeads', 8)
     self.NetDef_UseQKV = config_net_def.get('UseQKV', True)
     self.NetDef_DualAttentionMode = config_net_def.get('DualAttentionMode', 'None')

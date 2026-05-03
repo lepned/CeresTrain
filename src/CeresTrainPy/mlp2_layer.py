@@ -100,10 +100,14 @@ class MLP2Layer(torch.nn.Module):
         mlpGlobal = self.mlpGlobalLN(mlpGlobal);
         x = torch.concat((x, mlpGlobal.unsqueeze(1).expand(-1, 64, -1)), dim=-1)
 
-      x = self.linear1(x)
+      # SwiGLU: y = linear2(SiLU(linear1(x)) * linear3(x)) — both linears
+      # operate on the SAME original input x (post-global-concat). Save the
+      # input before linear1 overwrites it.
+      x_in = x
+      x = self.linear1(x_in)
       before_linear2 = self.activation_fn(x)
       if (self.activation_type == 'SwiGLU'):
-          before_linear2 *= self.linear3(x)
+          before_linear2 = before_linear2 * self.linear3(x_in)
 
       x_out = self.linear2(before_linear2)
 

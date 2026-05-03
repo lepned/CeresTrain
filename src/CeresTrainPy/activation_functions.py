@@ -31,8 +31,10 @@ def to_activation(activation_str : str) -> torch.nn.Module:
   elif activation_str == 'None' or activation_str == 'Identity':
     return torch.nn.Identity()
   elif activation_str == 'SwiGLU':
-    assert(False, "SwiGLU disabled. Use requires two functions, SiLU (here) but also subsequent Linear (see mlp2 for example)")
-    #self.activation_fn = torch.nn.SiLU() # First 
+    # SwiGLU is implemented as: y = linear2(SiLU(linear1(x)) * linear3(x))
+    # The SiLU is the per-channel activation; the multiplicative gate via
+    # linear3 is handled separately in mlp2_layer.py:forward.
+    return torch.nn.SiLU()
   else:
     raise Exception('Unknown activation type', activation_str)
  

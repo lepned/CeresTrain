@@ -100,10 +100,17 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       // net must see real history during training too.
       const bool EMIT_HISTORY = true;
 
+      // emitPlySinceLastMovePerSquare=FALSE: training must match inference, where Ceres's
+      // TPG conversion path produces 0 for the PlySinceLastMove byte (because batch.LastMovePlies
+      // is empty for puzzle inference). With true, training writes
+      // PliesSinceLastMoveEncoded(30)=36 (the "never moved" default), but inference at puzzle-
+      // test time produces 0 — that ~36-byte-per-square systematic mismatch was making
+      // trained nets see OOD inputs at inference (validated 2026-05-02 via byte-diff of
+      // training TPG vs Ceres-dumped inference buffer).
       TrainingPositionWriter writer = new TrainingPositionWriter(
         outFile, NUM_WORKER_THREADS, TPGGeneratorOptions.OutputRecordFormat.TPGRecord,
         true, System.IO.Compression.CompressionLevel.Optimal,
-        exactCount, null, null, null, batchSize, true, EMIT_HISTORY, true);
+        exactCount, null, null, null, batchSize, false, EMIT_HISTORY, true);
 
       long emitted = 0, skipped = 0;
       Stopwatch sw = Stopwatch.StartNew();
@@ -117,11 +124,23 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       {
         if (TryBuild(rec, out EncodedTrainingPosition etp, out TPGTrainingTargetNonPolicyInfo target))
         {
+          // For non-Standard records (OppDefence, etc.) we want the policy target
+          // to remain all-zero so target.greater(0) is False everywhere and
+          // policy loss = 0 on those records. Passing the default
+          // minLegalMoveProbability floors EVERY legal move to ~0.0005, turning
+          // the intended-zero target into a uniform-over-legal-moves target,
+          // which trains the policy head toward uniform on opp-to-move positions
+          // and catastrophically pollutes the policy signal. Passing 0 keeps
+          // the target genuinely zero. Standard records use the floor as before
+          // for proper teacher-policy floor smoothing.
+          float minProb = (rec.Kind == PuzzlePositionKind.Standard)
+                            ? CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE
+                            : 0f;
           int times = stratify ? RatingWeight(rec.Rating, thresholds, weights) : 1;
           for (int k = 0; k < times; k++)
           {
             writer.Write(in etp, target, 0, zeroLastMoveBySquares,
-                         CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE, 0);
+                         minProb, 0);
             emitted++;
           }
         }
