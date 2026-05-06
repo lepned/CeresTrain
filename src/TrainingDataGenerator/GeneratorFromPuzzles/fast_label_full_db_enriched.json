@@ -1,0 +1,17 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+  "MinRating": 0,
+  "MaxRating": 99999,
+  "ThemeIncludeAny": null,
+  "ThemeExcludeAny": null,
+  "MaxPuzzlesToRead": 1000000000,
+  "ResumeFromCheckpoint": true,
+  "OutDir": "C:/Dev/Chess/Puzzles/fast_label_full_db",
+  "LabeledJsonlFileName": "labeled_2600plus.jsonl",
+  "NetSpec": "unused",
+  "Device": "unused",
+  "TeacherNodes": 100,
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+  "MaxRecordsToLabel": 0
+}

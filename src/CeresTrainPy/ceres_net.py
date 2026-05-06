@@ -245,7 +245,11 @@ class CeresNet(pl.LightningModule):
                       use_rel_bias=config.NetDef_UseRelBias,
                       use_nonlinear_attention=config.NetDef_NonLinearAttention,
                       dual_attention_mode = config.NetDef_DualAttentionMode if not config.Exec_TestFlag else (config.NetDef_DualAttentionMode if i % 2 == 1 else 'None'),
-                      test = config.Exec_TestFlag)
+                      test = config.Exec_TestFlag,
+                      tsb_enabled = getattr(config, 'NetDef_TSB_Enabled', False),
+                      tsb_ffn_multiplier = getattr(config, 'NetDef_TSB_FFNMultiplier', 1),
+                      tsb_gate_bias_init = getattr(config, 'NetDef_TSB_GateBiasInit', -4.0),
+                      tsb_gate_mlp_hidden_divisor = getattr(config, 'NetDef_TSB_GateMLPHiddenDivisor', 8))
         for i in range(self.NUM_DISTINCT_LAYERS)])
 
     self.policy_loss_weight = policy_loss_weight
@@ -284,6 +288,13 @@ class CeresNet(pl.LightningModule):
       self.tactical_gate    = PositionGate(in_dim=self.EMBEDDING_DIM)
       # Buffer for last gate activation (for sparsity loss + diagnostics).
       self._last_gate_value = None
+
+    # TSB (Tactical SwiGLU Bypass) — per-block parallel SwiGLU FFN + scalar gate.
+    # Each EncoderLayer holds its own TSBSwiGLU; here we just track net-level
+    # state. Gate values are collected after the encoder forward for the
+    # gate-sparsity regularizer in train.py.
+    self.use_tsb = bool(getattr(config, 'NetDef_TSB_Enabled', False))
+    self._last_tsb_gates = None  # set in forward() when TSB is active
 
 
   def forward(self, squares: torch.Tensor, prior_state:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -351,6 +362,16 @@ class CeresNet(pl.LightningModule):
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
+
+    # TSB: collect per-block gate values across all layers for the gate-sparsity
+    # regularizer in train.py. Each layer caches its last gate in _last_tsb_gate.
+    if self.use_tsb:
+      _gates = [layer._last_tsb_gate for layer in self.transformer_layer
+                if getattr(layer, '_last_tsb_gate', None) is not None]
+      if len(_gates) > 0:
+        self._last_tsb_gates = torch.stack(_gates, dim=0)  # [num_layers, B, 1, 1]
+      else:
+        self._last_tsb_gates = None
 
 
     # GTAB residual add: tactical adapter contributes additively to body output,

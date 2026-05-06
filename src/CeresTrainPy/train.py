@@ -252,17 +252,20 @@ def Train():
   _headfront_div_init  = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
   _smolgen_div_init    = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
   _gtab_active_init    = int(os.environ.get('CERES_GTAB', '0') or 0) > 0
+  _tsb_active_init     = bool(getattr(config, 'NetDef_TSB_Enabled', False))
   _body_lora_active_init = (_body_attn_div_init > 0 or _body_ffn_div_init > 0 or _body_legacy_init > 0
                             or _headfront_div_init > 0 or _smolgen_div_init > 0
-                            or _gtab_active_init)
+                            or _gtab_active_init or _tsb_active_init)
 
   if config.Opt_LoRARankDivisor > 0 or _body_lora_active_init:
     # Freeze all parameters except:
     #   - LoRA (head LoRA via Opt_LoRARankDivisor and/or env-var LoRA)
     #   - GTAB tactical adapter and gate (when CERES_GTAB=1)
+    #   - TSB tactical FFN and gate (when NetDef_TSB_Enabled=true)
     for name, param in model.named_parameters():
       keep_trainable = ("lora_A" in name or "lora_B" in name or "lora_alpha" in name
-                        or "tactical_adapter" in name or "tactical_gate" in name)
+                        or "tactical_adapter" in name or "tactical_gate" in name
+                        or "tactical_ffn" in name or ".tsb." in name)
       if not keep_trainable:
         param.requires_grad = False
    
@@ -467,8 +470,10 @@ def Train():
     _headfront_div  = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
     _smolgen_div    = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
     _gtab_active    = int(os.environ.get('CERES_GTAB', '0') or 0) > 0
+    _tsb_active     = bool(getattr(config, 'NetDef_TSB_Enabled', False))
     _body_lora_active = (_body_attn_div > 0 or _body_ffn_div > 0 or _body_legacy > 0
-                         or _headfront_div > 0 or _smolgen_div > 0 or _gtab_active)
+                         or _headfront_div > 0 or _smolgen_div > 0 or _gtab_active
+                         or _tsb_active)
 
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # load checkpoint parameters, expect all to match (strict = True)
@@ -477,7 +482,7 @@ def Train():
       # Rebuild new state dictionary.
       # Mostly copy over parameters from the checkpoint with same name,
       # except if the current model has original_layer
-      # (indicating now subsumed within original_layer within LoRA layer) 
+      # (indicating now subsumed within original_layer within LoRA layer)
       # then map to the original name as saved in the pre-LoRA checkpoint.
       new_state_dict = {}
 
@@ -486,6 +491,8 @@ def Train():
           pass # not expected to be found in checkpoint, can start out empty
         elif "tactical_adapter" in name or "tactical_gate" in name:
           pass # GTAB modules are new — not in orig ckpt; keep their init values
+        elif "tactical_ffn" in name or ".tsb." in name:
+          pass # TSB modules are new — not in orig ckpt; keep their init values
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name
@@ -536,6 +543,79 @@ def Train():
 
     # NUM_POS_TO_SKIP = num_pos # enable this line if want to skip training data already seen (but slow)
     del loaded
+
+  # ----------------------------------------------------------------------
+  # KL-anchor reference model (optional, RLHF-style fine-tuning regularizer).
+  # When config.Opt_KLAnchorRefCheckpoint is set and at least one beta > 0,
+  # we load a frozen vanilla CeresNet from the reference checkpoint. Its forward
+  # outputs are used as soft targets for KL regularization terms added to the
+  # per-batch loss. Reference is NOT compiled, NOT wrapped by fabric.setup,
+  # NOT under DDP — pure eval-mode bf16 per rank with no autograd graph.
+  # ----------------------------------------------------------------------
+  ref_model = None
+  kl_active = (config.Opt_KLAnchorRefCheckpoint is not None
+               and config.Opt_KLAnchorRefCheckpoint != ""
+               and (float(config.Opt_KLAnchorPolicyWeight) > 0.0
+                    or float(config.Opt_KLAnchorValueWeight) > 0.0))
+  if kl_active:
+    if fabric.is_global_zero:
+      print(f"INFO: KL_ANCHOR_REF {config.Opt_KLAnchorRefCheckpoint} "
+            f"beta_pol={config.Opt_KLAnchorPolicyWeight} beta_val={config.Opt_KLAnchorValueWeight}")
+    # Build a vanilla CeresNet for the reference. Temporarily clear LoRA/GTAB
+    # env vars so the reference is constructed without adapters even if the
+    # trainable model uses them. Reference must match the saved ckpt's arch.
+    _saved_env_keys = ('CERES_LORA_ATTN_RANK_DIV', 'CERES_LORA_FFN_RANK_DIV',
+                       'CERES_LORA_TRANSFORMER_RANK_DIV', 'CERES_LORA_HEADFRONT_RANK_DIV',
+                       'CERES_LORA_SMOLGEN_RANK_DIV', 'CERES_GTAB',
+                       'CERES_LORA_LAYER_MIN', 'CERES_LORA_LAYER_MAX')
+    _saved_env = {k: os.environ.get(k, None) for k in _saved_env_keys}
+    _saved_lora_div = config.Opt_LoRARankDivisor
+    try:
+      for k in _saved_env_keys:
+        os.environ.pop(k, None)
+      config.Opt_LoRARankDivisor = 0
+      # Pass the same loss weights as the trainable model so architecture matches
+      # the saved checkpoint exactly (heads are conditionally constructed based on
+      # whether their loss weight is > 0). Reference is never used for loss compute,
+      # but its forward must produce the same shapes as the trainable's forward.
+      ref_model = CeresNet(fabric, config,
+                           policy_loss_weight=config.Opt_LossPolicyMultiplier,
+                           value_loss_weight=config.Opt_LossValueMultiplier,
+                           moves_left_loss_weight=config.Opt_LossMLHMultiplier,
+                           unc_loss_weight=config.Opt_LossUNCMultiplier,
+                           value2_loss_weight=config.Opt_LossValue2Multiplier,
+                           q_deviation_loss_weight=config.Opt_LossQDeviationMultiplier,
+                           value_diff_loss_weight=config.Opt_LossValueDMultiplier,
+                           value2_diff_loss_weight=config.Opt_LossValue2DMultiplier,
+                           action_loss_weight=config.Opt_LossActionMultiplier,
+                           uncertainty_policy_weight=config.Opt_LossUncertaintyPolicyMultiplier,
+                           action_uncertainty_loss_weight=config.Opt_LossActionUncertaintyMultiplier,
+                           q_ratio=config.Data_FractionQ)
+    finally:
+      config.Opt_LoRARankDivisor = _saved_lora_div
+      for k, v in _saved_env.items():
+        if v is not None:
+          os.environ[k] = v
+    ref_loaded = fabric.load(config.Opt_KLAnchorRefCheckpoint)
+    # strict=False: the saved checkpoint may contain extra heads (e.g. value2_head)
+    # that the current config doesn't enable — those keys are unused by the reference
+    # forward (only policy_out and value_out matter for KL) and can be discarded.
+    # Missing keys would still indicate a real mismatch — log them for visibility.
+    ref_load_result = ref_model.load_state_dict(ref_loaded["model"], strict=False)
+    if fabric.is_global_zero and (ref_load_result.missing_keys or ref_load_result.unexpected_keys):
+      print(f"INFO: KL_ANCHOR_REF_LOAD missing={len(ref_load_result.missing_keys)} "
+            f"unexpected={len(ref_load_result.unexpected_keys)}")
+      if ref_load_result.missing_keys:
+        print(f"  missing: {ref_load_result.missing_keys[:5]}{'...' if len(ref_load_result.missing_keys) > 5 else ''}")
+      if ref_load_result.unexpected_keys:
+        print(f"  unexpected: {ref_load_result.unexpected_keys[:5]}{'...' if len(ref_load_result.unexpected_keys) > 5 else ''}")
+    del ref_loaded
+    ref_model = ref_model.to(fabric.device).to(torch.bfloat16)
+    ref_model.eval()
+    for p in ref_model.parameters():
+      p.requires_grad_(False)
+    if fabric.is_global_zero:
+      print("INFO: KL_ANCHOR_REF_LOADED")
 
   # compute batch sizes
   batch_size_opt = config.Opt_BatchSizeBackwardPass
@@ -689,6 +769,66 @@ def Train():
       if getattr(model, 'use_gtab', False) and getattr(model, '_last_gate_value', None) is not None:
         _gtab_lambda = float(os.environ.get('CERES_GTAB_GATE_LAMBDA', '0.01') or 0.01)
         loss = loss + _gtab_lambda * model._last_gate_value.mean()
+
+      # TSB gate-sparsity regularizer: penalize unnecessary tactical-branch firing.
+      # Each transformer block has a per-block scalar gate; the net stacks them
+      # into _last_tsb_gates of shape [num_layers, B, 1, 1]. Mean across layers and
+      # batch encourages each block's gate to stay near 0 unless the puzzle loss
+      # gain from firing exceeds the sparsity cost. Default lambda 0.01.
+      if getattr(model, 'use_tsb', False) and getattr(model, '_last_tsb_gates', None) is not None:
+        _tsb_lambda = float(os.environ.get('CERES_TSB_GATE_LAMBDA', '0.01') or 0.01)
+        loss = loss + _tsb_lambda * model._last_tsb_gates.mean()
+
+      # KL-divergence anchor: pull student outputs toward frozen reference outputs.
+      # For BOARDS_PER_BATCH==4 we anchor only on board 1 (canonical learned target;
+      # 4x cheaper, and boards 2-4 are sequence-conditioned so a single anchor suffices).
+      # Policy KL is computed on legal moves only (illegal-move logits are arbitrary
+      # and would dominate the divergence). Both terms upcast to float32 for numerical
+      # stability — bf16 KL is too noisy.
+      if kl_active:
+        if BOARDS_PER_BATCH == 1:
+          _anchor_squares = batch['squares']
+          _anchor_policies = batch['policies']
+          _student_pol = policy_out
+          _student_val = value_out
+        else:
+          _anchor_squares = batch[0]['squares']
+          _anchor_policies = batch[0]['policies']
+          _student_pol = policy_out1
+          _student_val = value_out1
+
+        with torch.no_grad():
+          # Reference is bf16 but the dataloader-side input is float32
+          # (the trainable model is auto-cast by fabric; the reference is not).
+          _ref_input = _anchor_squares.to(torch.bfloat16)
+          _ref_pol, _ref_val, *_ = ref_model(_ref_input, None)
+
+        _beta_pol = float(config.Opt_KLAnchorPolicyWeight)
+        _beta_val = float(config.Opt_KLAnchorValueWeight)
+        _kl_pol_val = None
+        _kl_val_val = None
+
+        if _beta_pol > 0.0:
+          _legal_mask = (_anchor_policies > 0)
+          _NEG = -1e4
+          _sp_masked = torch.where(_legal_mask, _student_pol, torch.full_like(_student_pol, _NEG))
+          _rp_masked = torch.where(_legal_mask, _ref_pol, torch.full_like(_ref_pol, _NEG))
+          _log_sp = F.log_softmax(_sp_masked.float(), dim=-1)
+          _log_rp = F.log_softmax(_rp_masked.float(), dim=-1)
+          _kl_pol = (_log_sp.exp() * (_log_sp - _log_rp)).sum(-1).mean()
+          loss = loss + _beta_pol * _kl_pol
+          _kl_pol_val = _kl_pol.detach().item()
+
+        if _beta_val > 0.0:
+          _log_sv = F.log_softmax(_student_val.float(), dim=-1)
+          _log_rv = F.log_softmax(_ref_val.float(), dim=-1)
+          _kl_val = (_log_sv.exp() * (_log_sv - _log_rv)).sum(-1).mean()
+          loss = loss + _beta_val * _kl_val
+          _kl_val_val = _kl_val.detach().item()
+
+        if show_losses and fabric.is_global_zero:
+          print(f"KL_ANCHOR pol={_kl_pol_val if _kl_pol_val is not None else 'off'} "
+                f"val={_kl_val_val if _kl_val_val is not None else 'off'}")
 
       fabric.backward(loss)
         

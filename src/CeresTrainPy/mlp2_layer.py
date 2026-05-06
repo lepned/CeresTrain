@@ -112,3 +112,65 @@ class MLP2Layer(torch.nn.Module):
       x_out = self.linear2(before_linear2)
 
     return before_linear2, x_out
+
+
+class TSBSwiGLU(torch.nn.Module):
+  """Tactical SwiGLU Bypass: per-block parallel SwiGLU FFN + per-block scalar gate.
+
+  Sits beside the original frozen SwiGLU FFN (SP_FFN). The encoder layer combines
+  the two outputs via additive residual:
+
+      output = sp_ffn_out + g * tactical_ffn_out
+
+  where g = sigmoid(MLP(meanpool(x))). This additive form (rather than the convex
+  blend (1-g)*A + g*B) is bit-identical to SP-only behavior at init regardless of
+  the gate value — because tactical_ffn_out is exactly zero at init (zero-initted
+  linear3.weight makes the SwiGLU multiplicative gate produce zero).
+
+  Convention: parameter names are prefixed `tactical_ffn_*` and `tactical_gate_*`,
+  used by train.py freeze logic and resume strict=False filtering.
+  """
+
+  def __init__(self, model_dim: int, ffn_inner_dim: int,
+               activation_type: str = 'SwiGLU',
+               gate_hidden_divisor: int = 8,
+               gate_bias_init: float = -4.0):
+    super().__init__()
+    assert activation_type == 'SwiGLU', "TSBSwiGLU requires SwiGLU activation"
+
+    # Parallel SwiGLU FFN (same structure as MLP2Layer's SwiGLU branch but no LoRA wrap).
+    self.tactical_ffn_linear1 = torch.nn.Linear(model_dim, ffn_inner_dim, bias=USE_BIAS)
+    self.tactical_ffn_linear2 = torch.nn.Linear(ffn_inner_dim, model_dim, bias=USE_BIAS)
+    self.tactical_ffn_linear3 = torch.nn.Linear(model_dim, ffn_inner_dim, bias=False)
+    self.tactical_activation = to_activation(activation_type)
+    # CRITICAL: zero-init multiplicative gate => tactical FFN output is exactly 0
+    # at step 0, regardless of linear1/linear2 init. Combined with the additive
+    # residual in the encoder, this guarantees bit-identical forward at init.
+    torch.nn.init.zeros_(self.tactical_ffn_linear3.weight)
+
+    # Per-block scalar gate: model_dim -> hidden -> 1, sigmoid.
+    gate_hidden = max(1, model_dim // gate_hidden_divisor)
+    self.tactical_gate_fc1 = torch.nn.Linear(model_dim, gate_hidden, bias=True)
+    self.tactical_gate_fc2 = torch.nn.Linear(gate_hidden, 1, bias=True)
+    # Closed-init: zero fc2 weight + bias = -4 makes g = sigmoid(-4) ~= 0.018,
+    # combined with zero tactical output makes (g * 0) == 0 anyway.
+    torch.nn.init.zeros_(self.tactical_gate_fc2.weight)
+    torch.nn.init.constant_(self.tactical_gate_fc2.bias, float(gate_bias_init))
+
+  def forward(self, x: torch.Tensor):
+    """Returns (tactical_out, gate_value) tensors.
+
+    tactical_out: [B, T, model_dim] — same shape as SP_FFN output.
+    gate_value:   [B, 1, 1] — per-batch-element scalar, broadcast over T,model_dim.
+    """
+    # Tactical SwiGLU path: y = linear2(activation(linear1(x)) * linear3(x))
+    h = self.tactical_activation(self.tactical_ffn_linear1(x)) * self.tactical_ffn_linear3(x)
+    tactical_out = self.tactical_ffn_linear2(h)
+
+    # Per-block scalar gate from mean-pooled hidden state.
+    pooled = x.mean(dim=1)                                         # [B, model_dim]
+    gate_hidden = torch.nn.functional.gelu(self.tactical_gate_fc1(pooled))
+    gate_value = torch.sigmoid(self.tactical_gate_fc2(gate_hidden))  # [B, 1]
+    gate_value = gate_value.unsqueeze(-1)                            # [B, 1, 1]
+
+    return tactical_out, gate_value

@@ -18,7 +18,7 @@ import torch
 from activation_functions import Swish, ReLUSquared
 from rms_norm import RMSNorm
 from soft_moe_batched_dual import SoftMoEBatchedDual
-from mlp2_layer import MLP2Layer
+from mlp2_layer import MLP2Layer, TSBSwiGLU
 from dot_product_attention import DotProductAttention
 
 
@@ -40,7 +40,9 @@ class EncoderLayer(torch.nn.Module):
                 rpe_factor_shared  = None,
                 use_rel_bias: bool = False,
                 use_nonlinear_attention: bool = False,
-                dual_attention_mode : str = 'None', test : bool = False):
+                dual_attention_mode : str = 'None', test : bool = False,
+                tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
+                tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8):
     super().__init__()
 
     assert ffn_activation_type in ('ReLUSquared', 'ReLU', 'SwiGLU', 'Swish', 'Mish')
@@ -97,7 +99,22 @@ class EncoderLayer(torch.nn.Module):
       self.moe = None
 
     if ffn_hidden_size > 0:
-      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
+      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum)
+
+    # Tactical SwiGLU Bypass (TSB): parallel frozen-base + tactical-branch design.
+    # Per-block parallel SwiGLU FFN (smaller than the SP FFN by tsb_ffn_multiplier)
+    # plus a per-block scalar gate. Output is sp_ffn + g * tactical_ffn.
+    # Initialized to zero output so forward is bit-identical to non-TSB at step 0.
+    self.tsb_enabled = bool(tsb_enabled) and ffn_activation_type == 'SwiGLU' and ffn_hidden_size > 0
+    if self.tsb_enabled:
+      tsb_ffn_inner = hidden_size * int(tsb_ffn_multiplier)
+      self.tsb = TSBSwiGLU(model_dim=hidden_size,
+                           ffn_inner_dim=tsb_ffn_inner,
+                           activation_type='SwiGLU',
+                           gate_hidden_divisor=int(tsb_gate_mlp_hidden_divisor),
+                           gate_bias_init=float(tsb_gate_bias_init))
+    else:
+      self.tsb = None
 
 
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -113,7 +130,7 @@ class EncoderLayer(torch.nn.Module):
         assert self.ffn_activation_type in ('ReLUSquared') # SoftMoEBatchedDual currently only supports ReLUSquared
         mlp_output = self.moe(out1)
       else:
-        (mlp_before_linear2, mlp_output) = self.mlp(out1) 
+        (mlp_before_linear2, mlp_output) = self.mlp(out1)
         if self.moe:
           if self.smoe_mode == 'AddLinearSecondLayer':
             mlp_output += self.moe(mlp_before_linear2)
@@ -122,9 +139,18 @@ class EncoderLayer(torch.nn.Module):
           else:
             assert False, f"Invalid smoe_mode {self.smoe_mode}"
 
+        # TSB: additive residual from a parallel tactical FFN, gated per-block.
+        # At init the tactical output is zero, so this is a no-op regardless of g.
+        if self.tsb is not None:
+          tactical_out, gate_value = self.tsb(out1)
+          mlp_output = mlp_output + gate_value * tactical_out
+          self._last_tsb_gate = gate_value
+        else:
+          self._last_tsb_gate = None
+
         if self.dropout_rate > 0:
           mlp_output = self.dropout_mlp(mlp_output)
-      
+
         out2 = self.ln2(out1 * self.alpha + mlp_output)
     else:
       out2 = out1

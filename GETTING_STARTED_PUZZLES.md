@@ -293,57 +293,55 @@ CeresTrain.exe label-puzzles --puzzle-config=C:/Dev/Chess/CeresTrain/c3_2600_270
 Output: `D:/Puzzles/c3_2600_2700/labeled.jsonl`. ETA ≈ 1 minute per ~1,000
 puzzle records on RTX 5090 at 200 nodes.
 
-### 4b. Stage 2: post-process (clamp + rank-1 nudge)
+### 4b. Stage 2 (RECOMMENDED): augment 2× via vertical-flip + side-swap
+
+The session-best recipe uses solver-only puzzle data with 2× augmentation. No
+post-processing is needed: the labeler now writes `StartFen` + `PriorUciMoves`
+natively (the old `patch_jsonl_history.py` step is no longer required, and
+`clamp_wdl.py` was a workaround for an MCGS-aggregation rounding bug that's
+since been fixed).
+
+Use `scripts/augment_realhist_jsonl.py` (or a path-edited copy) to emit each
+record twice — original and mirrored:
 
 ```bash
-python C:/Users/<you>/source/repos/CeresTrain/scripts/clamp_wdl.py \
-    D:/Puzzles/c3_2600_2700/labeled.jsonl \
-    D:/Puzzles/c3_2600_2700/labeled_clamped.jsonl
+python C:/Users/<you>/source/repos/CeresTrain/scripts/augment_realhist_jsonl.py
 ```
 
-This clamps any negative WDL components from MCGS-aggregation rounding and
-ensures the Lichess solution is the unique top of the policy distribution.
+Inputs and outputs are hardcoded paths near the top of the script — edit
+`SRC` and `DST` to your dirs.
 
-### 4c. Stage 3a (optional but recommended): OppDefence enrichment
+Output: `D:/Puzzles/c3_<band>_aug/labeled_aug.jsonl` (~2× the labeled count).
 
-Adds opp-to-move records with search-backed WDL targets so the value head
-gets calibration coverage on the positions MCTS reaches at inference. Use
-`labeled_clamped.jsonl` as input via `LabeledJsonlFileName`:
+### 4c. Stage 3 (optional, legacy): OppDefence enrichment
 
-```json
-{
-  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_<date>.csv",
-  "MinRating": 2600,
-  "MaxRating": 2700,
-  "SkipMining": true,
-  "OutDir": "D:/Puzzles/c3_2600_2700",
-  "LabeledJsonlFileName": "labeled_clamped.jsonl",
-  "NetSpec": "C:/Dev/Chess/Networks/CeresNet/C3-384-12-I8.onnx",
-  "Device": "GPU:0#TensorRTNative",
-  "TeacherNodes": 100,
-  "TeacherWorkerThreads": 1
-}
-```
+The session demonstrated that **PONLY (`LossValueMultiplier=0`) + KL anchor**
+on solver-only data outperforms OppDef-enriched corpora for the recipe that
+ships. OppDef enrichment is left in for completeness but is no longer
+recommended for the default puzzle FT pipeline.
+
+If you do want OppDef enrichment (for an experimental run or on an older
+recipe), it adds opp-to-move records with search-backed WDL targets:
 
 ```bash
-CeresTrain.exe enrich-opp-defence --puzzle-config=C:/Dev/Chess/CeresTrain/c3_2600_2700_oppdef.json
+CeresTrain.exe enrich-opp-defence --puzzle-config=C:/Dev/Chess/CeresTrain/c3_<band>_oppdef.json
 ```
 
-Output: `D:/Puzzles/c3_2600_2700/labeled_with_oppdef.jsonl`. ETA ≈ 70 min for
-~200K records. OppDef records are emitted with all-zero policy targets
-downstream, so the policy head trains only on solver-side puzzle moves while
-the value head sees both.
+The opp-side records get all-zero policy targets, so the policy head trains
+only on solver moves while the value head sees both. With the modern recipe
+`LossValueMultiplier=0` makes those records zero-loss no-ops anyway, hence
+the simplification.
 
-### 4d. Stage 3b: convert to TPG
+### 4d. Stage 4: convert to TPG
 
-Same config as enrichment, just point `LabeledJsonlFileName` at the file you
-want to train on (typically `labeled_with_oppdef.jsonl`):
+Point `LabeledJsonlFileName` at the file you want to train on (modern
+recipe: `labeled.jsonl` for non-aug or `labeled_aug.jsonl` for aug):
 
 ```bash
-CeresTrain.exe puzzles-to-tpg --puzzle-config=C:/Dev/Chess/CeresTrain/c3_2600_2700_tpg.json
+CeresTrain.exe puzzles-to-tpg --puzzle-config=C:/Dev/Chess/CeresTrain/c3_<band>_tpg.json
 ```
 
-Output: `D:/Puzzles/c3_2600_2700/tpg/puzzles_<timestamp>.tpg_set0.zst`. About
+Output: `D:/Puzzles/c3_<band>/tpg/puzzles_<timestamp>.tpg_set0.zst`. About
 1-2 minutes for ~350K records.
 
 ### 4e. (Optional) merge multiple rating bands
@@ -377,9 +375,68 @@ Always start from the **orig checkpoint** (never resume from a prior LoRA bin):
 "CheckpointResumeFromFileName": "/mnt/c/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0"
 ```
 
-### 5a. Recipe: head-only PV LoRA (safest, current best Pareto)
+### 5a. ⭐ RECIPE: KL anchor + body+head LoRA + PONLY (CURRENT SHIP)
+
+This is the session-best recipe — tournament-confirmed +18.4 ±9.6 Elo over
+orig at 200n. Combines:
+
+- Body LoRA r-div=32 + head LoRA r-div=32 (about 12.3M trainable params)
+- KL-divergence anchor to orig (β=3.0 on policy AND value)
+- `LossValueMultiplier=0` ("PONLY") to avoid gradient-conflict between
+  puzzle policy and value losses
+- Trained on the solver-only 2x-aug corpus
 
 In `c1_640_34_ceres_opt.json`:
+
+```json
+{
+  "LoRARankDivisor": 32,
+  "LoRARestrictPolicyValueOnly": false,
+  "LoRARestrictValueOnly": false,
+  "NumTrainingPositions": 1000000,
+  "CheckpointFrequencyNumPositions": 250000,
+  "CheckpointResumeFromFileName": "/mnt/c/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0",
+  "WeightDecay": 0.005,
+  "LearningRateBase": 0.0001,
+  "LRBeginDecayAtFractionComplete": 0.5,
+  "LRWarmupPhaseMultiplier": 0.1,
+  "Beta1": 0.95,
+  "Beta2": 0.999,
+  "LossValueMultiplier": 0.0,
+  "LossPolicyMultiplier": 1.0,
+  "LossUNCMultiplier": 0.01,
+  "LossQDeviationMultiplier": 0.02,
+  "LossUncertaintyPolicyMultiplier": 0.01,
+  "KLAnchorRefCheckpoint": "/mnt/c/Dev/Chess/CeresTrain/nets/ckpt_c1_640_34_from_onnx_0",
+  "KLAnchorPolicyWeight": 3.0,
+  "KLAnchorValueWeight": 3.0
+}
+```
+
+In `c1_640_34_ceres_net.json` ensure `"SoftCapCutoff": 0` to match orig.
+
+Launch (WSL) with body-LoRA env var set:
+
+```bash
+source ~/cerestrain-env/bin/activate
+cd /mnt/c/Users/<you>/source/repos/CeresTrain/src/CeresTrainPy
+CERES_LORA_TRANSFORMER_RANK_DIV=32 \
+  python train.py c1_640_34 /mnt/c/Dev/Chess/CeresTrain
+```
+
+**β-sweep notes (1M positions, solver-only 2x-aug corpus):**
+
+The tournament Elo curve at 200n is unimodal in β with a plateau in
+[β=1.5, β=3.0] hitting roughly +16 to +18 Elo. β=1.0 collapses to ~+2 Elo
+(extreme drift, search can't recover). β=4.0 saturates at smaller gains.
+β=3.0 has the best raw policy quality at nodes=1 (smallest deficit vs orig)
+and is the safer ship despite being statistically tied with β=1.5 at 200n.
+
+### 5b. Legacy recipe: head-only PV LoRA (pre-KL-anchor era)
+
+Older recipe, kept for completeness. Achieves Val +1.28 / Pol par at hard-tail
+≥2710 in puzzle metrics. **No tournament-confirmed positive Elo** — use
+recipe 5a instead.
 
 ```json
 {
@@ -390,14 +447,11 @@ In `c1_640_34_ceres_opt.json`:
   "LossPolicyMultiplier": 1.0,
   "LearningRateBase": 0.0001,
   "NumTrainingPositions": 1000000,
-  "CheckpointFrequencyNumPositions": 1000000,
   "Beta2": 0.999
 }
 ```
 
-In `c1_640_34_ceres_net.json` ensure `"SoftCapCutoff": 0` to match orig.
-
-Launch (WSL):
+Launch (WSL), no body-LoRA env vars:
 
 ```bash
 source ~/cerestrain-env/bin/activate
@@ -469,6 +523,13 @@ Head LoRA (the "PV head" — policy and value heads) is controlled by the
 `opt.json` field `LoRARankDivisor` plus the boolean restrictors
 `LoRARestrictPolicyValueOnly` / `LoRARestrictValueOnly`.
 
+KL anchor (added in this session) is controlled by three opt.json fields:
+`KLAnchorRefCheckpoint` (path to frozen reference, typically the same as the
+warm-start ckpt), `KLAnchorPolicyWeight` (β_pol), `KLAnchorValueWeight`
+(β_val). All default to 0 / null when unset (no anchor). See
+`project_kl10_body32_ponly_breakthrough.md` in memory for full β-sweep
+results.
+
 ### 5e. Path-edit checklist (before first run on a new machine)
 
 Several paths are hardcoded across the repo. Search-and-replace these
@@ -526,7 +587,30 @@ test scripts.
 
 ## 7. Running puzzle tests
 
-Two harnesses live in `C:/Dev/Chess/CeresTrain/`:
+Two equivalent paths exist:
+
+### 7a (RECOMMENDED). EngineBattle Console `puzzlejson`
+
+The cleanest cross-engine puzzle comparison runner. Set up a JSON config
+(see `C:/Dev/Chess/EB/PuzzleLichess_CeresAlt.json` for a template) listing
+the engines and test types, then:
+
+```bash
+EngineBattle.Console.exe puzzlejson C:/Dev/Chess/EB/PuzzleLichess_<MyConfig>.json
+```
+
+Supports `Type: "policy, policy3, value"` for top-1/top-3 policy + value-head
+tests on the same set, multiple engines in one run via the `Engines[]` array,
+optional `RatingGroups` for cohort-specific output rows. Add `--json
+<output-path>` for stable structured JSON output (see PuzzleJsonSchema.md in
+the EngineBattle repo).
+
+For multi-net sweeps (one engine def, many networks), use `EngineWithNets`
+with `ListOfNetsWithPaths`.
+
+### 7b (LEGACY). Repo-local Python harnesses
+
+Two scripts live in `C:/Dev/Chess/CeresTrain/`:
 
 - **`compare_value_eb_full_line.py`** — value-head puzzle solving.
   Walks every solver-to-move position; counts a puzzle solved only if the
@@ -574,7 +658,9 @@ under `C:/Dev/Chess/Engines/EngineDefs/Ceres_lepdev_c1_640_34_v<N>.json`.
 
 ---
 
-## 8. Reference values (orig baseline)
+## 8. Reference values
+
+### 8a. Orig baseline (legacy harness)
 
 5K narrow ≥2710, EB-aligned full-line harness, TRT-Native:
 
@@ -583,6 +669,34 @@ under `C:/Dev/Chess/Engines/EngineDefs/Ceres_lepdev_c1_640_34_v<N>.json`.
 | value per-puzzle | 74.44% |
 | policy per-puzzle | 56.26% |
 | policy per-move | 84.11% |
+
+### 8b. EB Console puzzlejson (modern harness)
+
+2000 puzzles, AvgR ~2498, RatingGroups "2499", Type `value, policy, policy3`,
+Nodes 1:
+
+| metric | orig (`Ceres_C1-640-34-I8_orig_default.json`) |
+|---|---|
+| Policy Perf | 2649 |
+| Policy accuracy | 70.5% |
+| pTop3 Perf | 3077 |
+| pTop3 accuracy | 96.6% |
+| Value Perf | 2822 |
+| Value accuracy | 86.6% |
+| Pol KLD | 0.8874 |
+
+### 8c. Current shipping fine-tune (KL30 PONLY 2500up)
+
+Same harness as 8b:
+
+| metric | KL30 2500up | Δ vs orig |
+|---|---|---|
+| Policy Perf | 2679 | **+30** |
+| Policy accuracy | 74.0% | +3.5 pp |
+| pTop3 Perf | 3124 | +47 |
+| Value Perf | 2820 | par |
+
+Tournament: **+18.4 ±9.6 Elo over orig at 200n** (1000 games, CFS 100%).
 
 ---
 

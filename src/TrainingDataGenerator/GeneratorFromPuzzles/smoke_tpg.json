@@ -1,0 +1,14 @@
+{
+  "LichessCsvPath": "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv",
+  "NetSpec": "unused|CUDAGRAPHS=false",
+  "Device": "GPU:0",
+  "MinRating": 0,
+  "MaxRating": 99999,
+  "MaxPuzzlesToRead": 0,
+  "MaxRecordsToLabel": 0,
+  "TeacherNodes": 100,
+  "MineBatchSize": 512,
+  "TeacherWorkerThreads": 1,
+  "OutDir": "C:/Dev/Chess/Puzzles/fast_label_full_db",
+  "LabeledJsonlFileName": "labeled_action_enriched.jsonl"
+}

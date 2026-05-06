@@ -374,6 +374,14 @@ namespace CeresTrain.Networks.Transformer
     /// </summary>
     public readonly SoftMoEParams SoftMoEConfig { get; init; } = new SoftMoEParams();
 
+    /// <summary>
+    /// Tactical SwiGLU Bypass (TSB) configuration. When TSBConfig.Enabled is
+    /// true, each transformer block adds a parallel SwiGLU FFN with a per-block
+    /// scalar gate. Output is sp_ffn + g * tactical_ffn. Zero-init ensures
+    /// step-0 forward is bit-identical to non-TSB. Default disabled.
+    /// </summary>
+    public readonly TSBParams TSBConfig { get; init; } = new TSBParams();
+
     #region Helper methods
 
     /// <summary>

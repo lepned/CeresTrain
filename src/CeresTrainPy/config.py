@@ -113,6 +113,14 @@ class Configuration:
     self.Opt_LossPolicyMultiplier = config_opt.get('LossPolicyMultiplier', 1)
     self.Opt_LossMLHMultiplier = config_opt.get('LossMLHMultiplier', 0)
     self.Opt_LossUNCMultiplier = config_opt.get('LossUNCMultiplier', 0)
+
+    # KL-divergence anchor (RLHF-style reference-model regularization).
+    # When KLAnchorRefCheckpoint is set and at least one weight is > 0,
+    # train.py loads a frozen reference and adds beta * KL(student || ref) per batch.
+    self.Opt_KLAnchorRefCheckpoint = config_opt.get('KLAnchorRefCheckpoint', None)
+    self.Opt_KLAnchorPolicyWeight = config_opt.get('KLAnchorPolicyWeight', 0.0)
+    self.Opt_KLAnchorValueWeight = config_opt.get('KLAnchorValueWeight', 0.0)
+
     self.Opt_TestValue = config_opt.get('TestValue', 0)
 
     # Initialize class members from config_net_def
@@ -175,6 +183,15 @@ class Configuration:
     self.NetDef_SoftMoE_NumSlotsPerExpert = soft_moe_config.get('NumSlotsPerExpert', 0)
     self.NetDef_SoftMoE_UseNormalization = soft_moe_config.get('UseNormalization', False)
     self.NetDef_SoftMoE_UseBias = soft_moe_config.get('UseBias', True)
+
+    # TSB (Tactical SwiGLU Bypass) — nested config block.
+    # Per-block parallel SwiGLU FFN + scalar gate added beside the orig FFN.
+    # When Enabled=false (default), all TSB code paths are no-ops.
+    tsb_config = config_net_def.get('TSBConfig', {})
+    self.NetDef_TSB_Enabled = tsb_config.get('Enabled', False)
+    self.NetDef_TSB_FFNMultiplier = tsb_config.get('FFNMultiplier', 1)
+    self.NetDef_TSB_GateBiasInit = tsb_config.get('GateBiasInit', -4.0)
+    self.NetDef_TSB_GateMLPHiddenDivisor = tsb_config.get('GateMLPHiddenDivisor', 8)
 
 
   def pretty_print(self):

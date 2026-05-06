@@ -276,6 +276,36 @@ namespace CeresTrain.Trainer
 
     #endregion
 
+
+    #region KL-divergence anchor (fine-tuning regularizer)
+
+    /// <summary>
+    /// Path to a frozen reference checkpoint used for KL-divergence anchoring during fine-tuning.
+    /// When set, a frozen copy of the network is loaded from this path and its outputs are
+    /// used as soft targets for KL regularization terms added to the training loss.
+    /// Null/empty disables anchoring (no extra forward pass, zero overhead).
+    ///
+    /// Reference: RLHF-style reference-model KL anchoring (Ouyang et al. 2022, InstructGPT).
+    /// The reference checkpoint should be a vanilla (non-LoRA) full checkpoint matching the
+    /// same architecture as the training network.
+    /// </summary>
+    public readonly string KLAnchorRefCheckpoint { get; init; } = null;
+
+    /// <summary>
+    /// Beta weight for KL(student_policy || reference_policy). Higher values pull the trained
+    /// policy more strongly toward the reference policy. 0 disables the policy-side anchor.
+    /// </summary>
+    public readonly float KLAnchorPolicyWeight { get; init; } = 0.0f;
+
+    /// <summary>
+    /// Beta weight for KL(student_value || reference_value), computed over the 3-class WDL distribution.
+    /// 0 disables the value-side anchor.
+    /// </summary>
+    public readonly float KLAnchorValueWeight { get; init; } = 0.0f;
+
+    #endregion
+
+
     /// <summary>
     /// Reserved value used for debugging/experimentation to turn on a possible ad hoc test/diagnostic feature.
     /// </summary>
