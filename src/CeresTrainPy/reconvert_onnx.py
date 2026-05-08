@@ -1,20 +1,19 @@
 """
-Standalone helper: re-exports ONNX from an existing Lightning checkpoint
-by calling save_model.save_model(). Mirrors the end-of-training export path
-exactly — picks up the current (fixed) FP16 conversion logic.
+Standalone helper: re-exports ONNX from an existing checkpoint by calling
+save_model.save_model(). Mirrors the end-of-training export path exactly —
+picks up the current (fixed) FP16 conversion logic.
 
 Usage:
-    python reconvert_onnx.py <config_id> <outputs_dir> <ckpt_name>
+    python3 reconvert_onnx.py <config_id> <outputs_dir> <ckpt_name>
 
 Example:
-    python reconvert_onnx.py puzzle_py_smoke /mnt/c/Dev/Chess/CeresTrain ckpt_lepdev_puzzle_py_smoke_20000768
+    python3 reconvert_onnx.py puzzle_py_smoke /mnt/c/Dev/Chess/CeresTrain ckpt_lepdev_puzzle_py_smoke_20000768
 """
 
 import os
 import sys
 import socket
 import torch
-import lightning as pl
 
 from config import Configuration
 from ceres_net import CeresNet
@@ -31,15 +30,9 @@ CKPT_NAME = sys.argv[3]
 config = Configuration('.', os.path.join(OUTPUTS_DIR, "configs", CONFIG_ID))
 NAME = socket.gethostname() + "_" + os.path.basename(CONFIG_ID)
 
-fabric = pl.Fabric(
-    accelerator=config.Exec_DeviceType.lower(),
-    devices=[0] if isinstance(config.Exec_DeviceIDs, list) else config.Exec_DeviceIDs,
-    precision='bf16-mixed' if config.Exec_DataType == 'BFloat16' else '32-true',
-)
-fabric.launch()
-
+# Plain-PyTorch model construction; pass writer=None (this script never logs).
 model = CeresNet(
-    fabric, config,
+    None, config,
     1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5,
 )
 
@@ -68,13 +61,10 @@ if missing[:3]:
 if unexpected[:3]:
     print(f"  Sample unexpected: {unexpected[:3]}")
 
-# NOTE: do NOT fabric.setup(model) — that wraps it in _FabricModule which
-# breaks torch.export's input-count inference (sees (x,y) as 1 tuple element).
-# save_model() expects an unwrapped model_nocompile anyway.
 model = model.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
 model.eval()
 
 num_pos_str = CKPT_NAME.split('_')[-1]
 print(f"Calling save_model (will write ONNX with fixed FP16 conversion)")
-save_model(NAME, OUTPUTS_DIR, config, fabric, model, state={}, num_pos=num_pos_str, save_all_formats=True)
+save_model(NAME, OUTPUTS_DIR, config, model, state={}, num_pos=num_pos_str, save_all_formats=True)
 print("DONE")

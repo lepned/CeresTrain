@@ -16,7 +16,6 @@ If not, see <http://www.gnu.org/licenses/>.
 import torch
 from torch import nn
 from torch.nn import functional as F
-import lightning as pl
 
 
 
@@ -24,7 +23,7 @@ class LossCalculator():
   """Class to compute and keep track of losses on various training target heads.
    """
 
-  def __init__(self, model : pl.LightningModule):
+  def __init__(self, model : nn.Module):
     super().__init__()
 
     self.MASK_POLICY_VALUE = -6E4 # for illegal moves (stay within range of float16)
@@ -113,7 +112,7 @@ class LossCalculator():
   # warning: this zeros the other gradients of the model
   def calc_loss_grad_norm(self, loss_name : str, loss : torch.Tensor, loss_wt : float):
     self.model.zero_grad()
-    self.model.fabric.backward(loss, retain_graph = True)
+    loss.backward(retain_graph = True)
     norm = sum((p.grad.data.norm(2).item() ** 2 for p in self.model.parameters() if p.grad is not None)) ** 0.5
     self.model.zero_grad()
     print(loss_name, 'grad norm (weighted)', round(norm * loss_wt, 5), 'grad norm (raw)', round(norm, 5))

@@ -17,6 +17,7 @@ import sys
 import socket
 import datetime
 import math
+import contextlib
 import numpy as np
 from typing import Dict, Any
 
@@ -26,11 +27,12 @@ from torchinfo import summary
 from torch import nn, optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 
 from rms_norm import RMSNorm
 from losses import LossCalculator
-from tpg_dataset import TPGDataset
+from tpg_dataset import TPGDataset, TPGMixedDataset
 from config import Configuration
 import lora
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
@@ -41,14 +43,41 @@ from soft_moe_batched_dual import SoftMoEBatchedDual
 from multi_expert import MultiExpertLayer
 from save_model import save_model, save_checkpoint
 
-from lightning.fabric import Fabric
-from lightning.fabric.loggers import TensorBoardLogger, CSVLogger
-from lightning.pytorch.utilities import grad_norm
-
 from AdEMAMix import AdEMAMix
 from AdEMAMixShampoo import AdEMAMixDistributedShampoo
 from soap import SOAP
 from muon import Muon
+
+
+def _grad_norm(model, norm_type: float = 2.0) -> Dict[str, float]:
+    """Per-parameter and total gradient norms. Plain-PyTorch replacement for
+    lightning.pytorch.utilities.grad_norm. Returns a dict shaped like
+    {'grad_<n>_norm/<param-name>': float, 'grad_<n>_norm_total': float}.
+    Match Lightning's float-formatted keys (e.g. 'grad_2.0_norm_total')."""
+    nt = float(norm_type)
+    norms: Dict[str, float] = {}
+    total = 0.0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        n = p.grad.detach().data.norm(nt).item()
+        norms[f'grad_{nt}_norm/{name}'] = n
+        total += n ** nt
+    norms[f'grad_{nt}_norm_total'] = total ** (1.0 / nt) if total > 0 else 0.0
+    return norms
+
+
+def _move_batch_to_device(batch, device):
+    """Recursively move any tensor leaves in a batch (dict / list / tuple) to
+    device using non_blocking transfers (requires pin_memory=True). Replaces
+    Lightning's setup_dataloaders auto-move."""
+    if isinstance(batch, dict):
+        return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(_move_batch_to_device(v, device) for v in batch)
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device, non_blocking=True)
+    return batch
 
 print(torch.__version__)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -164,39 +193,40 @@ def calc_weight_update_ratio(model, logger):
 
 last_logged_pos_num = 0
 
-def on_before_optimizer_step(fabric, model, optimizer, pos_num):      
+def on_before_optimizer_step(writer, model, optimizer, pos_num):
     global last_logged_pos_num
 
     step = pos_num // BATCH_SIZE
-    
-    # Log only periodically, and only on rank 0
+
+    # Log only periodically.
     LOG_EVERY_N_POSITIONS = 100000
     positions_since_logged = pos_num - last_logged_pos_num
-    if (not fabric.is_global_zero) or (positions_since_logged < LOG_EVERY_N_POSITIONS):
-      return  
+    if positions_since_logged < LOG_EVERY_N_POSITIONS:
+      return
     else:
       last_logged_pos_num = pos_num
 
     # log ratio of average absolute weight update to average absolute weight
     # note that this does retain an extra copy of the model parameters and increase GPU memory usage
-    weight_ratio = calc_weight_update_ratio(model, fabric.logger)
-    fabric.logger.log_metrics({"update_weight_ratio": weight_ratio}, step=pos_num)
+    weight_ratio = calc_weight_update_ratio(model, writer)
+    writer.add_scalar("update_weight_ratio", weight_ratio, pos_num)
 
-    norms = grad_norm(model, norm_type=2)
-    
-    # update_magnitude is an approximate measure of effective magnitude of weight updates which 
+    norms = _grad_norm(model, norm_type=2)
+
+    # update_magnitude is an approximate measure of effective magnitude of weight updates which
     # depends multiplicatively upon the size of the gradients and the current learning rate
     update_magnitude = norms['grad_2.0_norm_total'] * optimizer.param_groups[0]['lr']
-    fabric.logger.log_metrics({"update_magnitude": update_magnitude}, step=pos_num)
+    writer.add_scalar("update_magnitude", update_magnitude, pos_num)
 
-    fabric.logger.log_metrics(norms, step=pos_num)
-    fabric.logger.log_metrics({"max_abs_weight": get_most_extreme_weight_value(model)}, step=pos_num) 
-     
+    for k, v in norms.items():
+      writer.add_scalar(k, v, pos_num)
+    writer.add_scalar("max_abs_weight", get_most_extreme_weight_value(model), pos_num)
+
     LOG_GRAD_HISTOGRAMS = False
     if LOG_GRAD_HISTOGRAMS:
       for k, v in model.named_parameters():
         if v.grad is not None:
-          fabric.logger.experiment.add_histogram(tag=k, values=v.grad, global_step=pos_num)
+          writer.add_histogram(tag=k, values=v.grad, global_step=pos_num)
 
 
 def Train():
@@ -207,24 +237,24 @@ def Train():
   
 
   if config.Exec_UseFP8:
-    from lightning.fabric.plugins import TransformerEnginePrecision
-    recipe = {"fp8_format": "HYBRID", "amax_history_len": 16, "amax_compute_algo": "max"}
-    precision = TransformerEnginePrecision(weights_dtype=torch.bfloat16, 
-                                           fallback_compute_dtype=torch.bfloat16,
-                                           recipe=recipe, replace_layers=True)
-    fabric = Fabric(plugins=precision,accelerator=accelerator, devices=devices,
-                    loggers=TensorBoardLogger(os.path.join(OUTPUTS_DIR, 'tblogs'), name=NAME))  
-  else:
-    fabric = Fabric(precision='bf16-pure' if config.Exec_DataType == 'BFloat16Pure' else 'bf16-mixed', 
-                    accelerator=accelerator, devices=devices,
-                    loggers=TensorBoardLogger(os.path.join(OUTPUTS_DIR, 'tblogs'), name=NAME))  
+    raise NotImplementedError(
+        "Exec_UseFP8 was previously supported via Lightning Fabric's TransformerEnginePrecision; "
+        "the plain-PyTorch path does not wire transformer-engine directly. "
+        "Use Exec_DataType='BFloat16' instead.")
+
+  # Plain-PyTorch device + tensorboard setup. Replaces Lightning Fabric.
+  device = torch.device(f"{accelerator}:{devices[0]}" if accelerator != 'cpu' else 'cpu')
+  writer = SummaryWriter(os.path.join(OUTPUTS_DIR, 'tblogs', NAME))
+  # bf16-mixed: model weights are fp32, forward runs under autocast
+  # bf16-pure : model weights are bf16, no autocast needed
+  USE_AUTOCAST = (config.Exec_DataType == 'BFloat16')
 
 
   # NOTE: these very small values for MLH and UNC are best because
   #       they enhance training stability and don't negatively affect policy/value
-  #       but produce MLH/UNC outputs which are not significantly less accurate 
+  #       but produce MLH/UNC outputs which are not significantly less accurate
   #       than if were at higher loss weight.
-  model = CeresNet(fabric, config, policy_loss_weight=config.Opt_LossPolicyMultiplier,
+  model = CeresNet(writer, config, policy_loss_weight=config.Opt_LossPolicyMultiplier,
                    value_loss_weight= config.Opt_LossValueMultiplier, 
                    moves_left_loss_weight= config.Opt_LossMLHMultiplier, 
                    unc_loss_weight= config.Opt_LossUNCMultiplier,
@@ -408,13 +438,16 @@ def Train():
     del torchscript_model
 
        
-  fabric.launch()
-  model, optimizer = fabric.setup(model, optimizer)
+  # Move model to device. (Lightning's fabric.setup did this implicitly along with
+  # DDP wrapping; we are single-process so just .to(device).)
+  model = model.to(device)
+  if config.Exec_DataType == 'BFloat16Pure':
+    model = model.to(torch.bfloat16)
 
   # Possibly dump summary of model layers.
   DUMP_SUMMARY = False # *** WARNING *** Inexplicably enabling this causes much worse loses (already seen at 5mm pos).
                        # Therefore this should only be enabled to capture the summary, not to include training.
-  if DUMP_SUMMARY and fabric.is_global_zero:
+  if DUMP_SUMMARY:
     SUMMARY_DTYPE = torch.float16 # summarize as if float16 because this is the likely target inference type
     SUMMARY_COL_NAMES_TO_SHOW = ("input_size", "output_size", "num_params", "params_percent", "mult_adds", "trainable",)
     model_for_summary = model_nocompile.to(SUMMARY_DTYPE)
@@ -438,16 +471,35 @@ def Train():
  
   world_size = len(devices)
   rank = 0 if world_size == 1 else dist.get_rank()
-  dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing, 
-                       rank, world_size, NUM_DATASET_WORKERS, 
-                       BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag)
+  primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
+                               rank, world_size, NUM_DATASET_WORKERS,
+                               BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag)
 
-  dataloader = DataLoader(dataset, batch_size=None, pin_memory=False, num_workers=NUM_DATASET_WORKERS, worker_init_fn=worker_init_fn, prefetch_factor=PREFETCH_FACTOR)
-  dataloader = fabric.setup_dataloaders(dataloader)
+  # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
+  # Triggered when both Data_TrainingFilesDirectory2 is set AND Data_RatioSet1ToSet2 > 0.
+  secondary_dataset = None
+  if (getattr(config, 'Data_TrainingFilesDirectory2', None)
+      and int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0) > 0):
+    secondary_dataset = TPGDataset(config.Data_TrainingFilesDirectory2,
+                                   batch_size_forward // world_size,
+                                   config.Data_WDLLabelSmoothing,
+                                   rank, world_size, NUM_DATASET_WORKERS,
+                                   BOARDS_PER_BATCH, 0, config.Exec_TestFlag)
+    print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
+    print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
+    print(f'[mixed-dataset] ratio = {config.Data_RatioSet1ToSet2}:1 (primary:secondary batches)')
 
-  if fabric.is_global_zero:
-    config.pretty_print()
-    print_model_trainable_details(model)
+  dataset = TPGMixedDataset(primary_dataset, secondary_dataset,
+                            int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0))
+
+  dataloader = DataLoader(dataset, batch_size=None, pin_memory=True, num_workers=NUM_DATASET_WORKERS, worker_init_fn=worker_init_fn, prefetch_factor=PREFETCH_FACTOR)
+  # NOTE: previously wrapped with fabric.setup_dataloaders to auto-move batches to
+  # device. We now move batches explicitly inside the training loop with
+  # _move_batch_to_device() — avoids Lightning's recursive _apply_to_collection_slow
+  # walk which intermittently wedged at CUDA-sync points.
+
+  config.pretty_print()
+  print_model_trainable_details(model)
 
 
   NUM_POS_TO_SKIP = 0
@@ -456,7 +508,7 @@ def Train():
   FLOPS_CALCULATED = False
   
   if config.Opt_CheckpointResumeFromFileName is not None:
-    loaded = fabric.load(config.Opt_CheckpointResumeFromFileName)
+    loaded = torch.load(config.Opt_CheckpointResumeFromFileName, map_location=device)
    
     # name adjustment sometimes needed for reload
     # loaded["model"] = {f'_orig_mod.{key}': value for key, value in loaded["model"].items()}
@@ -558,9 +610,8 @@ def Train():
                and (float(config.Opt_KLAnchorPolicyWeight) > 0.0
                     or float(config.Opt_KLAnchorValueWeight) > 0.0))
   if kl_active:
-    if fabric.is_global_zero:
-      print(f"INFO: KL_ANCHOR_REF {config.Opt_KLAnchorRefCheckpoint} "
-            f"beta_pol={config.Opt_KLAnchorPolicyWeight} beta_val={config.Opt_KLAnchorValueWeight}")
+    print(f"INFO: KL_ANCHOR_REF {config.Opt_KLAnchorRefCheckpoint} "
+          f"beta_pol={config.Opt_KLAnchorPolicyWeight} beta_val={config.Opt_KLAnchorValueWeight}")
     # Build a vanilla CeresNet for the reference. Temporarily clear LoRA/GTAB
     # env vars so the reference is constructed without adapters even if the
     # trainable model uses them. Reference must match the saved ckpt's arch.
@@ -578,7 +629,7 @@ def Train():
       # the saved checkpoint exactly (heads are conditionally constructed based on
       # whether their loss weight is > 0). Reference is never used for loss compute,
       # but its forward must produce the same shapes as the trainable's forward.
-      ref_model = CeresNet(fabric, config,
+      ref_model = CeresNet(None, config,  # writer=None: ref model never logs
                            policy_loss_weight=config.Opt_LossPolicyMultiplier,
                            value_loss_weight=config.Opt_LossValueMultiplier,
                            moves_left_loss_weight=config.Opt_LossMLHMultiplier,
@@ -596,13 +647,13 @@ def Train():
       for k, v in _saved_env.items():
         if v is not None:
           os.environ[k] = v
-    ref_loaded = fabric.load(config.Opt_KLAnchorRefCheckpoint)
+    ref_loaded = torch.load(config.Opt_KLAnchorRefCheckpoint, map_location=device)
     # strict=False: the saved checkpoint may contain extra heads (e.g. value2_head)
     # that the current config doesn't enable — those keys are unused by the reference
     # forward (only policy_out and value_out matter for KL) and can be discarded.
     # Missing keys would still indicate a real mismatch — log them for visibility.
     ref_load_result = ref_model.load_state_dict(ref_loaded["model"], strict=False)
-    if fabric.is_global_zero and (ref_load_result.missing_keys or ref_load_result.unexpected_keys):
+    if (ref_load_result.missing_keys or ref_load_result.unexpected_keys):
       print(f"INFO: KL_ANCHOR_REF_LOAD missing={len(ref_load_result.missing_keys)} "
             f"unexpected={len(ref_load_result.unexpected_keys)}")
       if ref_load_result.missing_keys:
@@ -610,12 +661,11 @@ def Train():
       if ref_load_result.unexpected_keys:
         print(f"  unexpected: {ref_load_result.unexpected_keys[:5]}{'...' if len(ref_load_result.unexpected_keys) > 5 else ''}")
     del ref_loaded
-    ref_model = ref_model.to(fabric.device).to(torch.bfloat16)
+    ref_model = ref_model.to(device).to(torch.bfloat16)
     ref_model.eval()
     for p in ref_model.parameters():
       p.requires_grad_(False)
-    if fabric.is_global_zero:
-      print("INFO: KL_ANCHOR_REF_LOADED")
+    print("INFO: KL_ANCHOR_REF_LOADED")
 
   # compute batch sizes
   batch_size_opt = config.Opt_BatchSizeBackwardPass
@@ -636,24 +686,31 @@ def Train():
     if (num_pos >= MAX_POSITIONS and not config.Exec_ExportOnly):
         break
 
+    # Move the freshly-fetched batch to GPU. Replaces Lightning's recursive
+    # auto-move; with pin_memory=True these are true async DMA transfers.
+    batch = _move_batch_to_device(batch, device)
+
     fraction_complete = num_pos / MAX_POSITIONS
     model.train()
 
     # Periodically log statistics
-    show_losses = (fabric.is_global_zero) and (num_pos % (1024 * 64) == 0)
+    show_losses = (num_pos % (1024 * 64) == 0)
 
     is_accumulating = ((batch_accumulation_counter + 1) % num_batches_gradient_accumulate) != 0
-    with fabric.no_backward_sync(model, enabled=is_accumulating): # see https://lightning.ai/docs/fabric/stable/advanced/gradient_accumulation.html
+    # Single-GPU: no DDP sync skipping needed. Autocast handles bf16-mixed precision
+    # (Fabric did this implicitly via precision='bf16-mixed').
+    _amp_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_AUTOCAST else contextlib.nullcontext()
+    with _amp_ctx:
       this_lr = scheduler.get_last_lr()[0]
 
-      if config.Exec_ExportOnly and fabric.is_global_zero:
+      if config.Exec_ExportOnly:
         assert config.Opt_CheckpointResumeFromFileName is not None, "ExportOnly specified but no checkpoint file specified"
         print("Exporting to files with postexport suffix....")
-        save_model(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, "postexport", True)
+        save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, "postexport", True)
         print("INFO: EXIT_STATUS", "SUCCESS")
         exit(3)
 
-      if COMPUTE_FLOPS and not FLOPS_CALCULATED and torch.cuda.is_available() and fabric.is_global_zero:
+      if COMPUTE_FLOPS and not FLOPS_CALCULATED and torch.cuda.is_available():
         calc_flops(model_nocompile.to(torch.float), batch[0], loss_calc, optimizer, num_pos, config.Opt_BatchSizeForwardPass, calc_backward=False)
         calc_flops(model_nocompile.to(torch.float), batch[0], loss_calc, optimizer, num_pos, config.Opt_BatchSizeForwardPass, calc_backward=True)
         optimizer.zero_grad()
@@ -826,37 +883,41 @@ def Train():
           loss = loss + _beta_val * _kl_val
           _kl_val_val = _kl_val.detach().item()
 
-        if show_losses and fabric.is_global_zero:
+        if show_losses:
           print(f"KL_ANCHOR pol={_kl_pol_val if _kl_pol_val is not None else 'off'} "
                 f"val={_kl_val_val if _kl_val_val is not None else 'off'}")
 
-      fabric.backward(loss)
-        
+    # Backward outside the autocast context (standard practice; bf16-mixed needs no
+    # gradient scaling unlike fp16, so plain loss.backward() is correct).
+    loss.backward()
+
     if not is_accumulating:
       if config.Opt_GradientClipLevel > 0:
-        fabric.clip_gradients(model, optimizer, max_norm=config.Opt_GradientClipLevel)
+        # NOTE: we deliberately do NOT pass error_if_nonfinite=True here. Lightning
+        # Fabric's clip_gradients defaulted that to True, which forced a CUDA-sync
+        # NaN/Inf check on every step and intermittently wedged on slow CUDA syncs.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.Opt_GradientClipLevel)
       scheduler.step()
 
 #      GRAD_NORM_LOG_FREQUENCY = 200
 #      if (num_pos // BATCH_SIZE) % GRAD_NORM_LOG_FREQUENCY == GRAD_NORM_LOG_FREQUENCY - 1:
-      on_before_optimizer_step(fabric, model, optimizer, num_pos)
-      
+      on_before_optimizer_step(writer, model, optimizer, num_pos)
+
       optimizer.step()
       optimizer.zero_grad()
 
     batch_accumulation_counter = batch_accumulation_counter + 1
-    
-    # update number of positions processed across all workers
-    num_pos = num_pos + (fabric.world_size * num_processing_now)
+
+    # update number of positions processed (single-GPU; world_size=1)
+    num_pos = num_pos + num_processing_now
     num_batches = num_pos // BATCH_SIZE
 
     # emit output files including checkpoint if specified interval passed
     if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions):
       num_batches_between_checkpoints = config.Opt_CheckpointFrequencyNumPositions // BATCH_SIZE
       if num_batches % num_batches_between_checkpoints == 0:
-        save_checkpoint(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, str(num_pos))
-        if fabric.is_global_zero:
-          save_model(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, str(num_pos), True)
+        save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+        save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
         last_save_model_pos = num_pos
 
     current_time = datetime.datetime.now()
@@ -876,7 +937,7 @@ def Train():
     SAVE_LAST_INTERVAL = 120 * 60 if config.Opt_LoRARankDivisor == 0 else 30 * 60
     should_save_transient = time_since_save_transient > SAVE_LAST_INTERVAL
     if should_save_transient:
-      save_model(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, "last", True)
+      save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, "last", True)
       time_last_save_transient  = datetime.datetime.now()
 
     if should_show_status:
@@ -923,11 +984,11 @@ def Train():
       time_last_status_update = datetime.datetime.now()
 
   # final save and convert to Torchscript
-  save_checkpoint(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, str(num_pos))
-  save_model(NAME, OUTPUTS_DIR, config, fabric, model_nocompile, state, str(num_pos), True)
+  save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+  save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
 
-  # Emit special phrase to indicate end of training.
-  fabric.barrier()
+  writer.flush()
+  writer.close()
   print("INFO: EXIT_STATUS", "SUCCESS")
 
 Train()

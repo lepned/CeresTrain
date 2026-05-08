@@ -22,9 +22,7 @@ import torch
 import torch.nn as nn
 from torch import nn
 
-import lightning as pl
-from lightning.fabric import Fabric
-from lightning.pytorch.utilities import grad_norm
+from torch.utils.tensorboard import SummaryWriter
 
 from activation_functions import to_activation
 from losses import LossCalculator
@@ -62,10 +60,10 @@ class Head(nn.Module):
     return flow
 
 
-class CeresNet(pl.LightningModule):
+class CeresNet(nn.Module):
   def __init__(
     self,
-    fabric : Fabric,
+    writer : SummaryWriter,
     config : Configuration,
     policy_loss_weight,
     value_loss_weight,
@@ -80,12 +78,12 @@ class CeresNet(pl.LightningModule):
     action_uncertainty_loss_weight,
     q_ratio):
     """
-    CeresNet is a transformer architecture network module for chess built with PyTorch Lightning. 
+    CeresNet is a transformer-architecture chess network built directly on PyTorch.
+    `writer` is a torch.utils.tensorboard.SummaryWriter (or None) used for metric logging.
     """
     super().__init__()
 
-    self.fabric = fabric
-    self.save_hyperparameters()
+    self.writer = writer
     self.config = config
      
     self.DROPOUT_RATE = config.Exec_DropoutRate
@@ -297,6 +295,16 @@ class CeresNet(pl.LightningModule):
     self._last_tsb_gates = None  # set in forward() when TSB is active
 
 
+  def _log(self, name, value, step):
+    """Log a scalar metric to tensorboard. Replaces former fabric.log() call.
+    Tolerates tensor or python-scalar values; no-op if writer is None."""
+    if self.writer is None:
+      return
+    if isinstance(value, torch.Tensor):
+      value = value.item()
+    self.writer.add_scalar(name, value, step)
+
+
   def forward(self, squares: torch.Tensor, prior_state:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(squares, list):
       # when saving/restoring from ONNX the input will appear as a list instead of sequence of arguments
@@ -433,7 +441,7 @@ class CeresNet(pl.LightningModule):
     # calculates and logs individual gradient norms for each loss
     LOG_PER_LOSS_GRADIENT_NORMS = False # N.B. this feature only works with non-compiled models run on a single GPU
                                         #      and slows down training significantly, so only use for quick tests 
-    if LOG_PER_LOSS_GRADIENT_NORMS and log_stats and self.fabric.is_global_zero:
+    if LOG_PER_LOSS_GRADIENT_NORMS and log_stats:
       self.compute_loss_or_gradnorm(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
                                     value2_out, q_deviation_lower_out, q_deviation_upper_out, uncertainty_policy_out,
                                     prior_value_out, prior_value2_out,
@@ -526,9 +534,9 @@ class CeresNet(pl.LightningModule):
         stat_suffix = ""
         policy_accuracy = 0 if policy_out is None else loss_calc.calc_accuracy(policy_target, policy_out, True)
         value_accuracy = 0 if value_out is None else loss_calc.calc_accuracy(value_target, value_out, False)
-        self.fabric.log("pos_mm", num_pos // 1000000., step=num_pos)
-        self.fabric.log("LR", last_lr, step=num_pos)
-        self.fabric.log("total_loss", total_loss, step=num_pos)
+        self._log("pos_mm", num_pos // 1000000., step=num_pos)
+        self._log("LR", last_lr, step=num_pos)
+        self._log("total_loss", total_loss, step=num_pos)
 
         # Log GPU (CUDA) statistics
         if torch.cuda.is_available():
@@ -541,32 +549,32 @@ class CeresNet(pl.LightningModule):
             #       2. Potentially (for power and thermal reasons) it is useful to monitor all devices
             #          even if not used by this training run.                   
             try:
-              self.fabric.log("gpu_temp_"+str(gpu_num), torch.cuda.temperature(gpu_num), step=num_pos)
-              self.fabric.log("gpu_power_draw_"+str(gpu_num), torch.cuda.power_draw(gpu_num)/1000, step=num_pos)
-              self.fabric.log("gpu_utilization_"+str(gpu_num), torch.cuda.utilization(gpu_num), step=num_pos)
-              #self.fabric.log("gpu_memory_used_"+str(gpu_num), torch.cuda.memory_usage(gpu_num), step=num_pos)
-              #self.fabric.log("gpu_clock_rate_"+str(gpu_num), torch.cuda.clock_rate(gpu_num), step=num_pos)
+              self._log("gpu_temp_"+str(gpu_num), torch.cuda.temperature(gpu_num), step=num_pos)
+              self._log("gpu_power_draw_"+str(gpu_num), torch.cuda.power_draw(gpu_num)/1000, step=num_pos)
+              self._log("gpu_utilization_"+str(gpu_num), torch.cuda.utilization(gpu_num), step=num_pos)
+              #self._log("gpu_memory_used_"+str(gpu_num), torch.cuda.memory_usage(gpu_num), step=num_pos)
+              #self._log("gpu_clock_rate_"+str(gpu_num), torch.cuda.clock_rate(gpu_num), step=num_pos)
             except:
               pass # requires pynvml, may fail e.g. on Windows    
       else:
         stat_suffix = "_gnorm"
 
       if not gradient_norm_logging_mode:
-        self.fabric.log("policy_acc" + stat_suffix,policy_accuracy,  step=num_pos)
-        self.fabric.log("value_acc" + stat_suffix,value_accuracy,  step=num_pos)
+        self._log("policy_acc" + stat_suffix,policy_accuracy,  step=num_pos)
+        self._log("value_acc" + stat_suffix,value_accuracy,  step=num_pos)
 
-      self.fabric.log("policy_loss" + stat_suffix, p_loss,  step=num_pos)
-      self.fabric.log("value_loss" + stat_suffix, v_loss,  step=num_pos)
-      self.fabric.log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
-      self.fabric.log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
-      self.fabric.log("unc_loss" + stat_suffix, u_loss, step=num_pos)
-      self.fabric.log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
-      self.fabric.log("q_deviation_lower_loss" + stat_suffix, q_deviation_lower_loss, step=num_pos)
-      self.fabric.log("q_deviation_upper_loss" + stat_suffix, q_deviation_upper_loss, step=num_pos)
-      self.fabric.log("value_diff_loss" + stat_suffix, value_diff_loss, step=num_pos)
-      self.fabric.log("value2_diff_loss" + stat_suffix, value2_diff_loss, step=num_pos)
-      self.fabric.log("action_loss" + stat_suffix, action_loss, step=num_pos)
-      self.fabric.log("action_uncertainty_loss" + stat_suffix, action_uncertainty_loss, step=num_pos)
+      self._log("policy_loss" + stat_suffix, p_loss,  step=num_pos)
+      self._log("value_loss" + stat_suffix, v_loss,  step=num_pos)
+      self._log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
+      self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
+      self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
+      self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
+      self._log("q_deviation_lower_loss" + stat_suffix, q_deviation_lower_loss, step=num_pos)
+      self._log("q_deviation_upper_loss" + stat_suffix, q_deviation_upper_loss, step=num_pos)
+      self._log("value_diff_loss" + stat_suffix, value_diff_loss, step=num_pos)
+      self._log("value2_diff_loss" + stat_suffix, value2_diff_loss, step=num_pos)
+      self._log("action_loss" + stat_suffix, action_loss, step=num_pos)
+      self._log("action_uncertainty_loss" + stat_suffix, action_uncertainty_loss, step=num_pos)
 
     return total_loss
 

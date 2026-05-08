@@ -15,8 +15,6 @@ grpcio==1.80.0
 idna==3.11
 Jinja2==3.1.6
 joblib==1.5.3
-lightning==2.6.1
-lightning-utilities==0.15.3
 Markdown==3.10.2
 MarkupSafe==3.0.3
 ml_dtypes==0.5.4
@@ -49,7 +47,6 @@ packaging==26.1
 pillow==12.1.1
 propcache==0.4.1
 protobuf==7.34.1
-pytorch-lightning==2.6.1
 PyYAML==6.0.3
 scikit-learn==1.8.0
 scipy==1.17.1

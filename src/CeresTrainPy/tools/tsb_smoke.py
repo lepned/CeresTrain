@@ -21,8 +21,10 @@ from config import Configuration, NUM_TOKENS_INPUT, NUM_INPUT_BYTES_PER_SQUARE
 from ceres_net import CeresNet
 
 
+# Note: post-Lightning-removal, CeresNet takes writer=None for no-logging tests.
+# The old _StubFabric class is kept here as a no-op for any callers that still
+# import it, but new code should just pass None directly.
 class _StubFabric:
-    """Minimal fabric stand-in so CeresNet can be constructed without lightning."""
     is_global_zero = True
     device = torch.device('cpu')
 
@@ -142,8 +144,7 @@ def _make_config(tsb_enabled: bool):
 
 
 def _make_net(cfg):
-    fabric = _StubFabric()
-    return CeresNet(fabric, cfg,
+    return CeresNet(None, cfg,  # writer=None for non-training smoke
                     policy_loss_weight=cfg.Opt_LossPolicyMultiplier,
                     value_loss_weight=cfg.Opt_LossValueMultiplier,
                     moves_left_loss_weight=cfg.Opt_LossMLHMultiplier,

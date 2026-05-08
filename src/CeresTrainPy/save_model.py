@@ -16,19 +16,15 @@ from typing import Dict, Any
 
 import torch
 
-from lightning.fabric import Fabric
-from lightning.fabric.loggers import TensorBoardLogger, CSVLogger
-
 from config import Configuration
 from lora import collect_and_save_lora_parameters
 
 
-def save_checkpoint(NAME : str, 
+def save_checkpoint(NAME : str,
                OUTPUTS_DIR : str,
-               config : Configuration,  
-               fabric : Fabric, 
+               config : Configuration,
                model_nocompile,
-               state : Dict[str, Any], 
+               state : Dict[str, Any],
                num_pos : str):
 
   # In head-LoRA-only mode we don't save full checkpoints
@@ -47,23 +43,37 @@ def save_checkpoint(NAME : str,
   if config.Opt_LoRARankDivisor > 0 and not _body_lora_active:
     return
 
-  # Save PyTorch checkpoint.
-  # N.B. This should be called independent of fabric.is_global_zero (https://github.com/Lightning-AI/pytorch-lightning/issues/19780)    
+  # Save PyTorch checkpoint. We persist *state dicts* rather than live objects:
+  # Lightning's fabric.save() did this transparently, but plain torch.save() of
+  # the model would try to pickle every attribute including non-picklable ones
+  # (e.g. SummaryWriter's background thread lock). state_dict() captures only
+  # the parameter tensors, which is the right thing to checkpoint anyway.
+  # The load path in train.py already expects loaded["model"] / loaded["optimizer"]
+  # to be state dicts (uses load_state_dict on both).
   SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', "ckpt_" + NAME + "_" + num_pos)
-  state_no_compile = {"model": model_nocompile, "optimizer": state['optimizer'], "num_pos" : num_pos}
-  fabric.save(SAVE_FULL_NAME, state_no_compile)
-  fabric.barrier()
+  _opt = state.get('optimizer', None)
+  state_no_compile = {
+    "model": model_nocompile.state_dict(),
+    "optimizer": _opt.state_dict() if hasattr(_opt, 'state_dict') else _opt,
+    "num_pos": num_pos,
+  }
+  torch.save(state_no_compile, SAVE_FULL_NAME)
   print ('INFO: CHECKPOINT_FILENAME', SAVE_FULL_NAME)
 
 
-def save_model(NAME : str, 
+def save_model(NAME : str,
                OUTPUTS_DIR : str,
-               config : Configuration,  
-               fabric : Fabric, 
+               config : Configuration,
                model_nocompile,
-               state : Dict[str, Any], 
-               num_pos : str, 
+               state : Dict[str, Any],
+               num_pos : str,
                save_all_formats : str):
+
+  # Resolve dtype/device from the model's parameters. (LightningModule used to
+  # provide model.dtype / model.device; plain nn.Module does not.)
+  _first_param = next(model_nocompile.parameters())
+  _model_dtype = _first_param.dtype
+  _model_device = _first_param.device
 
   with torch.no_grad():
 
@@ -84,12 +94,12 @@ def save_model(NAME : str,
       collect_and_save_lora_parameters(model_nocompile, SAVE_FULL_NAME_LORA_BIN)
       # Fall through and also produce a merged .onnx below.
 
-    convert_type = model_nocompile.dtype
+    convert_type = _model_dtype
     model_nocompile.eval()
 
 
     # AOT export. Works (generates .so file), but seemingly slower than ONNX export options.
-    if False and fabric.is_global_zero and CONVERT_ONLY:
+    if False and CONVERT_ONLY:
       try:
         #m = m.cuda().to(convert_type) # this might be necessary for AOT convert, but may cause subsequent failures if running net
 
@@ -108,8 +118,8 @@ def save_model(NAME : str,
           os.mkdir(aot_output_dir)
           
         batch_dim = torch.export.Dim("batch", min=1, max=1024)
-        aot_example_inputs = (torch.rand(256, 64, 137).to(convert_type).to(model_nocompile.device), 
-                              torch.rand(256, 64, 4).to(convert_type).to(model_nocompile.device))
+        aot_example_inputs = (torch.rand(256, 64, 137).to(convert_type).to(_model_device),
+                              torch.rand(256, 64, 4).to(convert_type).to(_model_device))
         with torch.no_grad():
           so_path = torch._export.aot_compile(model_nocompile,
                                             aot_example_inputs,
@@ -129,10 +139,10 @@ def save_model(NAME : str,
 
 
     # below simpler method fails, probably due to use of .compile
-    sample_inputs = [torch.rand(256, 64, 137).to(convert_type).to(model_nocompile.device), 
-                     torch.rand(256, 64, config.NetDef_PriorStateDim).to(convert_type).to(model_nocompile.device)]
+    sample_inputs = [torch.rand(256, 64, 137).to(convert_type).to(_model_device),
+                     torch.rand(256, 64, config.NetDef_PriorStateDim).to(convert_type).to(_model_device)]
 
-    if False and fabric.is_global_zero: # equivalent to below (this is just the raw PyTorch way rather than Lightning way above)
+    if False:
       try:
         SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + "_jit.ts")
         m_save = torch.jit.trace(model_nocompile, sample_inputs)        
@@ -144,19 +154,21 @@ def save_model(NAME : str,
     
     SAVE_TS = True
     SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + ".ts_" + num_pos)
-    if SAVE_TS and fabric.is_global_zero:
+    if SAVE_TS:
       try:
         SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + ".ts")
-        model_nocompile.to_torchscript(file_path=SAVE_FULL_NAME, method='trace', example_inputs=sample_inputs)
+        # to_torchscript was a LightningModule helper; equivalent on plain nn.Module:
+        ts_module = torch.jit.trace(model_nocompile, sample_inputs)
+        ts_module.save(SAVE_FULL_NAME)
         print('INFO: TS_FILENAME', SAVE_FULL_NAME )
         #model.to_onnx(SAVE_PATH + ".onnx", test_inputs_pytorch) #, export_params=True)
       except Exception as e:
-        print(f"Warning: to_torchscript save failed, skipping. Exception details: {e}")
-    
+        print(f"Warning: torchscript save failed, skipping. Exception details: {e}")
+
     if save_all_formats:
       # Still in beta testing as of PyTorch 2.3, not yet functional: torch.onnx.dynamo_export
       # TorchDynamo based export. Encountered warning/error on export.
-      if False and fabric.is_global_zero:
+      if False:
         try:
           SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + "_dynamo.onnx")
           export_options = torch.onnx.ExportOptions(dynamic_shapes=True)
@@ -167,7 +179,7 @@ def save_model(NAME : str,
           print(f"Warning: torch.onnx.dynamo_export save failed, skipping. Exception details: {e}")
 
       # Legacy ONNX export.
-      if True and fabric.is_global_zero:
+      if True:
         try:
           SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + ".onnx")
           # Output tensor previously named 'prior_state', same as the input — which is
@@ -195,8 +207,8 @@ def save_model(NAME : str,
           # to FP16 via onnxconverter-common below. Keeping the initial export FP32
           # avoids mixed-type MatMul errors that occur when inputs are declared FP16
           # while internal weights are still FP32.
-          sample_inputs = (torch.rand(256, 64, 137).to(torch.float32).to(model_nocompile.device),
-                            torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(model_nocompile.device))
+          sample_inputs = (torch.rand(256, 64, 137).to(torch.float32).to(_model_device),
+                            torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(_model_device))
           # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
           # only calls setTensorAddress on inputNames[0] — additional inputs are
           # never bound, causing enqueueV3 to fail with "Address is not set for
