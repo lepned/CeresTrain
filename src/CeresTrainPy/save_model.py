@@ -72,7 +72,14 @@ def save_model(NAME : str,
     # the normal ONNX export. The LoRA forward (base + alpha/sqrt(r) * A @ B @ x)
     # will be captured by torch.onnx.export's tracing and constant-folded so the
     # resulting ONNX contains the merged weights.
-    if config.Opt_LoRARankDivisor > 0:
+    _body_attn = int(os.environ.get('CERES_LORA_ATTN_RANK_DIV', '0') or 0)
+    _body_ffn  = int(os.environ.get('CERES_LORA_FFN_RANK_DIV',  '0') or 0)
+    _body_legacy = int(os.environ.get('CERES_LORA_TRANSFORMER_RANK_DIV', '0') or 0)
+    _headfront = int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0)
+    _smolgen   = int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0)
+    _env_lora_active = (_body_attn > 0 or _body_ffn > 0 or _body_legacy > 0
+                        or _headfront > 0 or _smolgen > 0)
+    if config.Opt_LoRARankDivisor > 0 or _env_lora_active:
       SAVE_FULL_NAME_LORA_BIN = os.path.join(OUTPUTS_DIR, 'nets', NAME + ".lora_" + num_pos + '.bin')
       collect_and_save_lora_parameters(model_nocompile, SAVE_FULL_NAME_LORA_BIN)
       # Fall through and also produce a merged .onnx below.
