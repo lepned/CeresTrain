@@ -162,6 +162,19 @@ namespace CeresTrain.TPG.TPGGenerator
     public bool RescoreWithTablebase { init; get; } = false;
 
     /// <summary>
+    /// If true, INVERTS the default game-variant filter: only Chess960 (FRC) games
+    /// are kept, and standard-chess games are skipped. Use this to extract a
+    /// FRC-only TPG corpus from TARs that contain mixed standard + 960 self-play.
+    ///
+    /// Default false → standard behavior: FRC games are skipped, standard kept.
+    ///
+    /// Note: Ceres has supported Chess960 castling encoding since the comment
+    /// in TrainingPositionGenerator about "castling moves not understood by Ceres"
+    /// was written; the resulting 960 TPGs are usable for training a 960-aware net.
+    /// </summary>
+    public bool ExtractOnlyFRC { init; get; } = false;
+
+    /// <summary>
     /// If number of ply since last move on each square is emitted.
     /// </summary>
     public bool EmitPlySinceLastMovePerSquare = false;

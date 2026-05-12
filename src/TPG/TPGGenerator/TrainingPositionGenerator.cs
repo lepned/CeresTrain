@@ -395,8 +395,15 @@ namespace CeresTrain.TPG.TPGGenerator
 
           Interlocked.Increment(ref numGamesProcessed);
 
-          // Always skip FRC games which could produce castling moves not understood by Ceres.
-          if (game.IsFRCGame)
+          // Game-variant filter. Two modes:
+          //   - Options.ExtractOnlyFRC == false (default): skip FRC games, keep standard
+          //     (legacy comment said "FRC games could produce castling moves not understood
+          //     by Ceres" — that has been addressed; Ceres now supports 960 castling, but
+          //     standard-only remains the default for back-compat with existing TPGs).
+          //   - Options.ExtractOnlyFRC == true: invert — skip STANDARD games, keep FRC.
+          //     Used to harvest a FRC-only TPG corpus from mixed-variant TARs.
+          bool skipDueToVariant = Options.ExtractOnlyFRC ? !game.IsFRCGame : game.IsFRCGame;
+          if (skipDueToVariant)
           {
             Interlocked.Increment(ref numFRCGamesSkipped);
             continue;

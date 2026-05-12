@@ -64,7 +64,8 @@ namespace CeresTrain.Tasks
     public static void GenerateTPG(string sourceDirectoryTARsOrZSTs,
                                    string targetDirectoryTPGs,
                                    int numSetsToGenerate,
-                                   string description)
+                                   string description,
+                                   bool extractOnlyFRC = false)
     {
       const int POSITION_SKIP_COUNT = 20;
 
@@ -73,7 +74,8 @@ namespace CeresTrain.Tasks
         GenerateTPG(sourceDirectoryTARsOrZSTs, targetDirectoryTPGs, NUM_POS_TOTAL, DEBUG, description,
                     (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true, // position.PieceCount <= 10,
                     null,
-                    positionSkipCount: POSITION_SKIP_COUNT);
+                    positionSkipCount: POSITION_SKIP_COUNT,
+                    extractOnlyFRC: extractOnlyFRC);
       }
     }
 
@@ -110,16 +112,17 @@ namespace CeresTrain.Tasks
     /// <param name="positionSkipCount"></param>
     /// <param name="numRelatedPositionsPerBlock"></param>
     /// <param name="emitPriorMoveWinLoss"></param>
-    public static void GenerateTPG(string sourceDirectoryTARsOrZSTs, 
+    public static void GenerateTPG(string sourceDirectoryTARsOrZSTs,
                                    string targetDirectoryTPGs,
-                                   long numPositionsTotal, 
+                                   long numPositionsTotal,
                                    bool debugMode,
                                    string description,
                                    TPGGeneratorOptions.AcceptRejectAnnotationDelegate acceptRejectDelegate = null,
                                    TrainingPositionGenerator.PositionPostprocessor postprocessorDelegate = null,
                                    int positionSkipCount = 20,
                                    int numRelatedPositionsPerBlock = 1,
-                                   bool emitPriorMoveWinLoss = false)
+                                   bool emitPriorMoveWinLoss = false,
+                                   bool extractOnlyFRC = false)
     {
       ArgumentNullException.ThrowIfNullOrEmpty(sourceDirectoryTARsOrZSTs, nameof(sourceDirectoryTARsOrZSTs));
       ArgumentNullException.ThrowIfNullOrEmpty(targetDirectoryTPGs, nameof(targetDirectoryTPGs));
@@ -170,7 +173,12 @@ namespace CeresTrain.Tasks
           EmitPriorMoveWinLoss = emitPriorMoveWinLoss,
 
           RescoreWithTablebase = useTablebases,
-          NumThreads = debugMode ? 1 : 16 + Math.Min(Environment.ProcessorCount, 50),
+          // NumThreads default: 48 on a 32-core CPU. Override via env TPG_NUM_THREADS=N (useful on HDD source dirs
+          // where >8-16 concurrent TAR reads cause head thrashing and tank throughput).
+          NumThreads = debugMode ? 1
+                                 : (int.TryParse(Environment.GetEnvironmentVariable("TPG_NUM_THREADS"), out int _nt) && _nt > 0
+                                      ? _nt
+                                      : 16 + Math.Min(Environment.ProcessorCount, 50)),
 
           NumConcurrentSets = debugMode ? 1 : 16,
           PositionSkipCount = positionSkipCount,
@@ -187,6 +195,8 @@ namespace CeresTrain.Tasks
           TargetFileNameBase = Path.Combine(targetDirectoryTPGs, @$"TPG_{DateTime.Now.Ticks % 100000}"),
 
           EnablePositionFocus = true, // Currently this simply filters out extreme blunder-impacted postions
+
+          ExtractOnlyFRC = extractOnlyFRC, // when true, inverts variant filter: keep FRC, drop standard
         };
 
         // Create the generator and run
