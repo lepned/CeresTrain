@@ -43,6 +43,7 @@ namespace CeresTrain.TrainCommands
     static Option<int> numTPGSetsOption;
     static Option<long> genTpgNumPosOption;   // gen-tpg: default 0 = use num-sets path
     static Option<bool> frcOnlyOption;        // gen-tpg: when true, extract ONLY Chess960/FRC games (default false = standard only)
+    static Option<bool> includeFrcOption;     // gen-tpg: when true, keep BOTH standard and FRC games (mixed-variant corpus)
     static Option<string> piecesOptionRequired;
     static Option<string> piecesOptionOptional;
     static Option<string> netSpecificationOption;
@@ -102,6 +103,7 @@ namespace CeresTrain.TrainCommands
       numTPGSetsOption = new Option<int>("--num-tpg-sets", () => 1, "Number of sets of TPG positions to generate (~200mm positions per set)") { };
       genTpgNumPosOption = new Option<long>("--num-pos", () => 0, "Override num-sets: emit exactly this many positions (use for small quiet-anchor streams). 0 = use num-sets.") { };
       frcOnlyOption = new Option<bool>("--frc-only", () => false, "If true, INVERT variant filter: keep only Chess960/FRC games, skip standard. Default false (legacy: keep standard, drop FRC).") { };
+      includeFrcOption = new Option<bool>("--include-frc", () => false, "If true, DISABLE variant filter: keep BOTH standard and FRC games (mixed-variant corpus). Takes precedence over --frc-only.") { };
       piecesOptionRequired = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = true };
       piecesOptionOptional = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = false };
       netSpecificationOption = new Option<string>("--net-spec", "LC0 network specification in Ceres format, e.g. LC0:703810") { IsRequired = true };
@@ -130,7 +132,7 @@ namespace CeresTrain.TrainCommands
       evalLC0Command = new Command("eval-lc0", "Evaluate vs LC0 with specific pieces and network.               [pieces] [net-spec] [num-pos] [search-limit] [pos-fn] [verbose]") { piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption };
       extractPositionsCommand = new Command("extract-pos", "Generate EPD/PGN file with positions from specified PGN/EPD     [pieces] [num-pos] [pos-fn] [pos-out-fn]") { piecesOptionRequired, numPosOption, epdOrPgnFnOption, epdOrPgnOutputFileNameOption };
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
-      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption };
+      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
 
       minePuzzlesCommand = new Command("mine-puzzles", "Mine hard Lichess puzzles at nodes=1.                           [puzzle-config]") { puzzleConfigOption };
@@ -225,20 +227,25 @@ namespace CeresTrain.TrainCommands
       }, tarDirOption, packedZSTDirOption); 
 
 
-      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly) =>
+      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc) =>
       {
-        string variantSuffix = frcOnly ? " (FRC-only extraction)" : "";
+        // --include-frc takes precedence over --frc-only (both can't logically be on).
+        string variantSuffix;
+        if (includeFrc) variantSuffix = " (all-variants: standard + FRC)";
+        else if (frcOnly) variantSuffix = " (FRC-only extraction)";
+        else variantSuffix = "";
+
         if (numPos > 0)
         {
-          // explicit position count overrides numSets — emit exactly numPos positions
-          // NOTE: GenerateTPGCustomSize does not yet accept frcOnly; if --frc-only is
-          // requested alongside --num-pos we route through the long-form GenerateTPG
-          // entry which does accept it (passing numPos as numPositionsTotal).
-          if (frcOnly)
+          // explicit position count overrides numSets — emit exactly numPos positions.
+          // GenerateTPGCustomSize doesn't take variant args; if any variant flag is set
+          // route through the long-form GenerateTPG entry which does accept them.
+          if (frcOnly || includeFrc)
           {
             TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numPos, debugMode: false,
-                                          description: $"FRC-only extraction ({numPos} positions)",
-                                          extractOnlyFRC: true);
+                                          description: $"Custom-size extraction{variantSuffix} ({numPos} positions)",
+                                          extractOnlyFRC: frcOnly && !includeFrc,
+                                          includeAllVariants: includeFrc);
           }
           else
           {
@@ -247,9 +254,11 @@ namespace CeresTrain.TrainCommands
         }
         else
         {
-          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix, extractOnlyFRC: frcOnly);
+          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix,
+                                        extractOnlyFRC: frcOnly && !includeFrc,
+                                        includeAllVariants: includeFrc);
         }
-      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption);
+      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption);
 
 
       generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory) =>

@@ -65,7 +65,8 @@ namespace CeresTrain.Tasks
                                    string targetDirectoryTPGs,
                                    int numSetsToGenerate,
                                    string description,
-                                   bool extractOnlyFRC = false)
+                                   bool extractOnlyFRC = false,
+                                   bool includeAllVariants = false)
     {
       const int POSITION_SKIP_COUNT = 20;
 
@@ -75,7 +76,8 @@ namespace CeresTrain.Tasks
                     (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true, // position.PieceCount <= 10,
                     null,
                     positionSkipCount: POSITION_SKIP_COUNT,
-                    extractOnlyFRC: extractOnlyFRC);
+                    extractOnlyFRC: extractOnlyFRC,
+                    includeAllVariants: includeAllVariants);
       }
     }
 
@@ -122,7 +124,8 @@ namespace CeresTrain.Tasks
                                    int positionSkipCount = 20,
                                    int numRelatedPositionsPerBlock = 1,
                                    bool emitPriorMoveWinLoss = false,
-                                   bool extractOnlyFRC = false)
+                                   bool extractOnlyFRC = false,
+                                   bool includeAllVariants = false)
     {
       ArgumentNullException.ThrowIfNullOrEmpty(sourceDirectoryTARsOrZSTs, nameof(sourceDirectoryTARsOrZSTs));
       ArgumentNullException.ThrowIfNullOrEmpty(targetDirectoryTPGs, nameof(targetDirectoryTPGs));
@@ -197,6 +200,7 @@ namespace CeresTrain.Tasks
           EnablePositionFocus = true, // Currently this simply filters out extreme blunder-impacted postions
 
           ExtractOnlyFRC = extractOnlyFRC, // when true, inverts variant filter: keep FRC, drop standard
+          IncludeAllVariants = includeAllVariants, // when true, disables variant filter entirely (keeps both standard and FRC)
         };
 
         // Create the generator and run

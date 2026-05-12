@@ -175,6 +175,13 @@ namespace CeresTrain.TPG.TPGGenerator
     public bool ExtractOnlyFRC { init; get; } = false;
 
     /// <summary>
+    /// If true, the variant filter is disabled entirely — both standard and FRC
+    /// (Chess960) games are kept. Useful when training a single net on a mixed
+    /// classical+960 corpus. Takes precedence over ExtractOnlyFRC if both are set.
+    /// </summary>
+    public bool IncludeAllVariants { init; get; } = false;
+
+    /// <summary>
     /// If number of ply since last move on each square is emitted.
     /// </summary>
     public bool EmitPlySinceLastMovePerSquare = false;
