@@ -20,17 +20,27 @@ For chess: 2D RoPE with file (0-7) and rank (0-7) halves of d_head. First half
 of d_head rotates by file index, second half rotates by rank index. Squares
 are indexed in canonical 0-63 order: file = idx % 8, rank = idx // 8.
 """
+import os
 import torch
 from torch import Tensor
 
 
-def precompute_rope_freqs(d_head: int, base: float = 10000.0):
-  """Compute cos/sin lookup tables for 2D chess RoPE.
+def precompute_rope_freqs(d_head: int, base: float = None):
+  """If base is None, reads from ROPE_BASE env var (default 1000.0).
 
-  Returns:
-    cos_table, sin_table: each shape (64, d_head). Indexed by square 0-63.
-    Designed to multiply Q/K of shape (B, num_heads, 64, d_head) via broadcast.
-  """
+  Default base=1000 was chosen via 256-12 SwiGLU pre-norm 3M ablation:
+    base=10000: Pol 1995  (RoFormer default — wastes ~half the freq dims at
+                           chess's 0-7 position range, those dims rotate <0.01
+                           rad over the whole board so carry no signal)
+    base=1000:  Pol 2009  (+14 Pol — goldilocks, most freq dims active)
+    base=100:   Pol 1981  (-14 Pol — too aggressive, fastest dims alias
+                           before reaching position 7)
+  Override via env var ROPE_BASE for ablations."""
+  if base is None:
+    base = float(os.environ.get('ROPE_BASE', '1000.0'))
+  # Returns:
+  #   cos_table, sin_table: each shape (64, d_head). Indexed by square 0-63.
+  #   Designed to multiply Q/K of shape (B, num_heads, 64, d_head) via broadcast.
   assert d_head % 2 == 0, f"d_head={d_head} must be even"
   d_half = d_head // 2  # bytes per axis (file + rank)
   assert d_half % 2 == 0, f"d_half={d_half} must be even (we rotate pairs)"
