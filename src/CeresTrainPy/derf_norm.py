@@ -25,10 +25,12 @@ class DerfNorm(torch.nn.Module):
   saturates marginally faster in the tail — sharper outlier clipping).
 
   Parameters:
-    alpha:  scalar learnable squash-strength. Init read from env var
-            DERF_ALPHA_INIT (default 1.5). DyT paper recommends 0.5 for
-            pre-norm, 1.0+ for post-norm. Use env var to sweep without
-            config-plumbing.
+    alpha:  learnable squash-strength. Init value read from env var
+            DERF_ALPHA_INIT (default 1.5). Shape is scalar by default;
+            DERF_ALPHA_PER_CHANNEL=1 makes it per-channel vector
+            (matches RMSNorm's per-channel adaptive capacity — addresses
+            the diagnosed deficit where scalar alpha couldn't track
+            per-channel variance differentiation as training progressed).
     gamma:  per-channel learnable scale (init=1, like LayerNorm/RMSNorm affine).
     beta:   per-channel learnable shift (init=0).
 
@@ -40,7 +42,11 @@ class DerfNorm(torch.nn.Module):
     super().__init__()
     self.d_model = d_model
     alpha_init = float(os.environ.get('DERF_ALPHA_INIT', '1.5'))
-    self.alpha = torch.nn.Parameter(torch.tensor(alpha_init))
+    per_channel = os.environ.get('DERF_ALPHA_PER_CHANNEL', '0') == '1'
+    if per_channel:
+      self.alpha = torch.nn.Parameter(torch.full((d_model,), alpha_init))
+    else:
+      self.alpha = torch.nn.Parameter(torch.tensor(alpha_init))
     self.gamma = torch.nn.Parameter(torch.ones(d_model))
     self.beta  = torch.nn.Parameter(torch.zeros(d_model))
 

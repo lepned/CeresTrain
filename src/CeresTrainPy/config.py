@@ -175,6 +175,7 @@ class Configuration:
     self.NetDef_UseRPE = config_net_def.get('UseRPE', False)
     self.NetDef_UseRPE_V = config_net_def.get('UseRPE_V', True)
     self.NetDef_UseRelBias = config_net_def.get('UseRelBias', False)
+    self.NetDef_UseRoPE = config_net_def.get('UseRoPE', False)
     self.NetDef_UseQKNorm = config_net_def.get('UseQKNorm', False)
     self.NetDef_SoftCapCutoff = config_net_def.get('SoftCapCutoff', 100)
 

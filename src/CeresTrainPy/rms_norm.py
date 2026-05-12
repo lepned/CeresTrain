@@ -38,6 +38,7 @@ def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Modul
     'LayerNorm' — torch.nn.LayerNorm (per-channel affine, mean+var stats)
     'RMSNorm'   — RMSNorm (per-channel scale, RMS stat only)
     'Derf'      — DerfNorm (DyT-style: gamma*erf(alpha*x)+beta, no stats)
+    'DyT'       — DyTNorm (DyT-style: gamma*tanh(alpha*x)+beta, no stats)
   """
   if norm_type == 'LayerNorm':
     return torch.nn.LayerNorm(d_model, eps=eps)
@@ -46,5 +47,8 @@ def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Modul
   if norm_type == 'Derf':
     from derf_norm import DerfNorm
     return DerfNorm(d_model, eps=eps)
+  if norm_type == 'DyT':
+    from dyt_norm import DyTNorm
+    return DyTNorm(d_model, eps=eps)
   raise ValueError(f"Unknown norm_type: {norm_type!r} (expected one of "
-                   "'LayerNorm', 'RMSNorm', 'Derf')")
+                   "'LayerNorm', 'RMSNorm', 'Derf', 'DyT')")

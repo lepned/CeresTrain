@@ -32,6 +32,7 @@ import torch.distributed as dist
 
 from rms_norm import RMSNorm
 from derf_norm import DerfNorm
+from dyt_norm import DyTNorm
 from losses import LossCalculator
 from tpg_dataset import TPGDataset, TPGMixedDataset
 from config import Configuration
@@ -311,7 +312,7 @@ def Train():
   # carefully set weight decay to apply only to appropriate subset of parameters
   # based on code from: https://github.com/karpathy/minGPT
   whitelist_weight_modules = (torch.nn.Linear, SoftMoEBatchedDual, MultiExpertLayer)
-  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm, DerfNorm)
+  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm, DerfNorm, DyTNorm)
 
   decay = set()
   no_decay = set()

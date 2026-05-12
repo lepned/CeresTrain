@@ -40,6 +40,7 @@ class EncoderLayer(torch.nn.Module):
                 rpe_factor_shared  = None,
                 use_rel_bias: bool = False,
                 use_nonlinear_attention: bool = False,
+                use_rope: bool = False,
                 dual_attention_mode : str = 'None', test : bool = False,
                 tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
                 tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
@@ -47,7 +48,7 @@ class EncoderLayer(torch.nn.Module):
     super().__init__()
 
     assert ffn_activation_type in ('ReLUSquared', 'ReLU', 'SwiGLU', 'Swish', 'Mish')
-    assert norm_type in ('LayerNorm', 'RMSNorm', 'Derf') # None not supported
+    assert norm_type in ('LayerNorm', 'RMSNorm', 'Derf', 'DyT') # None not supported
 
     self.trunk_type = trunk_type
     self.test = test
@@ -68,7 +69,7 @@ class EncoderLayer(torch.nn.Module):
     self.attention = DotProductAttention(num_tokens_q, num_tokens_kv,  num_attention_heads, self.dim_per_head, norm_type, layernorm_eps,
                                          use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier,
                                          smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
-                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, test, layer_num=layerNum)
+                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 

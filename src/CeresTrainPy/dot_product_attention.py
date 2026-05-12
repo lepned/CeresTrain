@@ -96,10 +96,11 @@ class DotProductAttention(torch.nn.Module):
                smolgen_head_divisor : int = 1, smolgenPrepLayer = None,
                smolgen_activation_type : str = 'None', 
                use_rpe : bool = False,
-               use_rpe_v : bool = True,  
+               use_rpe_v : bool = True,
                rpe_factor_shared  = None,
                use_rel_bias: bool = False,
                use_nonlinear_attention: bool = False,
+               use_rope : bool = False,
                test : bool = False,
                layer_num : int = None) -> None:
     super().__init__()
@@ -119,12 +120,21 @@ class DotProductAttention(torch.nn.Module):
     self.use_rpe = use_rpe
     self.use_rpe_v = use_rpe_v
     self.use_rel_bias = use_rel_bias
-    self.use_nonlinear_attention = use_nonlinear_attention  
+    self.use_rope = use_rope
+    self.use_nonlinear_attention = use_nonlinear_attention
     self.use_qk_norm = use_qk_norm
     self.softcap_cutoff = softcap_cutoff
     self.layer_num = layer_num
 
-    assert self.use_smolgen + self.use_rpe + self.use_rel_bias <= 1, "only one of smolgen, rpe, and rel bias can be enabled"
+    assert self.use_smolgen + self.use_rpe + self.use_rel_bias + self.use_rope <= 1, "only one of smolgen, rpe, rel_bias, and rope can be enabled"
+
+    if self.use_rope:
+      from rope import precompute_rope_freqs
+      d_per_head = kv_channels * attention_multiplier
+      cos_table, sin_table = precompute_rope_freqs(d_per_head)
+      # buffers, not parameters: move with module to GPU but no gradients
+      self.register_buffer('rope_cos', cos_table, persistent=False)
+      self.register_buffer('rope_sin', sin_table, persistent=False)
     
     if self.use_smolgen:
       if (smolgen_activation_type == 'None'):
@@ -322,6 +332,13 @@ class DotProductAttention(torch.nn.Module):
     if self.use_qk_norm:
       Q = self.qLN(Q)
       K = self.kLN(K)
+
+    if self.use_rope:
+      # Apply rotation to Q and K (not V). Position info is intrinsic to
+      # rotated Q/K — no bias addition needed. Stays on the fast SDPA path.
+      from rope import apply_rope
+      Q = apply_rope(Q, self.rope_cos, self.rope_sin)
+      K = apply_rope(K, self.rope_cos, self.rope_sin)
 
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)

@@ -241,6 +241,7 @@ class CeresNet(nn.Module):
                       use_rpe_v=config.NetDef_UseRPE_V,
                       rpe_factor_shared=self.rpe_factor_shared,
                       use_rel_bias=config.NetDef_UseRelBias,
+                      use_rope=config.NetDef_UseRoPE,
                       use_nonlinear_attention=config.NetDef_NonLinearAttention,
                       dual_attention_mode = config.NetDef_DualAttentionMode if not config.Exec_TestFlag else (config.NetDef_DualAttentionMode if i % 2 == 1 else 'None'),
                       test = config.Exec_TestFlag,
