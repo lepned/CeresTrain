@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from einops import einsum, rearrange, repeat
-from rms_norm import RMSNorm
+from rms_norm import RMSNorm, make_norm
 
 from activation_functions import Swish, ReLUSquared
 from lora import LoRALinear
@@ -154,15 +154,15 @@ class DotProductAttention(torch.nn.Module):
     self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
     if self.use_nonlinear_attention:
-      self.qkvLN = torch.nn.LayerNorm(self.d_model * self.attention_multiplier) if norm_type == 'LayerNorm' else RMSNorm(self.d_model * self.attention_multiplier)
+      self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
       self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
       self.k2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
       self.v2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
 
     if self.use_qk_norm:
       # extra layernorm for enahnced training stability
-      self.qLN = torch.nn.LayerNorm(self.d_k * self.attention_multiplier) if norm_type == 'LayerNorm' else RMSNorm(self.d_k * self.attention_multiplier)
-      self.kLN = torch.nn.LayerNorm(self.d_k * self.attention_multiplier) if norm_type == 'LayerNorm' else RMSNorm(self.d_k * self.attention_multiplier)
+      self.qLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
+      self.kLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
 
     RPE_INNER_DIM = 16 # rounded up to power of 2 (there are only 15 possible values of a -  b where a and b are 0...7)
 
@@ -189,9 +189,9 @@ class DotProductAttention(torch.nn.Module):
       self.wrapped_smolgen_prep_layer = LinearWrapper(smolgenPrepLayer) # wrap so shared layer is not re-registered
       self.sm1 = _maybe_wrap_smolgen_lora(torch.nn.Linear(self.d_model, smolgen_per_square_dim))
       self.sm2 = _maybe_wrap_smolgen_lora(torch.nn.Linear(num_tokens_q * smolgen_per_square_dim, smolgen_intermediate_dim))
-      self.ln1 = torch.nn.LayerNorm(smolgen_intermediate_dim) if norm_type == 'LayerNorm' else RMSNorm(smolgen_intermediate_dim, eps=layernorm_eps)
+      self.ln1 = make_norm(norm_type, smolgen_intermediate_dim, eps=layernorm_eps)
       self.sm3 = _maybe_wrap_smolgen_lora(torch.nn.Linear(smolgen_intermediate_dim, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor))
-      self.ln2 = torch.nn.LayerNorm(num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor) if norm_type == 'LayerNorm' else RMSNorm(num_attention_heads * smolgen_intermediate_dim// smolgen_head_divisor, eps=layernorm_eps)
+      self.ln2 = make_norm(norm_type, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor, eps=layernorm_eps)
       
 
   @property

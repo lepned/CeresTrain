@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 
 from rms_norm import RMSNorm
+from derf_norm import DerfNorm
 from losses import LossCalculator
 from tpg_dataset import TPGDataset, TPGMixedDataset
 from config import Configuration
@@ -129,7 +130,8 @@ devices = config.Exec_DeviceIDs if not config.Exec_ExportOnly else config.Exec_D
 
 BATCH_SIZE = config.Opt_BatchSizeBackwardPass
 
-assert config.NetDef_PreNorm == False, 'PreNorm not supported'
+# PreNorm now supported (encoder_layer.py forward branches on pre_norm flag,
+# ceres_net.py adds a trunk-end norm after the stack). Both flag values legal.
 assert config.Exec_DataType == 'BFloat16' or config.Exec_DataType == 'BFloat16Pure', 'Only BFloat16 or BFloat16Pure training supported'
 assert config.Opt_LoRARankDivisor == 0 or config.Opt_CheckpointResumeFromFileName is not None, 'LoRA requires Opt_CheckpointResumeFromFileName resume'
 
@@ -309,7 +311,7 @@ def Train():
   # carefully set weight decay to apply only to appropriate subset of parameters
   # based on code from: https://github.com/karpathy/minGPT
   whitelist_weight_modules = (torch.nn.Linear, SoftMoEBatchedDual, MultiExpertLayer)
-  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm)
+  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm, DerfNorm)
 
   decay = set()
   no_decay = set()

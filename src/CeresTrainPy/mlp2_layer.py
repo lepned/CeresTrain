@@ -14,7 +14,7 @@ If not, see <http://www.gnu.org/licenses/>.
 import os
 import torch
 from activation_functions import to_activation
-from rms_norm import RMSNorm
+from rms_norm import RMSNorm, make_norm
 from lora import LoRALinear
 
 # FFN-LoRA gate. Reads CERES_LORA_FFN_RANK_DIV first (specific knob), falls
@@ -73,7 +73,7 @@ class MLP2Layer(torch.nn.Module):
         mlpGlobalDim = 64 * mlpGlobalPerSquare
         self.mlpGlobalSquareReduce = torch.nn.Linear(model_dim, mlpGlobalPerSquare, bias=USE_BIAS)
         self.mlpGlobalReduce = torch.nn.Linear(mlpGlobalDim, model_dim // MLP_GLOBAL_DIVISOR, bias=USE_BIAS)
-        self.mlpGlobalLN = torch.nn.LayerNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS) if norm_type == 'LayerNorm' else RMSNorm(model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS)
+        self.mlpGlobalLN = make_norm(norm_type, model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS)
 
       self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS), self.layer_num)
       self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS), self.layer_num)

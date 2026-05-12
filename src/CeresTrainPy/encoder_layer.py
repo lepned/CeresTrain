@@ -16,7 +16,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 from activation_functions import Swish, ReLUSquared
-from rms_norm import RMSNorm
+from rms_norm import RMSNorm, make_norm
 from soft_moe_batched_dual import SoftMoEBatchedDual
 from mlp2_layer import MLP2Layer, TSBSwiGLU
 from dot_product_attention import DotProductAttention
@@ -42,18 +42,20 @@ class EncoderLayer(torch.nn.Module):
                 use_nonlinear_attention: bool = False,
                 dual_attention_mode : str = 'None', test : bool = False,
                 tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
-                tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8):
+                tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
+                pre_norm : bool = False):
     super().__init__()
 
     assert ffn_activation_type in ('ReLUSquared', 'ReLU', 'SwiGLU', 'Swish', 'Mish')
-    assert norm_type in ('LayerNorm', 'RMSNorm') # None not supported
+    assert norm_type in ('LayerNorm', 'RMSNorm', 'Derf') # None not supported
 
     self.trunk_type = trunk_type
     self.test = test
-    self.layerNum = layerNum   
-    self.numLayers = num_layers 
+    self.layerNum = layerNum
+    self.numLayers = num_layers
     self.use_global = use_global
     self.alpha = alpha
+    self.pre_norm = pre_norm
     self.num_attention_heads = num_attention_heads
     self.dim_per_head = hidden_size // num_attention_heads
     self.use_qkv = use_qkv
@@ -62,22 +64,22 @@ class EncoderLayer(torch.nn.Module):
     self.dual_attention_mode = dual_attention_mode
     self.ffn_hidden_size = ffn_hidden_size
     
-    self.ln1 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
+    self.ln1 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
     self.attention = DotProductAttention(num_tokens_q, num_tokens_kv,  num_attention_heads, self.dim_per_head, norm_type, layernorm_eps,
                                          use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier,
                                          smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
                                          use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, test, layer_num=layerNum)
     if self.ffn_hidden_size > 0:
-      self.ln2 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
+      self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
     if self.dual_attention_mode in ('DualAttentionAndFFN', 'DualAttentionOnly'):
       NUM_ATTENTION2_HEADS = 8 
       self.attention2 = DotProductAttention(hidden_size, hidden_size, NUM_ATTENTION2_HEADS, num_tokens_q//NUM_ATTENTION2_HEADS, norm_type, layernorm_eps,
                                            1, 0, 0, 0, None, smolgen_activation_type, False, None, None, None, None, test, layer_num=layerNum)
-      self.ln3 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
+      self.ln3 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
       if self.dual_attention_mode == 'DualAttentionAndFFN':
         self.mlp2 = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
-        self.ln4 = torch.nn.LayerNorm(hidden_size, eps=layernorm_eps) if norm_type == 'LayerNorm' else RMSNorm(hidden_size, eps=layernorm_eps)
+        self.ln4 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
     if self.dropout_rate > 0:
       self.dropout_attn = torch.nn.Dropout(self.dropout_rate)
@@ -118,19 +120,31 @@ class EncoderLayer(torch.nn.Module):
 
 
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias)
-    
+    # Pre-norm vs post-norm differ ONLY in WHERE the norm sits relative to the
+    # residual. NormType (LayerNorm/RMSNorm/Derf) is orthogonal — applies the
+    # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
+    if self.pre_norm:
+      attn_input = self.ln1(x)
+      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias)
+    else:
+      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias)
+
     if (self.dropout_rate > 0):
       attn_output = self.dropout_attn(attn_output)
-      
-    out1 = self.ln1(x * self.alpha + attn_output)
+
+    if self.pre_norm:
+      out1 = x * self.alpha + attn_output
+    else:
+      out1 = self.ln1(x * self.alpha + attn_output)
 
     if self.ffn_hidden_size > 0:
+      mlp_input = self.ln2(out1) if self.pre_norm else out1
+
       if self.moe and self.smoe_mode == 'ReplaceLinear':
         assert self.ffn_activation_type in ('ReLUSquared') # SoftMoEBatchedDual currently only supports ReLUSquared
-        mlp_output = self.moe(out1)
+        mlp_output = self.moe(mlp_input)
       else:
-        (mlp_before_linear2, mlp_output) = self.mlp(out1)
+        (mlp_before_linear2, mlp_output) = self.mlp(mlp_input)
         if self.moe:
           if self.smoe_mode == 'AddLinearSecondLayer':
             mlp_output += self.moe(mlp_before_linear2)
@@ -142,7 +156,7 @@ class EncoderLayer(torch.nn.Module):
         # TSB: additive residual from a parallel tactical FFN, gated per-block.
         # At init the tactical output is zero, so this is a no-op regardless of g.
         if self.tsb is not None:
-          tactical_out, gate_value = self.tsb(out1)
+          tactical_out, gate_value = self.tsb(mlp_input)
           mlp_output = mlp_output + gate_value * tactical_out
           self._last_tsb_gate = gate_value
         else:
@@ -151,20 +165,29 @@ class EncoderLayer(torch.nn.Module):
         if self.dropout_rate > 0:
           mlp_output = self.dropout_mlp(mlp_output)
 
-        out2 = self.ln2(out1 * self.alpha + mlp_output)
+        if self.pre_norm:
+          out2 = out1 * self.alpha + mlp_output
+        else:
+          out2 = self.ln2(out1 * self.alpha + mlp_output)
     else:
       out2 = out1
-      
-    if self.dual_attention_mode != 'None':
-      out3_tr = out2.permute(0, 2, 1)
-      attn_output3 = self.attention2(out3_tr, out3_tr, out3_tr, out3_tr)
-      attn_output3 = attn_output3.permute(0, 2, 1)
 
-      out3 = self.ln3(out2 * self.alpha + attn_output3)
-      if self.dual_attention_mode == 'DualAttentionAndFFN':
-        (_, mlp_output2) = self.mlp2(out3) 
-        out3 = self.ln4(out3 * self.alpha + mlp_output2)
+    if self.dual_attention_mode != 'None':
+      if self.pre_norm:
+        attn3_input = self.ln3(out2).permute(0, 2, 1)
+        attn_output3 = self.attention2(attn3_input, attn3_input, attn3_input, out2.permute(0, 2, 1)).permute(0, 2, 1)
+        out3 = out2 * self.alpha + attn_output3
+        if self.dual_attention_mode == 'DualAttentionAndFFN':
+          (_, mlp_output2) = self.mlp2(self.ln4(out3))
+          out3 = out3 * self.alpha + mlp_output2
+      else:
+        out3_tr = out2.permute(0, 2, 1)
+        attn_output3 = self.attention2(out3_tr, out3_tr, out3_tr, out3_tr).permute(0, 2, 1)
+        out3 = self.ln3(out2 * self.alpha + attn_output3)
+        if self.dual_attention_mode == 'DualAttentionAndFFN':
+          (_, mlp_output2) = self.mlp2(out3)
+          out3 = self.ln4(out3 * self.alpha + mlp_output2)
       out2 = out3
-     
+
     return out2
 

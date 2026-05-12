@@ -29,7 +29,7 @@ from losses import LossCalculator
 from encoder_layer import EncoderLayer
 from config import Configuration
 from mlp2_layer import MLP2Layer
-from rms_norm import RMSNorm
+from rms_norm import RMSNorm, make_norm
 from lora import LoRALinear
 from utils import DWA
 from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
@@ -114,7 +114,7 @@ class CeresNet(nn.Module):
     self.test = config.Exec_TestFlag
 
     self.embedding_layer = nn.Linear(NUM_INPUT_BYTES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
-    self.embedding_norm = torch.nn.LayerNorm(self.EMBEDDING_DIM, eps=1E-6) if config.NetDef_NormType == 'LayerNorm' else RMSNorm(self.EMBEDDING_DIM, eps=1E-6)
+    self.embedding_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
 
     HEAD_MULT = config.NetDef_HeadWidthMultiplier
 
@@ -247,8 +247,19 @@ class CeresNet(nn.Module):
                       tsb_enabled = getattr(config, 'NetDef_TSB_Enabled', False),
                       tsb_ffn_multiplier = getattr(config, 'NetDef_TSB_FFNMultiplier', 1),
                       tsb_gate_bias_init = getattr(config, 'NetDef_TSB_GateBiasInit', -4.0),
-                      tsb_gate_mlp_hidden_divisor = getattr(config, 'NetDef_TSB_GateMLPHiddenDivisor', 8))
+                      tsb_gate_mlp_hidden_divisor = getattr(config, 'NetDef_TSB_GateMLPHiddenDivisor', 8),
+                      pre_norm = config.NetDef_PreNorm)
         for i in range(self.NUM_DISTINCT_LAYERS)])
+
+    # Pre-norm trunks need a final norm AFTER the stack and before the heads,
+    # because the residual stream is unnormalized at the stack output (each
+    # block applies norm only to its sublayer input, never to the residual).
+    # Without this, the head input's distribution depends on stack depth /
+    # init scale and can blow up. Standard pattern in LLaMA, GPT-NeoX, etc.
+    if config.NetDef_PreNorm:
+      self.trunk_end_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+    else:
+      self.trunk_end_norm = None
 
     self.policy_loss_weight = policy_loss_weight
     self.value_loss_weight = value_loss_weight
@@ -370,6 +381,10 @@ class CeresNet(nn.Module):
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
+
+    # Pre-norm: final norm before the heads (see __init__ comment).
+    if self.trunk_end_norm is not None:
+      flow = self.trunk_end_norm(flow)
 
     # TSB: collect per-block gate values across all layers for the gate-sparsity
     # regularizer in train.py. Each layer caches its last gate in _last_tsb_gate.
