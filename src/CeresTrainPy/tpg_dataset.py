@@ -32,10 +32,19 @@ def stable_str_hash(s: str) -> int:
 # Method to enhance shuffling of TPG files.
 # Try to avoid having files from same TPG set appearing more than once within blocks of 8.
 # Make repeated passes with random perturbations to achieve this to a large or complete degree.
+#
+# Seed selection: per-restart randomness eliminates the bias where a kill-mid-file
+# always re-reads the same beginning-of-file records on every resume. Each launch
+# of train.py picks a fresh seed (from time_ns), so the file-iteration order shifts
+# between runs. Set CERES_SHUFFLE_SEED to override (e.g. for reproducibility tests).
+import time as _time
+_RUN_SHUFFLE_SEED = int(os.environ.get('CERES_SHUFFLE_SEED', str(_time.time_ns() & 0xFFFFFFFF)))
+print(f'[try_shuffle] run-level shuffle seed = {_RUN_SHUFFLE_SEED} (override with CERES_SHUFFLE_SEED)')
+
 def try_shuffle(file_list):
     import random
     BLOCK_SIZE = 8  # Assume max 8 GPUs (TPG reading workers) per node
-    SEED = 42       # Fixed seed for reproducibility across processes
+    SEED = _RUN_SHUFFLE_SEED  # randomized per training launch (was fixed 42)
     NUM_PASSES = 50
     rand_gen = random.Random(SEED)
 
@@ -107,25 +116,38 @@ class TPGDataset(Dataset):
     self.generator = self.item_generator()
     self.boards_per_batch = boards_per_batch
     self.test = test
-    
-    # Get the list of files in the specified directory and select the subset appropriate for this worker.
-    all_files = fnmatch.filter(os.listdir(root_dir), '*.zst')
-    all_files.sort(key=lambda f: stable_str_hash(f))  # deterministic shuffle
-    assert len(all_files) >= num_files_to_skip + num_workers, f"Trying to skip more files than available: {len(all_files)} available, {num_files_to_skip} to skip, {num_workers} workers"
-    all_files = all_files[num_files_to_skip:]
-    all_files = try_shuffle(all_files)
 
-    # Divide files as evenly as possible among workers
-    files_per_worker = len(all_files) // world_size
-    start_index = rank * files_per_worker
-    end_index = start_index + files_per_worker
+    # State retained for re-enumeration (so files added to root_dir during a
+    # long training run get picked up automatically — see item_generator).
+    self.rank = rank
+    self.world_size = world_size
+    self.num_files_to_skip = num_files_to_skip
 
-     # Assign files to this worker
-    self.files = all_files[start_index:end_index]
+    # Get initial list of files and select the rank-subset for this worker.
+    self.files = self._discover_files(initial=True)
 
     self.worker_id = None
+    self._last_seen_count = len(self.files)
 
     print('Creating TPGDataset at', root_dir, ' found', len(self.files), 'files matching this worker', rank, 'of', world_size, 'to be split among', num_workers, 'workers.')
+
+
+  def _discover_files(self, initial=False):
+    """Enumerate the directory, sort/shuffle/skip per config, then return the
+    rank-partitioned subset for this rank. (Worker-id filtering happens
+    separately in item_generator.) Called both from __init__ and at the start
+    of each pass through the data so that new .zst files dropped into root_dir
+    during a long run get included automatically."""
+    all_files = fnmatch.filter(os.listdir(self.root_dir), '*.zst')
+    all_files.sort(key=lambda f: stable_str_hash(f))  # deterministic shuffle
+    if initial:
+      assert len(all_files) >= self.num_files_to_skip + self.num_workers, f"Trying to skip more files than available: {len(all_files)} available, {self.num_files_to_skip} to skip, {self.num_workers} workers"
+    all_files = all_files[self.num_files_to_skip:]
+    all_files = try_shuffle(all_files)
+    files_per_worker = len(all_files) // self.world_size
+    start_index = self.rank * files_per_worker
+    end_index = start_index + files_per_worker
+    return all_files[start_index:end_index]
 
 
   def set_worker_id(self, worker_id):
@@ -148,17 +170,25 @@ class TPGDataset(Dataset):
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
-    # Reduce files to be only the files that this worker is responsible for.
-#    assert self.num_workers == 0 or self.worker_id >= 0, "Worker ID expected to have been be set before calling item_generator" 
-    self.files = [file for index, file in enumerate(self.files) if self.num_workers == 0 or (index % self.num_workers == self.worker_id)]
-
     wdl_smoothing_transform = np.array([
         [1-self.wdl_smoothing, self.wdl_smoothing*0.75, self.wdl_smoothing*0.25],
         [self.wdl_smoothing*0.5, 1-self.wdl_smoothing, self.wdl_smoothing*0.5],
         [self.wdl_smoothing*0.25, self.wdl_smoothing*0.75, 1-self.wdl_smoothing]])
 
     while True:
-      for file_name in self.files:
+      # Re-enumerate the directory at the start of each pass so new .zst files
+      # dropped into root_dir during long training runs get picked up
+      # automatically (no restart needed). The original implementation cached
+      # the file list at __init__ time only.
+      rank_files = self._discover_files()
+      my_files = [file for index, file in enumerate(rank_files)
+                  if self.num_workers == 0 or (index % self.num_workers == self.worker_id)]
+      if len(my_files) != self._last_seen_count:
+        print(f'DATASET WORKER {self.worker_id} re-enumerated {self.root_dir}: '
+              f'now has {len(my_files)} files (was {self._last_seen_count})')
+        self._last_seen_count = len(my_files)
+
+      for file_name in my_files:
         print()
         print('DATASET WORKER', self.worker_id, 'PROCESSING TPG FILE', file_name)
         with open(os.path.join(self.root_dir, file_name),'rb') as file:
@@ -333,6 +363,49 @@ class TPGDataset(Dataset):
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]
+
+
+class TPGMixedDataset(Dataset):
+  """Mixes batches from two TPG datasets at a configurable ratio.
+
+  Yields `ratio_1_to_2` batches from the primary dataset, then 1 batch from the
+  secondary, repeating. If `secondary` is None or `ratio_1_to_2 <= 0`, yields only
+  from `primary` (matches single-source legacy behaviour exactly).
+
+  Use case: train on T80 self-play (primary, ~95% of batches) plus puzzle data
+  (secondary, ~5%) at ratio 19:1 — the trainer sees one puzzle batch per 20 steps.
+
+  Note: each DataLoader worker gets its own counter (worker process state isn't
+  shared). At the dataset level the ratio is honoured per-worker; aggregate ratio
+  across all workers is the same.
+  """
+  def __init__(self, primary, secondary=None, ratio_1_to_2: int = 0):
+    self.primary = primary
+    if secondary is not None and ratio_1_to_2 > 0:
+      self.secondary = secondary
+      self.ratio = int(ratio_1_to_2)
+    else:
+      self.secondary = None
+      self.ratio = 0
+    self.counter = 0
+
+  def __len__(self):
+    return self.primary.__len__()
+
+  def set_worker_id(self, worker_id):
+    self.primary.set_worker_id(worker_id)
+    if self.secondary is not None:
+      self.secondary.set_worker_id(worker_id)
+
+  def __getitem__(self, idx):
+    if self.secondary is None:
+      return self.primary[idx]
+    # Cycle of length (ratio+1): positions 0..ratio-1 are primary; position ratio is secondary.
+    cycle_pos = self.counter % (self.ratio + 1)
+    self.counter += 1
+    if cycle_pos == self.ratio:
+      return self.secondary[idx]
+    return self.primary[idx]
 
 
 def worker_init_fn(worker_id):

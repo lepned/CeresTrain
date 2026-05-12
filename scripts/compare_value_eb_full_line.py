@@ -20,10 +20,10 @@ Configure CONFIGS at top to test multiple nets vs orig in one pass.
 """
 import subprocess, time, threading, queue, csv
 
-CERES = r"C:/Dev/Chess/Ceres/artifacts/release/net10.0/Ceres.exe"   # match EB binary
+CERES = r"C:/Users/Navn/source/repos/Ceres/artifacts/release/net10.0/Ceres.exe"
 
 _COMMON = {
-    "SyzygyPath":       "D:/sygyzy",
+    "SyzygyPath":       "C:/Dev/Chess/TableBases/sygyzy",
     "VerboseMoveStats": "true",
     "LogLiveStats":     "true",
     "UCI_ShowWDL":      "true",
@@ -33,14 +33,11 @@ def _cfg(net, device="GPU:0#TensorRTNative"):
     return {"Network": net, "Device": device, **_COMMON}
 
 CONFIGS = {
-    "orig": _cfg("C:/Dev/Chess/Networks/CeresNet/C1-640-34-I8.onnx"),
-    "v52":  _cfg("C:/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34_v52_folded_trt.onnx"),
-    "v58":  _cfg("C:/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34_v58_folded_trt.onnx"),
-    "v60":  _cfg("C:/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34_v60_folded_trt.onnx"),
-    "v65":  _cfg("C:/Dev/Chess/CeresTrain/nets/lepdev_c1_640_34_v65_folded_trt.onnx"),
+    "orig":    _cfg("C:/Dev/Chess/Networks/CeresTrainNet/C1-640-34-I8.onnx"),
+    "v_smoke": _cfg("F:/cout/nets/lepdev_c1_640_34_v_smoke_folded_trt.onnx"),
 }
-CSV_PATH    = "C:/Dev/Chess/Puzzles/lichess_db_puzzle_july2025.csv"
-N_PUZZLES   = 5000   # default; bump to 5K+ only when nets are within ~1 pp
+CSV_PATH    = "C:/Dev/Chess/Lichess/lichess_db_puzzle_Jan2025.csv"
+N_PUZZLES   = 500   # smoke; bump to 5000 for real comparison
 START_RATING = 2710
 
 

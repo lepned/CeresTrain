@@ -27,7 +27,9 @@ import torch
 import onnx
 from onnx import numpy_helper
 
-CERES_PY_DIR = '/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+CERES_PY_DIR = os.environ.get('CERES_PY_DIR') or os.path.join(_REPO_ROOT, 'src', 'CeresTrainPy')
 sys.path.insert(0, CERES_PY_DIR)
 
 from config import Configuration

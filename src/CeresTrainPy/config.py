@@ -63,6 +63,11 @@ class Configuration:
     self.Data_NumTPGFilesToSkip = config_data.get('NumTPGFilesToSkip', 0)
     self.Data_FractionQ = config_data.get('FractionQ', 0.0)
     self.Data_WDLLabelSmoothing = config_data.get('WDLLabelSmoothing', 0.0)
+    # Optional secondary TPG dir for mixed-corpus training. When set, batches are
+    # interleaved with the primary at the configured ratio (e.g. 19 → 19 primary
+    # batches per 1 secondary). Default: None / 0 = single-source (legacy behaviour).
+    self.Data_TrainingFilesDirectory2 = config_data.get('TrainingFilesDirectory2', None)
+    self.Data_RatioSet1ToSet2 = int(config_data.get('RatioSet1ToSet2', 0))
 
     # Initialize class members from config_exec
     self.Exec_ID = config_exec.get('ID', 'TEST')

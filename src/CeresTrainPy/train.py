@@ -527,9 +527,15 @@ def Train():
                          or _headfront_div > 0 or _smolgen_div > 0 or _gtab_active
                          or _tsb_active)
 
+    # Load into model_nocompile (the un-wrapped nn.Module). When torch.compile
+    # is enabled, `model` is the OptimizedModule wrapper whose state_dict keys
+    # are prefixed with `_orig_mod.`, but the saved checkpoint comes from
+    # model_nocompile.state_dict() which has un-prefixed keys. Loading into
+    # model_nocompile sidesteps the prefix mismatch and updates the underlying
+    # parameters that `model` shares.
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # load checkpoint parameters, expect all to match (strict = True)
-      model.load_state_dict(loaded["model"], strict = True)
+      model_nocompile.load_state_dict(loaded["model"], strict = True)
     else:
       # Rebuild new state dictionary.
       # Mostly copy over parameters from the checkpoint with same name,
@@ -538,7 +544,7 @@ def Train():
       # then map to the original name as saved in the pre-LoRA checkpoint.
       new_state_dict = {}
 
-      for name, param in model.state_dict().items():
+      for name, param in model_nocompile.state_dict().items():
         if "lora_" in name:
           pass # not expected to be found in checkpoint, can start out empty
         elif "tactical_adapter" in name or "tactical_gate" in name:
@@ -551,7 +557,7 @@ def Train():
           new_state_dict[name] = loaded["model"][name_in_checkpoint]
 
       # Load updated state dict
-      model.load_state_dict(new_state_dict, strict=False)
+      model_nocompile.load_state_dict(new_state_dict, strict=False)
 
     # PiSSA re-initialization (if enabled). MUST run after base weights are loaded.
     # Vanilla LoRA init (lora_B=0) is already done inside LoRALinear.__init__; PiSSA
@@ -912,13 +918,18 @@ def Train():
     num_pos = num_pos + num_processing_now
     num_batches = num_pos // BATCH_SIZE
 
-    # emit output files including checkpoint if specified interval passed
+    # Emit checkpoint when specified interval has passed since last save.
+    # Previously also gated by `num_batches % (CheckpointFreq // BATCH_SIZE) == 0`,
+    # which silently doubled the effective interval when CheckpointFreq wasn't
+    # divisible by BATCH_SIZE (e.g. 100M / 2048 → modulo only matches at exact
+    # multiples of 48828 batches, which combined with the diff-threshold made the
+    # first checkpoint fire at ~200M instead of ~100M). The modulo check was
+    # only ever needed for cross-rank synchronization in multi-GPU runs; this is
+    # single-GPU, so the diff-threshold alone is correct and safer.
     if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions):
-      num_batches_between_checkpoints = config.Opt_CheckpointFrequencyNumPositions // BATCH_SIZE
-      if num_batches % num_batches_between_checkpoints == 0:
-        save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
-        save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
-        last_save_model_pos = num_pos
+      save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+      save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+      last_save_model_pos = num_pos
 
     current_time = datetime.datetime.now()
 

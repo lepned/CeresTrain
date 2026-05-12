@@ -32,7 +32,9 @@ class _MishDecomposed(torch.nn.Module):
 # that calls torch.nn.Mish() gets the decomposed version.
 torch.nn.Mish = _MishDecomposed
 
-CERES_PY_DIR = '/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+CERES_PY_DIR = os.environ.get('CERES_PY_DIR') or os.path.join(_REPO_ROOT, 'src', 'CeresTrainPy')
 sys.path.insert(0, CERES_PY_DIR)
 from config import Configuration
 from ceres_net import CeresNet
@@ -88,7 +90,9 @@ if LORA_BIN:
         applied += 1
     print(f'[export] folded {applied} bin entries, skipped {skipped} per SKIP_PREFIX')
 
-config = Configuration('/mnt/c/Dev/Chess/CeresTrain/configs', 'c1_640_34')
+_CONFIG_DIR = os.environ.get('V8_CONFIG_DIR', '/mnt/c/Dev/Chess/CeresTrain/configs')
+_CONFIG_NAME = os.environ.get('V8_CONFIG_NAME', 'c1_640_34')
+config = Configuration(_CONFIG_DIR, _CONFIG_NAME)
 config.Opt_LoRARankDivisor = 0
 from lightning.fabric import Fabric
 fabric = Fabric(accelerator='cpu', devices=1)
