@@ -234,12 +234,18 @@ def save_model(NAME : str,
             _input_names = ['squares', 'prior_state']
             _output_axes_single = output_axes
 
+          # Opset 18 matches what current PyTorch (>=2.4) actually emits — older
+          # `opset_version=17` triggers an internal 18→17 downgrade pass which
+          # can raise `axes_input_to_attribute.h:68 adapt: Assertion node->hasAttribute(kaxes)`
+          # in onnx's C version_converter and abort the export, losing the .onnx
+          # pointer file (the .onnx.data sidecar may still be written). Ceres
+          # consumes opset-18 ONNX fine, so we target 18 directly.
           torch.onnx.export(_export_model,
                             _export_inputs,
                             SAVE_FULL_NAME,
                             do_constant_folding=True,
                             export_params=True,
-                            opset_version=17, # Pytorch 2.3 maximum supported opset version 17
+                            opset_version=18,
                             input_names = _input_names,
                             output_names = head_output_names,
                             dynamic_axes=_output_axes_single)
