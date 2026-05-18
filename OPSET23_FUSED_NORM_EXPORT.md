@@ -141,19 +141,28 @@ pre-norm nets`). A plain `git pull` in the Ceres tree picks them up
 along with the **rebuilt Windows DLL** — no manual cpp compile is
 required.
 
-### Manual step after pull
+### After-pull workflow
 
-Ceres.exe loads the DLL from `artifacts/{release,debug}/net10.0/`, but
-those artifact-dir DLLs are **not** tracked in git. After pulling,
-copy the freshly-versioned DLL into both deploy locations:
+Ceres.Chess.csproj already has a `CopyToOutputDirectory` /
+`PreserveNewest` clause for `TensorRTWrapper.dll` (and the Linux
+`.so` variants), so a normal Ceres rebuild auto-deploys the newer
+DLL to `artifacts/release/net10.0/` (and `debug/` if you build
+that config):
 
 ```powershell
-$src = 'src\Ceres.Chess\NNEvaluators\Base\TensorRT\Native\TensorRTWrapper.dll'
-Copy-Item $src 'artifacts\release\net10.0\TensorRTWrapper.dll' -Force
-Copy-Item $src 'artifacts\debug\net10.0\TensorRTWrapper.dll'   -Force
+git pull                              # picks up new cpp + new DLL
+dotnet build -c Release Ceres.sln     # MSBuild copies the DLL to artifacts/
 ```
 
-(Skip the `debug` line if you don't run debug builds.)
+That's it — no manual copy required when going through `dotnet
+build`. The artifact-dir DLLs are not git-tracked (PreserveNewest
+makes them, build-time), so a pull alone wouldn't update them, but
+the next rebuild will.
+
+If you ever want to deploy a newer DLL *without* rebuilding the
+managed code (rare — e.g. swapping wrappers between Ceres versions
+for A/B), `Copy-Item` from `src\...\Native\TensorRTWrapper.dll` to
+the artifact dir is the manual shortcut.
 
 ### When you would need to rebuild from cpp
 
@@ -248,13 +257,11 @@ crashes on them.
 #    dot_product_attention.py). Sanity-check with git status that they
 #    are the only modified files. Push origin if not already there.
 
-# 2. In the Ceres repo: git pull. The wrapper change and rebuilt DLL
-#    are committed (commit 686bed7b). Then copy the DLL into the
-#    artifact dirs (NOT tracked in git):
-#      Copy-Item src\Ceres.Chess\NNEvaluators\Base\TensorRT\Native\TensorRTWrapper.dll `
-#                artifacts\release\net10.0\TensorRTWrapper.dll -Force
-#    (Repeat for artifacts\debug\net10.0 if you run debug builds.)
-#    No cpp rebuild is required unless the target machine is on TRT 9.x.
+# 2. In the Ceres repo: git pull, then dotnet build -c Release.
+#    The wrapper change and rebuilt DLL are committed (686bed7b);
+#    Ceres.Chess.csproj has a PreserveNewest copy rule that
+#    auto-deploys the DLL to artifacts/release/net10.0/ on rebuild.
+#    No cpp rebuild needed unless the target machine is on TRT 9.x.
 
 # 3. Set up the export env (one-time):
 python -m pip install --target D:\py-pkgs --no-user --upgrade onnxscript onnx onnxconverter-common
