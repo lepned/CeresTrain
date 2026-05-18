@@ -245,7 +245,7 @@ def save_model(NAME : str,
                             SAVE_FULL_NAME,
                             do_constant_folding=True,
                             export_params=True,
-                            opset_version=18,
+                            opset_version=23,
                             input_names = _input_names,
                             output_names = head_output_names,
                             dynamic_axes=_output_axes_single)

@@ -23,8 +23,14 @@ class RMSNorm(torch.nn.Module):
     self.scale = torch.nn.Parameter(torch.ones(d_model))
 
   def forward(self, x : Tensor) -> Tensor:
-      rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-      return x / rms * self.scale
+    # Use the PyTorch built-in so ONNX export emits a single fused
+    # LayerNormalization / RMSNormalization op (opset 17+) instead of the
+    # decomposed Pow→Mean→Sqrt→Div→Mul chain. TRT recognises the fused op
+    # and applies its internal FP32 fallback to only the reduction, leaving
+    # the surrounding ops in FP16 — avoiding the 6-op-per-norm FP32 cost
+    # that TensorRTWrapper's structural marker currently has to force.
+    # Mathematically identical to the explicit form (same scale, same eps).
+    return torch.nn.functional.rms_norm(x, (self.d_model,), self.scale, self.eps)
 
 
 def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Module:

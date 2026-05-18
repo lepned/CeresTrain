@@ -344,11 +344,16 @@ class DotProductAttention(torch.nn.Module):
       smolgen = self.calc_smolgen(x)
       H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias)
     else:
-      if self.use_rpe or piece_relation_bias is not None:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
-      else:
-        # N.B. attention softcap is not implemented on this code path!
-        H_cat = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+      # Always route through the explicit Q·Kᵀ → softmax → ·V form. The previous
+      # branch called torch.nn.functional.scaled_dot_product_attention, which
+      # PyTorch ≥ 2.10's dynamo ONNX exporter auto-fuses into the opset-23
+      # `Attention` op — and TRT 10.15's Attention plugin requires the network
+      # to be built in strongly-typed mode, which the C++ wrapper does not use,
+      # so engine build aborts with API Usage Error 3.
+      # The explicit form is mathematically equivalent (no mask, no dropout),
+      # exports cleanly to opset 23 as MatMul→Softmax→MatMul, and also gains
+      # softcap support that the F.sdpa path was lacking.
+      H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)
