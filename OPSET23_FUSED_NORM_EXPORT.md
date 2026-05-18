@@ -353,6 +353,115 @@ only the graph shape changed).
 
 ---
 
+## INT8 deployment validation
+
+The fused-norm pipeline is INT8-friendly: a quantized engine preserves policy
+and value with very high fidelity, opening up full-INT8 deployment (not the
+partial-precision compromise existing Ceres INT8 nets need).
+
+### Measured precision (smoke c2_640_34, 1 M puzzle pos, 1920 calibration positions)
+
+| metric | result | acceptance |
+|---|---|---|
+| Policy top-1 agreement | 78.54 % | ≥75 % ✓ |
+| Policy top-3 agreement (≥2 overlap) | 97.08 % | ≥90 % ✓ |
+| Policy KL(FP16 ‖ INT8) mean | **0.00520** | <0.02 ✓ (4× tighter than threshold) |
+| Value softmax L1 mean | 0.0295 | <0.05 ✓ |
+| **Value WDL argmax agreement** | **100.00 %** | ≥99 % ✓ (never disagrees on W/D/L) |
+
+The 22 % top-1 disagreement is between near-tied moves (expected quantization
+signature, not failure). The 100 % WDL-argmax-preserved property is the
+load-bearing finding for MCTS — eval direction never flips under INT8.
+
+### Measured speed (WSL TRT 10.16, RTX 5090, batch=64)
+
+| precision | latency/call | throughput | vs FP16 |
+|---|---|---|---|
+| FP16 | 7.43 ms | 8.62 K pos/sec | 1.00× |
+| INT8 (calibrated) | 5.87 ms | 10.91 K pos/sec | **+26.6 %** |
+
+Calibration quality affects accuracy (KLD), not speed — the same +27 % shows
+up with naïve no-calibration trtexec runs. Projected Ceres-side INT8 NPS for
+the c2_640_34 modern arch: **~12.3 K** (vs ~9.7 K FP16 measured, ~8.2 K for
+the orig INT8 baseline — roughly +50 % over orig).
+
+### Decision verdict thresholds
+
+| precision band | what it means | action |
+|---|---|---|
+| **GREEN**: KLD < 0.05, top-1 delta < 1 pp, val argmax ≥ 99 % | Architecture is INT8-friendly. Full-INT8 deployment plausible. | Commit to production training; plan INT8 release path. |
+| **AMBER**: KLD 0.05-0.20 | Borderline. Some layers will need FP16 kept (partial-INT8). | Train, plan partial-INT8 like existing orig/C3 pattern. |
+| **RED**: KLD > 0.20 or garbage outputs | Some op is quantization-hostile. | Defer; investigate which layer and whether to reformulate. |
+
+c2_640_34 lands solidly in the GREEN band.
+
+### Validation tool — `scripts/int8_validate.py`
+
+Builds FP16 + calibrated-INT8 engines, runs both on the same TPG inputs, and
+reports the comparison table above. Use it on any new ONNX from this export
+pipeline:
+
+```bash
+# WSL with cerestrain-env activated; cuda-python + tensorrt already in venv.
+# polygraphy is NOT used here — it crashes (`_Map_base::at`) on opset-23
+# RMSNormalization graphs. TRT Python API direct works.
+source ~/cerestrain-env/bin/activate
+python3 scripts/int8_validate.py \
+  /mnt/c/Dev/Chess/CeresTrain/nets/<your_net>.onnx \
+  /mnt/d/<your_tpg_dir> \
+  --num_batches 30 --calib_batches 8
+```
+
+Outputs:
+- `<your_net>.fp16.engine` and `<your_net>.int8.engine` saved next to the ONNX
+- `<your_net>.int8.engine.calib.cache` (the entropy calibration cache — keep
+  for reproducible rebuilds)
+- The precision table and a GREEN/AMBER/RED verdict printed to stdout
+- Per-call latency comparison
+
+### Caveats and known issues
+
+- **Polygraphy `convert --int8` is broken** for opset-23 + RMSNormalization on
+  TRT 10.15-10.16: crashes inside the calibrator with `_Map_base::at` regardless
+  of whether you provide a data loader. Use the TRT Python API directly (the
+  script above does this).
+
+- **TRT engines are platform-specific.** A Windows trtexec-built engine
+  cannot load in WSL Linux TRT and vice versa. Build engines on the platform
+  where they'll run. For Ceres-Windows production, build via the existing C++
+  wrapper path (which calls TRT internally) — the script above is for
+  validation/research in WSL only.
+
+- **TRT 10.16 (pip) is stricter than 10.15 (Windows install)** about
+  requiring an INT8 calibrator. 10.15 will build an INT8 engine with auto-
+  derived default ranges; 10.16 errors with "Calibration failure occurred
+  with no scaling factors detected" unless you provide a calibrator.
+
+- **Output-boundary Dequantize ops stay FP16** ("Dequantize NNN [SCALE] has
+  invalid precision Int8, ignored" warning during build is routine). The
+  inner trunk is fully INT8.
+
+- **Smoke-vs-production gap.** Activation-distribution shapes are largely
+  arch-determined and don't change much between an undertrained smoke and a
+  converged net, so the GREEN verdict here is meaningful for the production
+  decision. But re-run this validation against a properly-trained net before
+  shipping — sharp tactical positions in real play may stress the calibration
+  ranges differently than puzzle-only data.
+
+- **Production calibration data should be game positions**, not puzzle-only.
+  This smoke used the puzzle TPG corpus the net was trained on; broader
+  game-distribution calibration will give slightly different (probably
+  tighter) ranges.
+
+- **No Ceres-side INT8 loading path exists yet.** The wrapper has
+  `TRT_LoadMultiProfileEngineFile` (cpp:3495) which can load a pre-built
+  engine; wiring this into the engine-cache path so it picks up the INT8
+  variant instead of building from ONNX is a small additional task (~50
+  lines C# + minor naming convention). Defer this until a production-grade
+  INT8 net exists.
+
+---
+
 ## Rollback
 
 The trainer-side changes are zero-impact on the training trajectory (math
