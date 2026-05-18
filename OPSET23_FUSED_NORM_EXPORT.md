@@ -133,47 +133,71 @@ invocation.
 
 ---
 
-## File changes — Ceres repo (already shipped if Ceres was synced)
+## Wrapper-side changes — Ceres repo
 
-If the Ceres repo on this machine has not been synced with the wrapper-side
-fix, also patch:
+These are already shipped on `origin/main` of the Ceres repo (commit
+`686bed7b TensorRTNative: FP32-mark RMSNorm chains structurally for
+pre-norm nets`). A plain `git pull` in the Ceres tree picks them up
+along with the **rebuilt Windows DLL** — no manual cpp compile is
+required.
 
-### 4. `src/Ceres.Chess/NNEvaluators/Base/TensorRT/Native/TensorRTWrapper.cpp`
+### Manual step after pull
 
-Two changes — first, in `HasNormName()` (~line 321) add `trunk_end_norm`:
+Ceres.exe loads the DLL from `artifacts/{release,debug}/net10.0/`, but
+those artifact-dir DLLs are **not** tracked in git. After pulling,
+copy the freshly-versioned DLL into both deploy locations:
 
-```cpp
-static bool HasNormName(const char* layerName)
-{
-  std::string name(layerName);
-  return name.find("rms_norm") != std::string::npos
-    || name.find("ln1") != std::string::npos
-    || name.find("/ln2/") != std::string::npos
-    || name.find("qkvLN") != std::string::npos
-    || name.find("embedding_norm") != std::string::npos
-    || name.find("trunk_end_norm") != std::string::npos       // <-- ADD
-    || name.find("LayerNorm") != std::string::npos
-    || name.find("layer_norm") != std::string::npos
-    || name.find("rmsnorm") != std::string::npos;
-}
+```powershell
+$src = 'src\Ceres.Chess\NNEvaluators\Base\TensorRT\Native\TensorRTWrapper.dll'
+Copy-Item $src 'artifacts\release\net10.0\TensorRTWrapper.dll' -Force
+Copy-Item $src 'artifacts\debug\net10.0\TensorRTWrapper.dll'   -Force
 ```
 
-Second, just before the existing `if (opts->fp32PostAttentionNorm || ...)` block
-(~line 3092), add a structural FP32-norm marker that walks forward from each
-`*.scale` constant to the Mul consumer, then backward through the RMSNorm
-compute chain. This catches the decomposed pattern emitted by PyTorch's
-exporter when nodes have generic names like `node_pow_1`/`node_mean`/etc.
-Skip the marker entirely when BF16 is in use — BF16 has the same 8-bit
-exponent as FP32 so the overflow path doesn't exist.
+(Skip the `debug` line if you don't run debug builds.)
 
-The full code block is in the file as-shipped; if reapplying from scratch,
-search the file for the comment marker `// -------- STRUCTURAL FP32 norm marker`
-to copy the block verbatim.
+### When you would need to rebuild from cpp
 
-After the change: rebuild via `build_trunkend.cmd` in the same dir (uses
-`vcvars64.bat`, `cl /std:c++17 /O2 /MD /LD`, links `nvinfer_10.lib
-nvonnxparser_10.lib cudart.lib`). Copy the resulting `TensorRTWrapper.dll`
-into `artifacts/release/net10.0/` (and `debug/` if you run debug builds).
+The committed DLL is built against TRT 10.15.1.29 + CUDA 12.9 + VS
+2022 MSVC v143. TRT 10.x exposes a stable ABI, so it loads against
+any TRT 10.x runtime (10.10–10.15+ tested in this family). You only
+need to rebuild if:
+
+- the target machine has TRT 9.x or older (force-upgrade is easier);
+- you want a Linux build — `linux-{arm64,x64}/libTensorRTWrapper.so`
+  in the repo are pre-built from an earlier source revision and do
+  **not** include the new structural FP32-norm marker. Rebuild via
+  the `Makefile` in the same dir against your local TRT install;
+- you want to tweak the marker further.
+
+For a Windows rebuild, use the existing `build.cmd` in the same dir
+after adjusting its `CUDA_ROOT` / `TENSORRT_ROOT` to local paths.
+The script uses `cl /std:c++17 /O2 /MD /LD`, links `nvinfer_10.lib
+nvonnxparser_10.lib cudart.lib`, and writes the output `.dll`
+directly. After it succeeds, run the two `Copy-Item` lines above to
+deploy.
+
+### What the cpp changes look like
+
+For reference (the diff is already on `origin/main`):
+
+1. In `HasNormName()` (~line 322 of `TensorRTWrapper.cpp`), add the
+   line `|| name.find("trunk_end_norm") != std::string::npos` to the
+   substring list. The trainer's pre-norm trunk introduces a final
+   norm by that name that the previous matcher missed.
+
+2. Just before the existing `if (opts->fp32PostAttentionNorm ||
+   ...)` block (~line 3092), a new structural FP32-norm marker walks
+   forward from each `*.scale` initializer to its first
+   kELEMENTWISE consumer, then BFS-back over Pow/ReduceMean/Add/
+   Sqrt/Div compute layers and marks each FP32. Gated by
+   `if (!opts->useBF16)` so it's a no-op under BF16 (which has the
+   same 8-bit exponent as FP32 and doesn't overflow). An env-gated
+   debug dump (`TRT_DUMP_LAYER_NAMES=1`) at the end of the same
+   block enumerates the chains it finds — useful when the trainer's
+   exporter output changes shape in the future.
+
+To re-derive the block from scratch, search for the comment marker
+`// -------- STRUCTURAL FP32 norm marker` in the source.
 
 ---
 
@@ -222,10 +246,15 @@ crashes on them.
 ```bash
 # 1. Sync the three trainer files above (rms_norm.py, save_model.py,
 #    dot_product_attention.py). Sanity-check with git status that they
-#    are the only modified files.
+#    are the only modified files. Push origin if not already there.
 
-# 2. Apply the wrapper changes (TensorRTWrapper.cpp) and rebuild
-#    TensorRTWrapper.dll if the Ceres repo doesn't already have them.
+# 2. In the Ceres repo: git pull. The wrapper change and rebuilt DLL
+#    are committed (commit 686bed7b). Then copy the DLL into the
+#    artifact dirs (NOT tracked in git):
+#      Copy-Item src\Ceres.Chess\NNEvaluators\Base\TensorRT\Native\TensorRTWrapper.dll `
+#                artifacts\release\net10.0\TensorRTWrapper.dll -Force
+#    (Repeat for artifacts\debug\net10.0 if you run debug builds.)
+#    No cpp rebuild is required unless the target machine is on TRT 9.x.
 
 # 3. Set up the export env (one-time):
 python -m pip install --target D:\py-pkgs --no-user --upgrade onnxscript onnx onnxconverter-common
