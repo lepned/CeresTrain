@@ -37,7 +37,7 @@ from losses import LossCalculator
 from tpg_dataset import TPGDataset, TPGMixedDataset
 from config import Configuration
 import lora
-from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
+from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
 from utils import calc_flops
 
 from ceres_net import CeresNet
@@ -455,8 +455,8 @@ def Train():
     SUMMARY_COL_NAMES_TO_SHOW = ("input_size", "output_size", "num_params", "params_percent", "mult_adds", "trainable",)
     model_for_summary = model_nocompile.to(SUMMARY_DTYPE)
     model_stats = summary(model_for_summary,
-                          input_data=[torch.rand((256, NUM_TOKENS_INPUT, NUM_INPUT_BYTES_PER_SQUARE), dtype=SUMMARY_DTYPE, device=model_for_summary.device),
-                                      torch.rand((256, NUM_TOKENS_INPUT, 4), dtype=SUMMARY_DTYPE, device=model_for_summary.device)], 
+                          input_data=[torch.rand((256, NUM_TOKENS_INPUT, TOTAL_INPUT_FEATURES_PER_SQUARE), dtype=SUMMARY_DTYPE, device=model_for_summary.device),
+                                      torch.rand((256, NUM_TOKENS_INPUT, 4), dtype=SUMMARY_DTYPE, device=model_for_summary.device)],
                           dtypes=(SUMMARY_DTYPE, SUMMARY_DTYPE),
                           verbose=2, col_names = SUMMARY_COL_NAMES_TO_SHOW)
     print(model_stats)
@@ -467,9 +467,14 @@ def Train():
   def worker_init_fn(worker_id):
     dataset.set_worker_id(worker_id)
 
-  # Use two concurrent dataset workers (if more than one training data file is available)
+  # Use two concurrent dataset workers (if more than one training data file is available).
+  # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work is the
+  # bottleneck (e.g. CERES_AUG_FEATURES_PER_SQUARE>0 adds ~350ms/batch of python-chess work).
   count_zst_files = len(fnmatch.filter(os.listdir(TPG_TRAIN_DIR), '*.zst'))
-  NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1 # Not available on Windows. 1 meansone parallel worker always processing in advance (change with caution).
+  _DEFAULT_NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1
+  NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))
+  if NUM_DATASET_WORKERS != _DEFAULT_NUM_DATASET_WORKERS:
+    print(f'[train] NUM_DATASET_WORKERS override: {_DEFAULT_NUM_DATASET_WORKERS} -> {NUM_DATASET_WORKERS} (via CERES_NUM_DATASET_WORKERS)')
   PREFETCH_FACTOR = None if NUM_DATASET_WORKERS == 0 else 4 # to keep GPU busy
  
   world_size = len(devices)

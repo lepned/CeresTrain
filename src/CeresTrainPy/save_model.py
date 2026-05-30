@@ -16,7 +16,7 @@ from typing import Dict, Any
 
 import torch
 
-from config import Configuration
+from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE
 from lora import collect_and_save_lora_parameters
 
 
@@ -118,7 +118,7 @@ def save_model(NAME : str,
           os.mkdir(aot_output_dir)
           
         batch_dim = torch.export.Dim("batch", min=1, max=1024)
-        aot_example_inputs = (torch.rand(256, 64, 137).to(convert_type).to(_model_device),
+        aot_example_inputs = (torch.rand(256, 64, TOTAL_INPUT_FEATURES_PER_SQUARE).to(convert_type).to(_model_device),
                               torch.rand(256, 64, 4).to(convert_type).to(_model_device))
         with torch.no_grad():
           so_path = torch._export.aot_compile(model_nocompile,
@@ -139,7 +139,7 @@ def save_model(NAME : str,
 
 
     # below simpler method fails, probably due to use of .compile
-    sample_inputs = [torch.rand(256, 64, 137).to(convert_type).to(_model_device),
+    sample_inputs = [torch.rand(256, 64, TOTAL_INPUT_FEATURES_PER_SQUARE).to(convert_type).to(_model_device),
                      torch.rand(256, 64, config.NetDef_PriorStateDim).to(convert_type).to(_model_device)]
 
     if False:
@@ -207,7 +207,7 @@ def save_model(NAME : str,
           # to FP16 via onnxconverter-common below. Keeping the initial export FP32
           # avoids mixed-type MatMul errors that occur when inputs are declared FP16
           # while internal weights are still FP32.
-          sample_inputs = (torch.rand(256, 64, 137).to(torch.float32).to(_model_device),
+          sample_inputs = (torch.rand(256, 64, TOTAL_INPUT_FEATURES_PER_SQUARE).to(torch.float32).to(_model_device),
                             torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(_model_device))
           # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
           # only calls setTensorAddress on inputNames[0] — additional inputs are

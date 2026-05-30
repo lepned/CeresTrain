@@ -35,7 +35,7 @@ from utils import DWA
 from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
 from chess_geometry import PieceRelationBias
 
-from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE
+from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
 
 
 
@@ -113,7 +113,9 @@ class CeresNet(nn.Module):
     self.Activation  = to_activation(config.NetDef_HeadsActivationType)
     self.test = config.Exec_TestFlag
 
-    self.embedding_layer = nn.Linear(NUM_INPUT_BYTES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
+    # When CERES_AUG_FEATURES_PER_SQUARE > 0, TOTAL_INPUT_FEATURES_PER_SQUARE
+    # = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUG_FEATURES_PER_SQUARE (e.g. 140 vs 137).
+    self.embedding_layer = nn.Linear(TOTAL_INPUT_FEATURES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
     self.embedding_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
 
     HEAD_MULT = config.NetDef_HeadWidthMultiplier
@@ -231,11 +233,13 @@ class CeresNet(nn.Module):
                       attention_multiplier = ATTENTION_MULTIPLIER,
                       smoe_mode = config.NetDef_SoftMoE_MoEMode,
                       smoe_num_experts = config.NetDef_SoftMoE_NumExperts,
-                      smolgen_per_square_dim = SMOLGEN_PER_SQUARE_DIM, 
-                      smolgen_intermediate_dim = SMOLGEN_INTERMEDIATE_DIM, 
+                      smoe_expert_input_dim = config.NetDef_SoftMoE_ExpertInputDim,
+                      smolgen_per_square_dim = SMOLGEN_PER_SQUARE_DIM,
+                      smolgen_intermediate_dim = SMOLGEN_INTERMEDIATE_DIM,
                       smolgen_head_divisor = config.NetDef_SmolgenToHeadDivisor,
-                      smolgenPrepLayer = self.smolgenPrepLayer, 
+                      smolgenPrepLayer = self.smolgenPrepLayer,
                       smolgen_activation_type = config.NetDef_SmolgenActivationType,
+                      smolgen_delta_rank = config.NetDef_SmolgenDeltaRank,
                       alpha=self.alpha, layerNum=i, dropout_rate=self.DROPOUT_RATE,
                       use_rpe=config.NetDef_UseRPE, 
                       use_rpe_v=config.NetDef_UseRPE_V,
@@ -245,6 +249,7 @@ class CeresNet(nn.Module):
                       use_nonlinear_attention=config.NetDef_NonLinearAttention,
                       dual_attention_mode = config.NetDef_DualAttentionMode if not config.Exec_TestFlag else (config.NetDef_DualAttentionMode if i % 2 == 1 else 'None'),
                       test = config.Exec_TestFlag,
+                      use_diff_attention = config.NetDef_UseDiffAttention,
                       tsb_enabled = getattr(config, 'NetDef_TSB_Enabled', False),
                       tsb_ffn_multiplier = getattr(config, 'NetDef_TSB_FFNMultiplier', 1),
                       tsb_gate_bias_init = getattr(config, 'NetDef_TSB_GateBiasInit', -4.0),
@@ -349,7 +354,7 @@ class CeresNet(nn.Module):
     # flow[:, :, 108] = 1 - flow[:, :, 107]
 
     # Embedding layer.
-    flow_squares = flow.reshape(-1, NUM_TOKENS_INPUT, (NUM_TOKENS_INPUT * NUM_INPUT_BYTES_PER_SQUARE) // NUM_TOKENS_INPUT)
+    flow_squares = flow.reshape(-1, NUM_TOKENS_INPUT, (NUM_TOKENS_INPUT * TOTAL_INPUT_FEATURES_PER_SQUARE) // NUM_TOKENS_INPUT)
 
     if self.prior_state_dim > 0:
       # Append prior state to the input if is available for this position.

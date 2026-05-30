@@ -70,6 +70,12 @@ def try_shuffle(file_list):
 
 MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored (TPGRecord.MAX_MOVES)
 
+# Read at module import so the worker processes inherit it. Default 0 (disabled);
+# set CERES_AUG_FEATURES_PER_SQUARE=3 to enable the MVP augmented-features path.
+_NUM_AUG_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0') or 0)
+if _NUM_AUG_FEATURES_PER_SQUARE > 0:
+  print(f'[tpg_dataset] AUG_FEATURES enabled: +{_NUM_AUG_FEATURES_PER_SQUARE} channels per square via aug_features.compute_aug_features_batch')
+
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
 _POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
@@ -164,9 +170,10 @@ class TPGDataset(Dataset):
   def item_generator(self):
     DTYPE = np.float32
     BATCH_SIZE = self.batch_size
-    # Fixed size of TPGRecord (V2 format with USE_V2_TPG_RECORD=true):
-    # 9250 (original) + 2*64 (two PlyBinPerSquare64 arrays) = 9378
-    BYTES_PER_POS = 9378
+    # Fixed size of TPGRecord (V3 format with USE_V2 + USE_V3 both true):
+    # 9250 (original) + 2*64 (V2 PlyBin arrays) + 3*64 (V3 aug feature bytes) = 9570
+    # Must match Ceres TPGRecord.TOTAL_BYTES.
+    BYTES_PER_POS = 9570
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
@@ -301,7 +308,10 @@ class TPGDataset(Dataset):
                   pv32[active] = pv32[active] / row_sum
                   policies_values = pv32.astype(np.float16)
 
-              SIZE_SQUARE = 137
+              # V3 TPG layout: 140 bytes per square (137 base + 3 aug features baked
+              # in by Ceres's TPGSquareRecord.WritePosPieces). For 137-channel models,
+              # slice off the trailing 3 aug bytes per square here.
+              SIZE_SQUARE = 140
               squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
               DIVISOR = 100
               squares = np.divide(squares, DIVISOR).astype(DTYPE)
@@ -309,7 +319,13 @@ class TPGDataset(Dataset):
 
               assert offset == BYTES_PER_POS, f"Layout mismatch: offset={offset} expected={BYTES_PER_POS}"
 
-              yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty, 
+              # For backwards-compat 137-channel models, slice off the V3 aug tail.
+              # When CERES_AUG_FEATURES_PER_SQUARE == 0 the model is legacy 137-channel;
+              # when == 3 it's V3 140-channel and we pass through unchanged.
+              if _NUM_AUG_FEATURES_PER_SQUARE == 0:
+                squares = squares[:, :, :137]
+
+              yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,
                        uncertainty_policy))
 

@@ -13,6 +13,7 @@ If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import json
+import os
 
 """
 Global constants.
@@ -20,6 +21,18 @@ Global constants.
 NUM_TOKENS_INPUT = 64 # Raw input number of tokens
 NUM_TOKENS_NET = 64 # Number of tokens used by net
 NUM_INPUT_BYTES_PER_SQUARE = 137 # Raw input width per token
+
+# Optional augmented input features computed in DataLoader from the per-square
+# piece one-hot (chess.attackers-based). When > 0, the dataset's squares tensor
+# is widened by this many extra channels per square, and the embedding layer
+# input dim grows correspondingly. Currently fixed at 3 channels in the MVP:
+# (our_attackers, opp_attackers, net_attackers) — see aug_features.py.
+# Toggle via env var: CERES_AUG_FEATURES_PER_SQUARE=3 to enable.
+NUM_AUG_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0') or 0)
+TOTAL_INPUT_FEATURES_PER_SQUARE = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUG_FEATURES_PER_SQUARE
+if NUM_AUG_FEATURES_PER_SQUARE > 0:
+  print(f'[config] AUG_FEATURES enabled: +{NUM_AUG_FEATURES_PER_SQUARE} channels per square, '
+        f'total = {TOTAL_INPUT_FEATURES_PER_SQUARE} per square')
 
 
 def read_config(file_path):
@@ -171,11 +184,24 @@ class Configuration:
     self.NetDef_SmolgenDim = config_net_def.get('SmolgenDim', 512)
     self.NetDef_SmolgenToHeadDivisor = config_net_def.get('SmolgenToHeadDivisor', 2)
     self.NetDef_SmolgenActivationType = config_net_def.get('SmolgenActivationType', 'None')
+    # Variant A per-layer smolgen delta: per-encoder-layer low-rank zero-init
+    # additive correction on top of the shared smolgenPrepLayer output. 0 = off
+    # (baseline smolgen). > 0 = enable with that rank (typically 4 or 8). Only
+    # active when smolgen itself is enabled (SmolgenDim and SmolgenDimPerSquare
+    # both > 0). Module is zero-initialized so model is bit-identical to
+    # baseline at training step 0.
+    self.NetDef_SmolgenDeltaRank = config_net_def.get('SmolgenDeltaRank', 0)
     self.NetDef_HeadWidthMultiplier = config_net_def.get('HeadWidthMultiplier', 4)
     self.NetDef_UseRPE = config_net_def.get('UseRPE', False)
     self.NetDef_UseRPE_V = config_net_def.get('UseRPE_V', True)
     self.NetDef_UseRelBias = config_net_def.get('UseRelBias', False)
     self.NetDef_UseRoPE = config_net_def.get('UseRoPE', False)
+    # Differential Attention V2 (Microsoft Apr 2026): doubles Q heads (Q1, Q2
+    # split), computes two attention maps, subtracts with per-token sigmoid(λ)
+    # gate to cancel attention noise. When smolgen is on, bias is added to both
+    # attention maps (Option A — both branches inherit same per-position prior;
+    # differential cancels Q1-vs-Q2 noise on top). Untested with RoPE / softcap.
+    self.NetDef_UseDiffAttention = config_net_def.get('UseDiffAttention', False)
     self.NetDef_UseQKNorm = config_net_def.get('UseQKNorm', False)
     self.NetDef_SoftCapCutoff = config_net_def.get('SoftCapCutoff', 100)
 
@@ -189,6 +215,10 @@ class Configuration:
     self.NetDef_SoftMoE_NumSlotsPerExpert = soft_moe_config.get('NumSlotsPerExpert', 0)
     self.NetDef_SoftMoE_UseNormalization = soft_moe_config.get('UseNormalization', False)
     self.NetDef_SoftMoE_UseBias = soft_moe_config.get('UseBias', True)
+    # Fine-grained MoE: pre-projects ffn_dim -> ExpertInputDim before phi
+    # routing + expert processing. Only meaningful in ReplaceLinearSecondLayer
+    # mode. 0 disables (default — experts process full ffn_dim).
+    self.NetDef_SoftMoE_ExpertInputDim = soft_moe_config.get('ExpertInputDim', 0)
 
     # TSB (Tactical SwiGLU Bypass) — nested config block.
     # Per-block parallel SwiGLU FFN + scalar gate added beside the orig FFN.
