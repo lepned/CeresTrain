@@ -50,6 +50,8 @@ namespace CeresTrain.TrainCommands
     static Option<string> netSpecificationOptionalOption;
     static Option<string> netSpecificationFillinOption;
     static Option<string> tpgDirOption;
+    static Option<string> tpgDirInOption;       // upgrade-tpg-v2-v3: source V2 directory
+    static Option<string> tpgDirOutOption;      // upgrade-tpg-v2-v3: destination V3 directory
     static Option<string> tarDirOption;
     static Option<string> packedZSTDirOption;
     static Option<bool> verboseOption;
@@ -73,6 +75,7 @@ namespace CeresTrain.TrainCommands
 
     static Command generateTPGCommand;
     static Command convertTARToPackedZSTCommand;
+    static Command upgradeTPGV2ToV3Command;
 
     static Option<string> puzzleConfigOption;
     static Command minePuzzlesCommand;
@@ -110,6 +113,8 @@ namespace CeresTrain.TrainCommands
       netSpecificationOptionalOption = new Option<string>("--net-spec", "LC0 network specification used to compare performance against (or null for tablebase)") { IsRequired = false };
       netSpecificationFillinOption = new Option<string>("--net-spec-fillin", "LC0 network specification of network to use for noncovered positions") { IsRequired = false };
       tpgDirOption = new Option<string>("--tpg-dir", "Directory containing TPG training data files") { IsRequired = false };
+      tpgDirInOption  = new Option<string>("--tpg-dir-in",  "Source directory of V2 TPG shards (for upgrade-tpg-v2-v3)") { IsRequired = true };
+      tpgDirOutOption = new Option<string>("--tpg-dir-out", "Destination directory for V3 TPG shards (for upgrade-tpg-v2-v3)") { IsRequired = true };
       tarDirOption = new Option<string>("--tar-dir", "Directory containing TAR training data files") { IsRequired = false };
       packedZSTDirOption = new Option<string>("--zst-dir", "Directory containing packed ZST training data files") { IsRequired = true };
       verboseOption = new Option<bool>("--verbose", "If verbose information should be sent to Console (true of false).");
@@ -134,6 +139,7 @@ namespace CeresTrain.TrainCommands
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
       generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
+      upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (140 byte/sq) by computing aug feature bytes from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out]") { tpgDirInOption, tpgDirOutOption };
 
       minePuzzlesCommand = new Command("mine-puzzles", "Mine hard Lichess puzzles at nodes=1.                           [puzzle-config]") { puzzleConfigOption };
       labelPuzzlesCommand = new Command("label-puzzles", "Teacher-label hard puzzles via MCGS search.                     [puzzle-config]") { puzzleConfigOption };
@@ -161,6 +167,7 @@ namespace CeresTrain.TrainCommands
       rootCommand.AddCommand(generateEndgameTPGCommand);
       rootCommand.AddCommand(generateTPGCommand);
       rootCommand.AddCommand(convertTARToPackedZSTCommand);
+      rootCommand.AddCommand(upgradeTPGV2ToV3Command);
       rootCommand.AddCommand(minePuzzlesCommand);
       rootCommand.AddCommand(labelPuzzlesCommand);
       rootCommand.AddCommand(puzzlesToTPGCommand);
@@ -224,7 +231,15 @@ namespace CeresTrain.TrainCommands
       convertTARToPackedZSTCommand.SetHandler((sourceDir, targetDir) =>
       {
         TPGConvertFromTAR.GeneratePackedZSTFromTARs(sourceDir, targetDir);
-      }, tarDirOption, packedZSTDirOption); 
+      }, tarDirOption, packedZSTDirOption);
+
+
+      upgradeTPGV2ToV3Command.SetHandler((inDir, outDir) =>
+      {
+        Console.WriteLine($"V2→V3 TPG upgrade: {inDir} → {outDir}");
+        long total = TPGConvertV2ToV3.UpgradeDirectory(inDir, outDir);
+        Console.WriteLine($"Upgrade complete: {total:N0} positions written");
+      }, tpgDirInOption, tpgDirOutOption);
 
 
       generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc) =>
