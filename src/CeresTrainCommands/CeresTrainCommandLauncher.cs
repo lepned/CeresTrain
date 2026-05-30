@@ -52,6 +52,8 @@ namespace CeresTrain.TrainCommands
     static Option<string> tpgDirOption;
     static Option<string> tpgDirInOption;       // upgrade-tpg-v2-v3: source V2 directory
     static Option<string> tpgDirOutOption;      // upgrade-tpg-v2-v3: destination V3 directory
+    static Option<int>    zstdLevelOption;      // upgrade-tpg-v2-v3: zstd compression level
+    static Option<int>    maxFilesParallelOption; // upgrade-tpg-v2-v3: how many shards in parallel
     static Option<string> tarDirOption;
     static Option<string> packedZSTDirOption;
     static Option<bool> verboseOption;
@@ -115,6 +117,11 @@ namespace CeresTrain.TrainCommands
       tpgDirOption = new Option<string>("--tpg-dir", "Directory containing TPG training data files") { IsRequired = false };
       tpgDirInOption  = new Option<string>("--tpg-dir-in",  "Source directory of V2 TPG shards (for upgrade-tpg-v2-v3)") { IsRequired = true };
       tpgDirOutOption = new Option<string>("--tpg-dir-out", "Destination directory for V3 TPG shards (for upgrade-tpg-v2-v3)") { IsRequired = true };
+      zstdLevelOption = new Option<int>("--zstd-level", () => 5,
+          "zstd compression level (1-22). 5 = fast (default, +25% size). 11 = gen-tpg parity (smaller, ~3-5x slower). " +
+          "For billion-scale upgrades, try 11-19 to minimize storage.") { IsRequired = false };
+      maxFilesParallelOption = new Option<int>("--max-files-parallel", () => 4,
+          "Number of shards to upgrade simultaneously. Default 4. Raise on machines with many cores + fast SSD.") { IsRequired = false };
       tarDirOption = new Option<string>("--tar-dir", "Directory containing TAR training data files") { IsRequired = false };
       packedZSTDirOption = new Option<string>("--zst-dir", "Directory containing packed ZST training data files") { IsRequired = true };
       verboseOption = new Option<bool>("--verbose", "If verbose information should be sent to Console (true of false).");
@@ -139,7 +146,7 @@ namespace CeresTrain.TrainCommands
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
       generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
-      upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (140 byte/sq) by computing aug feature bytes from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out]") { tpgDirInOption, tpgDirOutOption };
+      upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (140 byte/sq) by computing aug feature bytes from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out] [--zstd-level N] [--max-files-parallel N]") { tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption };
 
       minePuzzlesCommand = new Command("mine-puzzles", "Mine hard Lichess puzzles at nodes=1.                           [puzzle-config]") { puzzleConfigOption };
       labelPuzzlesCommand = new Command("label-puzzles", "Teacher-label hard puzzles via MCGS search.                     [puzzle-config]") { puzzleConfigOption };
@@ -234,12 +241,17 @@ namespace CeresTrain.TrainCommands
       }, tarDirOption, packedZSTDirOption);
 
 
-      upgradeTPGV2ToV3Command.SetHandler((inDir, outDir) =>
+      upgradeTPGV2ToV3Command.SetHandler((inDir, outDir, zstdLevel, maxFilesParallel) =>
       {
         Console.WriteLine($"V2→V3 TPG upgrade: {inDir} → {outDir}");
-        long total = TPGConvertV2ToV3.UpgradeDirectory(inDir, outDir);
+        Console.WriteLine($"  zstd level: {zstdLevel}   files in parallel: {maxFilesParallel}");
+        long total = TPGConvertV2ToV3.UpgradeDirectory(
+          inDir, outDir,
+          parallelChunkSize: 8192,
+          maxFilesInParallel: maxFilesParallel,
+          zstdCompressionLevel: zstdLevel);
         Console.WriteLine($"Upgrade complete: {total:N0} positions written");
-      }, tpgDirInOption, tpgDirOutOption);
+      }, tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption);
 
 
       generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc) =>
