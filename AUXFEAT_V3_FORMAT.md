@@ -1,15 +1,15 @@
-# V3 TPG Format — Augmented Input Features
+# V3 TPG Format — Auxiliary Input Features
 
 **Status**: Implemented + validated end-to-end (Phase 4 EngineBattle eval: OOD +26 Pol Perf at −5% NPS on 384×12 quietmix-10M).
 **Repos**:
-- Ceres: `augfeat-mvp` branch (5 commits ahead of int8-impl/main)
-- CeresTrain: `main` branch (3 augfeat commits)
+- Ceres: `auxfeat-mvp` branch (5 commits ahead of int8-impl/main)
+- CeresTrain: `main` branch (3 auxfeat commits)
 
 ---
 
 ## What V3 adds
 
-3 augmented input feature bytes per square, baked into the TPG file format. These are chess-engine-computed semantic features that the network previously had to derive from raw piece placement:
+3 auxiliary input feature bytes per square, baked into the TPG file format. These are chess-engine-computed semantic features that the network previously had to derive from raw piece placement:
 
 | Channel | Encoding | Range | Meaning |
 |---|---|---|---|
@@ -35,7 +35,7 @@ Per-record TPGRecord total:
 
 Constants in `Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord`:
 - `USE_V3_TPG_RECORD = true` (compile-time const)
-- `NUM_AUG_FEATURE_BYTES_PER_SQUARE = 3`
+- `NUM_AUX_FEATURE_BYTES_PER_SQUARE = 3`
 - `BYTES_PER_SQUARE_RECORD = 140`
 - `TOTAL_BYTES = 9570`
 
@@ -47,7 +47,7 @@ Constants in `Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord`:
 | File | Role |
 |---|---|
 | `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGRecord.cs` | V3 const flags, byte sizing |
-| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGSquareRecord.cs` | Added `augFeatureBytes[3]` fixed buffer + `AugFeatureBytesSetter`/`ReadOnly` accessors. `WritePosPieces` now bakes aug bytes at record-write time. |
+| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGSquareRecord.cs` | Added `auxFeatureBytes[3]` fixed buffer + `AuxFeatureBytesSetter`/`ReadOnly` accessors. `WritePosPieces` now bakes aug bytes at record-write time. |
 | `Ceres.Chess/Position/PerSquareAttacks.cs` | The bitboard math. Three entry points: `Compute(in MGPosition)` (live position), `ComputeFromBitboards(...)` (already-extracted bitboards), `ComputeFromTpgSquareBytes(...)` (used by V2→V3 upgrade) |
 | `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGConvertersToFlat.cs` | Live-inference path; auto-detects V3 140-byte vs V2 137-byte caller buffer + slices when feeding a legacy 137-channel model |
 | `Ceres.Chess/NNEvaluators/Base/TensorRT/NNEvaluatorTensorRT.cs` | Buffer-size now derived from ONNX `inputElementsPerPosition` instead of hardcoded 137 |
@@ -59,9 +59,9 @@ Constants in `Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord`:
 |---|---|
 | `src/Tasks/TPGConvertV2ToV3.cs` | V2→V3 upgrade tool. `UpgradeFile()` / `UpgradeDirectory()`. Multi-threaded across positions, configurable across files. |
 | `src/CeresTrainCommands/CeresTrainCommandLauncher.cs` | CLI command `upgrade-tpg-v2-v3` |
-| `src/CeresTrainPy/aug_features.py` | Python reference + vectorized impl. Used as oracle for cross-language validation. Dead-code at training time when V3 corpus is used (features in TPG bytes). |
-| `src/CeresTrainPy/tpg_dataset.py` | Loader reads `BYTES_PER_POS=9570`. When `CERES_AUG_FEATURES_PER_SQUARE=0`, slices to 137 (legacy net compat). |
-| `src/CeresTrainPy/config.py` | New env-driven constants `NUM_AUG_FEATURES_PER_SQUARE` / `TOTAL_INPUT_FEATURES_PER_SQUARE` |
+| `src/CeresTrainPy/aux_features.py` | Python reference + vectorized impl. Used as oracle for cross-language validation. Dead-code at training time when V3 corpus is used (features in TPG bytes). |
+| `src/CeresTrainPy/tpg_dataset.py` | Loader reads `BYTES_PER_POS=9570`. When `CERES_AUX_FEATURES_PER_SQUARE=0`, slices to 137 (legacy net compat). |
+| `src/CeresTrainPy/config.py` | New env-driven constants `NUM_AUX_FEATURES_PER_SQUARE` / `TOTAL_INPUT_FEATURES_PER_SQUARE` |
 | `src/CeresTrainPy/ceres_net.py` | Embedding layer width = `TOTAL_INPUT_FEATURES_PER_SQUARE` (137 or 140) |
 | `src/CeresTrainPy/save_model.py` | ONNX export dummy input shape uses `TOTAL_INPUT_FEATURES_PER_SQUARE` |
 | `scripts/aug_features_dump_for_fen.py` | Python oracle for cross-language equality test |
@@ -119,12 +119,12 @@ The intrinsic **floor** of V3-over-V2 is ~30-35% — the new 3 bytes/sq carry re
 
 ## What's needed on the other machine
 
-Pull both repos with the augfeat commits + rebuild:
+Pull both repos with the auxfeat commits + rebuild:
 
 ```bash
-# Ceres (need branch with augfeat-mvp commits, or merge them into main)
+# Ceres (need branch with auxfeat-mvp commits, or merge them into main)
 cd Ceres
-git checkout augfeat-mvp     # or main once merged
+git checkout auxfeat-mvp     # or main once merged
 dotnet build src/Ceres.Chess/Ceres.Chess.csproj -c Release
 dotnet build src/Ceres/Ceres.csproj -c Release
 
@@ -172,13 +172,13 @@ file.zst: 1,000,000 positions in 5.0s (200,000/sec)
 | Move50/EP/castling state | ✓ | |
 | Piece placement (history planes) | ✓ | |
 | Q-blunder annotations | ✓ | |
-| `augFeatureBytes[3]` per square | | derived from piece placement |
+| `auxFeatureBytes[3]` per square | | derived from piece placement |
 
 **No labels are lost. No MCTS search is rerun.** Pure byte-level transformation.
 
 ---
 
-## Currently implemented aug features (V3 ships with these 3)
+## Currently implemented aux features (V3 ships with these 3)
 
 The 3 ships-with-V3 features are intentionally the minimum-viable set: chosen for unambiguous semantics + cheap compute + high signal in the MVP test (Phase 4: +26 OOD Pol Perf, no regressions on any band, +268 Val Perf on mate puzzles).
 
@@ -220,12 +220,12 @@ Ranked by ease + expected signal-to-noise:
 
 ### Implementation pattern for V4
 
-When adding new aug features:
-1. Bump `USE_V3_TPG_RECORD → USE_V4_TPG_RECORD = true`, add `NUM_AUG_FEATURE_BYTES_PER_SQUARE_V4 = N_NEW`
-2. Extend `TPGSquareRecord.augFeatureBytes[N]` to the new size (compile-time constant)
+When adding new aux features:
+1. Bump `USE_V3_TPG_RECORD → USE_V4_TPG_RECORD = true`, add `NUM_AUX_FEATURE_BYTES_PER_SQUARE_V4 = N_NEW`
+2. Extend `TPGSquareRecord.auxFeatureBytes[N]` to the new size (compile-time constant)
 3. Add computation in `PerSquareAttacks.Compute*` (or a new helper class for non-attack features)
 4. `WritePosPieces` bakes them at record-write time
-5. Python training: `aug_features.py` adds the new channels (or skip — they're already in the bytes)
+5. Python training: `aux_features.py` adds the new channels (or skip — they're already in the bytes)
 6. Embedding layer width = `137 + 3 + N_NEW`
 7. CLI: `upgrade-tpg-v3-v4` command for in-place upgrade of V3 corpora
 
@@ -265,5 +265,5 @@ The V2→V3 pattern is the template — the new converter is ~80 LoC of bitboard
 
 - Memory note: `project_augmented_input_features_mvp.md` (Phase 4 result)
 - Memory note: `project_aug_features_vectorize_plan.md` (numpy vectorization plan)
-- Ceres branch: `augfeat-mvp`, latest: `a9b63e63` (V2→V3 upgrade helper API)
+- Ceres branch: `auxfeat-mvp`, latest: `a9b63e63` (V2→V3 upgrade helper API)
 - CeresTrain branch: `main`, latest: `84dfb7c` (CLI zstd-level + max-files-parallel options)

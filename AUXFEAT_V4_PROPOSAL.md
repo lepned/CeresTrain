@@ -1,4 +1,4 @@
-# V4 Aug-Feature Proposal — Survey + Recommended Roadmap
+# V4 Aux-Feature Proposal — Survey + Recommended Roadmap
 
 **Status**: Research draft (2026-05-31, autonomous). Not yet implemented. Goal is to identify which next features to add after the V3 baseline.
 **Context**: V3 ships with 3 per-square bytes (our/opp/net attackers). Phase 4: OOD +26 Pol Perf, NPS −5%. The format is extensible: V4 = more bytes per square, same bake-in pattern.
@@ -124,8 +124,8 @@ Each new V4 feature follows the V3 V2→V3 template. Steps for each:
    if (TPGRecord.USE_V4_TPG_RECORD) {
      // ... existing V3 aug bytes ...
      // ... new V4 bytes ...
-     pieceRecord.AugFeatureBytesSetter[3] = (byte)mobility[squareNum];
-     pieceRecord.AugFeatureBytesSetter[4] = (byte)defenderCount[squareNum];
+     pieceRecord.AuxFeatureBytesSetter[3] = (byte)mobility[squareNum];
+     pieceRecord.AuxFeatureBytesSetter[4] = (byte)defenderCount[squareNum];
      // ...
    }
    ```
@@ -133,7 +133,7 @@ Each new V4 feature follows the V3 V2→V3 template. Steps for each:
 3. **Bump format constant** in `TPGRecord.cs`:
    ```csharp
    public const bool USE_V4_TPG_RECORD = true;
-   internal const int NUM_AUG_FEATURE_BYTES_PER_SQUARE = USE_V4_TPG_RECORD ? 8 : (USE_V3_TPG_RECORD ? 3 : 0);
+   internal const int NUM_AUX_FEATURE_BYTES_PER_SQUARE = USE_V4_TPG_RECORD ? 8 : (USE_V3_TPG_RECORD ? 3 : 0);
    ```
 
 4. **V3→V4 upgrade tool** in `CeresTrain/Tasks/TPGConvertV3ToV4.cs` (~mirror of V2→V3 converter):
@@ -145,7 +145,7 @@ Each new V4 feature follows the V3 V2→V3 template. Steps for each:
 5. **Python loader** updates:
    - `tpg_dataset.py`: BYTES_PER_POS = 9890 (or 10018)
    - SIZE_SQUARE = 145 (or 147)
-   - `config.py`: `NUM_AUG_FEATURES_PER_SQUARE = 8` (or 10)
+   - `config.py`: `NUM_AUX_FEATURES_PER_SQUARE = 8` (or 10)
 
 6. **Sanity test** in `tests/AugFeatSanity`: extend with V4 layout check + new feature-byte-correctness validation against python-chess oracle.
 
@@ -300,4 +300,4 @@ public static class KingDistanceFeatures
 - Phase 5 30M training result is the gate. Read decision tree (section 9) first.
 - If proceeding with V4: implement features 1-3 (mobility, defender, is-pinned) as the V4-mini smoke.
 - The V2→V3 converter pattern works as a direct template for V3→V4.
-- This doc + V3 format doc (`AUGFEAT_V3_FORMAT.md`) together are the full feature-engineering handoff.
+- This doc + V3 format doc (`AUXFEAT_V3_FORMAT.md`) together are the full feature-engineering handoff.
