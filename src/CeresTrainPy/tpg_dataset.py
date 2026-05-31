@@ -71,10 +71,11 @@ def try_shuffle(file_list):
 MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored (TPGRecord.MAX_MOVES)
 
 # Read at module import so the worker processes inherit it. Default 0 (disabled);
-# set CERES_AUG_FEATURES_PER_SQUARE=3 to enable the MVP augmented-features path.
-_NUM_AUG_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0') or 0)
-if _NUM_AUG_FEATURES_PER_SQUARE > 0:
-  print(f'[tpg_dataset] AUG_FEATURES enabled: +{_NUM_AUG_FEATURES_PER_SQUARE} channels per square via aug_features.compute_aug_features_batch')
+# set CERES_AUX_FEATURES_PER_SQUARE=3 to enable the auxiliary-features path.
+_NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
+                                          os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)
+if _NUM_AUX_FEATURES_PER_SQUARE > 0:
+  print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} channels per square via aux_features.compute_aux_features_batch')
 
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
@@ -320,9 +321,9 @@ class TPGDataset(Dataset):
               assert offset == BYTES_PER_POS, f"Layout mismatch: offset={offset} expected={BYTES_PER_POS}"
 
               # For backwards-compat 137-channel models, slice off the V3 aug tail.
-              # When CERES_AUG_FEATURES_PER_SQUARE == 0 the model is legacy 137-channel;
+              # When CERES_AUX_FEATURES_PER_SQUARE == 0 the model is legacy 137-channel;
               # when == 3 it's V3 140-channel and we pass through unchanged.
-              if _NUM_AUG_FEATURES_PER_SQUARE == 0:
+              if _NUM_AUX_FEATURES_PER_SQUARE == 0:
                 squares = squares[:, :, :137]
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,

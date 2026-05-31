@@ -113,8 +113,8 @@ class CeresNet(nn.Module):
     self.Activation  = to_activation(config.NetDef_HeadsActivationType)
     self.test = config.Exec_TestFlag
 
-    # When CERES_AUG_FEATURES_PER_SQUARE > 0, TOTAL_INPUT_FEATURES_PER_SQUARE
-    # = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUG_FEATURES_PER_SQUARE (e.g. 140 vs 137).
+    # When CERES_AUX_FEATURES_PER_SQUARE > 0, TOTAL_INPUT_FEATURES_PER_SQUARE
+    # = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUX_FEATURES_PER_SQUARE (e.g. 140 vs 137).
     self.embedding_layer = nn.Linear(TOTAL_INPUT_FEATURES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
     self.embedding_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
 

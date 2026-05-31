@@ -20,18 +20,18 @@ float in [0,1]) so training and inference features are bit-identical.
 
 Two implementations live here:
 
-  compute_aug_features_batch        (FAST: numpy-vectorized, ~30 ms / batch)
+  compute_aux_features_batch        (FAST: numpy-vectorized, ~30 ms / batch)
                                     Default production path. Uses bitboard
                                     representations + Kogge-Stone occluded
                                     fills for sliders + precomputed attack
                                     tables for non-sliders.
 
-  compute_aug_features_batch_slow   (REFERENCE: python-chess, ~350 ms / batch)
+  compute_aux_features_batch_slow   (REFERENCE: python-chess, ~350 ms / batch)
                                     Per-board chess.Board reconstruction +
                                     128 attackers_mask calls per board.
                                     Retained as oracle for `_validate_equality`.
 
-A standalone equality test (`python aug_features.py validate`) runs both on
+A standalone equality test (`python aux_features.py validate`) runs both on
 1000 random positions and asserts byte-identical output.
 
 The TPG per-square encoding (per scripts/inspect_tpg_for_960.py and
@@ -220,7 +220,7 @@ _BISHOP_DIRS = [_shift_ne, _shift_nw, _shift_se, _shift_sw]
 # Main vectorized entry point
 # ============================================================================
 
-def compute_aug_features_batch(squares: np.ndarray) -> np.ndarray:
+def compute_aux_features_batch(squares: np.ndarray) -> np.ndarray:
     """Batched aug-feature compute. (B, 64, 137) → (B, 64, 3) float32.
 
     Fully vectorized over the batch dimension. Per batch of 4096:
@@ -230,7 +230,7 @@ def compute_aug_features_batch(squares: np.ndarray) -> np.ndarray:
       - encode + assemble: ~2 ms
     Total: ~30 ms (vs ~350 ms for the python-chess reference).
 
-    Exactly bit-equivalent to compute_aug_features_batch_slow — validated by
+    Exactly bit-equivalent to compute_aux_features_batch_slow — validated by
     `_validate_equality()` on 1000 random positions.
     """
     B = squares.shape[0]
@@ -316,7 +316,7 @@ def _slow_squares_to_board(sq_tensor):
     return board
 
 
-def _slow_aug_features_for_board(board):
+def _slow_aux_features_for_board(board):
     """Reference per-board aug features via python-chess."""
     import chess
     feats = np.zeros((64, NUM_AUG_CHANNELS), dtype=np.float32)
@@ -329,14 +329,14 @@ def _slow_aug_features_for_board(board):
     return feats
 
 
-def compute_aug_features_batch_slow(squares: np.ndarray) -> np.ndarray:
+def compute_aux_features_batch_slow(squares: np.ndarray) -> np.ndarray:
     """REFERENCE python-chess implementation. ~350 ms per batch of 4096.
     Retained as oracle for the equality test against the fast vectorized version."""
     B = squares.shape[0]
     out = np.zeros((B, 64, NUM_AUG_CHANNELS), dtype=np.float32)
     for i in range(B):
         board = _slow_squares_to_board(squares[i])
-        out[i] = _slow_aug_features_for_board(board)
+        out[i] = _slow_aux_features_for_board(board)
     return out
 
 
@@ -396,12 +396,12 @@ def _validate_equality(n_positions: int = 1000, seed: int = 42) -> int:
     print(f'[validate] {n_positions} positions encoded; running both implementations...')
 
     t0 = time.perf_counter()
-    fast = compute_aug_features_batch(sq_batch)
+    fast = compute_aux_features_batch(sq_batch)
     t_fast = time.perf_counter() - t0
     print(f'  fast  : {t_fast*1000:.1f} ms ({t_fast*1000/n_positions:.3f} ms/pos)')
 
     t0 = time.perf_counter()
-    slow = compute_aug_features_batch_slow(sq_batch)
+    slow = compute_aux_features_batch_slow(sq_batch)
     t_slow = time.perf_counter() - t0
     print(f'  slow  : {t_slow*1000:.1f} ms ({t_slow*1000/n_positions:.3f} ms/pos)')
     print(f'  speedup: {t_slow/t_fast:.1f}×')
@@ -434,7 +434,7 @@ def _selftest():
     sq = _board_to_squares_tensor(start)
 
     # Slow reference
-    feats_slow = _slow_aug_features_for_board(start)
+    feats_slow = _slow_aux_features_for_board(start)
     assert feats_slow.shape == (64, 3)
     white_sum = feats_slow[:, 0].sum()
     black_sum = feats_slow[:, 1].sum()
@@ -443,7 +443,7 @@ def _selftest():
     assert abs(net_mean - 0.5) < 1e-2
 
     # Fast version on the same single position (B=1 batch)
-    feats_fast = compute_aug_features_batch(sq[np.newaxis, :, :])[0]
+    feats_fast = compute_aux_features_batch(sq[np.newaxis, :, :])[0]
     if not np.array_equal(feats_fast, feats_slow):
         diff = np.argwhere(feats_fast != feats_slow)
         print(f'[selftest] starting-pos MISMATCH at {len(diff)} positions')
@@ -452,7 +452,7 @@ def _selftest():
             print(f'  sq={sqi}, ch={ch}: fast={feats_fast[sqi, ch]} slow={feats_slow[sqi, ch]}')
         sys.exit(1)
 
-    print(f'[aug_features selftest] OK')
+    print(f'[aux_features selftest] OK')
     print(f'  starting pos: white-attackers-encoded sum = {white_sum:.3f}')
     print(f'  starting pos: black-attackers-encoded sum = {black_sum:.3f}')
     print(f'  starting pos: net-shifted mean           = {net_mean:.3f} (~0.5 = symmetric)')

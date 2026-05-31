@@ -469,7 +469,7 @@ def Train():
 
   # Use two concurrent dataset workers (if more than one training data file is available).
   # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work is the
-  # bottleneck (e.g. CERES_AUG_FEATURES_PER_SQUARE>0 adds ~350ms/batch of python-chess work).
+  # bottleneck (e.g. CERES_AUX_FEATURES_PER_SQUARE>0 adds ~350ms/batch of python-chess work).
   count_zst_files = len(fnmatch.filter(os.listdir(TPG_TRAIN_DIR), '*.zst'))
   _DEFAULT_NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1
   NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))

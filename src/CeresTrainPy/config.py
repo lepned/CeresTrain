@@ -13,7 +13,6 @@ If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import json
-import os
 
 """
 Global constants.
@@ -26,12 +25,14 @@ NUM_INPUT_BYTES_PER_SQUARE = 137 # Raw input width per token
 # piece one-hot (chess.attackers-based). When > 0, the dataset's squares tensor
 # is widened by this many extra channels per square, and the embedding layer
 # input dim grows correspondingly. Currently fixed at 3 channels in the MVP:
-# (our_attackers, opp_attackers, net_attackers) — see aug_features.py.
-# Toggle via env var: CERES_AUG_FEATURES_PER_SQUARE=3 to enable.
-NUM_AUG_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0') or 0)
-TOTAL_INPUT_FEATURES_PER_SQUARE = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUG_FEATURES_PER_SQUARE
-if NUM_AUG_FEATURES_PER_SQUARE > 0:
-  print(f'[config] AUG_FEATURES enabled: +{NUM_AUG_FEATURES_PER_SQUARE} channels per square, '
+# (our_attackers, opp_attackers, net_attackers) — see aux_features.py.
+# Toggle via env var: CERES_AUX_FEATURES_PER_SQUARE=3 to enable (or legacy CERES_AUG_FEATURES_PER_SQUARE=3).
+# Read CERES_AUX_FEATURES_PER_SQUARE (preferred), fall back to legacy CERES_AUG_FEATURES_PER_SQUARE
+NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
+                                  os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)
+TOTAL_INPUT_FEATURES_PER_SQUARE = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUX_FEATURES_PER_SQUARE
+if NUM_AUX_FEATURES_PER_SQUARE > 0:
+  print(f'[config] AUX_FEATURES enabled: +{NUM_AUX_FEATURES_PER_SQUARE} channels per square, '
         f'total = {TOTAL_INPUT_FEATURES_PER_SQUARE} per square')
 
 
