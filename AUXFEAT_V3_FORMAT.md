@@ -1,43 +1,50 @@
 # V3 TPG Format — Auxiliary Input Features
 
-**Status**: Implemented + validated end-to-end (Phase 4 EngineBattle eval: OOD +26 Pol Perf at −5% NPS on 384×12 quietmix-10M).
-**Repos**:
-- Ceres: `auxfeat-mvp` branch (5 commits ahead of int8-impl/main)
-- CeresTrain: `main` branch (3 auxfeat commits)
+**Status**: Finalized 2026-06-01 after ablation-driven cleanup. The format previously included 7-8 aux channels (V3-MVP attackers, V3-extended tactical features, SEE) and was reduced to **the 4 channels that demonstrably earned their place via tournament + puzzle ablation**.
 
 ---
 
 ## What V3 adds
 
-3 auxiliary input feature bytes per square, baked into the TPG file format. These are chess-engine-computed semantic features that the network previously had to derive from raw piece placement:
+4 auxiliary input feature bytes per square, baked into the TPG file format. These are tactical-motif features that the network can't compute cheaply in 1-2 attention layers:
 
 | Channel | Encoding | Range | Meaning |
 |---|---|---|---|
-| `our_attackers` | `count * 100 / 8` | byte [0, 100] → float [0, 1] | # of our pieces attacking this square (incl. defenders) |
-| `opp_attackers` | `count * 100 / 8` | byte [0, 100] → float [0, 1] | # of opp pieces attacking this square |
-| `net_attackers` | `(our - opp + 8) * 100 / 16` | byte [0, 100] → float [0, 1] | shifted-positive net (our-opp), centered at 0.5 |
+| `mobility`        | `raw * 100 / 27` (capped at 100) | byte [0, 100] → float [0, 1] | Pseudo-legal move count of piece on this square (captures-only for pawns) |
+| `defender_count`  | `count * 100 / 8`                | byte [0, 100] → float [0, 1] | Same-color attackers of this square (defending the piece on it) |
+| `is_pinned`       | 0 or 100                         | byte {0, 100} → float {0, 1} | Boolean: piece pinned to own king by an opp slider |
+| `is_threatened`   | 0 or 100                         | byte {0, 100} → float {0, 1} | Boolean: piece attacked by opp piece of *strictly lower* value (NNUE-spirit). Pawn never threatened; King threatened if attacked at all. |
 
-All three quantized via integer divide so Python (training) and C# (inference) match bit-for-bit through the `byte / 100` pipeline.
+All four are quantized via integer divide so Python (training oracle) and C# (TPG generation + inference) match bit-for-bit through the `byte / 100` pipeline.
+
+**Why these four:** ablation tested 0/3/7/8-aux feature sets at 256×10 + smolgen + SwiGLU + post-norm + Muon-LR8e4 + decay@0.7 + 10M positions. Findings:
+- 3 attacker counts (V3-MVP): tournament-tied vs 0-aux (dead weight — model derives internally)
+- 4 tactical features (mobility/defender/pinned/threatened): **+39 Elo tournament @ n=100 (CFS 99.6%)**, **+14 OOD puzzle Pol Perf** vs 0-aux
+- SEE (8th channel): bit-exact validated but tournament-negative under AdamW; puzzle-tied under Muon. Redundant with the 4 above.
 
 ---
 
-## Format diff: V2 (137 bytes/sq) → V3 (140 bytes/sq)
+## Format diff: V2 (137 bytes/sq) → V3 (141 bytes/sq)
 
 ```
 Per-square TPGSquareRecord layout:
   bytes [0..137)   = unchanged from V2 (piece history, castling, rank/file encoding, etc.)
-  bytes [137..140) = NEW V3 augmented feature bytes (our/opp/net attackers)
+  bytes [137..141) = V3 aux feature bytes:
+                       [137] mobility
+                       [138] defender_count
+                       [139] is_pinned
+                       [140] is_threatened
 
 Per-record TPGRecord total:
   V2: 9378 bytes  (9250 base + 2*64 V2 PlyBin arrays)
-  V3: 9570 bytes  (9250 base + 2*64 V2 PlyBin + 3*64 V3 aug bytes)
+  V3: 9634 bytes  (9250 base + 2*64 V2 PlyBin + 4*64 V3 aux bytes)
 ```
 
 Constants in `Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord`:
 - `USE_V3_TPG_RECORD = true` (compile-time const)
-- `NUM_AUX_FEATURE_BYTES_PER_SQUARE = 3`
-- `BYTES_PER_SQUARE_RECORD = 140`
-- `TOTAL_BYTES = 9570`
+- `NUM_AUX_FEATURE_BYTES_PER_SQUARE = 4`
+- `BYTES_PER_SQUARE_RECORD = 141`
+- `TOTAL_BYTES = 9634`
 
 ---
 
@@ -47,223 +54,77 @@ Constants in `Ceres.Chess.NNEvaluators.Ceres.TPG.TPGRecord`:
 | File | Role |
 |---|---|
 | `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGRecord.cs` | V3 const flags, byte sizing |
-| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGSquareRecord.cs` | Added `auxFeatureBytes[3]` fixed buffer + `AuxFeatureBytesSetter`/`ReadOnly` accessors. `WritePosPieces` now bakes aug bytes at record-write time. |
-| `Ceres.Chess/Position/PerSquareAttacks.cs` | The bitboard math. Three entry points: `Compute(in MGPosition)` (live position), `ComputeFromBitboards(...)` (already-extracted bitboards), `ComputeFromTpgSquareBytes(...)` (used by V2→V3 upgrade) |
-| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGConvertersToFlat.cs` | Live-inference path; auto-detects V3 140-byte vs V2 137-byte caller buffer + slices when feeding a legacy 137-channel model |
-| `Ceres.Chess/NNEvaluators/Base/TensorRT/NNEvaluatorTensorRT.cs` | Buffer-size now derived from ONNX `inputElementsPerPosition` instead of hardcoded 137 |
-| `Ceres.Chess/NNBackends/ONNXRuntime/ONNXNetExecutor.cs` | `TPG_BYTES_PER_SQUARE_RECORD` references `TPGRecord.BYTES_PER_SQUARE_RECORD` (auto-tracks V3) |
-| `tests/AugFeatSanity/` | Test project: 4-phase validation (layout sanity, starting-pos truth, Python↔C# byte equality on 25 FENs, WritePosPieces orientation correctness) |
+| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGSquareRecord.cs` | `AuxFeatureBytesSetter` writes 4 aux bytes per square. `WritePosPieces` bakes them at record-write time via `PerSquareAttacks.ComputeExtendedFeatures`. |
+| `Ceres.Chess/Position/PerSquareAttacks.cs` | The bitboard math. Three entry points: `Compute(in MGPosition)` (attackers only, live use), `ComputeExtendedFeatures(in MGPosition, ...)` (the 4 V3 aux, used by WritePosPieces), `ComputeExtendedFromTpgSquareBytes(...)` (used by V2→V3 upgrade) |
+| `Ceres.Chess/NNEvaluators/Ceres/TPG/TPGConvertersToFlat.cs` | Live-inference path. Auto-detects two model widths: 137 (legacy aux-blind) or 141 (V3 with all 4 aux). Slices off aux tail when feeding a legacy 137-channel model. |
+| `tests/AugFeatSanity/` | Test project: Phase 0 (layout sanity, 141 bytes/sq, 9634 bytes/record), Phase 1 (starting-pos attacker truth), Phase 2 (Python↔C# attacker-byte equality on 25 FENs). |
 
 ### CeresTrain (data pipeline + training)
 | File | Role |
 |---|---|
-| `src/Tasks/TPGConvertV2ToV3.cs` | V2→V3 upgrade tool. `UpgradeFile()` / `UpgradeDirectory()`. Multi-threaded across positions, configurable across files. |
-| `src/CeresTrainCommands/CeresTrainCommandLauncher.cs` | CLI command `upgrade-tpg-v2-v3` |
-| `src/CeresTrainPy/aux_features.py` | Python reference + vectorized impl. Used as oracle for cross-language validation. Dead-code at training time when V3 corpus is used (features in TPG bytes). |
-| `src/CeresTrainPy/tpg_dataset.py` | Loader reads `BYTES_PER_POS=9570`. When `CERES_AUX_FEATURES_PER_SQUARE=0`, slices to 137 (legacy net compat). |
-| `src/CeresTrainPy/config.py` | New env-driven constants `NUM_AUX_FEATURES_PER_SQUARE` / `TOTAL_INPUT_FEATURES_PER_SQUARE` |
-| `src/CeresTrainPy/ceres_net.py` | Embedding layer width = `TOTAL_INPUT_FEATURES_PER_SQUARE` (137 or 140) |
-| `src/CeresTrainPy/save_model.py` | ONNX export dummy input shape uses `TOTAL_INPUT_FEATURES_PER_SQUARE` |
-| `scripts/aug_features_dump_for_fen.py` | Python oracle for cross-language equality test |
+| `src/Tasks/TPGConvertV2ToV3.cs` | V2→V3 upgrade tool. Constants: `V3_BYTES_PER_POS=9634`, `SQ_BYTES_V3=141`, `NUM_AUX_BYTES=4`. `UpgradeOnePosition` writes the 4 aux bytes via `ComputeExtendedFromTpgSquareBytes`. |
+| `src/CeresTrainPy/tpg_dataset.py` | Loader reads `BYTES_PER_POS=9634`, `SIZE_SQUARE=141`. When `CERES_AUX_FEATURES_PER_SQUARE=0`, slices to 137 (legacy net compat). `CERES_AUX_CHANNEL_INDICES` env var supports cherry-picking specific aux channels for ablation. |
+| `src/CeresTrainPy/config.py` | `NUM_AUX_FEATURES_PER_SQUARE` env-var-driven; widens model input embed by N channels. |
+| `scripts/validate_v3ext_aux_bytes.py` | Python oracle that bit-exactly verifies the 4 aux bytes written by C# `WritePosPieces` against an independent python-chess implementation. Tested on 5K+ positions, zero mismatches. |
 
 ---
 
-## V2 → V3 conversion: usage
+## CLI commands
 
-The CLI command reads V2 .zst shards, computes aug bytes from the piece data **already in the records** (no re-labeling, no MCTS search), writes V3 .zst.
+### Upgrade an existing V2 corpus to V3 (preserves labels, no MCTS rerun needed)
 
 ```bash
-CeresTrain.exe upgrade-tpg-v2-v3 \
-    --tpg-dir-in  <V2 source directory> \
-    --tpg-dir-out <V3 destination directory> \
-    [--zstd-level 5|11|...]  \
-    [--max-files-parallel N]
+./CeresTrain.exe upgrade-tpg-v2-v3 \
+  --tpg-dir-in  <V2-corpus-path> \
+  --tpg-dir-out <V3-output-path> \
+  --zstd-level 5 \
+  --max-files-parallel 4
 ```
 
-### Defaults
-- `--zstd-level 5` — fast, +69% size vs V2. Right for one-off testing.
-- `--max-files-parallel 4` — balanced for multi-core + SSD.
+Throughput: ~100K positions/sec on a modern multi-core machine. 5M positions → ~50 sec.
 
-### For billion-scale upgrades (the other machine):
+### Generate V3 corpus from scratch (TAR → TPG)
+
+The `gen-tpg` command routes through `WritePosPieces` which auto-writes all 4 aux channels. Use the standard tool the same way as before; the new format is automatic when `USE_V3_TPG_RECORD=true` (current default).
+
+### Training
+
+Toggle V3 aux consumption via env var:
+```bash
+CERES_AUX_FEATURES_PER_SQUARE=4 python3 train.py <config-id> <ceres-train-root>
+```
+Setting `=0` reproduces a legacy 137-channel model on the same V3 corpus (auto-slices the aux tail).
+
+---
+
+## Validation
+
+End-to-end correctness verified by `scripts/validate_v3ext_aux_bytes.py`:
 
 ```bash
-CeresTrain.exe upgrade-tpg-v2-v3 \
-    --tpg-dir-in  /path/to/V2_corpus \
-    --tpg-dir-out /path/to/V3_corpus \
-    --zstd-level 11 \
-    --max-files-parallel 8
+python3 scripts/validate_v3ext_aux_bytes.py /path/to/V3-corpus.zst 5000
 ```
 
-- `--zstd-level 11` matches gen-tpg's "Optimal". Storage delta vs V2: **+35%** (vs +69% at lvl 5).
-- `--max-files-parallel 8` saturates more cores. Raise to 16+ on big-iron.
-
-### Throughput (measured on this machine, 5090, fast SSD)
-
-| Config | Throughput | Per-billion ETA |
-|---|---|---|
-| `--zstd-level 5  --max-files-parallel 4` | 199K positions/sec | ~84 min |
-| `--zstd-level 11 --max-files-parallel 1` | 25K positions/sec | ~11 hours |
-| `--zstd-level 11 --max-files-parallel 8` (extrapolated) | ~150K positions/sec | ~110 min |
-
-### Storage cost for V3 (rough)
-
-| Compression | Cost vs V2 | Notes |
-|---|---|---|
-| zstd 5 | +69% | Fast; ok for dev |
-| zstd 11 | +35% | gen-tpg parity; recommended for production storage |
-| zstd 19+ | Marginal further reduction | 2-3× slower; usually not worth it |
-
-The intrinsic **floor** of V3-over-V2 is ~30-35% — the new 3 bytes/sq carry real information (varies per-square per-position), so they can't compress as efficiently as V2's sparse marker bytes. **Even max compression can't go below +30%.**
+Decompresses the corpus, decodes positions to a chess.Board, computes the 4 aux channels independently via python-chess, compares byte-by-byte to the C#-baked values. On 5500 positions × 64 squares × 4 channels = 1,408,000 byte comparisons across self-play + puzzle shards: **0 mismatches**.
 
 ---
 
-## What's needed on the other machine
+## Historical (dropped) features
 
-Pull both repos with the auxfeat commits + rebuild:
+The following features were tested and **removed** from V3 after ablation. Kept here for posterity:
 
-```bash
-# Ceres (need branch with auxfeat-mvp commits, or merge them into main)
-cd Ceres
-git checkout auxfeat-mvp     # or main once merged
-dotnet build src/Ceres.Chess/Ceres.Chess.csproj -c Release
-dotnet build src/Ceres/Ceres.csproj -c Release
+- **`our_attackers`, `opp_attackers`, `net_attackers`** (V3-MVP, May 2026): the original 3-channel V3 design. Showed +73.9 OOD Pol Perf in early under-trained ablations (LR=2e-4), but at the proper prod LR (Muon-LR8e-4) gave **tournament-tied vs 0-aux**. Model derives attacker counts cheaply in 1 attention layer; baking them as inputs is dead weight at this scale.
 
-# CeresTrain (main branch)
-cd CeresTrain
-git pull
-dotnet build src/CeresTrain.csproj -c Release
-```
+- **`SEE`** (Static Exchange Evaluation, May-June 2026): the 8th channel. Bit-exact validated against a Python SEE oracle. Tournament-negative under AdamW; puzzle-tied with no-SEE under Muon. Captures ~half the signal of the 4 tactical features as a standalone, but adds nothing marginal when combined with them (model can integrate `is_threatened` + position structure into SEE-like evaluation internally).
 
-### Sanity-check it built correctly
-
-Run the test project (validates TPGRecord size = 140, aug encoding matches python-chess):
-
-```bash
-cd Ceres
-dotnet run --project tests/AugFeatSanity/AugFeatSanity.csproj -c Release
-```
-
-Expected output (last line):
-```
-ALL TESTS PASSED (Phase 1 + Phase 2 + Phase 3 v3-bake-in)
-```
-
-### Run the upgrade
-
-```bash
-artifacts/release/net10.0/CeresTrain.exe upgrade-tpg-v2-v3 \
-    --tpg-dir-in  /path/to/big_V2_corpus \
-    --tpg-dir-out /path/to/V3_corpus \
-    --zstd-level 11 \
-    --max-files-parallel 8
-```
-
-Watch throughput in the per-shard log lines:
-```
-file.zst: 1,000,000 positions in 5.0s (200,000/sec)
-```
-
-### What gets preserved vs computed
-
-| | Preserved from V2 | Computed fresh |
-|---|---|---|
-| Policy targets (MCTS visits) | ✓ | |
-| Value targets (WDL) | ✓ | |
-| Move50/EP/castling state | ✓ | |
-| Piece placement (history planes) | ✓ | |
-| Q-blunder annotations | ✓ | |
-| `auxFeatureBytes[3]` per square | | derived from piece placement |
-
-**No labels are lost. No MCTS search is rerun.** Pure byte-level transformation.
+Implementations of both are preserved in git history (commit prior to the 2026-06-01 cleanup) if revisiting at billion-position scale ever changes the picture.
 
 ---
 
-## Currently implemented aux features (V3 ships with these 3)
+## Notes
 
-The 3 ships-with-V3 features are intentionally the minimum-viable set: chosen for unambiguous semantics + cheap compute + high signal in the MVP test (Phase 4: +26 OOD Pol Perf, no regressions on any band, +268 Val Perf on mate puzzles).
+1. **Backward-compat with 137-channel models is preserved.** TPGConvertersToFlat auto-detects the caller's buffer width (137 or 141) and slices the aux tail when serving a legacy model. Existing production nets (like `lepned_320_15_rope_v3_*`) continue to serve correctly without rebuild.
 
-| # | Name | Bytes | Semantic |
-|---|---|---|---|
-| 0 | `our_attackers` | 1 | Count of our pieces with attack-mask covering this square (incl. defenders) |
-| 1 | `opp_attackers` | 1 | Count of opp pieces with attack-mask covering this square |
-| 2 | `net_attackers` | 1 | Shifted-positive (our - opp + 8) / 16 |
+2. **NPS impact: negligible.** Inference NPS test on 137-ch prod net: aux-baking overhead is within 1% noise. The CPU work in `WritePosPieces` is well-amortized vs GPU forward pass.
 
-All three derived from chess.Board attackers_mask (Python) / PerSquareAttacks (C#) — bit-identical, validated by `tests/AugFeatSanity`.
-
----
-
-## Future features (V4 format ideas, not yet implemented)
-
-If/when we want to expand the feature set, the additions go in a hypothetical V4 layout (new bytes appended after the V3 aug bytes — same compile-time-flag pattern). Each upgrade tool gets a similar V3→V4 path.
-
-Ranked by ease + expected signal-to-noise:
-
-| Feature | Bytes/sq | Computed via | Notes |
-|---|---|---|---|
-| **mobility** | 1 | popcount(piece-on-sq attack mask) | "How many squares can the piece here move to?" Trivial to compute once we have per-piece attack masks. |
-| **is-pinned** (1 bit) | 1 | SEE-style pin detection | "Is the piece on this square pinned to its own king?" Unambiguous for absolute pins; tricker for relative pins. |
-| **is-hanging** (1 bit) | 1 | `our_attackers < opp_attackers` (already derivable from V3) | Could be V3-derivable; encoding it explicitly might still help learning. |
-| **defender-count** | 1 | Same as our_attackers but only counts pieces defending same-color piece on the square | Decomposes V3 channel 0 into "defenders" vs "attacks on empty/opp squares" |
-| **x-ray-attackers** | 1 each color | Attack mask through one blocker | Useful for pin/skewer recognition |
-| **king-distance** | 1 each color | Chebyshev distance to enemy king | Useful for king safety + endgame king-activity |
-| **passed-pawn flag** | 1 (per square) | Pawn structure check | Heavy lift, encodes high-level pawn-structure signal |
-| **piece-square value (PSQT)** | 1 | Classical positional eval | Brings in handcrafted-evaluation prior |
-
-### Global features (broadcast to all 64 squares, or 1 extra "global" token)
-
-| Feature | Bytes | Notes |
-|---|---|---|
-| **material imbalance** | 5 (W-B for P/N/B/R/Q) | Material delta per piece type |
-| **phase indicator** | 1 | Opening/middlegame/endgame interpolated |
-| **open/semi-open file mask** | 1 per file | Where pawn structure breaks down |
-| **king-safety** | 2 (one per king) | Standard pawn-shield + open-files-near-king score |
-
-### Implementation pattern for V4
-
-When adding new aux features:
-1. Bump `USE_V3_TPG_RECORD → USE_V4_TPG_RECORD = true`, add `NUM_AUX_FEATURE_BYTES_PER_SQUARE_V4 = N_NEW`
-2. Extend `TPGSquareRecord.auxFeatureBytes[N]` to the new size (compile-time constant)
-3. Add computation in `PerSquareAttacks.Compute*` (or a new helper class for non-attack features)
-4. `WritePosPieces` bakes them at record-write time
-5. Python training: `aux_features.py` adds the new channels (or skip — they're already in the bytes)
-6. Embedding layer width = `137 + 3 + N_NEW`
-7. CLI: `upgrade-tpg-v3-v4` command for in-place upgrade of V3 corpora
-
-The V2→V3 pattern is the template — the new converter is ~80 LoC of bitboard math.
-
----
-
-## Performance characteristics (Phase 4 result on Phase 1-3 implementation)
-
-| Metric | Value |
-|---|---|
-| OOD avg Pol Perf delta | **+26.3** (acceptance bar +20) ✓ |
-| In-dist avg Pol Perf delta | +29.7 |
-| Mate-band Pol Perf delta | +71 Pol / +268 Val |
-| Universal across bands | ✓ no regressions |
-| KLD universally down | ✓ network more calibrated |
-| NPS startpos | −5% (cap −10%) ✓ |
-| Param delta | +1,152 (of 43M) |
-| Training overhead | **0 ms / batch** (V3 baked) |
-| Inference overhead | ~64 popcount + ray ops per position |
-
----
-
-## Open questions / known limitations
-
-1. **`ApplyPlySinceLastMoveTransformationToTPGBuffer`** casts buffer as `Span<TPGSquareRecord>` (140-byte stride with V3). Works fine for V3 + PlySinceLastMoveMode != Zero (most common). The earlier worry about misalignment was V2-only.
-
-2. **Backward compat**: existing 137-channel ONNX models can still be served on V3-formatted TPG data — `TPGConvertersToFlat` auto-slices the trailing 3 bytes per square when caller's output buffer is sized for 137. So you don't have to retrain everything to use V3 inference.
-
-3. **No automatic V3-detection in Python loader yet**. `tpg_dataset.py` hardcodes `BYTES_PER_POS=9570` (V3 only). Reading old V2 files needs the upgrader first. (Adding per-file auto-detect is a 30-min change if needed.)
-
-4. **The Phase 4 result was achieved with a now-fixed orientation bug** (Phase 1C used XOR-56 rank-only flip; should have been 63-i 180-rotation, per `TPGSquareRecord.WritePosPieces` line 363). V3 bake-in does the right thing. Future Phase 4 reruns on V3 should show **stronger** signal.
-
----
-
-## Memory + git references
-
-- Memory note: `project_augmented_input_features_mvp.md` (Phase 4 result)
-- Memory note: `project_aug_features_vectorize_plan.md` (numpy vectorization plan)
-- Ceres branch: `auxfeat-mvp`, latest: `a9b63e63` (V2→V3 upgrade helper API)
-- CeresTrain branch: `main`, latest: `84dfb7c` (CLI zstd-level + max-files-parallel options)
+3. **Format is stable.** This is the final V3 design after extensive ablation. Further channel additions would constitute V4.

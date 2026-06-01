@@ -74,8 +74,25 @@ MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored
 # set CERES_AUX_FEATURES_PER_SQUARE=3 to enable the auxiliary-features path.
 _NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
                                           os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)
+
+# Optional: pick specific aux-channel INDICES (1-based-into-aux-slice) instead of
+# the default "first N channels". Comma-separated; count must match
+# CERES_AUX_FEATURES_PER_SQUARE. Example: CERES_AUX_CHANNEL_INDICES=7 with
+# CERES_AUX_FEATURES_PER_SQUARE=1 → use only aux[7] (SEE-only ablation).
+_AUX_INDICES_ENV = os.environ.get('CERES_AUX_CHANNEL_INDICES', '').strip()
+_AUX_CHANNEL_INDICES = None
+if _AUX_INDICES_ENV:
+  _AUX_CHANNEL_INDICES = [int(x.strip()) for x in _AUX_INDICES_ENV.split(',') if x.strip()]
+  if len(_AUX_CHANNEL_INDICES) != _NUM_AUX_FEATURES_PER_SQUARE:
+    raise ValueError(f'CERES_AUX_CHANNEL_INDICES count ({len(_AUX_CHANNEL_INDICES)}) must equal '
+                     f'CERES_AUX_FEATURES_PER_SQUARE ({_NUM_AUX_FEATURES_PER_SQUARE})')
+
 if _NUM_AUX_FEATURES_PER_SQUARE > 0:
-  print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} channels per square via aux_features.compute_aux_features_batch')
+  if _AUX_CHANNEL_INDICES is not None:
+    print(f'[tpg_dataset] AUX_FEATURES enabled: {_NUM_AUX_FEATURES_PER_SQUARE} channels '
+          f'at INDICES {_AUX_CHANNEL_INDICES} (non-default selection)')
+  else:
+    print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} channels per square via aux_features.compute_aux_features_batch')
 
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
@@ -171,10 +188,15 @@ class TPGDataset(Dataset):
   def item_generator(self):
     DTYPE = np.float32
     BATCH_SIZE = self.batch_size
-    # Fixed size of TPGRecord (V3 format with USE_V2 + USE_V3 both true):
-    # 9250 (original) + 2*64 (V2 PlyBin arrays) + 3*64 (V3 aug feature bytes) = 9570
+    # Fixed size of TPGRecord (V3 format with USE_V2 + USE_V3 both true, post-2026-06-01 cleanup):
+    # 9250 (original) + 2*64 (V2 PlyBin arrays) + 4*64 (V3 aux feature bytes) = 9634
+    # The 4 aux channels per square are:
+    #   [0] mobility            — pseudo-legal move count of piece on square
+    #   [1] defender_count      — same-color attackers of piece on square
+    #   [2] is_pinned           — boolean (0/100), pinned to own king by opp slider
+    #   [3] is_threatened       — boolean (0/100), attacked by strictly-lower-value opp piece
     # Must match Ceres TPGRecord.TOTAL_BYTES.
-    BYTES_PER_POS = 9570
+    BYTES_PER_POS = 9634
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
@@ -309,10 +331,10 @@ class TPGDataset(Dataset):
                   pv32[active] = pv32[active] / row_sum
                   policies_values = pv32.astype(np.float16)
 
-              # V3 TPG layout: 140 bytes per square (137 base + 3 aug features baked
+              # V3 TPG layout: 141 bytes per square (137 base + 4 aux features baked
               # in by Ceres's TPGSquareRecord.WritePosPieces). For 137-channel models,
-              # slice off the trailing 3 aug bytes per square here.
-              SIZE_SQUARE = 140
+              # slice off the trailing 4 aux bytes per square here.
+              SIZE_SQUARE = 141
               squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
               DIVISOR = 100
               squares = np.divide(squares, DIVISOR).astype(DTYPE)
@@ -320,11 +342,20 @@ class TPGDataset(Dataset):
 
               assert offset == BYTES_PER_POS, f"Layout mismatch: offset={offset} expected={BYTES_PER_POS}"
 
-              # For backwards-compat 137-channel models, slice off the V3 aug tail.
-              # When CERES_AUX_FEATURES_PER_SQUARE == 0 the model is legacy 137-channel;
-              # when == 3 it's V3 140-channel and we pass through unchanged.
-              if _NUM_AUX_FEATURES_PER_SQUARE == 0:
-                squares = squares[:, :, :137]
+              # Drop unused trailing aux channels. V3 carries 4 aux bytes; trainers using
+              # CERES_AUX_FEATURES_PER_SQUARE < 4 slice the tail.
+              #   0 = legacy 137-channel model (no aux)
+              #   4 = full V3 (mobility / defender / is_pinned / is_threatened)
+              # CERES_AUX_CHANNEL_INDICES can override the default first-N selection
+              # (cherry-pick specific channels for ablation; indices are into the 4-channel
+              # aux slice, mapping to absolute positions 137..140).
+              if _AUX_CHANNEL_INDICES is not None:
+                idx_abs = [137 + i for i in _AUX_CHANNEL_INDICES]
+                squares = np.concatenate([squares[:, :, :137], squares[:, :, idx_abs]], axis=2)
+              else:
+                keep_channels = 137 + _NUM_AUX_FEATURES_PER_SQUARE
+                if keep_channels < SIZE_SQUARE:
+                  squares = squares[:, :, :keep_channels]
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,

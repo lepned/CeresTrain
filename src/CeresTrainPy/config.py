@@ -22,11 +22,16 @@ NUM_TOKENS_NET = 64 # Number of tokens used by net
 NUM_INPUT_BYTES_PER_SQUARE = 137 # Raw input width per token
 
 # Optional augmented input features computed in DataLoader from the per-square
-# piece one-hot (chess.attackers-based). When > 0, the dataset's squares tensor
-# is widened by this many extra channels per square, and the embedding layer
-# input dim grows correspondingly. Currently fixed at 3 channels in the MVP:
-# (our_attackers, opp_attackers, net_attackers) — see aux_features.py.
-# Toggle via env var: CERES_AUX_FEATURES_PER_SQUARE=3 to enable (or legacy CERES_AUG_FEATURES_PER_SQUARE=3).
+# piece-one-hot information. V3 layout (post-2026-06-01 cleanup) exposes 4 channels —
+# tactical-motif features that earned their place via ablation:
+#   [0]=mobility            (pseudo-legal moves per piece)
+#   [1]=defender_count      (same-color attackers of piece)
+#   [2]=is_pinned           (boolean: piece pinned to own king by opp slider)
+#   [3]=is_threatened       (boolean: attacked by strictly-lower-value opp piece)
+# When > 0, the dataset's squares tensor is widened by this many extra channels per
+# square and the embedding layer input dim grows correspondingly.
+# Toggle via env var: CERES_AUX_FEATURES_PER_SQUARE=4 (full V3) or =0 (legacy 137-channel).
+# Legacy CERES_AUG_FEATURES_PER_SQUARE also honored.
 # Read CERES_AUX_FEATURES_PER_SQUARE (preferred), fall back to legacy CERES_AUG_FEATURES_PER_SQUARE
 NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
                                   os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)

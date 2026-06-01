@@ -30,13 +30,16 @@ namespace CeresTrain.Tasks
 {
   /// <summary>
   /// In-place upgrade of V2 TPG shards (137 bytes/square, 9378 bytes/record) to V3
-  /// (140 bytes/square, 9570 bytes/record). Writes the 3 augmented-input-feature bytes
-  /// per square (our_attackers / opp_attackers / shifted_net) derived from the piece
-  /// placement already present in the V2 record.
+  /// (141 bytes/square, 9634 bytes/record). Writes 4 auxiliary-input-feature bytes per
+  /// square derived from the piece placement already present in the V2 record:
+  ///   [0] mobility            — pseudo-legal move count of piece on square
+  ///   [1] defender_count      — same-color attackers of piece on square
+  ///   [2] is_pinned           — boolean, piece pinned to its king by opp slider
+  ///   [3] is_threatened       — boolean, attacked by opp piece of strictly lower value
   ///
   /// Crucially: this is a BYTE-LEVEL UPGRADE — no re-labeling, no re-scoring. The
   /// existing labels, policy targets, value targets, history, etc. are preserved
-  /// untouched. Only the 3 new aug bytes per square (totaling 192 extra bytes per
+  /// untouched. Only the 4 new aux bytes per square (totaling 256 extra bytes per
   /// record) are computed and inserted into the per-square slots.
   ///
   /// This is the recommended path when you have an expensive-to-regenerate V2 corpus
@@ -50,11 +53,11 @@ namespace CeresTrain.Tasks
   public static class TPGConvertV2ToV3
   {
     public const int V2_BYTES_PER_POS = 9378;
-    public const int V3_BYTES_PER_POS = 9570;
+    public const int V3_BYTES_PER_POS = 9634;
     public const int HEADER_BYTES = 610;          // BYTES_PER_POS - 64 * BYTES_PER_SQUARE_RECORD (same in both V2/V3)
     public const int SQ_BYTES_V2 = 137;
-    public const int SQ_BYTES_V3 = 140;
-    public const int NUM_AUG_BYTES = 3;
+    public const int SQ_BYTES_V3 = 141;
+    public const int NUM_AUX_BYTES = 4;
 
     /// <summary>
     /// Upgrade a single V2 .zst shard to V3 .zst. Streams through the file in chunks so
@@ -121,35 +124,42 @@ namespace CeresTrain.Tasks
     /// In-record byte-level upgrade. Spec:
     ///   - bytes [0 .. HEADER_BYTES)               → copy unchanged
     ///   - bytes [HEADER_BYTES .. HEADER_BYTES + 64*137) (V2 squares, contiguous)
-    ///     → for each of 64 squares: copy 137 V2 bytes + append 3 aug bytes
-    /// Total V3 layout: HEADER_BYTES + 64 * 140 = 610 + 8960 = 9570
+    ///     → for each of 64 squares: copy 137 V2 bytes + append 4 aux bytes
+    /// Total V3 layout: HEADER_BYTES + 64 * 141 = 610 + 9024 = 9634
+    ///
+    /// 4 aux channels per square (matches Ceres TPGSquareRecord.WritePosPieces exactly):
+    ///   [0] mobility        — by ComputeExtendedFromTpgSquareBytes
+    ///   [1] defender_count  — by ComputeExtendedFromTpgSquareBytes
+    ///   [2] is_pinned       — by ComputeExtendedFromTpgSquareBytes
+    ///   [3] is_threatened   — by ComputeExtendedFromTpgSquareBytes
     /// </summary>
     private static void UpgradeOnePosition(byte[] v2Buf, int v2Off, byte[] v3Buf, int v3Off)
     {
       // Copy pre-square header (610 bytes) unchanged.
       Buffer.BlockCopy(v2Buf, v2Off, v3Buf, v3Off, HEADER_BYTES);
 
-      // Compute aug bytes from the V2 square block (PerSquareAttacks works on raw bytes).
+      // Compute all 4 aux channels from the V2 square block in one pass.
+      // (attacker spans are computed internally but not written — defender_count needs them.)
       ReadOnlySpan<byte> v2Squares = new ReadOnlySpan<byte>(v2Buf, v2Off + HEADER_BYTES, 64 * SQ_BYTES_V2);
-      Span<byte> ourAtt = stackalloc byte[64];
-      Span<byte> oppAtt = stackalloc byte[64];
-      PerSquareAttacks.ComputeFromTpgSquareBytes(v2Squares, ourAtt, oppAtt);
+      Span<byte> ourAtt        = stackalloc byte[64];
+      Span<byte> oppAtt        = stackalloc byte[64];
+      Span<byte> mobility      = stackalloc byte[64];
+      Span<byte> defenderCount = stackalloc byte[64];
+      Span<byte> isPinned      = stackalloc byte[64];
+      Span<byte> isThreatened  = stackalloc byte[64];
+      PerSquareAttacks.ComputeExtendedFromTpgSquareBytes(v2Squares,
+        ourAtt, oppAtt, mobility, defenderCount, isPinned, isThreatened);
 
-      // For each square: copy 137 base bytes + write 3 aug bytes in slot [137..140).
-      // V3 byte encoding (matches Ceres TPGSquareRecord.WritePosPieces exactly):
-      //   our_byte = count * 100 / 8
-      //   opp_byte = count * 100 / 8
-      //   net_byte = (our - opp + 8) * 100 / 16
+      // For each square: copy 137 base bytes + write 4 aux bytes in slot [137..141).
       for (int sq = 0; sq < 64; sq++)
       {
         int v2SqOff = v2Off + HEADER_BYTES + sq * SQ_BYTES_V2;
         int v3SqOff = v3Off + HEADER_BYTES + sq * SQ_BYTES_V3;
         Buffer.BlockCopy(v2Buf, v2SqOff, v3Buf, v3SqOff, SQ_BYTES_V2);
-        int ourCount = ourAtt[sq];
-        int oppCount = oppAtt[sq];
-        v3Buf[v3SqOff + SQ_BYTES_V2 + 0] = (byte)(ourCount * 100 / 8);
-        v3Buf[v3SqOff + SQ_BYTES_V2 + 1] = (byte)(oppCount * 100 / 8);
-        v3Buf[v3SqOff + SQ_BYTES_V2 + 2] = (byte)((ourCount - oppCount + 8) * 100 / 16);
+        v3Buf[v3SqOff + SQ_BYTES_V2 + 0] = mobility[sq];
+        v3Buf[v3SqOff + SQ_BYTES_V2 + 1] = defenderCount[sq];
+        v3Buf[v3SqOff + SQ_BYTES_V2 + 2] = isPinned[sq];
+        v3Buf[v3SqOff + SQ_BYTES_V2 + 3] = isThreatened[sq];
       }
     }
 
