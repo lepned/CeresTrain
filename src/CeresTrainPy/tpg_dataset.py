@@ -92,7 +92,7 @@ if _NUM_AUX_FEATURES_PER_SQUARE > 0:
     print(f'[tpg_dataset] AUX_FEATURES enabled: {_NUM_AUX_FEATURES_PER_SQUARE} channels '
           f'at INDICES {_AUX_CHANNEL_INDICES} (non-default selection)')
   else:
-    print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} channels per square via aux_features.compute_aux_features_batch')
+    print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} baked V3 aux channels per square (read directly from the TPG record, no recompute)')
 
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
