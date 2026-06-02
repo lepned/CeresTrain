@@ -53,6 +53,60 @@ def _maybe_wrap_smolgen_lora(layer):
     n = int(os.environ.get("CERES_LORA_SMOLGEN_RANK_DIV", "0") or "0")
     return LoRALinear(layer, n, True) if n > 0 else layer
 
+class SmolgenPerLayerDelta(torch.nn.Module):
+  """Per-layer low-rank zero-init delta added on top of the shared
+  smolgenPrepLayer output.
+
+  Variant A of the per-layer mini-smolgen experiment: the shared
+  smolgenPrepLayer (the one architectural "concentration" point in the
+  otherwise per-layer smolgen pipeline) is kept as-is; each layer additionally
+  produces a small low-rank per-head correction `A_l @ B_l^T` from its own
+  pre-prep per-head state, which is added to the prep-layer output before
+  reshape.
+
+  Zero-init: both W_A and W_B are zero-initialized so the delta is exactly 0
+  at step 0 → model is bit-identical to baseline smolgen at init. Deltas grow
+  from training signal if and only if per-layer output adaptation is useful;
+  otherwise they remain near zero and the model degenerates to baseline.
+
+  Parameters:
+    sm_per_head_dim: per-head intermediate dim feeding smolgenPrepLayer
+                     (smolgen_intermediate_dim // smolgen_head_divisor).
+    num_heads: attention heads (delta is produced per head).
+    num_tokens: square count (64 for chess).
+    rank: low-rank factorization rank of the [64, 64] per-head delta.
+    bottleneck: per-head compression dim before A/B projection.
+  """
+  def __init__(self, sm_per_head_dim, num_heads, num_tokens=64, rank=4, bottleneck=32):
+    super().__init__()
+    self.num_heads = num_heads
+    self.num_tokens = num_tokens
+    self.rank = rank
+    # Per-head compression (weights shared across heads, applied to each
+    # head's intermediate state independently).
+    self.W_compress = torch.nn.Linear(sm_per_head_dim, bottleneck, bias=False)
+    self.W_A = torch.nn.Linear(bottleneck, num_tokens * rank, bias=False)
+    self.W_B = torch.nn.Linear(bottleneck, num_tokens * rank, bias=False)
+    # LoRA-style init: zero-init only W_B; leave W_A and W_compress at
+    # standard init. delta = (W_A·h) @ (W_B·h)^T = ... @ 0 = 0 at step 0
+    # (bit-identical to baseline), but gradient flows: dL/dW_B is non-zero
+    # because W_A is non-zero. Once W_B starts to move, W_A also receives
+    # non-zero gradient. Double zero-init creates a dead-unit (neither
+    # receives gradient) — that bug was caught by the post-train diagnostic
+    # showing exact zeros on both matrices across all layers.
+    torch.nn.init.xavier_uniform_(self.W_compress.weight)
+    torch.nn.init.xavier_uniform_(self.W_A.weight)
+    torch.nn.init.zeros_(self.W_B.weight)
+
+  def forward(self, smolgen_per_head_state):
+    # smolgen_per_head_state: [B, num_heads, sm_per_head_dim]
+    h = self.W_compress(smolgen_per_head_state)                              # [B, H, bottleneck]
+    A = self.W_A(h).reshape(-1, self.num_heads, self.num_tokens, self.rank)  # [B, H, T, r]
+    B = self.W_B(h).reshape(-1, self.num_heads, self.num_tokens, self.rank)  # [B, H, T, r]
+    delta = torch.matmul(A, B.transpose(-1, -2))                             # [B, H, T, T]
+    return delta
+
+
 class LinearWrapper:
   def __init__(self, linear_layer):
     self._layer = linear_layer
@@ -92,9 +146,10 @@ class DotProductAttention(torch.nn.Module):
                softcap_cutoff : float = 0, 
                use_qk_norm : bool = False,
                attention_multiplier : int = 1,
-               smolgen_per_square_dim : int = 0, smolgen_intermediate_dim : int = 0, 
+               smolgen_per_square_dim : int = 0, smolgen_intermediate_dim : int = 0,
                smolgen_head_divisor : int = 1, smolgenPrepLayer = None,
-               smolgen_activation_type : str = 'None', 
+               smolgen_activation_type : str = 'None',
+               smolgen_delta_rank : int = 0,
                use_rpe : bool = False,
                use_rpe_v : bool = True,
                rpe_factor_shared  = None,
@@ -102,7 +157,8 @@ class DotProductAttention(torch.nn.Module):
                use_nonlinear_attention: bool = False,
                use_rope : bool = False,
                test : bool = False,
-               layer_num : int = None) -> None:
+               layer_num : int = None,
+               use_diff_attention : bool = False) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -126,7 +182,8 @@ class DotProductAttention(torch.nn.Module):
     self.softcap_cutoff = softcap_cutoff
     self.layer_num = layer_num
 
-    assert self.use_smolgen + self.use_rpe + self.use_rel_bias + self.use_rope <= 1, "only one of smolgen, rpe, rel_bias, and rope can be enabled"
+    # smolgen + RoPE coexistence allowed: RoPE rotates Q/K before scores;
+    # smolgen adds learned bias to scores after. Compose cleanly (verified 2026-05-22).
 
     if self.use_rope:
       from rope import precompute_rope_freqs
@@ -159,8 +216,25 @@ class DotProductAttention(torch.nn.Module):
       assert not self.use_nonlinear_attention, "nonlinear_attention not allowed when not use_qkv"
 
     # Fused Q, K, and V linear projection for improved efficiency.
-    self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
+    # DiffAttention V2 (Microsoft Apr 2026): doubles Q (Q1, Q2 split) while KV
+    # stays single — produces two attention maps, subtracts with per-token
+    # sigmoid(lambda) gate to cancel attention noise.
+    self.use_diff_attention = use_diff_attention
+    if self.use_diff_attention:
+      assert self.use_qkv, "DiffAttention requires use_qkv"
+      self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
+    else:
+      self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
     self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS), self.layer_num)
+    if self.use_diff_attention:
+      # Per-token per-head lambda gate. Sigmoid output gives lambda in [0,1].
+      # Bias init -2.2 → sigmoid ≈ 0.1 at start → small differential subtraction
+      # initially (~pure attn1), training can grow lambda as the noise-cancellation
+      # signal becomes useful. Zero-init weight keeps lambda input-independent at
+      # init, layer-dependent via the bias only.
+      self.lambda_proj = torch.nn.Linear(self.d_model, num_attention_heads, bias=True)
+      torch.nn.init.zeros_(self.lambda_proj.weight)
+      torch.nn.init.constant_(self.lambda_proj.bias, -2.2)
     self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
     if self.use_nonlinear_attention:
@@ -168,6 +242,9 @@ class DotProductAttention(torch.nn.Module):
       self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
       self.k2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
       self.v2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
+      if self.use_diff_attention:
+        # Second Q projection for the differential head, mirrors q2.
+        self.q2b = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
 
     if self.use_qk_norm:
       # extra layernorm for enahnced training stability
@@ -202,7 +279,20 @@ class DotProductAttention(torch.nn.Module):
       self.ln1 = make_norm(norm_type, smolgen_intermediate_dim, eps=layernorm_eps)
       self.sm3 = _maybe_wrap_smolgen_lora(torch.nn.Linear(smolgen_intermediate_dim, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor))
       self.ln2 = make_norm(norm_type, num_attention_heads * smolgen_intermediate_dim // smolgen_head_divisor, eps=layernorm_eps)
-      
+
+    # Variant A: per-layer low-rank zero-init delta added to the shared
+    # smolgenPrepLayer output. Only active when smolgen is on AND rank > 0.
+    self.use_smolgen_delta = self.use_smolgen and smolgen_delta_rank > 0
+    if self.use_smolgen_delta:
+      self.smolgen_delta = SmolgenPerLayerDelta(
+        sm_per_head_dim=smolgen_intermediate_dim // smolgen_head_divisor,
+        num_heads=num_attention_heads,
+        num_tokens=num_tokens_q,
+        rank=smolgen_delta_rank,
+        bottleneck=32,
+      )
+
+
 
   @property
   def smolgenPrepLayer(self):
@@ -220,6 +310,43 @@ class DotProductAttention(torch.nn.Module):
     return score
 
  
+  def sdp_diff(self, Q1:torch.Tensor, Q2:torch.Tensor, K:torch.Tensor, V:torch.Tensor,
+               smolgen:torch.Tensor, x:torch.Tensor,
+               piece_relation_bias:torch.Tensor = None):
+    """DiffAttention V2 (Microsoft Apr 2026): two attention maps from Q1 / Q2,
+    differential subtraction with per-token sigmoid(lambda) gate cancels
+    attention noise. Smolgen bias added to BOTH attention maps (Option A) —
+    both branches inherit the same per-position smolgen prior; the differential
+    cancels Q1-vs-Q2 noise on top of it. Softcap unsupported in this path
+    (assert in __init__ if needed)."""
+    # Two attention score matrices using the same K
+    scores1 = torch.matmul(Q1, K.transpose(2, 3)) / math.sqrt(self.d_k)
+    scores2 = torch.matmul(Q2, K.transpose(2, 3)) / math.sqrt(self.d_k)
+
+    # Smolgen bias added to BOTH branches (Option A)
+    if smolgen is not None:
+      assert self.num_tokens_q == self.num_tokens_kv, "use_smolgen requires equal number of tokens for Q and K"
+      scores1 = scores1 + smolgen
+      scores2 = scores2 + smolgen
+
+    # Piece-relation bias also added to both (same rationale)
+    if piece_relation_bias is not None:
+      prb = piece_relation_bias.to(scores1.dtype)
+      scores1 = scores1 + prb
+      scores2 = scores2 + prb
+
+    attn1 = self.softmax(scores1)
+    attn2 = self.softmax(scores2)
+
+    # Per-token per-head lambda gate (sigmoid). x: [B, T, d_model].
+    # lambda_proj outputs [B, T, H] → reshape to [B, H, T, 1] to broadcast over K-dim.
+    lambda_t = torch.sigmoid(self.lambda_proj(x))           # [B, T, H]
+    lambda_t = lambda_t.permute(0, 2, 1).unsqueeze(-1)      # [B, H, T, 1]
+
+    attn = attn1 - lambda_t * attn2                          # [B, H, T_q, T_k]
+    H = torch.matmul(attn, V)
+    return H, attn
+
   def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None): # -> torch.Tensor, torch.Tensor:
     # Note that scaling could be done separately on Q and K to possibly improve stability. See:
     #   https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/118
@@ -291,9 +418,19 @@ class DotProductAttention(torch.nn.Module):
     smolgen = self.ln2(smolgen)
 
     smolgen = smolgen.reshape(-1, self.num_heads, self.smolgen_intermediate_dim // self.smolgen_head_divisor)
-    smolgen = self.smolgenPrepLayer(smolgen)
 
+    # Variant A: capture the per-head pre-prep state to feed the delta.
+    # Compute delta BEFORE smolgenPrepLayer so both branches use the same
+    # intermediate state. Branch is a no-op when delta is disabled.
+    if self.use_smolgen_delta:
+      delta = self.smolgen_delta(smolgen)  # [B, H, T, T]
+
+    smolgen = self.smolgenPrepLayer(smolgen)
     smolgen = smolgen.reshape(-1, self.num_heads, self.num_tokens_q, self.num_tokens_q)
+
+    if self.use_smolgen_delta:
+      smolgen = smolgen + delta
+
     return smolgen
 
 
@@ -312,22 +449,41 @@ class DotProductAttention(torch.nn.Module):
       V = qkv.reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier)
       V = V.permute(0, 2, 1, 3)
     elif not self.use_nonlinear_attention:
-      # Split apart Q, K, V (with heads on the left)
-      qkv = qkv.reshape(batch_size, -1, self.num_heads, 3*self.d_k * self.attention_multiplier)
-      qkv = qkv.permute(0, 2, 1, 3)
-      Q, K, V = qkv.chunk(3, dim=-1)    
+      if self.use_diff_attention:
+        # DiffAttention V2: 4-way split (Q1, Q2, K, V); Q is doubled.
+        qkv = qkv.reshape(batch_size, -1, self.num_heads, 4*self.d_k * self.attention_multiplier)
+        qkv = qkv.permute(0, 2, 1, 3)
+        Q1, Q2, K, V = qkv.chunk(4, dim=-1)
+        Q = (Q1, Q2)  # pass as tuple; sdp_diff will unpack
+      else:
+        # Split apart Q, K, V (with heads on the left)
+        qkv = qkv.reshape(batch_size, -1, self.num_heads, 3*self.d_k * self.attention_multiplier)
+        qkv = qkv.permute(0, 2, 1, 3)
+        Q, K, V = qkv.chunk(3, dim=-1)
     else:
       # Idea of introducing nonlinearity in the QKV was proposed in:
       #   "Neural Attention : Enhancing QKV Calculation in Self-Attention Mechanism with Neural Networks"
       #   Muhan Zhang, 2023
-      qkv = qkv.reshape(batch_size, -1, 3, self.d_model * self.attention_multiplier)
-      qkv = self.qkvLN(qkv)
-      qkv = torch.nn.functional.mish(qkv)
-      q, k, v = torch.unbind(qkv, dim=-2)
+      if self.use_diff_attention:
+        # 4-way split: q1, q2, k, v through shared LN+Mish, then per-stream Linear projections.
+        qkv = qkv.reshape(batch_size, -1, 4, self.d_model * self.attention_multiplier)
+        qkv = self.qkvLN(qkv)
+        qkv = torch.nn.functional.mish(qkv)
+        q1, q2, k, v = torch.unbind(qkv, dim=-2)
+        Q1 = self.q2 (q1).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        Q2 = self.q2b(q2).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        K  = self.k2 (k ).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        V  = self.v2 (v ).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        Q = (Q1, Q2)
+      else:
+        qkv = qkv.reshape(batch_size, -1, 3, self.d_model * self.attention_multiplier)
+        qkv = self.qkvLN(qkv)
+        qkv = torch.nn.functional.mish(qkv)
+        q, k, v = torch.unbind(qkv, dim=-2)
 
-      Q = self.q2(q).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
-      K = self.k2(k).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
-      V = self.v2(v).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)  
+        Q = self.q2(q).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        K = self.k2(k).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        V = self.v2(v).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
 
     if self.use_qk_norm:
       Q = self.qLN(Q)
@@ -342,7 +498,11 @@ class DotProductAttention(torch.nn.Module):
 
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
-      H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias)
+      if self.use_diff_attention:
+        Q1, Q2 = Q  # unpack tuple
+        H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
+      else:
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias)
     else:
       # Always route through the explicit Q·Kᵀ → softmax → ·V form. The previous
       # branch called torch.nn.functional.scaled_dot_product_attention, which
@@ -353,7 +513,11 @@ class DotProductAttention(torch.nn.Module):
       # The explicit form is mathematically equivalent (no mask, no dropout),
       # exports cleanly to opset 23 as MatMul→Softmax→MatMul, and also gains
       # softcap support that the F.sdpa path was lacking.
-      H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
+      if self.use_diff_attention:
+        Q1, Q2 = Q  # unpack tuple
+        H_cat, A = self.sdp_diff(Q1, Q2, K, V, None, qkv_x, piece_relation_bias=piece_relation_bias)
+      else:
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)

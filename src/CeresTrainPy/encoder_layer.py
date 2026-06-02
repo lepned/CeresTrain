@@ -29,11 +29,13 @@ class EncoderLayer(torch.nn.Module):
                use_qkv : bool, softcap_cutoff: float, use_qk_norm : bool, 
                 num_attention_heads: int,  ffn_activation_type : str, norm_type : str, layernorm_eps : float = 1e-5,
                 use_global : bool = False,
-                smolgen_per_square_dim : int = 0, smolgen_intermediate_dim : int = 0, 
+                smolgen_per_square_dim : int = 0, smolgen_intermediate_dim : int = 0,
                 smolgen_head_divisor : int = 1, smolgenPrepLayer = None,
                 smolgen_activation_type : str = 'None',
-                attention_multiplier : int = 1, 
+                smolgen_delta_rank : int = 0,
+                attention_multiplier : int = 1,
                 smoe_mode : str = 'None', smoe_num_experts : int = 0,
+                smoe_expert_input_dim : int = 0,
                 alpha : float = 1, layerNum : int = 0, dropout_rate : float = 0,
                 use_rpe : bool = False, 
                 use_rpe_v : bool = True,
@@ -42,6 +44,7 @@ class EncoderLayer(torch.nn.Module):
                 use_nonlinear_attention: bool = False,
                 use_rope: bool = False,
                 dual_attention_mode : str = 'None', test : bool = False,
+                use_diff_attention : bool = False,
                 tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
                 tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
                 pre_norm : bool = False):
@@ -69,7 +72,9 @@ class EncoderLayer(torch.nn.Module):
     self.attention = DotProductAttention(num_tokens_q, num_tokens_kv,  num_attention_heads, self.dim_per_head, norm_type, layernorm_eps,
                                          use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier,
                                          smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
-                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum)
+                                         smolgen_delta_rank,
+                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum,
+                                         use_diff_attention=use_diff_attention)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
@@ -97,7 +102,8 @@ class EncoderLayer(torch.nn.Module):
       self.moe = SoftMoEBatchedDual(dim=hidden_size, ffn_dim=ffn_hidden_size,
                                     num_experts=smoe_num_experts, slots_per_expert=SMOE_SLOTS_PER_EXPERT,
                                     use_normalization=SMOE_USE_NORMALIZATION, only_second_layer=SMOE_ONLY_SECOND_LAYER,
-                                    bias = SMOE_USE_BIAS) 
+                                    bias = SMOE_USE_BIAS,
+                                    expert_input_dim = smoe_expert_input_dim)
     else:
       self.moe = None
 

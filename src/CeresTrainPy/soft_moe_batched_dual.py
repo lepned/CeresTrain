@@ -54,7 +54,15 @@ class SoftMoEBatchedDual(nn.Module):
         slots_per_expert: int,
         use_normalization : bool,
         only_second_layer : bool,
-        bias: bool = True):
+        bias: bool = True,
+        expert_input_dim: int = 0):
+        """
+        expert_input_dim: when > 0 AND only_second_layer=True, insert a shared
+        pre-projection that maps inputs from ffn_dim to expert_input_dim BEFORE
+        phi routing and expert processing. Enables fine-grained MoE (more,
+        narrower experts) at controlled total param budget. 0 disables (default
+        behaviour: experts see full ffn_dim).
+        """
 
         super().__init__()
         self.dim = dim
@@ -65,13 +73,26 @@ class SoftMoEBatchedDual(nn.Module):
         self.only_second_layer = only_second_layer
         self.bias = bias
 
-        dim_dispatch_in = ffn_dim if only_second_layer else dim
+        # Fine-grained MoE support: optional pre-projection narrows the dim that
+        # phi routes over AND that experts process. Only meaningful in
+        # only_second_layer mode (replaces FFN's second linear).
+        self.use_pre_projection = (expert_input_dim > 0) and only_second_layer and (expert_input_dim != ffn_dim)
+        if self.use_pre_projection:
+            self.expert_input_dim = expert_input_dim
+            self.pre_proj = nn.Linear(ffn_dim, expert_input_dim, bias=False)
+        else:
+            self.expert_input_dim = ffn_dim
+
+        dim_dispatch_in = self.expert_input_dim if only_second_layer else dim
         self.phi = nn.Parameter(torch.empty((dim_dispatch_in, num_experts, slots_per_expert)))
 
         if not self.only_second_layer:
           self.experts1 = MultiExpertLayer(dim, ffn_dim, num_experts, bias)
-        
-        self.experts2 = MultiExpertLayer(ffn_dim, dim, num_experts, bias)
+
+        # experts2 input dim follows expert_input_dim when fine-grained,
+        # else original ffn_dim (back-compat).
+        experts2_in = self.expert_input_dim if only_second_layer else ffn_dim
+        self.experts2 = MultiExpertLayer(experts2_in, dim, num_experts, bias)
 
         if self.use_normalization:
           # See section 2.3 of the Soft MoE paper
@@ -113,12 +134,17 @@ class SoftMoEBatchedDual(nn.Module):
 #        elif x.ndim != 3:
 #            raise ValueError(f"Expected input to have 3 dimensions, but got {x.ndim}.")
 
+        # Fine-grained pre-projection: narrow x from ffn_dim to expert_input_dim
+        # before routing + expert processing (only_second_layer mode).
+        if self.use_pre_projection:
+            x = self.pre_proj(x)
+
         if self.use_normalization:
             xPrepared = self.normX(x)
             phiPrepared = self.normPhi(self.phi)
         else:
             xPrepared = x
-            phiPrepared = self.phi   
+            phiPrepared = self.phi
 
         logits = einsum(xPrepared, phiPrepared, "b m d, d n p -> b m n p")
 
