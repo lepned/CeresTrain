@@ -23,14 +23,21 @@ class RMSNorm(torch.nn.Module):
     self.scale = torch.nn.Parameter(torch.ones(d_model))
 
   def forward(self, x : Tensor) -> Tensor:
-    # Use the PyTorch built-in so ONNX export emits a single fused
-    # LayerNormalization / RMSNormalization op (opset 17+) instead of the
-    # decomposed Pow→Mean→Sqrt→Div→Mul chain. TRT recognises the fused op
-    # and applies its internal FP32 fallback to only the reduction, leaving
-    # the surrounding ops in FP16 — avoiding the 6-op-per-norm FP32 cost
-    # that TensorRTWrapper's structural marker currently has to force.
-    # Mathematically identical to the explicit form (same scale, same eps).
-    return torch.nn.functional.rms_norm(x, (self.d_model,), self.scale, self.eps)
+    # Explicit decomposed RMSNorm (Pow→Mean→Add→rsqrt→Mul→Mul). Mathematically
+    # identical to F.rms_norm (same scale, same eps).
+    #
+    # We deliberately do NOT use torch.nn.functional.rms_norm here: that lowers
+    # to aten._fused_rms_norm, which ONNX export emits as a single fused opset-23
+    # RMSNormalization op. TensorRT runs that fused op in PURE FP16 — it does NOT
+    # auto-promote the mean(x^2) reduction to FP32 — so the unnormalized residual
+    # stream (|x| can exceed 256) overflows FP16 inside the norm, producing
+    # NaN/Inf that poisons the value head (garbage WDL) while the argmax policy
+    # still looks plausible. The decomposed chain below is recognised and forced
+    # FP32 by TensorRTWrapper's structural scale-constant marker, matching how
+    # every working production net (opset≤18, decomposed norms) behaves.
+    var = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(var + self.eps)
+    return x * self.scale
 
 
 def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Module:
