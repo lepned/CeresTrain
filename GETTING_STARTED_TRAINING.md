@@ -190,10 +190,22 @@ config's index 0 then maps to your chosen physical GPU.
 
 Two ways. Pick whichever works on your machine.
 
+> **⚠️ Required env var for V3-aux nets: `CERES_AUX_FEATURES_PER_SQUARE`.**
+> If the net consumes the V3 auxiliary input features (the 4 tactical channels →
+> 141-byte squares), you **must** set `CERES_AUX_FEATURES_PER_SQUARE=4` in the
+> launch environment (both methods below). It is read at import by `config.py`
+> (model input embedding width) and `tpg_dataset.py` (channel slicing), and must
+> be present in the parent env so DataLoader workers inherit it. Omitting it
+> builds a legacy **137**-channel model: a from-scratch run silently trains the
+> wrong width, and **resuming an aux-trained checkpoint fails immediately** with
+> `size mismatch for embedding_layer.weight: copying [256, 141] ... current [256, 137]`.
+> Set `=0` only to deliberately reproduce a legacy 137-channel net on a V3 corpus.
+
 ### A. Direct Python via WSL (no Spectre UI, easier to script)
 
 ```bash
 wsl bash -c "cd /mnt/c/Users/<you>/source/repos/CeresTrain/src/CeresTrainPy && \
+  export CERES_AUX_FEATURES_PER_SQUARE=4 && \
   nohup python3 -u train.py \
     /mnt/f/cout/configs/c1_256_12_v1_off_pt3 \
     /mnt/f/cout \
@@ -234,8 +246,16 @@ source of truth.)
 Each training step logs a line like:
 
 ```
-TRAIN: <positions>, <total_loss>, <value_loss>, <policy_loss>, <policy_acc%>, <value_acc%>, ..., <lr>
+TRAIN: <positions>, <total_loss>, <value_loss>, <policy_loss>, <value_acc%>, <policy_acc%>, ..., <lr>
 ```
+
+**Field-order quirk:** within each pair, the **value** metric comes *before* the
+policy metric — `value_loss, policy_loss` then `value_acc, policy_acc`. It is easy
+to misread as policy-first (the more natural English ordering), which silently
+inverts every diagnostic — e.g. value_acc (~90%, near-deterministic WDL targets)
+looks like a great "policy" number while the real policy top-1 (~53%) hides in the
+value slot. The C# parser (`CeresTrainProgressLoggingLine.cs`) and `train.py:982`
+are the source of truth for the exact order.
 
 Tail it:
 
