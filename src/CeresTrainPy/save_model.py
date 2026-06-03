@@ -239,13 +239,19 @@ def save_model(NAME : str,
           # can raise `axes_input_to_attribute.h:68 adapt: Assertion node->hasAttribute(kaxes)`
           # in onnx's C version_converter and abort the export, losing the .onnx
           # pointer file (the .onnx.data sidecar may still be written). Ceres
-          # consumes opset-18 ONNX fine, so we target 18 directly.
+          # consumes opset-18 ONNX fine, so we DEFAULT to 18: it keeps RMSNorm
+          # DECOMPOSED (Pow/ReduceMean/rsqrt/Mul), which Ceres TensorRT-Native
+          # handles safely. Opset 23 emits a single FUSED RMSNormalization op that
+          # TRT-Native runs in pure FP16 and overflows the unnormalized residual
+          # stream -> garbage value head (and a corrupted trunk). Override with
+          # CERES_ONNX_OPSET=23 ONLY when the backend FP32 fused-norm marker .dll
+          # is deployed (that path keeps fused-norm NPS).
           torch.onnx.export(_export_model,
                             _export_inputs,
                             SAVE_FULL_NAME,
                             do_constant_folding=True,
                             export_params=True,
-                            opset_version=int(os.environ.get('CERES_ONNX_OPSET', '23')),
+                            opset_version=int(os.environ.get('CERES_ONNX_OPSET', '18')),
                             input_names = _input_names,
                             output_names = head_output_names,
                             dynamic_axes=_output_axes_single)
