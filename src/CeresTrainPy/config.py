@@ -30,11 +30,17 @@ NUM_INPUT_BYTES_PER_SQUARE = 137 # Raw input width per token
 #   [3]=is_threatened       (boolean: attacked by strictly-lower-value opp piece)
 # When > 0, the dataset's squares tensor is widened by this many extra channels per
 # square and the embedding layer input dim grows correspondingly.
-# Toggle via env var: CERES_AUX_FEATURES_PER_SQUARE=4 (full V3) or =0 (legacy 137-channel).
-# Legacy CERES_AUG_FEATURES_PER_SQUARE also honored.
-# Read CERES_AUX_FEATURES_PER_SQUARE (preferred), fall back to legacy CERES_AUG_FEATURES_PER_SQUARE
+# DEFAULTS TO 4 (full V3). The TPG reader (tpg_dataset.py) is V3-only — every
+# record carries 141 bytes/square = 137 base + these 4 baked aux channels — so a
+# model that consumes them is the right default for all current data. Overriding
+# to 0 builds a legacy 137-channel model that IGNORES the aux features (use only
+# for deliberate no-aux ablations or to resume a pre-aux 137-channel net).
+# Toggle via env var: CERES_AUX_FEATURES_PER_SQUARE=4 (full V3, default) / =0 (legacy)
+# / =N to use the first N aux channels. Legacy CERES_AUG_FEATURES_PER_SQUARE also honored.
+# This is the SINGLE SOURCE OF TRUTH — tpg_dataset.py imports this value rather than
+# re-reading the env, so the model width and data width can never disagree.
 NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
-                                  os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)
+                                  os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '4')) or 4)
 TOTAL_INPUT_FEATURES_PER_SQUARE = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUX_FEATURES_PER_SQUARE
 if NUM_AUX_FEATURES_PER_SQUARE > 0:
   print(f'[config] AUX_FEATURES enabled: +{NUM_AUX_FEATURES_PER_SQUARE} channels per square, '

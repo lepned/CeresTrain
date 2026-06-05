@@ -70,10 +70,12 @@ def try_shuffle(file_list):
 
 MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored (TPGRecord.MAX_MOVES)
 
-# Read at module import so the worker processes inherit it. Default 0 (disabled);
-# set CERES_AUX_FEATURES_PER_SQUARE=3 to enable the auxiliary-features path.
-_NUM_AUX_FEATURES_PER_SQUARE = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE',
-                                          os.environ.get('CERES_AUG_FEATURES_PER_SQUARE', '0')) or 0)
+# SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
+# re-reading the env here. This guarantees the data width (how many aux channels
+# we keep per square) always matches the model width (config.py's embedding sizing).
+# Defaults to 4 (full V3); override with CERES_AUX_FEATURES_PER_SQUARE. Resolved at
+# module import so spawned worker processes inherit the same value.
+from config import NUM_AUX_FEATURES_PER_SQUARE as _NUM_AUX_FEATURES_PER_SQUARE
 
 # Optional: pick specific aux-channel INDICES (1-based-into-aux-slice) instead of
 # the default "first N channels". Comma-separated; count must match

@@ -518,7 +518,29 @@ def Train():
   
   if config.Opt_CheckpointResumeFromFileName is not None:
     loaded = torch.load(config.Opt_CheckpointResumeFromFileName, map_location=device)
-   
+
+    # AUX-WIDTH GUARD: the checkpoint's embedding layer encodes how many input
+    # features (hence aux channels) it was trained with. If that disagrees with the
+    # model we just built, the strict=False resume paths below would SILENTLY skip
+    # the embedding and leave it randomly initialized (a garbage net, no error).
+    # Fail loudly here instead, naming the exact env var to set. (Relevant now that
+    # CERES_AUX_FEATURES_PER_SQUARE defaults to 4: resuming a legacy 137-channel net
+    # requires CERES_AUX_FEATURES_PER_SQUARE=0.)
+    _ckpt_emb_w = loaded["model"].get("embedding_layer.weight", None)
+    if _ckpt_emb_w is not None:
+      _ckpt_in = _ckpt_emb_w.shape[1]
+      _model_in = model_nocompile.embedding_layer.weight.shape[1]
+      if _ckpt_in != _model_in:
+        _prior = config.NetDef_PriorStateDim
+        _ckpt_aux = _ckpt_in - NUM_INPUT_BYTES_PER_SQUARE - _prior
+        _model_aux = _model_in - NUM_INPUT_BYTES_PER_SQUARE - _prior
+        raise ValueError(
+          f"Aux-feature width mismatch on resume: checkpoint embedding expects "
+          f"{_ckpt_in} input features/square ({_ckpt_aux} aux), but this run built a model "
+          f"with {_model_in} ({_model_aux} aux). Set CERES_AUX_FEATURES_PER_SQUARE={_ckpt_aux} "
+          f"to match the checkpoint, then re-run. "
+          f"(checkpoint: {config.Opt_CheckpointResumeFromFileName})")
+
     # name adjustment sometimes needed for reload
     # loaded["model"] = {f'_orig_mod.{key}': value for key, value in loaded["model"].items()}
 
