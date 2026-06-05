@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from rms_norm import RMSNorm
 from derf_norm import DerfNorm
@@ -129,6 +130,60 @@ NAME = socket.gethostname() + "_" + os.path.basename(TRAINING_ID)
 accelerator = config.Exec_DeviceType.lower()
 devices = config.Exec_DeviceIDs if not config.Exec_ExportOnly else config.Exec_DeviceIDs[0]
 
+# ---------------------------------------------------------------------------
+# Distributed (multi-GPU) setup — OPT-IN via torchrun. When NOT launched under
+# torchrun, WORLD_SIZE is unset/1 and everything below runs EXACTLY as before:
+# one process, rank 0, world_size 1 (the long-standing single-GPU path).
+#
+#   Real multi-GPU :  torchrun --nproc_per_node=4 train.py <ID> <OUT>
+#   Single-GPU sim :  CERES_DDP_BACKEND=gloo torchrun --nproc_per_node=2 train.py <ID> <OUT>
+#                     (NCCL wants one GPU per rank and hangs if ranks share a
+#                      device, so the simulation uses the gloo CPU backend and
+#                      maps every rank onto cuda:0. Validates all DDP control
+#                      flow — grad all-reduce, no_sync accumulation, rank-0 save
+#                      gating, data sharding, global position counting — but
+#                      gives no speedup and needs N model copies to fit in VRAM.)
+#
+# Optimizer note: the Muon variant in muon.py updates each param from its local
+# .grad; DDP all-reduces (averages) grads across ranks BEFORE optimizer.step(),
+# so Muon sees the global-mean gradient — no double reduction (its
+# `import torch.distributed` is unused). AdEMAMixShampoo DOES call all_reduce
+# itself — review separately before running Shampoo under DDP.
+# ---------------------------------------------------------------------------
+def _setup_distributed():
+  ws = int(os.environ.get('WORLD_SIZE', '1') or 1)
+  if ws <= 1 or config.Exec_ExportOnly:
+    return False, 0, 0, 1
+  rank = int(os.environ.get('RANK', '0') or 0)
+  local_rank = int(os.environ.get('LOCAL_RANK', '0') or 0)
+  backend = os.environ.get('CERES_DDP_BACKEND', 'nccl')
+  dist.init_process_group(backend=backend, init_method='env://')
+  if torch.cuda.is_available():
+    gpu = local_rank if local_rank < torch.cuda.device_count() else 0
+    torch.cuda.set_device(gpu)
+  return True, rank, local_rank, ws
+
+IS_DISTRIBUTED, RANK, LOCAL_RANK, WORLD_SIZE = _setup_distributed()
+IS_MASTER = (RANK == 0)
+# GPU ordinal this rank trains on. Normally one GPU per rank (cuda:local_rank);
+# in the single-GPU simulation (more ranks than GPUs) every rank shares cuda:0.
+DDP_LOCAL_GPU = (LOCAL_RANK if (IS_DISTRIBUTED and torch.cuda.is_available()
+                                and LOCAL_RANK < torch.cuda.device_count()) else 0)
+if IS_DISTRIBUTED:
+  print(f"[ddp] rank={RANK}/{WORLD_SIZE} local_rank={LOCAL_RANK} gpu=cuda:{DDP_LOCAL_GPU} "
+        f"backend={os.environ.get('CERES_DDP_BACKEND','nccl')} master={IS_MASTER}", flush=True)
+
+
+class _NoOpWriter:
+  """Stand-in for SummaryWriter on non-master ranks: silently drops all logging
+  so only rank 0 writes tensorboard + console output. Prevents 4× duplicate
+  TRAIN lines that the C# CeresTrainProgressLoggingLine parser would choke on."""
+  def add_scalar(self, *a, **k): pass
+  def add_histogram(self, *a, **k): pass
+  def add_text(self, *a, **k): pass
+  def flush(self): pass
+  def close(self): pass
+
 BATCH_SIZE = config.Opt_BatchSizeBackwardPass
 
 # PreNorm now supported (encoder_layer.py forward branches on pre_norm flag,
@@ -199,6 +254,11 @@ last_logged_pos_num = 0
 def on_before_optimizer_step(writer, model, optimizer, pos_num):
     global last_logged_pos_num
 
+    # Only rank 0 logs grad/weight diagnostics. (calc_weight_update_ratio also
+    # retains a full extra copy of the params — no reason to pay that on 3 ranks.)
+    if not IS_MASTER:
+      return
+
     step = pos_num // BATCH_SIZE
 
     # Log only periodically.
@@ -246,8 +306,12 @@ def Train():
         "Use Exec_DataType='BFloat16' instead.")
 
   # Plain-PyTorch device + tensorboard setup. Replaces Lightning Fabric.
-  device = torch.device(f"{accelerator}:{devices[0]}" if accelerator != 'cpu' else 'cpu')
-  writer = SummaryWriter(os.path.join(OUTPUTS_DIR, 'tblogs', NAME))
+  if IS_DISTRIBUTED:
+    device = torch.device(f"cuda:{DDP_LOCAL_GPU}")
+  else:
+    device = torch.device(f"{accelerator}:{devices[0]}" if accelerator != 'cpu' else 'cpu')
+  # Only rank 0 writes tensorboard/console; other ranks get a silent no-op writer.
+  writer = SummaryWriter(os.path.join(OUTPUTS_DIR, 'tblogs', NAME)) if IS_MASTER else _NoOpWriter()
   # bf16-mixed: model weights are fp32, forward runs under autocast
   # bf16-pure : model weights are bf16, no autocast needed
   USE_AUTOCAST = (config.Exec_DataType == 'BFloat16')
@@ -441,11 +505,44 @@ def Train():
     del torchscript_model
 
        
-  # Move model to device. (Lightning's fabric.setup did this implicitly along with
-  # DDP wrapping; we are single-process so just .to(device).)
+  # Move model to device, then (multi-GPU only) wrap in DistributedDataParallel.
+  # The optimizer above was built from these same parameter tensors; DDP does NOT
+  # replace them (it only registers gradient-sync hooks), so the optimizer stays
+  # valid and optimizer.step() updates the same tensors DDP fills .grad on.
   model = model.to(device)
   if config.Exec_DataType == 'BFloat16Pure':
     model = model.to(torch.bfloat16)
+  if IS_DISTRIBUTED:
+    # Two DDP modes, chosen by the data layout:
+    #
+    #  * BOARDS_PER_BATCH==1 (single forward per backward): default mode with
+    #    find_unused_parameters=True. CeresNet has conditionally-used heads, and an
+    #    output that never reaches the loss would otherwise trip DDP's
+    #    "parameter ... did not receive grad" error. Set CERES_DDP_FIND_UNUSED=0 once
+    #    a config is verified to use every parameter (drops a per-step graph walk).
+    #
+    #  * BOARDS_PER_BATCH==4 (model() called 3-4× before ONE backward): the default
+    #    reducer mishandles multiple forwards per backward ("marked ready twice").
+    #    static_graph=True is the supported path for that — it also natively handles
+    #    unused params and is faster, at the cost of assuming the used-parameter set
+    #    is identical every iteration (true here). Auto-enabled for 4-board; force
+    #    on/off with CERES_DDP_STATIC_GRAPH=1/0. static_graph and
+    #    find_unused_parameters are mutually exclusive, so static_graph wins.
+    _static_graph = int(os.environ.get('CERES_DDP_STATIC_GRAPH',
+                                       '1' if BOARDS_PER_BATCH > 1 else '0') or 0) > 0
+    _find_unused = (int(os.environ.get('CERES_DDP_FIND_UNUSED', '1') or 1) > 0
+                    and not _static_graph)
+    model = DDP(model, device_ids=[DDP_LOCAL_GPU], output_device=DDP_LOCAL_GPU,
+                find_unused_parameters=_find_unused, gradient_as_bucket_view=True,
+                static_graph=_static_graph)
+    print(f"[ddp] model wrapped in DistributedDataParallel "
+          f"(static_graph={_static_graph}, find_unused_parameters={_find_unused})", flush=True)
+  # Custom CeresNet methods/attributes (compute_loss, use_gtab, _last_gate_value,
+  # _last_tsb_gates) are NOT exposed through the DDP wrapper — DDP only forwards
+  # forward(). Route those calls through the raw module (model_nocompile shares the
+  # same parameter tensors); the DDP-wrapped `model` is used only for forward() so
+  # its gradient-sync hooks fire. In single-GPU mode `core is model_nocompile` too.
+  core = model_nocompile
 
   # Possibly dump summary of model layers.
   DUMP_SUMMARY = False # *** WARNING *** Inexplicably enabling this causes much worse loses (already seen at 5mm pos).
@@ -478,8 +575,13 @@ def Train():
     print(f'[train] NUM_DATASET_WORKERS override: {_DEFAULT_NUM_DATASET_WORKERS} -> {NUM_DATASET_WORKERS} (via CERES_NUM_DATASET_WORKERS)')
   PREFETCH_FACTOR = None if NUM_DATASET_WORKERS == 0 else 4 # to keep GPU busy
  
-  world_size = len(devices)
-  rank = 0 if world_size == 1 else dist.get_rank()
+  # world_size/rank come from torchrun (single-GPU: 1 and 0). Each rank reads a
+  # disjoint file-shard (tpg_dataset slices files by rank/world_size) and a
+  # 1/world_size slice of the GLOBAL forward batch, so the effective optimization
+  # batch — and therefore the LR schedule — is identical to a single-GPU run.
+  # Requires batch_size_forward divisible by world_size and >= world_size files.
+  world_size = WORLD_SIZE
+  rank = RANK
   primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
                                rank, world_size, NUM_DATASET_WORKERS,
                                BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag)
@@ -507,8 +609,9 @@ def Train():
   # _move_batch_to_device() — avoids Lightning's recursive _apply_to_collection_slow
   # walk which intermittently wedged at CUDA-sync points.
 
-  config.pretty_print()
-  print_model_trainable_details(model)
+  if IS_MASTER:
+    config.pretty_print()
+    print_model_trainable_details(model)
 
 
   NUM_POS_TO_SKIP = 0
@@ -711,7 +814,9 @@ def Train():
   batch_accumulation_counter = 0
   last_save_model_pos = 0
 
-  loss_calc = LossCalculator(model)
+  # Pass the raw module (LossCalculator just stores the ref for metadata; the
+  # DDP wrapper would not expose CeresNet's custom attributes).
+  loss_calc = LossCalculator(core)
 
   model.train()
 
@@ -734,8 +839,15 @@ def Train():
     show_losses = (num_pos % (1024 * 64) == 0)
 
     is_accumulating = ((batch_accumulation_counter + 1) % num_batches_gradient_accumulate) != 0
-    # Single-GPU: no DDP sync skipping needed. Autocast handles bf16-mixed precision
-    # (Fabric did this implicitly via precision='bf16-mixed').
+    # DDP gradient-accumulation: suppress the cross-rank all-reduce on every micro-
+    # step EXCEPT the last one of an accumulation window (this is exactly what
+    # model.no_sync() toggles; setting the flag avoids re-indenting the forward
+    # block). On the final, non-accumulating micro-step the flag is True, so the
+    # backward all-reduces the summed gradients once. No-op in single-GPU mode.
+    if IS_DISTRIBUTED:
+      model.require_backward_grad_sync = (not is_accumulating)
+    # Autocast handles bf16-mixed precision (Fabric did this implicitly via
+    # precision='bf16-mixed').
     _amp_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if USE_AUTOCAST else contextlib.nullcontext()
     with _amp_ctx:
       this_lr = scheduler.get_last_lr()[0]
@@ -758,7 +870,7 @@ def Train():
         batch = batch[0]
         num_processing_now = batch['squares'].shape[0]
         policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, _, _, _ = model(batch['squares'], None)
-        loss = model.compute_loss(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
+        loss = core.compute_loss(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
                                   value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, 
                                   None, None, 
                                   None, None,
@@ -783,7 +895,7 @@ def Train():
         #Board 1
         sub_batch = batch[0]
         policy_out1, value_out1, moves_left_out1, unc_out1, value2_out1,  q_deviation_lower1, q_deviation_upper1, uncertainty_policy_out1, action_out1, state_out1, action_uncertainty_out1 = model(sub_batch['squares'], None)
-        loss1 = model.compute_loss(loss_calc, sub_batch, policy_out1, value_out1, moves_left_out1, unc_out1,
+        loss1 = core.compute_loss(loss_calc, sub_batch, policy_out1, value_out1, moves_left_out1, unc_out1,
                                    value2_out1, q_deviation_lower1, q_deviation_upper1, uncertainty_policy_out1, 
 
                                    None, None, 
@@ -803,7 +915,7 @@ def Train():
         else:
           extracted_action1_out = None
           
-        loss2 = model.compute_loss(loss_calc, sub_batch, policy_out2, value_out2, moves_left_out2, unc_out2,
+        loss2 = core.compute_loss(loss_calc, sub_batch, policy_out2, value_out2, moves_left_out2, unc_out2,
                                    value2_out2, q_deviation_lower2, q_deviation_upper2, uncertainty_policy_out2, 
 
                                    value_out1[:, wdl_reverse], value2_out1[:, wdl_reverse], # prior value outputs for value differencing
@@ -823,7 +935,7 @@ def Train():
         else:
           extracted_action2_out = None
 
-        loss3 = model.compute_loss(loss_calc, sub_batch, policy_out3, value_out3, moves_left_out3, unc_out3,
+        loss3 = core.compute_loss(loss_calc, sub_batch, policy_out3, value_out3, moves_left_out3, unc_out3,
                                    value2_out3, q_deviation_lower3, q_deviation_upper3, uncertainty_policy_out3,
 
                                    value_out2[:, wdl_reverse], value2_out2[:, wdl_reverse], # prior value outputs for value differencing
@@ -842,7 +954,7 @@ def Train():
           extracted_action1_other_out = action_out1[torch.arange(0, action_out1.size(0)), action4_played_move_indices.squeeze(-1)]
           extracted_action1_other_out = extracted_action1_other_out[:, wdl_reverse]
           
-          loss4 = model.compute_loss(loss_calc, sub_batch, None, None, None, None,
+          loss4 = core.compute_loss(loss_calc, sub_batch, None, None, None, None,
                                      None, None, None, None,
 
                                      None, None,
@@ -860,18 +972,18 @@ def Train():
       # The gate's last value was cached in the forward pass. Adding mean(g)
       # to the loss encourages the gate to stay near 0 unless the puzzle loss
       # gain from firing exceeds the sparsity cost. Default lambda 0.01.
-      if getattr(model, 'use_gtab', False) and getattr(model, '_last_gate_value', None) is not None:
+      if getattr(core, 'use_gtab', False) and getattr(core, '_last_gate_value', None) is not None:
         _gtab_lambda = float(os.environ.get('CERES_GTAB_GATE_LAMBDA', '0.01') or 0.01)
-        loss = loss + _gtab_lambda * model._last_gate_value.mean()
+        loss = loss + _gtab_lambda * core._last_gate_value.mean()
 
       # TSB gate-sparsity regularizer: penalize unnecessary tactical-branch firing.
       # Each transformer block has a per-block scalar gate; the net stacks them
       # into _last_tsb_gates of shape [num_layers, B, 1, 1]. Mean across layers and
       # batch encourages each block's gate to stay near 0 unless the puzzle loss
       # gain from firing exceeds the sparsity cost. Default lambda 0.01.
-      if getattr(model, 'use_tsb', False) and getattr(model, '_last_tsb_gates', None) is not None:
+      if getattr(core, 'use_tsb', False) and getattr(core, '_last_tsb_gates', None) is not None:
         _tsb_lambda = float(os.environ.get('CERES_TSB_GATE_LAMBDA', '0.01') or 0.01)
-        loss = loss + _tsb_lambda * model._last_tsb_gates.mean()
+        loss = loss + _tsb_lambda * core._last_tsb_gates.mean()
 
       # KL-divergence anchor: pull student outputs toward frozen reference outputs.
       # For BOARDS_PER_BATCH==4 we anchor only on board 1 (canonical learned target;
@@ -945,8 +1057,13 @@ def Train():
 
     batch_accumulation_counter = batch_accumulation_counter + 1
 
-    # update number of positions processed (single-GPU; world_size=1)
-    num_pos = num_pos + num_processing_now
+    # Update GLOBAL positions processed. num_processing_now is this rank's share
+    # (forward batch was split batch_size_forward // world_size), so multiply by
+    # WORLD_SIZE to count positions across all ranks. WORLD_SIZE==1 single-GPU, so
+    # this is unchanged there. Counting globally keeps MAX_POSITIONS, checkpoint
+    # cadence and the LR-decay schedule (fraction_complete) on the same footing as
+    # a single-GPU run rather than running world_size× too long.
+    num_pos = num_pos + num_processing_now * WORLD_SIZE
     num_batches = num_pos // BATCH_SIZE
 
     # Emit checkpoint when specified interval has passed since last save.
@@ -958,8 +1075,13 @@ def Train():
     # only ever needed for cross-rank synchronization in multi-GPU runs; this is
     # single-GPU, so the diff-threshold alone is correct and safer.
     if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions):
-      save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
-      save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+      # Only rank 0 writes checkpoint/ONNX/TS — all ranks hold identical (DDP-synced)
+      # weights, so rank 0's copy is authoritative; letting every rank write the same
+      # paths would corrupt the files. last_save_model_pos is still advanced on every
+      # rank so the cadence stays in lockstep.
+      if IS_MASTER:
+        save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+        save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
       last_save_model_pos = num_pos
 
     current_time = datetime.datetime.now()
@@ -973,11 +1095,13 @@ def Train():
     time_since_save_transient = (current_time - time_last_save_transient).seconds
 
     STATUS_UPDATE_INTERVAL = 10 # log output to console every 10 seconds
-    should_show_status = (time_since_status_update > STATUS_UPDATE_INTERVAL) or (num_pos >= MAX_POSITIONS)
-  
-    # save output artifacts (except checkpoint file) every 120 (or 30 if LoRA) minutes (with label "last")    
+    # Only rank 0 prints the (parsed) TRAIN status lines — multiple ranks emitting
+    # them would feed duplicate/interleaved lines to the C# log parser.
+    should_show_status = ((time_since_status_update > STATUS_UPDATE_INTERVAL) or (num_pos >= MAX_POSITIONS)) and IS_MASTER
+
+    # save output artifacts (except checkpoint file) every 120 (or 30 if LoRA) minutes (with label "last")
     SAVE_LAST_INTERVAL = 120 * 60 if config.Opt_LoRARankDivisor == 0 else 30 * 60
-    should_save_transient = time_since_save_transient > SAVE_LAST_INTERVAL
+    should_save_transient = (time_since_save_transient > SAVE_LAST_INTERVAL) and IS_MASTER
     if should_save_transient:
       save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, "last", True)
       time_last_save_transient  = datetime.datetime.now()
@@ -1025,13 +1149,23 @@ def Train():
       loss_calc.reset_counters()
       time_last_status_update = datetime.datetime.now()
 
-  # final save and convert to Torchscript
-  save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
-  save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+  # final save and convert to Torchscript (rank 0 only; weights are DDP-synced).
+  if IS_MASTER:
+    save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+    save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
 
   writer.flush()
   writer.close()
-  print("INFO: EXIT_STATUS", "SUCCESS")
+
+  # Hold all ranks until rank 0 has finished writing the final artifacts, then
+  # tear down the process group cleanly (avoids NCCL teardown warnings / a rank
+  # exiting mid-collective).
+  if IS_DISTRIBUTED:
+    dist.barrier()
+    dist.destroy_process_group()
+
+  if IS_MASTER:
+    print("INFO: EXIT_STATUS", "SUCCESS")
 
 Train()
 
