@@ -300,7 +300,11 @@ class DotProductAttention(torch.nn.Module):
 
   @property
   def rpeFactorShared(self):
-    return self.wrapped_rpe_factor_shared.parameter.data
+    # NB: return the parameter itself, NOT .data. The factor is a fixed constant
+    # (requires_grad=False) so this is training-neutral, but .data detaches it into
+    # a constant that torch.export lifts as a FakeTensor → ONNX save fails
+    # ("Cannot take content out from the FakeTensor ... lifted_tensor_0").
+    return self.wrapped_rpe_factor_shared.parameter
 
   # Function to cap logit scores (as used in the grok and gemma models).
   def soft_cap(self, score, softcap):
