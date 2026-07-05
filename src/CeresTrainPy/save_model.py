@@ -17,7 +17,7 @@ from typing import Dict, Any
 import torch
 
 from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE
-from lora import collect_and_save_lora_parameters
+from lora import collect_and_save_lora_parameters, merge_lora_to_model
 
 
 def save_checkpoint(NAME : str,
@@ -78,10 +78,15 @@ def save_model(NAME : str,
   with torch.no_grad():
 
     # If running in LoRA fine-tuning mode, first save the LoRA weights binary
-    # (for potential use merging into a different base), then continue on to do
-    # the normal ONNX export. The LoRA forward (base + alpha/sqrt(r) * A @ B @ x)
-    # will be captured by torch.onnx.export's tracing and constant-folded so the
-    # resulting ONNX contains the merged weights.
+    # (for potential use merging into a different base), then explicitly fold the
+    # adapters into the base weights before the ONNX export below.
+    # NOTE: torch.onnx.export does NOT distribute the two parallel matmuls
+    # (base + adapter) into a single one — constant-folding only collapses A@B
+    # into one constant, it does not turn x@W.T + x@(A@B).T into x@(W+ΔW).T. So
+    # without an explicit merge the exported graph keeps an extra low-rank matmul
+    # per adapted layer (~2x slower at inference, +adapter bytes on disk).
+    # merge_lora_to_model() performs the fold so the export is a clean single
+    # matmul per layer.
     _body_attn = int(os.environ.get('CERES_LORA_ATTN_RANK_DIV', '0') or 0)
     _body_ffn  = int(os.environ.get('CERES_LORA_FFN_RANK_DIV',  '0') or 0)
     _body_legacy = int(os.environ.get('CERES_LORA_TRANSFORMER_RANK_DIV', '0') or 0)
@@ -92,7 +97,10 @@ def save_model(NAME : str,
     if config.Opt_LoRARankDivisor > 0 or _env_lora_active:
       SAVE_FULL_NAME_LORA_BIN = os.path.join(OUTPUTS_DIR, 'nets', NAME + ".lora_" + num_pos + '.bin')
       collect_and_save_lora_parameters(model_nocompile, SAVE_FULL_NAME_LORA_BIN)
-      # Fall through and also produce a merged .onnx below.
+      # Bin is saved from the live (unmerged) adapter params above; now fold the
+      # adapters into the base weights so the .onnx exported below is merged and
+      # runs at full (base-net) speed.
+      merge_lora_to_model(model_nocompile)
 
     convert_type = _model_dtype
     model_nocompile.eval()

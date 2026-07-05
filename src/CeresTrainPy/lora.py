@@ -90,6 +90,36 @@ class LoRALinear(nn.Module):
     else:
       return self.original_layer(x)
 
+  def merge_lora_weights(self):
+    """Fold the LoRA adapter into the base linear weight, then disable the adapter.
+
+    The forward computes  original_layer(x) + scaling * (x @ (A@B).T)
+                        =  x @ (W + scaling*(A@B)).T + b,
+    so the inference-equivalent merged weight is  W' = W + scaling*(A@B)
+    with scaling = lora_alpha / sqrt(rank).
+
+    Used before ONNX export: torch.onnx.export does NOT distribute the two
+    parallel matmuls (base + adapter) into one, so without this the exported
+    graph keeps an extra low-rank matmul per adapted layer (~2x slower at
+    inference). After merging, enable_lora is set False and the adapter
+    parameters are dropped, so forward is a single matmul identical in shape
+    to the original layer.
+
+    MUST be called after training / checkpoint load and only for export.
+    """
+    if not self.enable_lora:
+      return
+    with torch.no_grad():
+      w = self.original_layer.weight
+      scaling = (self.lora_alpha / math.sqrt(self.rank)).to(w.dtype)
+      delta = (self.lora_A @ self.lora_B).to(w.dtype)   # (out, in), same shape as W
+      w.data.add_(scaling * delta)
+    # Disable and drop adapter params so they are not traced/exported.
+    self.enable_lora = False
+    self.lora_A = None
+    self.lora_B = None
+    self.lora_alpha = None
+
   def apply_pissa(self):
     """Re-initialize lora_A, lora_B, lora_alpha using PiSSA (SVD of base weight).
 
@@ -161,6 +191,22 @@ def apply_pissa_to_model(model):
   if skipped:
     print(f"PiSSA: skipped {len(skipped)} rank-saturated layers (kept vanilla init, alpha=sqrt(r)): {skipped}")
 
+
+
+def merge_lora_to_model(model):
+  """Walk the model and fold every enabled LoRALinear adapter into its base weight.
+
+  Returns the number of adapters merged. Idempotent: already-merged
+  (enable_lora=False) layers are skipped. Call this right before ONNX export so
+  the exported graph has a single matmul per layer (no parallel adapter path).
+  """
+  n = 0
+  for m in model.modules():
+    if isinstance(m, LoRALinear) and m.enable_lora:
+      m.merge_lora_weights()
+      n += 1
+  print(f"LoRA merge: folded {n} adapter(s) into base weights for export.")
+  return n
 
 
 def serialize_lora_to_binary(filename : str, lora_matrices):
