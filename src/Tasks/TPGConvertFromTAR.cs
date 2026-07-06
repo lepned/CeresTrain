@@ -68,7 +68,7 @@ namespace CeresTrain.Tasks
                                    bool extractOnlyFRC = false,
                                    bool includeAllVariants = false)
     {
-      const int POSITION_SKIP_COUNT = 20;
+      const int POSITION_SKIP_COUNT = 30;
 
       for (int i = 0; i < numSetsToGenerate; i++)
       {
@@ -93,7 +93,7 @@ namespace CeresTrain.Tasks
                                              long numPositions,
                                              string description)
     {
-      const int POSITION_SKIP_COUNT = 20;
+      const int POSITION_SKIP_COUNT = 30;
       GenerateTPG(sourceDirectoryTARsOrZSTs, targetDirectoryTPGs, numPositions, DEBUG, description,
                   (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true,
                   null,
@@ -141,6 +141,11 @@ namespace CeresTrain.Tasks
       }
 
       bool useTablebases = CeresUserSettingsManager.Settings.TablebaseDirectory != null;
+      if (Environment.GetEnvironmentVariable("TPG_NO_TABLEBASE_RESCORE") == "1")
+      {
+        useTablebases = false;
+        ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "TPG_NO_TABLEBASE_RESCORE=1: tablebase rescoring DISABLED (experiment).");
+      }
       if (!useTablebases)
       {
         ConsoleUtils.WriteLineColored(ConsoleColor.Red, "Warning: DirTablebases not specified in Ceres.json. Endgame tablebases rescoring will not be used in TPG generation.");
@@ -206,6 +211,14 @@ namespace CeresTrain.Tasks
         // Create the generator and run
         TrainingPositionGenerator tpg = new(options);
         tpg.RunGeneratorLoop();
+
+        if (TrainingPositionGeneratorGameRescorer.DRAW_ACCEPT_PROB < 1.0f)
+        {
+          ConsoleUtils.WriteLineColored(ConsoleColor.Yellow,
+            $"[diag] DRAW_ACCEPT_PROB={TrainingPositionGeneratorGameRescorer.DRAW_ACCEPT_PROB}  "
+            + $"drawnGamesSeen={TrainingPositionGeneratorGameRescorer._diagDrawnGamesSeen:N0}  "
+            + $"drawnGamesDropped={TrainingPositionGeneratorGameRescorer._diagDrawnGamesDropped:N0}");
+        }
 
         Console.WriteLine();
         Console.WriteLine($"SkipModulus {tpg.NumSkippedDueToModulus} "

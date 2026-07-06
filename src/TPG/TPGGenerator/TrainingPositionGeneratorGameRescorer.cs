@@ -48,6 +48,23 @@ namespace CeresTrain.TPG.TPGGenerator
 
     const int MAX_PLY = 512;
 
+    // Optional draw-result downsampling to shape the value target (nondeblundered z) toward
+    // more decisive positions (e.g. to match sharper, older production data). Env-gated,
+    // default 1.0 = keep all draws (no change to normal runs). TPG_DRAW_ACCEPT_PROB in (0,1]
+    // = probability of KEEPING a drawn-result position. InvariantCulture so '.' decimal works
+    // regardless of machine locale.
+    internal static readonly float DRAW_ACCEPT_PROB =
+        float.TryParse(Environment.GetEnvironmentVariable("TPG_DRAW_ACCEPT_PROB"),
+                       System.Globalization.NumberStyles.Float,
+                       System.Globalization.CultureInfo.InvariantCulture, out float _drawP)
+          && _drawP > 0 && _drawP <= 1 ? _drawP : 1.0f;
+
+    internal static long _diagDrawnGamesSeen = 0;
+    internal static long _diagDrawnGamesDropped = 0;
+
+    // Set during CalcTrainWDL: true if this game's result is a draw (constant across the game).
+    public bool GameResultIsDraw;
+
     EncodedTrainingPositionGame thisGame;
     EncodedPositionWithHistory[] gamePositionsBufferRAW = new EncodedPositionWithHistory[MAX_PLY];
     Memory<EncodedPositionWithHistory> gamePositionsBuffer = default;
@@ -203,6 +220,9 @@ namespace CeresTrain.TPG.TPGGenerator
         if (i == numPosThisGame - 1)
         {
           currentTrainWDL = thisInfoTraining.ResultWDL;
+          // Game-level draw flag (constant across a game) for optional draw downsampling
+          // applied by the generator. ResultWDL.d ~1.0 for a drawn game.
+          GameResultIsDraw = thisInfoTraining.ResultWDL.d > 0.5f;
         }
 
         // Always override current position evaluation based on tablebase value (if any).

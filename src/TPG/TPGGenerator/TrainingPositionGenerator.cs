@@ -471,6 +471,20 @@ namespace CeresTrain.TPG.TPGGenerator
           gameAnalyzer.CalcBlundersAndTablebaseLookups(eval);
           gameAnalyzer.CalcTrainWDL(Options.Deblunder, Options.RescoreWithTablebase, Options.EnablePositionFocus);
 
+          // Game-level draw-result downsampling (env TPG_DRAW_ACCEPT_PROB in (0,1], default off):
+          // drop entire drawn games with probability (1 - prob) so the value target (nondeblundered z)
+          // shifts toward more decisive positions. MUST be per-GAME: draw-ness is constant within a
+          // game, so a per-position reject just slides to the next (still-drawn) position (no net effect).
+          if (TrainingPositionGeneratorGameRescorer.DRAW_ACCEPT_PROB < 1.0f && gameAnalyzer.GameResultIsDraw)
+          {
+            Interlocked.Increment(ref TrainingPositionGeneratorGameRescorer._diagDrawnGamesSeen);
+            if (Random.Shared.NextDouble() > TrainingPositionGeneratorGameRescorer.DRAW_ACCEPT_PROB)
+            {
+              Interlocked.Increment(ref TrainingPositionGeneratorGameRescorer._diagDrawnGamesDropped);
+              continue;
+            }
+          }
+
           // Update statistics.
           Interlocked.Add(ref numTBLookup, gameAnalyzer.numTBLookup);
           Interlocked.Add(ref numTBFound, gameAnalyzer.numTBFound);
