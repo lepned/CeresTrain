@@ -99,6 +99,17 @@ if _NUM_AUX_FEATURES_PER_SQUARE > 0:
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
 _POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
+
+# On-disk TPG record format: V3 (141 B/square, 9634 B/pos, 4 aux baked in) vs upstream
+# V2 (137 B/square, 9378 B/pos, no aux). Mirrors Ceres.Chess TPGRecord.USE_V3_TPG_RECORD.
+# Default '1' (V3) preserves prior behavior; set CERES_TPG_V3=0 to read a V2 corpus.
+# NB: a V2 corpus has no aux on disk, so it requires CERES_AUX_FEATURES_PER_SQUARE=0.
+_USE_V3_TPG = os.environ.get('CERES_TPG_V3', '1') != '0'
+_SIZE_SQUARE_ONDISK = 141 if _USE_V3_TPG else 137
+_BYTES_PER_POS_ONDISK = 9634 if _USE_V3_TPG else 9378
+if not _USE_V3_TPG and _NUM_AUX_FEATURES_PER_SQUARE != 0:
+  raise ValueError('CERES_TPG_V3=0 (V2 corpus) requires CERES_AUX_FEATURES_PER_SQUARE=0 '
+                   f'(got {_NUM_AUX_FEATURES_PER_SQUARE}) — V2 has no aux bytes on disk.')
 if _POLICY_TARGET_ALPHA > 0:
   print(f"[tpg_dataset] policy-target sharpening: alpha = {_POLICY_TARGET_ALPHA}")
 
@@ -197,8 +208,8 @@ class TPGDataset(Dataset):
     #   [1] defender_count      — same-color attackers of piece on square
     #   [2] is_pinned           — boolean (0/100), pinned to own king by opp slider
     #   [3] is_threatened       — boolean (0/100), attacked by strictly-lower-value opp piece
-    # Must match Ceres TPGRecord.TOTAL_BYTES.
-    BYTES_PER_POS = 9634
+    # Must match Ceres TPGRecord.TOTAL_BYTES (9634 for V3, 9378 for V2). See _USE_V3_TPG.
+    BYTES_PER_POS = _BYTES_PER_POS_ONDISK
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
@@ -336,7 +347,7 @@ class TPGDataset(Dataset):
               # V3 TPG layout: 141 bytes per square (137 base + 4 aux features baked
               # in by Ceres's TPGSquareRecord.WritePosPieces). For 137-channel models,
               # slice off the trailing 4 aux bytes per square here.
-              SIZE_SQUARE = 141
+              SIZE_SQUARE = _SIZE_SQUARE_ONDISK
               squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
               DIVISOR = 100
               squares = np.divide(squares, DIVISOR).astype(DTYPE)

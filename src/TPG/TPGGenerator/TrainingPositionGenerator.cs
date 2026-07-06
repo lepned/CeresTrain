@@ -292,6 +292,16 @@ namespace CeresTrain.TPG.TPGGenerator
 
     int exceptionCount = 0;
 
+    // Dedup dictionary scalability guard:
+    // ConcurrentDictionary<ulong,int> becomes unstable past ~500M entries (resize races
+    // can throw NullReferenceException internally). For very large corpora (1B+ positions)
+    // we cap the dictionary's growth and let the remainder bypass dedup. At PositionMaxFraction
+    // = 1e-7 the cap is far higher than per-position frequency anyway, so this only fires
+    // once the working set has saturated.
+    private const long MAX_DEDUP_HASHES = 200_000_000;
+    private static long dedupHashCount = 0;
+    private static volatile bool dedupCapReached = false;
+
     bool PositionAtIndexShouldBeProcessed(int i, 
                                           in EncodedTrainingPositionGame game, 
                                           bool includeCheckForPositionMaxFraction,
@@ -319,19 +329,44 @@ namespace CeresTrain.TPG.TPGGenerator
       }
 
       // Possibly skip this position if it has already been written too many times.
-      if (includeCheckForPositionMaxFraction && Options.PositionMaxFraction < 1)
+      // Once the dedup dictionary hits MAX_DEDUP_HASHES, skip further bookkeeping
+      // to avoid the ConcurrentDictionary scalability cliff. Try/catch is a safety net
+      // in case a race still slips through under heavy parallel load.
+      if (includeCheckForPositionMaxFraction && Options.PositionMaxFraction < 1 && !dedupCapReached)
       {
-        ulong thisPositionHash = thisPosition.CalcZobristHash(PositionMiscInfo.HashMove50Mode.ValueBoolIfAbove98, false);
-        positionUsedCountsByHash.TryGetValue(thisPositionHash, out int timesAlreadyUsed);
-        float fractionOfTotalAlreadyUsed = (float)timesAlreadyUsed / numWrittenThisFile;
-        if (fractionOfTotalAlreadyUsed >= Options.PositionMaxFraction)
+        try
         {
-          Interlocked.Increment(ref numDuplicatesSkipped);
-          return false;
+          ulong thisPositionHash = thisPosition.CalcZobristHash(PositionMiscInfo.HashMove50Mode.ValueBoolIfAbove98, false);
+          positionUsedCountsByHash.TryGetValue(thisPositionHash, out int timesAlreadyUsed);
+          float fractionOfTotalAlreadyUsed = (float)timesAlreadyUsed / numWrittenThisFile;
+          if (fractionOfTotalAlreadyUsed >= Options.PositionMaxFraction)
+          {
+            Interlocked.Increment(ref numDuplicatesSkipped);
+            return false;
+          }
+          else
+          {
+            positionUsedCountsByHash[thisPositionHash] = timesAlreadyUsed + 1;
+            if (timesAlreadyUsed == 0)
+            {
+              long newCount = Interlocked.Increment(ref dedupHashCount);
+              if (newCount >= MAX_DEDUP_HASHES && !dedupCapReached)
+              {
+                dedupCapReached = true;
+                Console.WriteLine($"[INFO] dedup dictionary reached cap of {newCount:N0} entries; remaining positions bypass dedup");
+              }
+            }
+          }
         }
-        else
+        catch (NullReferenceException)
         {
-          positionUsedCountsByHash[thisPositionHash] = timesAlreadyUsed + 1;
+          // ConcurrentDictionary internal corruption under extreme load (resize race).
+          // Disable further dedup for the rest of the run rather than crashing the thread.
+          if (!dedupCapReached)
+          {
+            dedupCapReached = true;
+            Console.WriteLine("[WARN] NullReferenceException in dedup dictionary; disabling dedup for rest of run");
+          }
         }
       }
 

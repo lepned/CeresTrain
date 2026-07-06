@@ -506,10 +506,11 @@ class CeresNet(nn.Module):
     # Therefore the values logged (e.g. to Tensorboard) are the raw (unweighted) losses 
     # which are invariant to the particular weights in use (to facilitate comparison across different training runs).
 
-    # Possibly create a blended value target for Value2.
-    # The intention is to slightly soften the noisy and hard wdl_nondeblundered target.
-    wdl_blend = (wdl_nondeblundered * 0.70 + wdl_deblundered * 0.15 + wdl_q * 0.15)
-    #wdl_blend = wdl_nondeblundered  
+    # Value2 target = pure nondeblundered z (game result), per production dual-value recipe
+    # (value1 = search-Q via q_ratio=FractionQ, value2 = raw outcome z). The softened
+    # 0.70/0.15/0.15 blend below is the prior default, disabled for the prod recipe.
+    #wdl_blend = (wdl_nondeblundered * 0.70 + wdl_deblundered * 0.15 + wdl_q * 0.15)
+    wdl_blend = wdl_nondeblundered
     value_target = wdl_q * self.q_ratio + wdl_deblundered * (1 - self.q_ratio)
 
     p_loss = 0 if policy_out is None else loss_calc.policy_loss(policy_target, policy_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.policy_loss_weight)
