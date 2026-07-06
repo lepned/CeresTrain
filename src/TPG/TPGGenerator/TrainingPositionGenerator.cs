@@ -298,7 +298,12 @@ namespace CeresTrain.TPG.TPGGenerator
     // we cap the dictionary's growth and let the remainder bypass dedup. At PositionMaxFraction
     // = 1e-7 the cap is far higher than per-position frequency anyway, so this only fires
     // once the working set has saturated.
-    private const long MAX_DEDUP_HASHES = 200_000_000;
+    // Kept below the point where the dictionary's table-doubling allocation (multiple GB in
+    // one request) exceeds available heap on a 64GB box. The hazard is the doubling, not the
+    // steady count: 100M crosses only the ~67M->134M bucket growth (~1GB, mid-run) then
+    // freezes, whereas growth attempted near ~190M entries needs a 3+GB single allocation on
+    // an already-large heap (OOM'd three T91 skip-1 runs at 200M).
+    private const long MAX_DEDUP_HASHES = 100_000_000;
     private static long dedupHashCount = 0;
     private static volatile bool dedupCapReached = false;
 
