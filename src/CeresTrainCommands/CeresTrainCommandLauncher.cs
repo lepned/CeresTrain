@@ -162,6 +162,20 @@ namespace CeresTrain.TrainCommands
       enrichOppDefenceCommand = new Command("enrich-opp-defence", "Add MCGS-search-backed OppDefence records (post-solver-move positions) to labeled.jsonl. Targets the value-head opp-to-move calibration gap. [puzzle-config]") { puzzleConfigOption };
       oppDefDeepenSmokeCommand = new Command("oppdef-deepen-smoke", "Re-search a sample of low-|Q| OppDef records at a higher node budget; report whether they resolve to sharper Q. [puzzle-config]") { puzzleConfigOption };
 
+      // Diagnostic: raw value1/value2 quality of an ONNX net evaluated through a real
+      // Ceres backend on TPG-shard positions (bit-exact inputs, temps=1, no blending).
+      Option<string> probeTpgFileOption = new Option<string>("--tpg-file", "TPG shard (.zst) supplying positions + value targets") { IsRequired = true };
+      Option<string> probeOnnxOption = new Option<string>("--onnx", "Path to ONNX network file") { IsRequired = true };
+      Option<string> probeDeviceOption = new Option<string>("--device", () => "GPU:0#TensorRTNative", "Device/backend spec (e.g. GPU:0#TensorRTNative, GPU:0#TensorRT, GPU:0)") { };
+      Option<long> probeNumPosOption = new Option<long>("--num-pos", () => 8192, "Number of positions to evaluate") { };
+      Command probeValueCommand = new Command("probe-value", "Diagnostic: raw value-head quality via real backend on TPG positions. [tpg-file] [onnx] [device] [num-pos]")
+        { probeTpgFileOption, probeOnnxOption, probeDeviceOption, probeNumPosOption };
+      probeValueCommand.SetHandler((string tpgFile, string onnxFile, string device, long numPos) =>
+      {
+        CeresTrain.Tasks.ValueProbeFromTPG.Run(tpgFile, onnxFile, device, numPos);
+      }, probeTpgFileOption, probeOnnxOption, probeDeviceOption, probeNumPosOption);
+      rootCommand.AddCommand(probeValueCommand);
+
       rootCommand.AddCommand(initCommand);
       rootCommand.AddCommand(infoCommand);
       rootCommand.AddCommand(trainCommand);
