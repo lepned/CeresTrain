@@ -226,6 +226,38 @@ actually does (basis for weight choices instead of loss-magnitude guessing).
 Interpretability: `scripts/survival_heatmap.py` renders per-square predicted-fate
 grids from real TPG records (never hand-encoded FENs — standalone-input trap).
 
+## 8a. Tablebase perfect-play survival (DESIGN, 2026-07-07 — priority after user review)
+
+Extend the endgame-TPG stream (`gen-endgame-tpg`, positions sampled from piece configs and
+labeled by Syzygy) with survival sidecars. TB records have no game continuation — so we
+SYNTHESIZE one: from each position, walk K plies of TB-OPTIMAL play (winning side picks
+DTZ-minimizing moves, losing side DTZ-maximizing; deterministic tie-break), then run the
+existing position-diff fate labeling over the walked line.
+
+Why this is attractive — the labels are **perfect-play ground truth**:
+- Zero label noise: game-derived fates include blunders (~6% of plies flagged in T91);
+  TB-walked fates are exact. This is §8's "counterfactual best-play fates" idea, exact
+  rather than teacher-approximated.
+- DTZ-optimal play is naturally FORCING (DTZ counts down to the next capture/pawn event),
+  so lines are rich in capture dynamics. A WDL-only walk would NOT work (winning side
+  could shuffle; every label would read "survives").
+- Verdict+mechanism pairing in the purest-tactics domain: the TB stream's historic role is
+  endgame VALUE (verdict); this adds the perfect-play mechanism to the same positions.
+
+Design decisions:
+- v1 labels DECISIVE positions only; draws emit all-zero (unsupervised) rows — "any
+  WDL-preserving move" makes drawn-position fates highly line-dependent.
+- Optimal-move ties: deterministic tie-break for reproducibility; bucket loss absorbs
+  residual exact-ply jitter (same move-order-noise argument as game corpora).
+- Mixed semantics (game shards = realistic-play fates, TB shards = perfect-play fates,
+  one head): assumed benign — piece count tells the net the regime — but A/B-gated like
+  everything else (endgame stream ± survival, 20M).
+- Cost: ~K x branching DTZ probes per position (memory-mapped, fast); TB streams are
+  small (millions of positions) so throughput is a non-issue.
+- Plumbing note: the TB generator (`TablebaseTPGBatchGenerator`) streams raw records to
+  `.dat.zst` rather than going through `TrainingPositionWriter` — sidecar emission and
+  loader consumption for this stream need their own wiring (see implementation).
+
 ## 8. Open questions / v2 ideas (parked)
 
 - ~~Distance-bucketed classes~~ → ADOPTED as default (§6.1, buckets + capture weight).
