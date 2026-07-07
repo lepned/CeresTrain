@@ -152,11 +152,11 @@ namespace CeresTrain.TPG.TPGGenerator
     void Init()
     {
       string targetFNBase = Options.TargetFileNameBase == null ? null : Options.TargetFileNameBase + ".tpg";
-      writer = new TrainingPositionWriter(targetFNBase, 
+      writer = new TrainingPositionWriter(targetFNBase,
                                           Options.NumConcurrentSets,
                                           Options.OutputFormat,
-                                          Options.UseZstandard, 
-                                          Options.TargetCompression,                                         
+                                          Options.UseZstandard,
+                                          Options.TargetCompression,
                                           Options.NumPositionsTotal,
                                           Options.AnnotationNNEvaluator,
                                           Options.AnnotationPostprocessor,
@@ -164,7 +164,8 @@ namespace CeresTrain.TPG.TPGGenerator
                                           Options.BatchSize,
                                           Options.EmitPlySinceLastMovePerSquare,
                                           Options.FillInHistoryPlanes,
-                                          VALIDATE_BEFORE_WRITE);
+                                          VALIDATE_BEFORE_WRITE,
+                                          Options.SurvivalTargetHorizon);
 
       if (Options.CeresJSONFileName == null)
       {
@@ -490,6 +491,12 @@ namespace CeresTrain.TPG.TPGGenerator
             }
           }
 
+          // K-ply piece-survival target labels for this game (real-board square indexing;
+          // remapped to record slots in PreparePosition). See SURVIVAL_TARGET_SPEC.md.
+          byte[][] gameSurvival = Options.SurvivalTargetHorizon > 0
+                                ? SurvivalLabeler.ComputeGameSurvival(in game, Options.SurvivalTargetHorizon)
+                                : null;
+
           // Update statistics.
           Interlocked.Add(ref numTBLookup, gameAnalyzer.numTBLookup);
           Interlocked.Add(ref numTBFound, gameAnalyzer.numTBFound);
@@ -562,7 +569,7 @@ namespace CeresTrain.TPG.TPGGenerator
             if (Options.NumRelatedPositionsPerBlock == 1)
             {
               // Simple case of just a single board.
-              var pendingItem = PreparePosition(fn, in game, i);
+              var pendingItem = PreparePosition(fn, in game, i, gameSurvival);
               writer.Write(setNum, Options.MinProbabilityForLegalMove, pendingItem);
 
 const bool TEST = false;
@@ -661,7 +668,7 @@ const bool TEST = false;
                     } 
 
                     // Construct tuple of information to be passed to the Write method.
-                    (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares) pos2Tuple = default;
+                    (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares) pos2Tuple = default;
                     pos2Tuple.targetInfo = randomTargetInfo;
                     pos2Tuple.record = randomPos;
                     pos2Tuple.indexMoveInGame = pendingItem.indexMoveInGame;
@@ -693,7 +700,7 @@ const bool TEST = false;
               MGPosition startMGPos = game.PositionAtIndex(i).FinalPosition.ToMGPosition;
 
               // Helper method which creates new training data for position after specified move.
-              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[])
+              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[])
                 MakeForDrawIndex(EncodedMove encodedMove)
               {
                 //                short moveIndex = policyMoves[drawIndex].IndexNeuralNet;
@@ -706,10 +713,10 @@ const bool TEST = false;
                 target3.ForwardSumNegativeBlunders = item1.targetInfo.ForwardSumNegativeBlunders;
 
                 EncodedTrainingPosition pos3 = TrainingPositionAfterMove(game.TrainingPositionAtIndex(i), move3);
-                return (pos3, target3, -1, null);
+                return (pos3, target3, -1, null, null);
               }
 
-              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[]) item4;
+              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[]) item4;
               if (policyLen == 1)
               {
                 // Only one move choice, must use this a second time.
@@ -827,8 +834,8 @@ const bool TEST = false;
     }
 
 
-    private (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares)
-      PreparePosition(string fn, in EncodedTrainingPositionGame game, int i)
+    private (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares)
+      PreparePosition(string fn, in EncodedTrainingPositionGame game, int i, byte[][] gameSurvival = null)
     {
       // Extract the position from the raw data.
       ref readonly EncodedPositionWithHistory thisGamePos = ref gameAnalyzer.PositionRef(i);
@@ -898,10 +905,28 @@ const bool TEST = false;
 
       TPGTrainingTargetNonPolicyInfo targetInfo = target;
 
+      // K-ply survival labels: remap from real-board square indexing (A1=0..H8=63) to
+      // TPG record slot indexing. With White to move slot == squareNum. With Black to
+      // move the record is encoded from the mirrored (white-perspective) position, so
+      // slot == squareNum ^ 56 (rank flip, file preserved) — validated empirically
+      // against record occupancy across the full corpus (identity + rank-flip explain
+      // 100.0% of records; 63-s reversal explains 0%).
+      byte[] survivalBySquares = null;
+      if (gameSurvival != null)
+      {
+        byte[] realBoard = gameSurvival[i];
+        survivalBySquares = new byte[64];
+        bool whiteToMove = thisPosition.SideToMove == SideType.White;
+        for (int s = 0; s < 64; s++)
+        {
+          survivalBySquares[whiteToMove ? s : s ^ 56] = realBoard[s];
+        }
+      }
+
       // TODO: avoid calling PositionAdIndex here
       EncodedTrainingPosition saveTrainingPos = new EncodedTrainingPosition(game.Version, game.InputFormat,
                                                                             game.PositionAtIndex(i), game.PolicyAtIndex(i));
-      return (saveTrainingPos, targetInfo, i, gameAnalyzer.lastMoveIndexBySquare?[i]);
+      return (saveTrainingPos, targetInfo, i, gameAnalyzer.lastMoveIndexBySquare?[i], survivalBySquares);
     }
 
 

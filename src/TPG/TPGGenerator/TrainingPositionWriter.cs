@@ -81,6 +81,16 @@ namespace CeresTrain.TPG.TPGGenerator
 
     byte[][][] bufferPliesSinceLastPieceMoveBySquare;
 
+    /// <summary>
+    /// K-ply survival target sidecar support (SurvivalTargetHorizon > 0):
+    /// per-record 64 label bytes buffered in lockstep with the main buffers and
+    /// flushed to parallel "<shard>.tgt.zst" streams at the same append point,
+    /// guaranteeing identical record ordering. See SURVIVAL_TARGET_SPEC.md.
+    /// </summary>
+    readonly int SurvivalTargetHorizon;
+    byte[][][] bufferSurvivalBySquare;
+    Stream[] survivalOutStreams;
+
     public TPGTrainingTargetNonPolicyInfo[][] buffersTargets;
     CompressedPolicyVector?[][] buffersOverridePolicies;
 
@@ -112,7 +122,7 @@ namespace CeresTrain.TPG.TPGGenerator
     /// <exception cref="ArgumentException"></exception>
     public TrainingPositionWriter(string outputFileNameBase, int numSets,
                                   TPGGeneratorOptions.OutputRecordFormat outputFormat,
-                                  bool useZstandard, CompressionLevel compressionLevel,                                  
+                                  bool useZstandard, CompressionLevel compressionLevel,
                                   long totalNumPositionsToBeWritten,
                                   NNEvaluator evaluator,
                                   TrainingPositionGenerator.PositionPostprocessor evaluatorPostprocessor,
@@ -120,9 +130,20 @@ namespace CeresTrain.TPG.TPGGenerator
                                   int batchSize,
                                   bool emitPlySinceLastMovePerSquare,
                                   bool emitHistory,
-                                  bool validateBeforeWrite)
+                                  bool validateBeforeWrite,
+                                  int survivalTargetHorizon = 0)
     {
       BUFFER_SIZE = batchSize;
+      SurvivalTargetHorizon = survivalTargetHorizon;
+
+      if (survivalTargetHorizon > 0 && (evaluator != null || evaluatorPostprocessor != null))
+      {
+        throw new ArgumentException("Survival target sidecars are incompatible with evaluator/postprocessor record omission.");
+      }
+      if (survivalTargetHorizon > 0 && !useZstandard)
+      {
+        throw new ArgumentException("Survival target sidecars require Zstandard output.");
+      }
 
       if (totalNumPositionsToBeWritten % BUFFER_SIZE != 0)
       {
@@ -154,6 +175,12 @@ namespace CeresTrain.TPG.TPGGenerator
       writingBuffersLocks = new object[numSets];
       countsInBuffer = new int[numSets];
 
+      if (survivalTargetHorizon > 0)
+      {
+        bufferSurvivalBySquare = new byte[numSets][][];
+        survivalOutStreams = outputFileNameBase == null ? null : new Stream[numSets];
+      }
+
       for (int i = 0; i < numSets; i++)
       {
         // Allocate buffers for this set.
@@ -171,6 +198,15 @@ namespace CeresTrain.TPG.TPGGenerator
           }
         }
 
+        if (survivalTargetHorizon > 0)
+        {
+          bufferSurvivalBySquare[i] = new byte[BUFFER_SIZE][];
+          for (int b = 0; b < BUFFER_SIZE; b++)
+          {
+            bufferSurvivalBySquare[i][b] = new byte[64];
+          }
+        }
+
         if (outputFileNameBase != null)
         {
           // Create output stream.
@@ -182,14 +218,31 @@ namespace CeresTrain.TPG.TPGGenerator
           Stream compressedStream = useZstandard ? new ZstandardStream(outStream, zStdCompressionEquivalents[(int)compressionLevel])
                                                  : new GZipStream(outStream, compressionLevel);
           outStreams[i] = compressedStream;
+
+          if (survivalTargetHorizon > 0)
+          {
+            // Parallel sidecar stream with 16-byte header (see SURVIVAL_TARGET_SPEC.md):
+            // magic "TPGT" | version=1 | numChannels=1 | horizon K | 9 reserved zeros.
+            string survFN = outputFileNameBase + "_set" + i + ".tgt.zst";
+            Stream survOutStream = new FileStream(survFN, FileMode.Create);
+            Stream survCompressed = new ZstandardStream(survOutStream, zStdCompressionEquivalents[(int)compressionLevel]);
+            Span<byte> header = stackalloc byte[16];
+            header.Clear();
+            header[0] = (byte)'T'; header[1] = (byte)'P'; header[2] = (byte)'G'; header[3] = (byte)'T';
+            header[4] = 1;                              // format version
+            header[5] = 1;                              // channels
+            header[6] = (byte)survivalTargetHorizon;    // K
+            survCompressed.Write(header);
+            survivalOutStreams[i] = survCompressed;
+          }
         }
       }
     }
 
 
-    public void Write(int targetSetIndex, float minLegalMoveProbability, 
-                      params (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, 
-                      int indexMoveInGame, short[] indexLastMoveBySquares)[] items)
+    public void Write(int targetSetIndex, float minLegalMoveProbability,
+                      params (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo,
+                      int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares)[] items)
     {
       // Take the lock on the buffer associated with this target set
       // so that we can't have two concurrent writes to the same target set.
@@ -197,7 +250,7 @@ namespace CeresTrain.TPG.TPGGenerator
       {
         foreach (var item in items)
         {
-          Write(item.record, item.targetInfo, item.indexMoveInGame, item.indexLastMoveBySquares, minLegalMoveProbability, targetSetIndex);
+          Write(item.record, item.targetInfo, item.indexMoveInGame, item.indexLastMoveBySquares, minLegalMoveProbability, targetSetIndex, item.survivalBySquares);
         }
       }
     }
@@ -215,7 +268,7 @@ namespace CeresTrain.TPG.TPGGenerator
     /// <param name="emitMoves"></param>
     public void Write(in EncodedTrainingPosition record, in TPGTrainingTargetNonPolicyInfo targetInfo,
                       int indexMoveInGame, short[] indexLastMoveBySquares, float minLegalMoveProbability,
-                      int targetSetIndex)
+                      int targetSetIndex, byte[] survivalBySquares = null)
     {
       if (shutdown)
       {
@@ -248,6 +301,15 @@ namespace CeresTrain.TPG.TPGGenerator
           {
             pliesSinceLastPieceMoveBySquare[s] = TPGRecordEncoding.ToPliesSinceLastPieceMoveBySquare(indexMoveInGame, indexLastMoveBySquares[s]);
           }
+        }
+
+        if (SurvivalTargetHorizon > 0)
+        {
+          if (survivalBySquares == null)
+          {
+            throw new ArgumentException("SurvivalTargetHorizon > 0 but record arrived without survival labels.");
+          }
+          Array.Copy(survivalBySquares, bufferSurvivalBySquare[targetSetIndex][thisBufferIndex], 64);
         }
 
         countsInBuffer[targetSetIndex]++;
@@ -560,6 +622,17 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
           throw new NotImplementedException("Unsupported OutputFormat of " + OutputFormat);
         }
 
+        // Survival sidecar: append the 64 label bytes per record, in exactly the
+        // order the records above were written (same buffer, same flush point).
+        if (SurvivalTargetHorizon > 0 && survivalOutStreams != null)
+        {
+          byte[][] survRows = bufferSurvivalBySquare[targetSetIndex];
+          for (int i = 0; i < positions.Length; i++)
+          {
+            survivalOutStreams[targetSetIndex].Write(survRows[i], 0, 64);
+          }
+        }
+
         // Record fact that records actually written.
         numRecordsWritten[targetSetIndex] += positions.Length;
 
@@ -595,6 +668,16 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
             }
           }
           outStreams = null;
+
+          if (survivalOutStreams != null)
+          {
+            for (int i = 0; i < survivalOutStreams.Length; i++)
+            {
+              survivalOutStreams[i]?.Dispose();
+              survivalOutStreams[i] = null;
+            }
+            survivalOutStreams = null;
+          }
         }
       }
     }

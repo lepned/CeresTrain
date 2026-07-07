@@ -65,19 +65,20 @@ namespace CeresTrain.Tasks
                                    string targetDirectoryTPGs,
                                    int numSetsToGenerate,
                                    string description,
+                                   int positionSkipCount = 20,
                                    bool extractOnlyFRC = false,
-                                   bool includeAllVariants = false)
+                                   bool includeAllVariants = false,
+                                   int survivalTargetHorizon = 0)
     {
-      const int POSITION_SKIP_COUNT = 30;
-
       for (int i = 0; i < numSetsToGenerate; i++)
       {
         GenerateTPG(sourceDirectoryTARsOrZSTs, targetDirectoryTPGs, NUM_POS_TOTAL, DEBUG, description,
                     (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true, // position.PieceCount <= 10,
                     null,
-                    positionSkipCount: POSITION_SKIP_COUNT,
+                    positionSkipCount: positionSkipCount,
                     extractOnlyFRC: extractOnlyFRC,
-                    includeAllVariants: includeAllVariants);
+                    includeAllVariants: includeAllVariants,
+                    survivalTargetHorizon: survivalTargetHorizon);
       }
     }
 
@@ -91,13 +92,13 @@ namespace CeresTrain.Tasks
     public static void GenerateTPGCustomSize(string sourceDirectoryTARsOrZSTs,
                                              string targetDirectoryTPGs,
                                              long numPositions,
-                                             string description)
+                                             string description,
+                                             int positionSkipCount = 20)
     {
-      const int POSITION_SKIP_COUNT = 30;
       GenerateTPG(sourceDirectoryTARsOrZSTs, targetDirectoryTPGs, numPositions, DEBUG, description,
                   (EncodedTrainingPositionGame game, int positionIndex, in Position position) => true,
                   null,
-                  positionSkipCount: POSITION_SKIP_COUNT);
+                  positionSkipCount: positionSkipCount);
     }
 
 
@@ -125,7 +126,8 @@ namespace CeresTrain.Tasks
                                    int numRelatedPositionsPerBlock = 1,
                                    bool emitPriorMoveWinLoss = false,
                                    bool extractOnlyFRC = false,
-                                   bool includeAllVariants = false)
+                                   bool includeAllVariants = false,
+                                   int survivalTargetHorizon = 0)
     {
       ArgumentNullException.ThrowIfNullOrEmpty(sourceDirectoryTARsOrZSTs, nameof(sourceDirectoryTARsOrZSTs));
       ArgumentNullException.ThrowIfNullOrEmpty(targetDirectoryTPGs, nameof(targetDirectoryTPGs));
@@ -206,6 +208,7 @@ namespace CeresTrain.Tasks
 
           ExtractOnlyFRC = extractOnlyFRC, // when true, inverts variant filter: keep FRC, drop standard
           IncludeAllVariants = includeAllVariants, // when true, disables variant filter entirely (keeps both standard and FRC)
+          SurvivalTargetHorizon = survivalTargetHorizon, // >0: emit K-ply survival sidecar files (SURVIVAL_TARGET_SPEC.md)
         };
 
         // Create the generator and run

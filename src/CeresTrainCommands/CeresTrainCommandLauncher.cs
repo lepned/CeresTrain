@@ -44,6 +44,8 @@ namespace CeresTrain.TrainCommands
     static Option<long> genTpgNumPosOption;   // gen-tpg: default 0 = use num-sets path
     static Option<bool> frcOnlyOption;        // gen-tpg: when true, extract ONLY Chess960/FRC games (default false = standard only)
     static Option<bool> includeFrcOption;     // gen-tpg: when true, keep BOTH standard and FRC games (mixed-variant corpus)
+    static Option<int> skipCountOption;       // gen-tpg: position skip modulus (1 = keep every position)
+    static Option<int> survivalHorizonOption; // gen-tpg: K-ply survival target sidecars (0 = off)
     static Option<string> piecesOptionRequired;
     static Option<string> piecesOptionOptional;
     static Option<string> netSpecificationOption;
@@ -109,6 +111,8 @@ namespace CeresTrain.TrainCommands
       genTpgNumPosOption = new Option<long>("--num-pos", () => 0, "Override num-sets: emit exactly this many positions (use for small quiet-anchor streams). 0 = use num-sets.") { };
       frcOnlyOption = new Option<bool>("--frc-only", () => false, "If true, INVERT variant filter: keep only Chess960/FRC games, skip standard. Default false (legacy: keep standard, drop FRC).") { };
       includeFrcOption = new Option<bool>("--include-frc", () => false, "If true, DISABLE variant filter: keep BOTH standard and FRC games (mixed-variant corpus). Takes precedence over --frc-only.") { };
+      skipCountOption = new Option<int>("--skip-count", () => 20, "Position skip modulus: keep ~1 of every N positions per game (default 20). Use 1 to keep ALL positions (positions within a game are highly correlated).") { };
+      survivalHorizonOption = new Option<int>("--survival-horizon", () => 0, "If > 0, also emit K-ply piece-survival target sidecar files (<shard>.tgt.zst) for auxiliary-head training (see SURVIVAL_TARGET_SPEC.md). 0 = off.") { };
       piecesOptionRequired = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = true };
       piecesOptionOptional = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = false };
       netSpecificationOption = new Option<string>("--net-spec", "LC0 network specification in Ceres format, e.g. LC0:703810") { IsRequired = true };
@@ -144,7 +148,7 @@ namespace CeresTrain.TrainCommands
       evalLC0Command = new Command("eval-lc0", "Evaluate vs LC0 with specific pieces and network.               [pieces] [net-spec] [num-pos] [search-limit] [pos-fn] [verbose]") { piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption };
       extractPositionsCommand = new Command("extract-pos", "Generate EPD/PGN file with positions from specified PGN/EPD     [pieces] [num-pos] [pos-fn] [pos-out-fn]") { piecesOptionRequired, numPosOption, epdOrPgnFnOption, epdOrPgnOutputFileNameOption };
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
-      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption };
+      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc] [--skip-count N] [--survival-horizon K]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
       upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (141 byte/sq) by computing 4 aux feature bytes per square (mobility, defender_count, is_pinned, is_threatened) from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out] [--zstd-level N] [--max-files-parallel N]") { tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption };
 
@@ -268,38 +272,43 @@ namespace CeresTrain.TrainCommands
       }, tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption);
 
 
-      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc) =>
+      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc, skipCount, survivalHorizon) =>
       {
         // --include-frc takes precedence over --frc-only (both can't logically be on).
         string variantSuffix;
         if (includeFrc) variantSuffix = " (all-variants: standard + FRC)";
         else if (frcOnly) variantSuffix = " (FRC-only extraction)";
         else variantSuffix = "";
+        string survivalSuffix = survivalHorizon > 0 ? $" (+survival K={survivalHorizon})" : "";
 
         if (numPos > 0)
         {
           // explicit position count overrides numSets — emit exactly numPos positions.
-          // GenerateTPGCustomSize doesn't take variant args; if any variant flag is set
+          // GenerateTPGCustomSize doesn't take variant/survival args; if any is set
           // route through the long-form GenerateTPG entry which does accept them.
-          if (frcOnly || includeFrc)
+          if (frcOnly || includeFrc || survivalHorizon > 0)
           {
             TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numPos, debugMode: false,
-                                          description: $"Custom-size extraction{variantSuffix} ({numPos} positions)",
+                                          description: $"Custom-size extraction{variantSuffix}{survivalSuffix} ({numPos} positions, skip {skipCount})",
+                                          positionSkipCount: skipCount,
                                           extractOnlyFRC: frcOnly && !includeFrc,
-                                          includeAllVariants: includeFrc);
+                                          includeAllVariants: includeFrc,
+                                          survivalTargetHorizon: survivalHorizon);
           }
           else
           {
-            TPGConvertFromTAR.GenerateTPGCustomSize(sourceDir, targetDir, numPos, $"Converted using TPGConvertFromTAR.GenerateTPGCustomSize ({numPos} positions)");
+            TPGConvertFromTAR.GenerateTPGCustomSize(sourceDir, targetDir, numPos, $"Converted using TPGConvertFromTAR.GenerateTPGCustomSize ({numPos} positions, skip {skipCount})", skipCount);
           }
         }
         else
         {
-          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix,
+          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix + survivalSuffix,
+                                        positionSkipCount: skipCount,
                                         extractOnlyFRC: frcOnly && !includeFrc,
-                                        includeAllVariants: includeFrc);
+                                        includeAllVariants: includeFrc,
+                                        survivalTargetHorizon: survivalHorizon);
         }
-      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption);
+      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption);
 
 
       generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory) =>

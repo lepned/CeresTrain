@@ -182,6 +182,13 @@ namespace CeresTrain.TPG.TPGGenerator
     public bool IncludeAllVariants { init; get; } = false;
 
     /// <summary>
+    /// If > 0, K-ply piece-survival target labels are computed for every emitted
+    /// position and written to sidecar files (one "&lt;shard&gt;.tgt.zst" per output set;
+    /// see SURVIVAL_TARGET_SPEC.md). 0 = off (no sidecars, bit-identical legacy output).
+    /// </summary>
+    public int SurvivalTargetHorizon { init; get; } = 0;
+
+    /// <summary>
     /// If number of ply since last move on each square is emitted.
     /// </summary>
     public bool EmitPlySinceLastMovePerSquare = false;
@@ -374,6 +381,24 @@ namespace CeresTrain.TPG.TPGGenerator
       if (PositionMaxFraction <= 0)
       {
         throw new Exception("PositionMaxFraction must be greater than 0 (use 1.0 to disable filtering).");
+      }
+
+      if (SurvivalTargetHorizon > 0)
+      {
+        // Sidecar row ordering mirrors the main record stream 1:1; paths that reorder,
+        // synthesize, or omit records after buffering are not supported with sidecars.
+        if (NumRelatedPositionsPerBlock != 1)
+        {
+          throw new Exception("SurvivalTargetHorizon requires NumRelatedPositionsPerBlock == 1 (multiboard blocks unsupported).");
+        }
+        if (AnnotationNNEvaluator != null || AnnotationPostprocessor != null)
+        {
+          throw new Exception("SurvivalTargetHorizon is incompatible with AnnotationNNEvaluator/AnnotationPostprocessor (record omission would desync sidecars).");
+        }
+        if (SurvivalTargetHorizon > 254)
+        {
+          throw new Exception("SurvivalTargetHorizon must be <= 254 (byte label encoding).");
+        }
       }
     }
 
