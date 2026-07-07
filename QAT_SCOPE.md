@@ -1,5 +1,16 @@
 # QAT Scope — closing the INT8 PTQ quality gap on C1-640-34
 
+> **STATUS: CAMPAIGN CLOSED (2026-06-12) — VERDICT: SHIP PTQ, DO NOT RETRAIN.**
+> The best QAT variant (pure-KD weights-only, frozen weight scales, 6M positions with
+> decay) EXACTLY MATCHES plain PTQ at n=10000 puzzles (79.0/90.7 vs 79.1/90.65) —
+> neither wins. Weight rounding is a negligible share of the INT8 gap; the residual
+> lives in ACTIVATION quantization, which weights-only QAT cannot address and whose
+> clip-training variant produced off-manifold weights (CE fine-tune drifted −6pp).
+> Ops lesson: sub-1pp INT8 comparisons need n=10000 — n=2000 deltas are noise.
+> The document below is the original scope, kept as-written for context; the
+> fake-quant infrastructure it specified is committed and reusable
+> (`src/CeresTrainPy/fake_quant.py`, env-gated in train.py).
+
 ## Goal
 PTQ ceiling (strongly-typed TRT, 99.999/64 percentile calib) is **−0.6pp policy / −0.8pp value**
 vs FP16, giving "≈equal" tournament play at **+45% NPS**. QAT's job: recover that gap so the
@@ -104,10 +115,10 @@ by construction. B is the fallback if manual STE proves fiddly.
 - Calibration OOM that capped PTQ at 64 positions does NOT bind QAT — QAT calibration is one-time
   range-seeding, ranges then adapt via gradients over the whole corpus.
 
-## Deliverables checklist
-- [ ] `src/CeresTrainPy/fake_quant.py` (FakeQuantLinear + swap + percentile calibrate)
-- [ ] `train.py` `Opt_QAT` flag wiring (swap+calibrate after resume; reuse KL-anchor as teacher)
-- [ ] config: `c1_640_34_ceres_qat.json` (resume=from_onnx_0, KL-anchor=from_onnx_0, low LR, 20–50M)
-- [ ] dev-box 5M smoke: step-0 == PTQ, loss converges
-- [ ] prod 20–50M distill run → export via qdq_export → strongly-typed TRT
-- [ ] validate: FEN sanity + rg2340/3-band puzzle ≥ FP16 floor
+## Deliverables checklist (final outcomes)
+- [x] `src/CeresTrainPy/fake_quant.py` (FakeQuantLinear + swap + percentile calibrate) — committed
+- [x] `train.py` QAT wiring (env-gated swap+calibrate after resume; KL-anchor as teacher)
+- [x] dev-box smoke: step-0 == PTQ verified, loss converged
+- [x] distill runs (3 variants: act-clip, CE fine-tune, pure-KD weights-only w/ frozen wscale)
+- [x] validate at n=10000: best QAT == PTQ exactly → **campaign closed, PTQ shipped**
+- [ ] ~~prod 20–50M run~~ — cancelled (no gap left to recover; see status banner)
