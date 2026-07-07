@@ -80,7 +80,15 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.95, 0.95),
         adamw_eps=1e-8,
+        adamw_lr=None,
     ):
+        # adamw_lr: separate learning rate for the internal-AdamW group (heads, embeddings,
+        # norms, biases). The docstring always advertised it but it was never implemented -
+        # both groups silently shared `lr`, i.e. one knob for two optimizers with different
+        # natural scales. Stored as a RATIO so the external LR scheduler (which rescales
+        # group['lr']) keeps the two rates proportional through warmup/decay.
+        # None (default) = legacy behavior, adamw group uses `lr` unchanged.
+        adamw_lr_ratio = (adamw_lr / lr) if adamw_lr is not None else 1.0
 
         defaults = dict(
             lr=lr,
@@ -90,6 +98,7 @@ class Muon(torch.optim.Optimizer):
             ns_steps=ns_steps,
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
+            adamw_lr_ratio=adamw_lr_ratio,
         )
 
         params = list(muon_params)
@@ -173,7 +182,9 @@ class Muon(torch.optim.Optimizer):
             ############################
 
             params = [p for p in group["params"] if not self.state[p]["use_muon"]]
-            lr = group['lr']
+            # Split-LR: heads/embeddings/norms/biases run at their own (typically much
+            # lower) rate; ratio-based so schedules stay proportional. 1.0 = legacy.
+            lr = group['lr'] * group.get("adamw_lr_ratio", 1.0)
             beta1, beta2 = group["adamw_betas"]
             eps = group["adamw_eps"]
             weight_decay = group["wd"]

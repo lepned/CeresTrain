@@ -126,6 +126,10 @@ class Configuration:
     self.Opt_PyTorchCompileMode = config_opt.get('PyTorchCompileMode', "max-autotune")
     self.Opt_WeightDecay = config_opt.get('WeightDecay', 0.01)
     self.Opt_LearningRateBase = config_opt.get('LearningRateBase', 0.0005)
+    # Split-LR (Muon only): separate absolute rate for the internal-AdamW group
+    # (heads/embeddings/norms/biases); the Muon trunk keeps LearningRateBase.
+    # None/absent = legacy single-rate. Env CERES_MUON_HEADS_LR overrides.
+    self.Opt_LearningRateBaseHeads = config_opt.get('LearningRateBaseHeads', None)
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)

@@ -451,7 +451,23 @@ def Train():
   elif config.Opt_Optimizer == 'Muon':
     muon_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embedding" not in n and "transformer_layer" in n and p.requires_grad] # 2D parameters can use Muon
     adamw_params =[p for n, p in model.named_parameters() if (p.ndim < 2 or "embedding" in n or not "transformer_layer" in n) and p.requires_grad] # non-2D should not use Muon
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=config.Opt_Beta1, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), muon_params=muon_params, adamw_params=adamw_params)
+    # Split-LR: separate rate for the internal-AdamW group (heads/embeddings/norms/biases)
+    # while the Muon trunk keeps LearningRateBase. One knob was silently shared by two
+    # optimizers with different natural scales; the fast trunk rate is needed by the trunk
+    # (all-cold 20M arm collapsed) while AdamW@2e-4 is the prod-validated value rate.
+    # Ratio-preserved through the LR schedule. CONFIG-ONLY by design ('LearningRateBaseHeads'
+    # in the opt json; absent/null = legacy single-rate) — no env override, so the config
+    # artifact always tells the truth about what trained.
+    if os.environ.get('CERES_MUON_HEADS_LR'):
+      raise ValueError('CERES_MUON_HEADS_LR was removed by design - set LearningRateBaseHeads '
+                       'in the _ceres_opt.json config instead (config-only, self-documenting).')
+    _heads_lr = getattr(config, 'Opt_LearningRateBaseHeads', None)
+    if _heads_lr is not None:
+      _heads_lr = float(_heads_lr)
+    if _heads_lr is not None:
+      print(f'[train] Muon SPLIT-LR: trunk (Muon 2-D) lr={LR}, heads/embeddings/norms (internal AdamW) lr={_heads_lr} '
+            f'(ratio {_heads_lr / LR:.4g}, schedule-proportional); {len(muon_params)} muon / {len(adamw_params)} adamw params')
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=config.Opt_Beta1, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr)
   elif config.Opt_Optimizer == 'AdEMAMix':
     optimizer = AdEMAMix(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), alpha=config.Opt_Alpha, T_alpha_beta3= STEPS_AdEMAMix_WARMUP)
   elif config.Opt_Optimizer == 'AdEMAMixShampoo':
