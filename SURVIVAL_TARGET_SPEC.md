@@ -246,13 +246,15 @@ release build. The survival changes are gen-side C# + python; no Ceres-engine ch
 
 ```
 CeresTrain.exe gen-tpg --tar-dir <TAR_DIR> --tpg-dir <OUT_DIR> \
-    --num-pos <N> --skip-count 1 --survival-horizon 8
+    --num-pos <N> --skip-count 1 --survival-horizon 8 --include-frc
 ```
 
 - `--num-pos` MUST be a multiple of 4096 (writer hard-errors otherwise).
 - CLI uses NAMED options only (positional args are rejected).
-- Variant filter default DROPS Chess960/FRC games; add `--include-frc` to keep both.
-- Memory: the dedup dictionary is capped at 100M entries (~5GB; commit 8221700).
+- `--include-frc` is the PRODUCTION DEFAULT (matches dje's recipe; the labeler is
+  Chess960-safe). Omitting it DROPS all FRC games (legacy filter) — only do that
+  deliberately, e.g. to reproduce the 2026-07 dev-box tactics corpora.
+- Memory: the dedup dictionary is capped at 100M entries (~5GB; commit 6e221d4).
   Budget roughly 30-40GB RAM for a 200M-position skip-1 run; measured throughput
   ~110K pos/s on a 24-core box (~30 min per 200M).
 - Output: `TPG_<id>.tpg_setN.zst` (pure V2, 9378 B/pos — shareable with any V2
