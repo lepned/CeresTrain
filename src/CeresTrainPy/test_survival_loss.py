@@ -61,9 +61,11 @@ def mode_bucket():
   target, output = build_case()
   lc = make_calc()
   loss = lc.survival_loss(target, output, False, 0.3)
-  # Independent reimplementation.
+  # Independent reimplementation. Class 0 (empty) is EXCLUDED from pooling: it is never
+  # a target under the mask, and pooling its logit into bucket 0 was a (fixed) noise leak.
   bounds = [2, 4, 8]
   c2b = torch.zeros(C, dtype=torch.long)
+  c2b[0] = -1
   for c in range(1, K + 1):
     c2b[c] = next(i for i, bnd in enumerate(bounds) if c <= bnd)
   c2b[K + 1] = len(bounds)
@@ -76,6 +78,13 @@ def mode_bucket():
   w[:len(bounds)] = 4.0
   expected = F.cross_entropy(bl, tm, weight=w)
   assert torch.allclose(loss, expected, atol=1e-6), f'{loss} vs {expected}'
+  # And the exclusion must matter: pooling WITH class 0 should give a different loss
+  # whenever the class-0 logit is non-negligible (guards against silent regression).
+  c2b_leaky = c2b.clone(); c2b_leaky[0] = 0
+  bl_leaky = torch.stack([torch.logsumexp(om[:, (c2b_leaky == b).nonzero(as_tuple=True)[0]], dim=1)
+                          for b in range(len(bounds) + 1)], dim=1)
+  leaky = F.cross_entropy(bl_leaky, tm, weight=w)
+  assert not torch.allclose(loss, leaky, atol=1e-6), 'class-0 exclusion had no effect - test inputs degenerate?'
   print('bucket OK')
 
 

@@ -110,7 +110,7 @@ namespace CeresTrain.TrainCommands
       numTPGSetsOption = new Option<int>("--num-tpg-sets", () => 1, "Number of sets of TPG positions to generate (~200mm positions per set)") { };
       genTpgNumPosOption = new Option<long>("--num-pos", () => 0, "Override num-sets: emit exactly this many positions (use for small quiet-anchor streams). 0 = use num-sets.") { };
       frcOnlyOption = new Option<bool>("--frc-only", () => false, "If true, INVERT variant filter: keep only Chess960/FRC games, skip standard. Default false (legacy: keep standard, drop FRC).") { };
-      includeFrcOption = new Option<bool>("--include-frc", () => false, "If true, DISABLE variant filter: keep BOTH standard and FRC games (mixed-variant corpus). Takes precedence over --frc-only.") { };
+      includeFrcOption = new Option<bool>("--include-frc", () => true, "If true (DEFAULT, production parity), keep BOTH standard and FRC games. Pass '--include-frc false' to restore the legacy standard-only filter. Takes precedence over --frc-only.") { };
       skipCountOption = new Option<int>("--skip-count", () => 20, "Position skip modulus: keep ~1 of every N positions per game (default 20). Use 1 to keep ALL positions (positions within a game are highly correlated).") { };
       survivalHorizonOption = new Option<int>("--survival-horizon", () => 0, "If > 0, also emit K-ply piece-survival target sidecar files (<shard>.tgt.zst) for auxiliary-head training (see SURVIVAL_TARGET_SPEC.md). 0 = off.") { };
       piecesOptionRequired = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = true };

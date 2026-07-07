@@ -181,6 +181,9 @@ any out-of-band ordering assumption wrong).
   logsumexp into capture-distance buckets; CE at bucket granularity. Adopted default
   (exact timing is move-order noise; measured 13% exact-ply). Bounds must be ascending
   and END AT the configured horizon: `"2,4,8"` at K=8, `"2,4"` at K=4 (current default).
+  2026-07-08 fix: the never-targeted empty-class logit is now EXCLUDED from bucket-0
+  pooling (was a small self-limiting noise leak) — survival CE/acc values shift
+  negligibly vs logs from runs before this fix; do not chase sub-0.01 CE diffs.
 - `CERES_SURVIVAL_CAPTURE_WEIGHT=4` — CE class weight on capture classes/buckets
   (survives stays 1); counters the ~10:1 survive:capture imbalance. Adopted default.
 - ❌ REMOVED after falsification (2026-07-07, t91s1k4i20M 20M A/B vs t91s1k420M): ordinal
@@ -305,9 +308,14 @@ CeresTrain.exe gen-tpg --tar-dir <TAR_DIR> --tpg-dir <OUT_DIR> \
 
 - `--num-pos` MUST be a multiple of 4096 (writer hard-errors otherwise).
 - CLI uses NAMED options only (positional args are rejected).
-- `--include-frc` is the PRODUCTION DEFAULT (matches dje's recipe; the labeler is
-  Chess960-safe). Omitting it DROPS all FRC games (legacy filter) — only do that
-  deliberately, e.g. to reproduce the 2026-07 dev-box tactics corpora.
+- `--include-frc` now DEFAULTS TO TRUE in code (2026-07-08 fix — it was briefly
+  documentation-only): unflagged runs keep both standard and FRC. Pass
+  `--include-frc false` to reproduce the legacy standard-only corpora (all pre-2026-07-08
+  corpora, including the 2026-07 dev-box tactics set, were generated standard-only).
+- `--skip-count` default is 20 and ALWAYS HAS BEEN in this repo (verified back to the
+  original gen-tpg commit ba9df7d). Note dje's own production driver sets 30 explicitly
+  (per his HOP options dump) — pass `--skip-count 30` if exact dje-parity sampling
+  density is wanted; the §9 command uses 1 (single-pass fresh-data regime) regardless.
 - Memory: the dedup dictionary is capped at 100M entries (~5GB; commit 6e221d4).
   Budget roughly 30-40GB RAM for a 200M-position skip-1 run; measured throughput
   ~110K pos/s on a 24-core box (~30 min per 200M).

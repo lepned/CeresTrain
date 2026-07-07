@@ -249,6 +249,7 @@ class LossCalculator():
       assert bounds == sorted(bounds) and bounds[-1] == K, \
         f'CERES_SURVIVAL_LOSS_BUCKETS must be ascending and end at K={K}, got {bounds}'
       class_to_bucket = torch.zeros(num_classes, dtype=torch.long, device=device)
+      class_to_bucket[0] = -1                         # empty class: excluded from pooling
       for c in range(1, K + 1):
         class_to_bucket[c] = next(i for i, b in enumerate(bounds) if c <= b)
       num_buckets = len(bounds) + 1
@@ -281,7 +282,8 @@ class LossCalculator():
     if class_to_bucket is not None:
       # Ordinal buckets: pool exact-ply logits into bucket logits (logsumexp = probability
       # sum in log space), grade at bucket granularity. Class 0 (empty) never appears under
-      # the mask; its logit is pooled into bucket 0 but contributes only as (tiny) noise mass.
+      # the mask and its logit is EXCLUDED from pooling (it used to leak into bucket 0 as
+      # noise mass; fixed 2026-07-07 — survival CE values shift negligibly vs older logs).
       num_buckets = int(weights.shape[0])
       bucket_logits = output_masked.new_full((output_masked.shape[0], num_buckets), float('-inf'))
       for b in range(num_buckets):
