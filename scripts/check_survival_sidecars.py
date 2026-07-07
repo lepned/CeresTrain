@@ -55,7 +55,9 @@ tot = {"recs": 0, "empty_mismatch": 0, "king_bad": 0}
 hist = np.zeros(K + 2, dtype=np.int64)
 cap_by_class = {"our_pawn": [0, 0], "our_piece": [0, 0], "opp_pawn": [0, 0], "opp_piece": [0, 0]}
 
-shards = sorted(glob.glob(os.path.join(corpus, "*.tpg_set*.zst")))
+# Any .zst with a matching sidecar qualifies: game shards (*.tpg_setN.zst) and
+# tablebase endgame streams (*.dat.zst) share the sidecar naming convention.
+shards = sorted(glob.glob(os.path.join(corpus, "*.zst")))
 shards = [s for s in shards if not s.endswith(".tgt.zst")]
 # Optional argv[2]: substring filter on shard basename (e.g. "set3.") so big corpora
 # can be validated with one process per shard in parallel.

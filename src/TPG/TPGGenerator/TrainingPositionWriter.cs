@@ -99,6 +99,13 @@ namespace CeresTrain.TPG.TPGGenerator
     readonly object[] writingBuffersLocks;
     Func<TPGRecord[], bool> BatchPostprocessorDelegate;
 
+    // Variant of BatchPostprocessorDelegate additionally receiving the survival sidecar
+    // rows buffered for the batch (null when SurvivalTargetHorizon == 0). Rows are the
+    // writer's REUSED per-set buffers - consumers must copy before the call returns.
+    // Used by generators that stream records themselves instead of writing shard files
+    // (TablebaseTPGBatchGenerator) but still need the sidecar bytes in lockstep.
+    Func<TPGRecord[], byte[][], bool> BatchPostprocessorWithTargetsDelegate;
+
     bool shutdown = false;
 
 
@@ -131,10 +138,12 @@ namespace CeresTrain.TPG.TPGGenerator
                                   bool emitPlySinceLastMovePerSquare,
                                   bool emitHistory,
                                   bool validateBeforeWrite,
-                                  int survivalTargetHorizon = 0)
+                                  int survivalTargetHorizon = 0,
+                                  Func<TPGRecord[], byte[][], bool> batchPostprocessorWithTargetsDelegate = null)
     {
       BUFFER_SIZE = batchSize;
       SurvivalTargetHorizon = survivalTargetHorizon;
+      BatchPostprocessorWithTargetsDelegate = batchPostprocessorWithTargetsDelegate;
 
       if (survivalTargetHorizon > 0 && (evaluator != null || evaluatorPostprocessor != null))
       {
@@ -583,7 +592,17 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
           TPGRecord[] convertedToTPG = ConvertedTPGRecords(positions, EmitHistory, positionsTargets, targetPolicyOverrides, minLegalMoveProbability,
                                                            pliesSinceLastPieceMoveBySquare, ValidateBeforeWrite);
 
-          if (BatchPostprocessorDelegate != null)
+          if (BatchPostprocessorWithTargetsDelegate != null)
+          {
+            // Rows are the reused per-set buffers; the delegate must copy what it keeps.
+            byte[][] survivalRows = SurvivalTargetHorizon > 0 ? bufferSurvivalBySquare[targetSetIndex] : null;
+            bool processedOK = BatchPostprocessorWithTargetsDelegate(convertedToTPG, survivalRows);
+            if (!processedOK)
+            {
+              throw new NotImplementedException("Shutdown not yet implemented");
+            }
+          }
+          else if (BatchPostprocessorDelegate != null)
           {
             bool processedOK = BatchPostprocessorDelegate(convertedToTPG);
             if (!processedOK)

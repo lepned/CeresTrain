@@ -226,7 +226,29 @@ actually does (basis for weight choices instead of loss-magnitude guessing).
 Interpretability: `scripts/survival_heatmap.py` renders per-square predicted-fate
 grids from real TPG records (never hand-encoded FENs — standalone-input trap).
 
-## 8a. Tablebase perfect-play survival (DESIGN, 2026-07-07 — priority after user review)
+## 8a. Tablebase perfect-play survival — IMPLEMENTED + A/B-CONFIRMED (2026-07-07)
+
+> **STATUS: BUILT, VALIDATED, RESULT POSITIVE.** `gen-endgame-tpg --survival-horizon K`
+> emits `<file>.dat.tgt.zst` sidecars (same header/row format; loader-compatible by naming,
+> zero loader changes). Implementation: `TablebaseSurvivalWalker` (DTZ-optimal K-ply walk)
+> + `SurvivalLabeler.ComputeSurvivalForLine` reuse (identity slot map — TB positions are
+> normalized white-to-move) + writer `batchPostprocessorWithTargetsDelegate` for streaming
+> consumers + paired-queue transport. Also fixed: TB path resolved the tablebase dir via
+> `SyzygyPath` only and threw on `DirTablebases`-style configs; now via `TablebaseDirectory`.
+>
+> **A/B (endgame-only, 256x10, 20M single-epoch, imbalanced 5/6-man mix, single variable):
+> survival ON cuts held-out value errors by ~1/3** — holdout probe-value vs exact Syzygy WDL
+> (2 x 16,384 unseen positions): acc 97.3/97.1 vs 95.8/95.5, CE -35%, corrEV 0.968 vs 0.949,
+> ~10-sigma, train==holdout (no memorization). First perfect-label test of the survival
+> mechanism: the effect is LARGER than on blunder-noisy game corpora.
+>
+> Ops notes: generate DECISIVE-friendly piece mixes (equal material is heavily drawn — an
+> imbalanced mix like [KRPkr .25][KRPkrp .15][KPPkp .15][KQPkq .15][KBPkb .15][KNPkn .15]
+> measured 62.4% supervised vs ~55% for KRPkrp-only); ~5-6K pos/s with walks on a 16-thread
+> box; TB-arm training shows policy acc ~100% + slightly negative policy loss (near-one-hot
+> DTZ policy targets; cosmetic).
+
+### Original design rationale (kept for context)
 
 Extend the endgame-TPG stream (`gen-endgame-tpg`, positions sampled from piece configs and
 labeled by Syzygy) with survival sidecars. TB records have no game continuation — so we

@@ -73,6 +73,14 @@ namespace CeresTrain.TrainingDataGenerator
     /// </summary>
     public readonly bool SucceedIfIncompleteDTZInformation;
 
+    /// <summary>
+    /// If > 0, K-ply piece-survival sidecar rows are computed for every record from a
+    /// synthesized TB-OPTIMAL continuation (perfect-play fates; SURVIVAL_TARGET_SPEC.md
+    /// section 8a). Rows for draws / failed probes are all-zero (unsupervised).
+    /// Consume record+row pairs via EnumeratorWithSurvival (record order == row order).
+    /// </summary>
+    public readonly int SurvivalTargetHorizon;
+
 
     TrainingPositionWriter writer;
     int maxQueueLength;
@@ -86,10 +94,12 @@ namespace CeresTrain.TrainingDataGenerator
     /// <param name="posGenerator"></param>
     /// <param name="batchSize"></param>
     /// <param name="numWorkerThreads"></param>
-    public TablebaseTPGBatchGenerator(string description, Func<Position> posGenerator, 
+    public TablebaseTPGBatchGenerator(string description, Func<Position> posGenerator,
                                       bool succeedIfIncompleteDTZInformation,
-                                      int batchSize = 2048, int numWorkerThreads = 5)
+                                      int batchSize = 2048, int numWorkerThreads = 5,
+                                      int survivalTargetHorizon = 0)
     {
+      SurvivalTargetHorizon = survivalTargetHorizon;
       if (numWorkerThreads <= 0)
       {
         throw new ArgumentException("must be greater than zero", nameof(numWorkerThreads));
@@ -110,6 +120,17 @@ namespace CeresTrain.TrainingDataGenerator
 
     public TPGRecord[] GetBatch()
     {
+      return GetBatchWithSurvival(out _);
+    }
+
+    /// <summary>
+    /// Dequeues the next batch together with its survival sidecar rows
+    /// (survivalRows is null when SurvivalTargetHorizon == 0). The rows queue is
+    /// drained in lockstep even by survival-unaware callers so the pairing can
+    /// never desynchronize.
+    /// </summary>
+    public TPGRecord[] GetBatchWithSurvival(out byte[][] survivalRows)
+    {
       if (!haveStarted)
       {
         const int DEFAULT_QUEUE_LENGTH = 4;
@@ -121,6 +142,17 @@ namespace CeresTrain.TrainingDataGenerator
       {
         Thread.Sleep(30);
       }
+
+      survivalRows = null;
+      if (SurvivalTargetHorizon > 0)
+      {
+        // Rows are enqueued atomically with their records, so once the records batch
+        // is visible its rows are already present (or arrive momentarily).
+        while (!PendingSurvivalRows.TryDequeue(out survivalRows))
+        {
+          Thread.Sleep(1);
+        }
+      }
       return batch;
     }
 
@@ -129,6 +161,18 @@ namespace CeresTrain.TrainingDataGenerator
       while (true)
       {
         yield return GetBatch();
+      }
+    }
+
+    /// <summary>
+    /// Enumerates (records, survivalRows) pairs; rows are in record order.
+    /// </summary>
+    public IEnumerable<(TPGRecord[] Records, byte[][] SurvivalRows)> EnumeratorWithSurvival()
+    {
+      while (true)
+      {
+        TPGRecord[] batch = GetBatchWithSurvival(out byte[][] rows);
+        yield return (batch, rows);
       }
     }
 
@@ -166,8 +210,17 @@ namespace CeresTrain.TrainingDataGenerator
     /// </summary>
     public ConcurrentQueue<TPGRecord[]> PendingRecords = new();
 
+    /// <summary>
+    /// Survival sidecar rows for the batches in PendingRecords, in the SAME order
+    /// (only populated when SurvivalTargetHorizon > 0; enqueues to the two queues are
+    /// made atomic under enqueueLock so pairwise dequeue by a single consumer is safe).
+    /// </summary>
+    ConcurrentQueue<byte[][]> PendingSurvivalRows = new();
 
-    bool PostProcessor(TPGRecord[] records)
+    readonly object enqueueLock = new();
+
+
+    bool PostProcessor(TPGRecord[] records, byte[][] survivalRows)
     {
       while (PendingRecords.Count > maxQueueLength)
       {
@@ -184,8 +237,27 @@ namespace CeresTrain.TrainingDataGenerator
       TPGRecord[] copy = new TPGRecord[records.Length];
       Array.Copy(records, copy, copy.Length);
 
-      // Enqueue records.
-      PendingRecords.Enqueue(copy);
+      // Copy the survival rows too: the writer hands us its REUSED per-set buffers.
+      byte[][] rowsCopy = null;
+      if (SurvivalTargetHorizon > 0)
+      {
+        rowsCopy = new byte[records.Length][];
+        for (int i = 0; i < records.Length; i++)
+        {
+          rowsCopy[i] = (byte[])survivalRows[i].Clone();
+        }
+      }
+
+      // Enqueue records (and rows) atomically so the two queues stay in lockstep
+      // even with concurrent per-set flushes.
+      lock (enqueueLock)
+      {
+        PendingRecords.Enqueue(copy);
+        if (SurvivalTargetHorizon > 0)
+        {
+          PendingSurvivalRows.Enqueue(rowsCopy);
+        }
+      }
 
       return true;
     }
@@ -204,9 +276,19 @@ namespace CeresTrain.TrainingDataGenerator
 
       writer = new TrainingPositionWriter(outFileName, NumWorkerThreads, TPGGeneratorOptions.OutputRecordFormat.TPGRecord,
                                           true, System.IO.Compression.CompressionLevel.Optimal, TARGET_NUM_TPG(),
-                                          null, null, PostProcessor, BatchSize, false, EMIT_HISTORY, true);
+                                          null, null, null, BatchSize, false, EMIT_HISTORY, true,
+                                          SurvivalTargetHorizon, PostProcessor);
 
-      ISyzygyEvaluatorEngine tbEvaluator = ISyzygyEvaluatorEngine.DefaultEngine;
+      // Resolve TB path via TablebaseDirectory (honors BOTH the SyzygyPath and DirTablebases
+      // Ceres.json spellings); ISyzygyEvaluatorEngine.DefaultEngine reads only SyzygyPath and
+      // throws ArgumentNull on configs using DirTablebases (as the gen-tpg rescoring path,
+      // which uses TablebaseDirectory, has always tolerated).
+      string tbDir = Ceres.Chess.UserSettings.CeresUserSettingsManager.Settings.TablebaseDirectory;
+      if (tbDir == null)
+      {
+        throw new InvalidOperationException("No tablebase directory configured (set SyzygyPath or DirTablebases in Ceres.json).");
+      }
+      ISyzygyEvaluatorEngine tbEvaluator = SyzygyEvaluatorPool.GetSessionForPaths(tbDir);
       List<Task> tasksList = new List<Task>();
       for (int i = 0; i < NumWorkerThreads; i++)
       {
@@ -245,6 +327,7 @@ namespace CeresTrain.TrainingDataGenerator
         while (!threadsAllDone)
         {
           PendingBatchQueue.Clear();
+          PendingSurvivalRows.Clear();
           threadsAllDone = Task.WaitAll(tasks.ToArray(), 100);
         }
 
@@ -282,7 +365,22 @@ namespace CeresTrain.TrainingDataGenerator
 
         if (generated)
         {
-          writer.Write(in etp, targetInfo, 0, null, CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE, indexInSet);
+          byte[] survivalRow = null;
+          if (SurvivalTargetHorizon > 0)
+          {
+            // Perfect-play fates from a synthesized TB-optimal continuation.
+            // Draws / failed probes yield an all-zero (unsupervised) row.
+            // pos was normalized to White to move above, so the labeler's real-board
+            // square indexing coincides with the record slot indexing (no ^56 remap).
+            List<Position> line = TablebaseSurvivalWalker.TryWalkOptimalLine(in pos, tbEvaluator,
+                                                                             SurvivalTargetHorizon,
+                                                                             succeedIfIncompleteDTZData);
+            survivalRow = line == null ? new byte[64]
+                                       : SurvivalLabeler.ComputeSurvivalForLine(line, SurvivalTargetHorizon)[0];
+          }
+
+          writer.Write(in etp, targetInfo, 0, null, CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE, indexInSet,
+                       survivalBySquares: survivalRow);
           numWritten++;
         }
 

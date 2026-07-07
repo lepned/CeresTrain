@@ -152,9 +152,12 @@ namespace CeresTrain.Examples
     /// <param name="piecesString"></param>
     /// <param name="numPositions"></param>
     /// <param name="outputDirectory"></param>
-    public static void GenerateTPGFilesFromTablebasePositions(string piecesString, 
-                                                              long numPositions, 
-                                                              string outputDirectory)
+    /// <param name="survivalTargetHorizon">if > 0, emit K-ply perfect-play survival sidecars
+    /// (<file>.dat.tgt.zst; SURVIVAL_TARGET_SPEC.md section 8a)</param>
+    public static void GenerateTPGFilesFromTablebasePositions(string piecesString,
+                                                              long numPositions,
+                                                              string outputDirectory,
+                                                              int survivalTargetHorizon = 0)
     {
       if (!Directory.Exists(outputDirectory))
       {
@@ -178,7 +181,7 @@ namespace CeresTrain.Examples
         List<Task> tasks = new();
         Enumerable.Range(0, NUM_THREADS).ToList().ForEach(i =>
         {
-          tasks.Add(Task.Run(() => GenerateTPGFileFromTablebasePositions(SUCCEED_IF_INCOMPLETE_DTZ_INFORMATION, outputDirectory, piecesString, i, BATCH_SIZE, NUM_BATCHES_TO_WRITE)));
+          tasks.Add(Task.Run(() => GenerateTPGFileFromTablebasePositions(SUCCEED_IF_INCOMPLETE_DTZ_INFORMATION, outputDirectory, piecesString, i, BATCH_SIZE, NUM_BATCHES_TO_WRITE, survivalTargetHorizon)));
         });
         Task.WaitAll(tasks.ToArray());
       }
@@ -199,17 +202,19 @@ namespace CeresTrain.Examples
     /// <param name="filenameIndex"></param>
     /// <param name="batchSize"></param>
     /// <param name="numBatches"></param>
-    static void GenerateTPGFileFromTablebasePositions(bool succeedIfIncompleteDTZInformation, 
-                                                      string outputDirectory, 
-                                                      string piecesString, 
-                                                      int filenameIndex, 
-                                                      int batchSize, 
-                                                      long numBatches)
+    static void GenerateTPGFileFromTablebasePositions(bool succeedIfIncompleteDTZInformation,
+                                                      string outputDirectory,
+                                                      string piecesString,
+                                                      int filenameIndex,
+                                                      int batchSize,
+                                                      long numBatches,
+                                                      int survivalTargetHorizon = 0)
     {
-      PositionGeneratorRandomFromPieces generator = 
+      PositionGeneratorRandomFromPieces generator =
         piecesString.Contains("[") ? PositionGeneratorRandomFromPieces.CreateFromMultiPiecesStr(piecesString) // e.g. "[KQPkqp,0.2],[KRPkrp,0.8]"
                                    : new PositionGeneratorRandomFromPieces(piecesString);
-      TablebaseTPGBatchGenerator tpgGenerator = new(generator.ID, generator.GeneratePosition, succeedIfIncompleteDTZInformation, batchSize);
+      TablebaseTPGBatchGenerator tpgGenerator = new(generator.ID, generator.GeneratePosition, succeedIfIncompleteDTZInformation, batchSize,
+                                                    survivalTargetHorizon: survivalTargetHorizon);
 
       string outFN = Path.Combine(outputDirectory, @$"{FileUtils.FileNameSanitized(generator.ID)}_{Random.Shared.Next()}_{filenameIndex}.dat.zst");
 
@@ -217,11 +222,38 @@ namespace CeresTrain.Examples
       using FileStream fs = new FileStream(outFN, FileMode.Create, FileAccess.Write);
       using ZstandardStream zs = new ZstandardStream(fs, COMPRESSION_LEVEL);
 
+      // Survival sidecar: parallel stream named so the loader's <shard minus .zst> + ".tgt.zst"
+      // convention finds it (X.dat.zst -> X.dat.tgt.zst). Same 16-byte header as the
+      // game-corpus sidecars (TPGT | version | numChannels | K | 9 reserved zeros).
+      FileStream survFS = null;
+      ZstandardStream survZS = null;
+      if (survivalTargetHorizon > 0)
+      {
+        string survFN = outFN.Substring(0, outFN.Length - ".zst".Length) + ".tgt.zst";
+        survFS = new FileStream(survFN, FileMode.Create, FileAccess.Write);
+        survZS = new ZstandardStream(survFS, COMPRESSION_LEVEL);
+        byte[] header = new byte[16];
+        header[0] = (byte)'T'; header[1] = (byte)'P'; header[2] = (byte)'G'; header[3] = (byte)'T';
+        header[4] = 1;                              // format version
+        header[5] = 1;                              // channels
+        header[6] = (byte)survivalTargetHorizon;    // K
+        survZS.Write(header, 0, header.Length);
+      }
+
       long numBatchesWritten = 0;
-      foreach (TPGRecord[] batch in tpgGenerator.Enumerator())
+      foreach ((TPGRecord[] batch, byte[][] survivalRows) in tpgGenerator.EnumeratorWithSurvival())
       {
         // Write compressed to the windows.
         StreamUtils.WriteSpanToStream<TPGRecord>(zs, batch);
+
+        if (survZS != null)
+        {
+          // One 64-byte row per record, in exactly the record order just written.
+          for (int i = 0; i < batch.Length; i++)
+          {
+            survZS.Write(survivalRows[i], 0, 64);
+          }
+        }
 
         // Stop once enough records written.
         if (++numBatchesWritten == numBatches)
@@ -229,6 +261,9 @@ namespace CeresTrain.Examples
           break;
         }
       }
+
+      survZS?.Dispose();
+      survFS?.Dispose();
 
       Console.WriteLine("Done " + outFN);
       tpgGenerator.Shutdown();

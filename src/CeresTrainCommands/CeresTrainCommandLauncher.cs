@@ -147,7 +147,7 @@ namespace CeresTrain.TrainCommands
       uciCommand = new Command("uci", "Launch trained net with specified configuration as UCI engine.  [config] [pieces] [net-spec-fillin]") { configOption, piecesOptionRequired, netSpecificationFillinOption };
       evalLC0Command = new Command("eval-lc0", "Evaluate vs LC0 with specific pieces and network.               [pieces] [net-spec] [num-pos] [search-limit] [pos-fn] [verbose]") { piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption };
       extractPositionsCommand = new Command("extract-pos", "Generate EPD/PGN file with positions from specified PGN/EPD     [pieces] [num-pos] [pos-fn] [pos-out-fn]") { piecesOptionRequired, numPosOption, epdOrPgnFnOption, epdOrPgnOutputFileNameOption };
-      generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption };
+      generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir] [--survival-horizon K]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption, survivalHorizonOption };
       generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc] [--skip-count N] [--survival-horizon K]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
       upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (141 byte/sq) by computing 4 aux feature bytes per square (mobility, defender_count, is_pinned, is_threatened) from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out] [--zstd-level N] [--max-files-parallel N]") { tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption };
@@ -311,17 +311,23 @@ namespace CeresTrain.TrainCommands
       }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption);
 
 
-      generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory) =>
+      generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory, survivalHorizon) =>
       {
         if (tarDirectory == null)
         {
-          CeresNetEvaluation.GenerateTPGFilesFromTablebasePositions(piecesStr, numPos, outDirectory);
+          CeresNetEvaluation.GenerateTPGFilesFromTablebasePositions(piecesStr, numPos, outDirectory, survivalHorizon);
         }
         else
         {
+          if (survivalHorizon > 0)
+          {
+            throw new NotImplementedException("--survival-horizon for gen-endgame-tpg is only supported for "
+                                            + "tablebase-sampled positions (omit --tar-dir); the TAR-sourced path "
+                                            + "has no TB-optimal continuation to walk.");
+          }
           CeresNetEvaluation.GenerateTPGFilesFromLC0TrainingData(piecesStr, numPos, tarDirectory, outDirectory);
         }
-      }, piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption);
+      }, piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption, survivalHorizonOption);
 
 
       trainCommand.SetHandler((configID, piecesStr, numPos, tpgDir, hostName, devices) =>
