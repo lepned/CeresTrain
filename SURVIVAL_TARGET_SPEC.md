@@ -1,7 +1,7 @@
 # K-Ply Survival Targets — Spec + As-Built Reference (v1.0, 2026-07-07)
 
 > **STATUS: IMPLEMENTED, VALIDATED, TOURNAMENT-CONFIRMED.** Channel S (piece fate) is fully
-> built and committed (gen 4a973c5, puzzles 98d7b02, training e33305a, scripts a11ea9a).
+> built and committed (gen 565ada1, puzzles da2ba11, training 3a7a479, scripts 0ff2ec5).
 > Channel A (king attack) is DESIGN ONLY — not implemented; sidecars on disk have C=1.
 > §9 is the production data-preparation quickstart — start there if you are the other machine.
 
@@ -117,7 +117,7 @@ record is appended, by the same writer (`TrainingPositionWriter`), per concurren
 set — never in a parallel pass (the generator's threading/deblunder/skip logic makes
 any out-of-band ordering assumption wrong).
 
-## 4. Generation (C#) — AS BUILT (commit 4a973c5)
+## 4. Generation (C#) — AS BUILT (commit 565ada1)
 
 1. **Compute**: `SurvivalLabeler.ComputeGameSurvival(in game, horizonPlies)`
    (`src/TPG/TPGGenerator/SurvivalLabeler.cs`) — one O(plies) pass per game using
@@ -146,7 +146,7 @@ any out-of-band ordering assumption wrong).
    (the s^56 slot mapping). Plus training-side sanity: fate accuracy must clear the
    trivial all-survive floor (~91% at K=8, ~96% at K=4 bucket-graded).
 
-## 5. Loader (`tpg_dataset.py`) — AS BUILT (commit e33305a)
+## 5. Loader (`tpg_dataset.py`) — AS BUILT (commit 3a7a479)
 
 - Env `CERES_TPG_TARGET_SIDECAR`: `0`/unset = off (legacy) · `1` = required (every
   shard must have `<shard>.tgt.zst`, hard error otherwise) · `auto` = per-shard
@@ -239,7 +239,7 @@ grids from real TPG records (never hand-encoded FENs — standalone-input trap).
 
 ## 9. PRODUCTION DATA-PREP QUICKSTART (for the other machine)
 
-Prereqs: CeresTrain at commit `a11ea9a` or later (survival series: 4a973c5 → a11ea9a),
+Prereqs: CeresTrain at commit `0ff2ec5` or later (survival series: 565ada1 → 0ff2ec5),
 release build. The survival changes are gen-side C# + python; no Ceres-engine change.
 
 **Generate** (V2 shards + K=8 sidecars; always K=8 — see §1 K guidance):
