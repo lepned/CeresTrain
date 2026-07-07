@@ -110,7 +110,40 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       TrainingPositionWriter writer = new TrainingPositionWriter(
         outFile, NUM_WORKER_THREADS, TPGGeneratorOptions.OutputRecordFormat.TPGRecord,
         true, System.IO.Compression.CompressionLevel.Optimal,
-        exactCount, null, null, null, batchSize, false, EMIT_HISTORY, true);
+        exactCount, null, null, null, batchSize, false, EMIT_HISTORY, true,
+        opts.SurvivalTargetHorizon);
+
+      // K-ply survival sidecars: fates come from the puzzle's remaining solution line,
+      // which must be looked up in the Lichess CSV by PuzzleId (records only carry the
+      // single next move). Build the id -> full-move-list map for exactly the ids present
+      // in the labeled JSONL (one CSV scan).
+      Dictionary<string, string> movesByPuzzleId = null;
+      long survivalFallbacks = 0;
+      if (opts.SurvivalTargetHorizon > 0)
+      {
+        HashSet<string> neededIds = new();
+        foreach (LabeledPuzzleRecord rec in JsonlIO.Read<LabeledPuzzleRecord>(opts.LabeledJsonlPath))
+        {
+          if (!string.IsNullOrEmpty(rec.PuzzleId))
+          {
+            neededIds.Add(rec.PuzzleId);
+          }
+        }
+        movesByPuzzleId = new Dictionary<string, string>(neededIds.Count);
+        foreach (string line in File.ReadLines(opts.LichessCsvPath))
+        {
+          int c1 = line.IndexOf(',');
+          if (c1 <= 0) continue;
+          string id = line.Substring(0, c1);
+          if (!neededIds.Contains(id)) continue;
+          int c2 = line.IndexOf(',', c1 + 1);
+          int c3 = c2 < 0 ? -1 : line.IndexOf(',', c2 + 1);
+          if (c3 < 0) continue;
+          movesByPuzzleId[id] = line.Substring(c2 + 1, c3 - c2 - 1); // Moves field
+        }
+        Console.WriteLine($"[to-tpg] survival K={opts.SurvivalTargetHorizon}: solution lines found for "
+                        + $"{movesByPuzzleId.Count:N0} of {neededIds.Count:N0} puzzle ids");
+      }
 
       long emitted = 0, skipped = 0;
       Stopwatch sw = Stopwatch.StartNew();
@@ -136,11 +169,21 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
           float minProb = (rec.Kind == PuzzlePositionKind.Standard)
                             ? CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE
                             : 0f;
+
+          byte[] survivalRow = null;
+          if (opts.SurvivalTargetHorizon > 0)
+          {
+            if (!TryBuildSurvivalRow(rec, movesByPuzzleId, opts.SurvivalTargetHorizon, out survivalRow))
+            {
+              survivalFallbacks++;
+            }
+          }
+
           int times = stratify ? RatingWeight(rec.Rating, thresholds, weights) : 1;
           for (int k = 0; k < times; k++)
           {
             writer.Write(in etp, target, 0, zeroLastMoveBySquares,
-                         minProb, 0);
+                         minProb, 0, survivalRow);
             emitted++;
           }
         }
@@ -159,6 +202,11 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
       EmitStats stats = new EmitStats { Emitted = emitted, Skipped = skipped, ElapsedSec = sw.Elapsed.TotalSeconds };
       Console.WriteLine($"[to-tpg] Done. Emitted={stats.Emitted:N0} Skipped={stats.Skipped:N0} " +
                         $"-> {outFile}");
+      if (opts.SurvivalTargetHorizon > 0)
+      {
+        Console.WriteLine($"[to-tpg] survival rows: {survivalFallbacks:N0} records fell back to survives-all "
+                        + "(no CSV line / prior-move mismatch / synthetic continuation)");
+      }
       return stats;
     }
 
@@ -400,6 +448,121 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
         if (rating < thresholds[i]) { bin = i; break; }
       }
       return weights[bin];
+    }
+
+
+    /// <summary>
+    /// Builds the K-ply survival label row (record-slot indexing) for a labeled puzzle record.
+    /// Fates are computed along the puzzle's remaining solution line: replay
+    /// (StartFen + PriorUciMoves) to the record's position, verify PriorUciMoves is a prefix
+    /// of the puzzle's full CSV move list, then continue along the remaining moves (up to K).
+    /// The line truncates at its end, so pieces untouched by the tactic label as "survives".
+    ///
+    /// Returns false (with a survives-all fallback row) when the continuation cannot be
+    /// reconstructed: puzzle id missing from the CSV map, PriorUciMoves not a prefix of the
+    /// CSV line (synthetic/enriched continuations like OAIS), or replay failure. The fallback
+    /// is the correct "no observed continuation" label, identical to a game ending here.
+    /// </summary>
+    static bool TryBuildSurvivalRow(LabeledPuzzleRecord rec, Dictionary<string, string> movesByPuzzleId,
+                                    int horizonPlies, out byte[] slotRow)
+    {
+      slotRow = null;
+      Position currentPos = default;
+      List<Position> line = null;
+      bool haveLine = false;
+
+      try
+      {
+        if (!string.IsNullOrWhiteSpace(rec.StartFen))
+        {
+          Position startPos = Position.FromFEN(rec.StartFen);
+          MGPosition mg = startPos.ToMGPosition;
+          string[] prior = string.IsNullOrWhiteSpace(rec.PriorUciMoves)
+                             ? Array.Empty<string>()
+                             : rec.PriorUciMoves.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+          bool replayOK = true;
+          foreach (string uci in prior)
+          {
+            MGMove mv = MGMoveFromString.ParseMove(in mg, uci);
+            if (mv == default) { replayOK = false; break; }
+            mg.MakeMove(mv);
+          }
+
+          if (replayOK)
+          {
+            currentPos = mg.ToPosition;
+            line = new List<Position>(horizonPlies + 1) { currentPos };
+
+            // Remaining solution line: full CSV move list with PriorUciMoves as verified prefix.
+            // Color-flip-augmented records ("_aug" corpora duplicate every record with a
+            // vertically-mirrored, color-swapped twin) carry FLIPPED move strings, so when the
+            // original orientation is not a prefix, retry against the FlipUci'd CSV line.
+            if (movesByPuzzleId != null
+             && !string.IsNullOrEmpty(rec.PuzzleId)
+             && movesByPuzzleId.TryGetValue(rec.PuzzleId, out string movesStr))
+            {
+              string[] full = movesStr.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+              bool IsPrefix(string[] candidate)
+              {
+                if (candidate.Length < prior.Length) return false;
+                for (int i = 0; i < prior.Length; i++)
+                {
+                  if (!string.Equals(candidate[i], prior[i], StringComparison.OrdinalIgnoreCase)) return false;
+                }
+                return true;
+              }
+
+              if (!IsPrefix(full))
+              {
+                string[] flipped = new string[full.Length];
+                for (int i = 0; i < full.Length; i++) flipped[i] = FlipUci(full[i]);
+                full = IsPrefix(flipped) ? flipped : null;
+              }
+
+              if (full != null)
+              {
+                haveLine = true;
+                int numContinuation = Math.Min(horizonPlies, full.Length - prior.Length);
+                for (int i = 0; i < numContinuation; i++)
+                {
+                  MGMove mv = MGMoveFromString.ParseMove(in mg, full[prior.Length + i]);
+                  if (mv == default) { haveLine = false; break; }
+                  mg.MakeMove(mv);
+                  line.Add(mg.ToPosition);
+                }
+              }
+            }
+          }
+        }
+      }
+      catch
+      {
+        line = null;
+      }
+
+      if (!haveLine)
+      {
+        // No observed continuation (unreconstructable / synthetic record): emit an ALL-ZERO
+        // row. Label 0 is masked from the survival loss on every square, so such records
+        // contribute no fate supervision at all — strictly more honest than claiming
+        // "survives" for pieces whose actual continuation we never saw.
+        slotRow = new byte[64];
+        return false;
+      }
+
+      byte[] realRow = SurvivalLabeler.ComputeSurvivalForLine(line, horizonPlies)[0];
+
+      // Remap real-board squares to TPG record slots (same rule as TrainingPositionGenerator:
+      // White to move slot == squareNum, Black to move slot == squareNum ^ 56).
+      slotRow = new byte[64];
+      bool whiteToMove = currentPos.SideToMove == SideType.White;
+      for (int s = 0; s < 64; s++)
+      {
+        slotRow[whiteToMove ? s : s ^ 56] = realRow[s];
+      }
+
+      return haveLine;
     }
 
 

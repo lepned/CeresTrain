@@ -119,6 +119,14 @@ namespace CeresTrain.TrainingDataGenerator.GeneratorFromPuzzles
     /// </summary>
     public int[] RatingBinWeights { get; set; }
 
+    /// <summary>
+    /// puzzles-to-tpg: if &gt; 0, K-ply piece-survival target labels are computed for every
+    /// emitted record (fates along the puzzle's remaining solution line from the Lichess CSV,
+    /// truncating to "survives" at line end) and written to sidecar files
+    /// (&lt;shard&gt;.tgt.zst; see SURVIVAL_TARGET_SPEC.md). 0 = off.
+    /// </summary>
+    public int SurvivalTargetHorizon { get; set; } = 0;
+
     public int TeacherNodes { get; set; } = 100;
     public int MineBatchSize { get; set; } = 512;
     public int TeacherWorkerThreads { get; set; } = 4;
