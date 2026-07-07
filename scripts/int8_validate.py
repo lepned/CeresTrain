@@ -62,14 +62,15 @@ def cc(rc):
 
 
 class InlineCalibrator(trt.IInt8EntropyCalibrator2):
-    def __init__(self, tpg_dir, num_batches, batch_size, cache_path):
+    def __init__(self, tpg_dir, num_batches, batch_size, cache_path, feat):
         super().__init__()
         self.num_batches = num_batches
         self.batch_size = batch_size
         self.cache_path = cache_path
+        self.feat = feat  # input channels per square (137 = V2, 141 = V3 4-aux)
         self.ds = TPGDataset(tpg_dir, batch_size, 0.0, 0, 1, 0, 1, 0, False)
         self.idx = 0
-        self.dev_in = cc(cudart.cudaMalloc(batch_size * 64 * 137 * 4))[0]
+        self.dev_in = cc(cudart.cudaMalloc(batch_size * 64 * feat * 4))[0]
 
     def get_batch_size(self):
         return self.batch_size
@@ -110,6 +111,10 @@ def build_engine(onnx_path, out_path, batch, tpg_dir,
             for i in range(parser.num_errors):
                 print('[parse-err]', parser.get_error(i))
             raise RuntimeError('ONNX parse failed')
+    # Derive input channels from the parsed network so this works for both the
+    # 137-ch V2 nets and the 141-ch V3 4-aux nets (was hardcoded 137).
+    feat = int(network.get_input(0).shape[-1])
+    print(f'[build] input feature channels = {feat}')
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 33)
     if use_fp16:
@@ -118,14 +123,14 @@ def build_engine(onnx_path, out_path, batch, tpg_dir,
     if use_int8:
         config.set_flag(trt.BuilderFlag.INT8)
         cache = out_path + '.calib.cache'
-        calibrator = InlineCalibrator(tpg_dir, calib_batches, batch, cache)
+        calibrator = InlineCalibrator(tpg_dir, calib_batches, batch, cache, feat)
         config.int8_calibrator = calibrator
     profile = builder.create_optimization_profile()
-    profile.set_shape('squares', (1, 64, 137), (batch, 64, 137), (256, 64, 137))
+    profile.set_shape('squares', (1, 64, feat), (batch, 64, feat), (256, 64, feat))
     config.add_optimization_profile(profile)
     if calibrator is not None:
         calib_profile = builder.create_optimization_profile()
-        calib_profile.set_shape('squares', (batch, 64, 137), (batch, 64, 137), (batch, 64, 137))
+        calib_profile.set_shape('squares', (batch, 64, feat), (batch, 64, feat), (batch, 64, feat))
         config.set_calibration_profile(calib_profile)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
@@ -204,7 +209,11 @@ def compare(fp16, int8, ds, batch, num_batches):
         of = fp16.prepare(x); fp16.infer(); fp16.copy_outputs(of)
         oi = int8.prepare(x); int8.infer(); int8.copy_outputs(oi)
         pf = of['policy'].astype(np.float32); pi = oi['policy'].astype(np.float32)
-        vf = of['value'].astype(np.float32);  vi = oi['value'].astype(np.float32)
+        # PyTorch ≥2.10 dynamo aliases identical outputs. When LossValue2Multiplier=0
+        # in the trainer config, value2_out IS value_out (same tensor) — exporter
+        # keeps only 'value2' and drops 'value' entirely. Pick whichever exists.
+        v_key = 'value' if 'value' in of else 'value2'
+        vf = of[v_key].astype(np.float32);  vi = oi[v_key].astype(np.float32)
         top1 += int((pf.argmax(-1) == pi.argmax(-1)).sum())
         t3f = np.argpartition(-pf, 3, -1)[:, :3]
         t3i = np.argpartition(-pi, 3, -1)[:, :3]

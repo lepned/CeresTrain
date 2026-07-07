@@ -128,11 +128,20 @@ head_out = ['policy','value','mlh','unc','value2','q_deviation_lower',
             'q_deviation_upper','uncertainty_policy','action','prior_state','action_uncertainty']
 axes = {n: {0:'batch_size'} for n in ['squares_byte']+head_out}
 
+# V8_OPSET / V8_DYNAMO: torch >= 2.10 defaults to the dynamo exporter at
+# opset 18 (its down-conversion to 17 crashes: axes_input_to_attribute
+# assertion). V8_DYNAMO=0 forces the legacy TorchScript exporter — the
+# May-proven opset-17 deployment family for this net.
+_OPSET = int(os.environ.get('V8_OPSET', '18'))
+_kw = {}
+if os.environ.get('V8_DYNAMO', '') != '':
+    _kw['dynamo'] = os.environ['V8_DYNAMO'] == '1'
+print(f'[export] opset={_OPSET} dynamo_kw={_kw}')
 torch.onnx.export(wrapper, sample_inputs, OUT,
                   do_constant_folding=True,
-                  export_params=True, opset_version=17,
+                  export_params=True, opset_version=_OPSET,
                   input_names=['squares_byte'], output_names=head_out,
-                  dynamic_axes=axes)
+                  dynamic_axes=axes, **_kw)
 print("FP32 exported. Converting to FP16...")
 
 from onnxconverter_common.float16 import convert_float_to_float16
