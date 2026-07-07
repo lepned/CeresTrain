@@ -45,7 +45,8 @@ namespace CeresTrain.TPG.TPGGenerator
     /// <summary>
     /// Returns [numPositions][64] label bytes in REAL-board square indexing
     /// (A1=0 .. H8=63, BottomToTopLeftToRight). Callers writing TPG records must
-    /// remap to record slots (slot = sq if White to move, else 63 - sq).
+    /// remap to record slots: slot = sq if White to move, else sq ^ 56 (RANK flip,
+    /// file preserved — NOT 63-sq; validated empirically, see call sites).
     /// </summary>
     public static byte[][] ComputeGameSurvival(in EncodedTrainingPositionGame game, int horizonPlies)
     {
