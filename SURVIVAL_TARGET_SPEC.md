@@ -1,4 +1,9 @@
-# K-Ply Survival Targets — Research Spec (v0.1, 2026-07-06)
+# K-Ply Survival Targets — Spec + As-Built Reference (v1.0, 2026-07-07)
+
+> **STATUS: IMPLEMENTED, VALIDATED, TOURNAMENT-CONFIRMED.** Channel S (piece fate) is fully
+> built and committed (gen 4a973c5, puzzles 98d7b02, training e33305a, scripts a11ea9a).
+> Channel A (king attack) is DESIGN ONLY — not implemented; sidecars on disk have C=1.
+> §9 is the production data-preparation quickstart — start there if you are the other machine.
 
 Dense per-square **auxiliary prediction targets** for value-head research: for every
 training position, predict the short-horizon *fate* of each piece (and each king's
@@ -48,14 +53,19 @@ side-to-move flip; the input squares are already stm-oriented in TPG — the sid
 follows the SAME square ordering as the record's 64 square slots, so square index
 alignment is automatic).
 
-### Channel A — king attack (per square, uint8; v1.1, same replay pass)
+### Channel A — king attack (per square, uint8) — ⚠️ DESIGN ONLY, NOT IMPLEMENTED
 
 0 everywhere except the two king squares of `P_i`:
 `min(number of checks this king receives within K plies, 3) + 4 * (this side is MATED within K plies)`.
-Captures the attacking dimension explicitly (see §2). Ships immediately after
-Channel S (identical plumbing; labels computed in the same replay).
+Captures the attacking dimension explicitly (see §2). Same replay pass as Channel S;
+the sidecar header's numChannels byte reserves room. Queued in the corpus-v2 regen
+bundle; all existing sidecars are single-channel (C=1, Channel S only).
 
-Default **K = 8** (research knob `--survival-horizon`; sweep 4/8/16 later).
+**K guidance (post-sweep, 2026-07-07): GENERATE at K=8, TRAIN at any K' ≤ 8.**
+The loader remaps labels losslessly downward (see §6.1), so one K=8 corpus serves every
+smaller horizon; K' > 8 would require regeneration. A 2/4/8 sweep at 20M was null (K
+insensitive; even 2-ply induces the threat features) — training default is K=4 (easier
+task, smaller head), but always emit sidecars at K=8 to keep the corpus future-proof.
 
 ## 2. Sacrifice semantics — why sacs are NOT mislabeled (design position)
 
@@ -107,37 +117,50 @@ record is appended, by the same writer (`TrainingPositionWriter`), per concurren
 set — never in a parallel pass (the generator's threading/deblunder/skip logic makes
 any out-of-band ordering assumption wrong).
 
-## 4. Generation (C#) — implementation map
+## 4. Generation (C#) — AS BUILT (commit 4a973c5)
 
-1. **Compute** per game, once: in `TrainingPositionGenerator` where the per-game
-   loop runs with full game context (`TrainingPositionGenerator.cs:453`,
-   `gameAnalyzer.PositionRef(i)` for every ply). Replay the game's moves
-   (`EncodedTrainingPositionGame` → MGMove path, Chess960-aware) building
-   `fate[ply][64]` + `kingEvents[ply][64]` arrays in one O(plies) pass, then slice
-   per emitted position (fate at ply i = f(captures at plies i+1..i+K)).
-2. **Carry**: add `byte[] SurvivalTargets` (64*C) to `TPGTrainingTargetNonPolicyInfo`
-   (already threaded per-position into the writer: `TrainingPositionWriter.Write(record, targetInfo, ...)`
-   at `TrainingPositionWriter.cs:216`).
-3. **Write**: in the writer's per-set append path (same place
-   `TPGRecordConverter.ConvertToTPGRecord` output is buffered,
-   `TrainingPositionWriter.cs:437`), append the 64*C bytes to a parallel per-set
-   zstd stream; open/close alongside the main stream.
-4. **CLI**: `gen-tpg --survival-horizon K` (0 = off, default 0 → bit-identical
-   current behavior and no sidecar files).
-5. **Validation tool** (python, one-shot): for a sample of records, decode the
-   shard's square bytes to a board, replay via python-chess from the raw kovax tar
-   by position match, recompute fate independently, compare bit-for-bit (the same
-   oracle-validation pattern used for the V3 aux bytes, `validate_v3ext_aux_bytes.py`).
+1. **Compute**: `SurvivalLabeler.ComputeGameSurvival(in game, horizonPlies)`
+   (`src/TPG/TPGGenerator/SurvivalLabeler.cs`) — one O(plies) pass per game using
+   position-DIFF piece tracking (compares consecutive board states rather than
+   replaying moves; FRC/EP/promotion-safe, asserts on incoherent transitions).
+   Returns `byte[][] gameSurvival` = per-ply [64] fate labels in REAL-BOARD indexing.
+   Called from the per-game loop in `TrainingPositionGenerator.Read` (gated on
+   `Options.SurvivalTargetHorizon > 0`).
+2. **Carry**: the per-square labels travel as an explicit `byte[] survivalBySquares`
+   element of the writer's item tuple — NOT inside `TPGTrainingTargetNonPolicyInfo`
+   (the spec's original plan; the tuple slot was cleaner). Real-board → record-slot
+   remap happens in `PreparePosition` (black-to-move slot = realSquare ^ 56).
+3. **Write**: `TrainingPositionWriter` opens a parallel per-set zstd stream
+   `<base>_setN.tgt.zst`, writes the 16-byte header at open, buffers one 64-byte row
+   per record in `bufferSurvivalBySquare`, and flushes rows at the exact same
+   4096-record flush points as the main stream (order lockstep by construction).
+   Guards: sidecars require zstd output; incompatible with evaluator/postprocessor
+   record-omission modes (throws at construction).
+4. **CLI**: `gen-tpg ... --survival-horizon K` (0 = off, default 0 → bit-identical
+   legacy behavior, no sidecar files). See §9 for the full production command.
+5. **Validation** (as built): `scripts/check_survival_sidecars.py` — structural gate
+   (header, shard/sidecar row lockstep, empty-mask ≡ label-0 which catches any
+   desync or slot-flip, kings-always-survive, class stats). The empty-mask
+   equivalence is the load-bearing check: it fails on ANY record-order or
+   orientation error. An orientation bug was in fact caught this way pre-v1
+   (the s^56 slot mapping). Plus training-side sanity: fate accuracy must clear the
+   trivial all-survive floor (~91% at K=8, ~96% at K=4 bucket-graded).
 
-## 5. Loader (`tpg_dataset.py`)
+## 5. Loader (`tpg_dataset.py`) — AS BUILT (commit e33305a)
 
-- Env `CERES_TPG_TARGET_SIDECAR=1`: for each shard, require `<shard>.tgt.zst`,
-  stream it in lockstep (same remainder-carry pattern as the main stream; validate
-  header + equal record counts; hard error on mismatch — silent misalignment is the
-  known corruption class here).
-- Yield an extra `survival_targets` [B, 64, C] uint8 tensor in the batch dict.
-- The `CERES_KEEP_DRAW_PROB` filter and any future row filter MUST index it with the
-  same `_keep` mask (add to the filter list — this list is a known desync hazard).
+- Env `CERES_TPG_TARGET_SIDECAR`: `0`/unset = off (legacy) · `1` = required (every
+  shard must have `<shard>.tgt.zst`, hard error otherwise) · `auto` = per-shard
+  (sidecar-less shards yield batches with NO 'survival' key and the loss skips them
+  — enables a huge sidecar-less primary mixed with survival-labeled secondaries).
+- Sidecar streamed in lockstep with the shard via `read_exact` (zstd stream_reader
+  stops at FRAME boundaries — a naive short-read check silently drops data; this bit
+  us once). Header validated: magic/version/channels, and K per §6.1's remap rule.
+- Batch key: **`batch['survival']`**, shape **[B, 64] uint8** (C=1 is implicit —
+  a channels dimension appears only if/when Channel A ships).
+- `.tgt.zst` files are EXCLUDED from shard discovery (a sidecar being picked up as a
+  training shard was a real bug, now guarded).
+- The draw filter and any row filter index survival with the same `_keep` mask
+  (this filter list is a known desync hazard — extend it for any new filter).
 
 ## 6. Model + loss (`ceres_net.py`, placement-head patterns throughout)
 
@@ -148,15 +171,16 @@ any out-of-band ordering assumption wrong).
 - Env `CERES_SURVIVAL_TARGET_WEIGHT` (default 0 = off; start 0.3). Reuse verbatim:
   `self.training`-gated stash (export safety), `LossCalculator.survival_loss` with
   PENDING/LAST accumulator (+ per-class accuracy for monitoring), `SURV:` log line,
-  resume key handling (generalize the placement `placement_value_` prefix strip/init
-  to an aux-prefix list: `('placement_value_', 'survival_')`), DDP loud-error guard,
+  resume key handling (aux-prefix list, as built: `('placement_value_', 'survival_head.')`
+  in train.py), DDP loud-error guard,
   4-board loud-error guard, per-stream routing multiplier `CERES_SECONDARY_LOSS_SURVIVAL_MULT`.
 
 ### 6.1 Loss-shaping variants (all pure loss-side; head shape and checkpoints unchanged)
 
-- `CERES_SURVIVAL_LOSS_BUCKETS="2,4,8"` — ordinal-bucket CE: exact-ply logits pooled by
-  logsumexp into capture-distance buckets [1-2],[3-4],[5-8],[survives]; CE at bucket
-  granularity. Adopted default (exact timing is move-order noise; measured 13% exact-ply).
+- `CERES_SURVIVAL_LOSS_BUCKETS` — ordinal-bucket CE: exact-ply logits pooled by
+  logsumexp into capture-distance buckets; CE at bucket granularity. Adopted default
+  (exact timing is move-order noise; measured 13% exact-ply). Bounds must be ascending
+  and END AT the configured horizon: `"2,4,8"` at K=8, `"2,4"` at K=4 (current default).
 - `CERES_SURVIVAL_CAPTURE_WEIGHT=4` — CE class weight on capture classes/buckets
   (survives stays 1); counters the ~10:1 survive:capture imbalance. Adopted default.
 - ❌ REMOVED after falsification (2026-07-07, t91s1k4i20M 20M A/B vs t91s1k420M): ordinal
@@ -185,29 +209,79 @@ lines. Single-GPU + `PyTorchCompileMode` off only; each pass costs ~one backward
 Intended use: short measurement runs to put numbers on how much trunk-shaping each head
 actually does (basis for weight choices instead of loss-magnitude guessing).
 
-## 7. Experiment plan
+## 7. Results record (what has been established, 2026-07-06/07)
 
-1. Regenerate the kovax skip-1 corpus with `--survival-horizon 8` (~4 min + replay
-   cost; sidecars ≈ 64B/pos raw, ~a few MB/shard compressed).
-2. Oracle-validate 4K sampled labels (python-chess, incl. FRC cells) before any run.
-3. Arms at 20M positions, 256×10 prodclone recipe (baselines already exist):
-   a. baseline (done: `kvx20M_s1`) · b. +survival@0.3 · c. +survival+placement.
-4. Read: puzzle bands (a *tactical* target should show there, unlike placement —
-   mate + rg bands are the honest yardstick for this one); survival-head accuracy
-   by class (does it actually learn captures-at-d?); value/policy non-regression.
-5. Success gate (TACTICS-ONLY phase): value Perf +≥50 on ≥2 tactical bands over
-   baseline (outside single-seed noise), or clear policy gains (threat-awareness
-   helps policy too). Then: K sweep, weight sweep, Channel A, aggressive combos
-   (survival aux + puzzle-policy stream via loss routing). Tournament/general-play
-   evaluation is DEFERRED by design to a later phase (v66-v70 lesson still applies
-   before any production/shipping claim — but not to this research loop).
-6. Interpretability: per-square predicted-fate heatmaps from any checkpoint ("the
-   net thinks this knight is lost in 3") — use real TPG records as input, never
-   hand-encoded FENs (known standalone-input trap).
+| experiment | result |
+|---|---|
+| survival@0.3 vs baseline, 20M (kovax) | value +17..+46 ALL 4 bands, policy free |
+| + puzzle-surv secondary 32:1 value-masked ("combined") | policy +70..+194, value +40..+63; **tournament +38 Elo** over survival-only |
+| epochs on 22.5M corpus (60M→200M pos) | policy keeps climbing; **value plateaus ~60M** |
+| 100M on FRESH 191.5M corpus (14M net) | value plateau UNCHANGED → not data exhaustion |
+| grad-norm measurement | value1 = 48% of trunk gradient, policy 33%, survival 1.5% → aux works by INFORMATION, not gradient share |
+| K sweep 2/4/8, 20M | null (K insensitive) → train K=4, generate K=8 |
+| ordinal + piece-value loss | Pareto-negative → removed (§6.1) |
+| weight sweep 0.3/0.6/1.0 | mate value +50/+42, saturates at 0.6 → **0.6 adopted** |
+| **43M SwiGLU/smolgen × 200M fresh (t91s1swg200M)** | **value plateau BROKEN +64..+86 all bands (capacity was binding); mate value beats prod-600mm; +68 Elo prelim (26 games, CFS 97%, TC 60+1) over prod despite 35% nps deficit** |
+
+Interpretability: `scripts/survival_heatmap.py` renders per-square predicted-fate
+grids from real TPG records (never hand-encoded FENs — standalone-input trap).
 
 ## 8. Open questions / v2 ideas (parked)
 
-- Distance-bucketed classes {1-2, 3-4, 5-8, survives} vs exact-ply (v1 = exact; buckets if class imbalance hurts).
-- Second horizon channel (game-end survival = positional variant) for later A/B with tournament gate.
-- Blunder-masked labels (skip fate labels crossing a NoiseBlund ply).
-- Counterfactual (search-verified) fates for a subsample via teacher MCGS — turns descriptive labels into "best-play" fates where budget allows.
+- ~~Distance-bucketed classes~~ → ADOPTED as default (§6.1, buckets + capture weight).
+- Channel A (king attack) — designed (§1), queued in the corpus-v2 regen bundle.
+- Blunder-TRUNCATED labels (cut fate windows at NoiseBlund plies; truncate, don't
+  discard — and only on noise_blund, since err_blund masking would bias against
+  sharp positions; requires updating the validator's empty≡0 invariant).
+- Second horizon channel (game-end survival = positional variant), tournament-gated.
+- Counterfactual (search-verified) fates for a subsample via teacher MCGS.
+- Attribution: Mish-twin of t91s1swg200M (isolate SwiGLU's share of the breakthrough).
+
+## 9. PRODUCTION DATA-PREP QUICKSTART (for the other machine)
+
+Prereqs: CeresTrain at commit `a11ea9a` or later (survival series: 4a973c5 → a11ea9a),
+release build. The survival changes are gen-side C# + python; no Ceres-engine change.
+
+**Generate** (V2 shards + K=8 sidecars; always K=8 — see §1 K guidance):
+
+```
+CeresTrain.exe gen-tpg --tar-dir <TAR_DIR> --tpg-dir <OUT_DIR> \
+    --num-pos <N> --skip-count 1 --survival-horizon 8
+```
+
+- `--num-pos` MUST be a multiple of 4096 (writer hard-errors otherwise).
+- CLI uses NAMED options only (positional args are rejected).
+- Variant filter default DROPS Chess960/FRC games; add `--include-frc` to keep both.
+- Memory: the dedup dictionary is capped at 100M entries (~5GB; commit 8221700).
+  Budget roughly 30-40GB RAM for a 200M-position skip-1 run; measured throughput
+  ~110K pos/s on a 24-core box (~30 min per 200M).
+- Output: `TPG_<id>.tpg_setN.zst` (pure V2, 9378 B/pos — shareable with any V2
+  consumer, sidecars are an optional overlay) + `TPG_<id>.tpg_setN.tgt.zst`.
+
+**Validate before training** (non-negotiable; catches desync/orientation classes):
+
+```
+python check_survival_sidecars.py <OUT_DIR>              # single process, or
+python check_survival_sidecars.py <OUT_DIR> "setN."      # one process per set, parallel
+```
+
+PASS requires: 0 empty-square mismatches, 0 king violations. Expect capture-within-8
+rates ~7.5% pawns / ~10.5% pieces, side-symmetric (game corpora; puzzle corpora are
+legitimately asymmetric).
+
+**Train** (adopted env block, 2026-07-07):
+
+```
+CERES_TPG_TARGET_SIDECAR=1        # or 'auto' for mixed sidecar-less primaries
+CERES_SURVIVAL_HORIZON=4          # trains K'=4 from K=8 sidecars (lossless remap)
+CERES_SURVIVAL_TARGET_WEIGHT=0.6
+CERES_SURVIVAL_LOSS_BUCKETS=2,4   # bounds MUST end at the configured horizon
+CERES_SURVIVAL_CAPTURE_WEIGHT=4
+# combined recipe (puzzle secondary, value-masked):
+CERES_SECONDARY_LOSS_VALUE_MULT=0
+CERES_SECONDARY_LOSS_VALUE2_MULT=0
+CERES_SECONDARY_LOSS_AUX_MULT=0
+```
+
+Aux heads are single-GPU only (loud error under DDP). Expect a `SURV:` log line per
+stats interval; bucket-graded accuracy ~96% at K=4 is healthy (trivial floor ~91%).
