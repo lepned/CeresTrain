@@ -96,6 +96,44 @@ if _NUM_AUX_FEATURES_PER_SQUARE > 0:
   else:
     print(f'[tpg_dataset] AUX_FEATURES enabled: +{_NUM_AUX_FEATURES_PER_SQUARE} baked V3 aux channels per square (read directly from the TPG record, no recompute)')
 
+# TPG FILE format: bytes per square IN THE SHARD FILES (not the model width).
+#   141 (default) = V3 shards (137 base + 4 baked aux bytes per square, 9634 B/pos)
+#   137           = upstream V2 shards (no aux bytes, 9378 B/pos)
+# For 137, CERES_AUX_FEATURES_PER_SQUARE must be 0 (the file carries no aux to serve).
+# Default honors CERES_TPG_V3=0 (whole-corpus V2 toggle from upstream) when the
+# per-dataset env is not set explicitly.
+_TPG_SQUARE_BYTES = int(os.environ.get('CERES_TPG_SQUARE_BYTES',
+                                       '137' if os.environ.get('CERES_TPG_V3', '1') == '0' else '141'))
+if _TPG_SQUARE_BYTES not in (137, 141):
+  raise ValueError(f'CERES_TPG_SQUARE_BYTES must be 137 (V2 shards) or 141 (V3 shards), got {_TPG_SQUARE_BYTES}')
+if _TPG_SQUARE_BYTES == 137:
+  if _NUM_AUX_FEATURES_PER_SQUARE != 0:
+    raise ValueError('CERES_TPG_SQUARE_BYTES=137 (V2 shards, no aux bytes) requires CERES_AUX_FEATURES_PER_SQUARE=0, '
+                     f'got {_NUM_AUX_FEATURES_PER_SQUARE}')
+  print('[tpg_dataset] V2 TPG shard format: 137 bytes/square (9378 bytes/pos), no aux channels')
+
+# K-ply survival target sidecars (SURVIVAL_TARGET_SPEC.md): companion '<shard minus .zst>.tgt.zst'
+# files with a 16-byte header (TPGT|ver|channels|K|reserved) followed by [numRecords, 64] uint8
+# fate labels in the SAME record order. Exposed as batch['survival'] for the survival aux head.
+# Modes (CERES_TPG_TARGET_SIDECAR):
+#   0 / unset : off — sidecars ignored entirely (legacy)
+#   1         : required — EVERY shard must have a sidecar (hard error otherwise)
+#   auto      : per-shard — shards with sidecars supply survival targets, shards without
+#               simply yield batches with no 'survival' key (the survival loss skips them).
+#               Enables mixing a huge sidecar-less primary with survival-labeled secondaries.
+_TPG_TARGET_SIDECAR_ENV = (os.environ.get('CERES_TPG_TARGET_SIDECAR', '0') or '0').strip().lower()
+if _TPG_TARGET_SIDECAR_ENV in ('0', ''):
+  _TPG_TARGET_SIDECAR_MODE = 'off'
+elif _TPG_TARGET_SIDECAR_ENV == '1':
+  _TPG_TARGET_SIDECAR_MODE = 'required'
+elif _TPG_TARGET_SIDECAR_ENV == 'auto':
+  _TPG_TARGET_SIDECAR_MODE = 'auto'
+else:
+  raise ValueError(f"CERES_TPG_TARGET_SIDECAR must be 0, 1 or 'auto', got {_TPG_TARGET_SIDECAR_ENV!r}")
+_SURVIVAL_HORIZON = int(os.environ.get('CERES_SURVIVAL_HORIZON', '8') or 8)
+if _TPG_TARGET_SIDECAR_MODE != 'off':
+  print(f'[tpg_dataset] survival target sidecars ENABLED, mode={_TPG_TARGET_SIDECAR_MODE} (expect K={_SURVIVAL_HORIZON} in headers)')
+
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
 _POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
@@ -112,6 +150,13 @@ if not _USE_V3_TPG and _NUM_AUX_FEATURES_PER_SQUARE != 0:
                    f'(got {_NUM_AUX_FEATURES_PER_SQUARE}) — V2 has no aux bytes on disk.')
 if _POLICY_TARGET_ALPHA > 0:
   print(f"[tpg_dataset] policy-target sharpening: alpha = {_POLICY_TARGET_ALPHA}")
+
+# Decisive-position oversampling: keep all win/loss records but keep DRAW records only with
+# probability CERES_KEEP_DRAW_PROB (default 1.0 = off). Counters draw-saturation of strong
+# self-play data (e.g. 0.40 lifts decisive share ~28% -> ~50%). Draw class = argmax(wdl_q)==1.
+_KEEP_DRAW_PROB = float(os.environ.get('CERES_KEEP_DRAW_PROB', '1.0'))
+if _KEEP_DRAW_PROB < 1.0:
+  print(f"[tpg_dataset] decisive oversampling: keep_draw_prob = {_KEEP_DRAW_PROB}")
 
 
 class TPGDataset(Dataset):
@@ -136,20 +181,31 @@ class TPGDataset(Dataset):
       num_files_to_skip: Optional number of TPG files to be skipped by this worker (to avoids reprocessing files already processed)
       test (bool): If the Exec test flag is enabled.
   """
-  def __init__(self, root_dir, 
-               batch_size: int, 
-               wdl_smoothing : bool, 
-               rank : int, 
-               world_size : int, 
-               num_workers : int, 
-               boards_per_batch : int, 
+  def __init__(self, root_dir,
+               batch_size: int,
+               wdl_smoothing : bool,
+               rank : int,
+               world_size : int,
+               num_workers : int,
+               boards_per_batch : int,
                num_files_to_skip : int = 0,
-               test : bool = False):
+               test : bool = False,
+               square_bytes : int = None):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
     self.wdl_smoothing = wdl_smoothing
     self.num_workers = num_workers
+    # Per-dataset shard record format (137 = upstream V2, 141 = V3 with baked aux).
+    # Default = the process-wide CERES_TPG_SQUARE_BYTES; override per dataset to mix
+    # e.g. a V3 primary with a V2 secondary. A 137-byte dataset carries no aux bytes,
+    # so any aux-channel model input requires all datasets to be 141.
+    self.square_bytes = int(square_bytes) if square_bytes is not None else _TPG_SQUARE_BYTES
+    if self.square_bytes not in (137, 141):
+      raise ValueError(f'square_bytes must be 137 (V2) or 141 (V3), got {self.square_bytes}')
+    if self.square_bytes == 137 and _NUM_AUX_FEATURES_PER_SQUARE != 0:
+      raise ValueError(f'dataset {root_dir}: 137-byte (V2) shards carry no aux bytes; '
+                       f'CERES_AUX_FEATURES_PER_SQUARE must be 0 (got {_NUM_AUX_FEATURES_PER_SQUARE})')
     self.generator = self.item_generator()
     self.boards_per_batch = boards_per_batch
     self.test = test
@@ -176,6 +232,8 @@ class TPGDataset(Dataset):
     of each pass through the data so that new .zst files dropped into root_dir
     during a long run get included automatically."""
     all_files = fnmatch.filter(os.listdir(self.root_dir), '*.zst')
+    # Survival target sidecars (<shard>.tgt.zst) are companion label files, never shards.
+    all_files = [f for f in all_files if not f.endswith('.tgt.zst')]
     all_files.sort(key=lambda f: stable_str_hash(f))  # deterministic shuffle
     if initial:
       assert len(all_files) >= self.num_files_to_skip + self.num_workers, f"Trying to skip more files than available: {len(all_files)} available, {self.num_files_to_skip} to skip, {self.num_workers} workers"
@@ -208,8 +266,9 @@ class TPGDataset(Dataset):
     #   [1] defender_count      — same-color attackers of piece on square
     #   [2] is_pinned           — boolean (0/100), pinned to own king by opp slider
     #   [3] is_threatened       — boolean (0/100), attacked by strictly-lower-value opp piece
-    # Must match Ceres TPGRecord.TOTAL_BYTES (9634 for V3, 9378 for V2). See _USE_V3_TPG.
-    BYTES_PER_POS = _BYTES_PER_POS_ONDISK
+    # Must match Ceres TPGRecord.TOTAL_BYTES (9634 for V3, 9378 for V2).
+    # Per-dataset (self.square_bytes) so a V3 primary can mix with V2 secondaries in one run.
+    BYTES_PER_POS = 9378 + (self.square_bytes - 137) * 64
     POS_PER_BLOCK = 24576//2 # read this many positions per loop iteration (somewhat arbitrary, each block about 115MB)
     BYTES_PER_BLOCK = POS_PER_BLOCK * BYTES_PER_POS
 
@@ -231,22 +290,88 @@ class TPGDataset(Dataset):
               f'now has {len(my_files)} files (was {self._last_seen_count})')
         self._last_seen_count = len(my_files)
 
+      def _read_exact(reader, n):
+        """Read exactly n bytes from a zstd stream_reader (short reads happen at
+        frame boundaries and are NOT EOF). Raises on premature end of stream."""
+        parts = []
+        remaining = n
+        while remaining > 0:
+          piece = reader.read(remaining)
+          if not piece:
+            raise RuntimeError(f'survival sidecar ended prematurely ({remaining} of {n} bytes missing)')
+          parts.append(piece)
+          remaining -= len(piece)
+        return b''.join(parts) if len(parts) != 1 else parts[0]
+
       for file_name in my_files:
         print()
         print('DATASET WORKER', self.worker_id, 'PROCESSING TPG FILE', file_name)
+
+        surv_file = None
+        surv_reader = None
+        if _TPG_TARGET_SIDECAR_MODE != 'off':
+          surv_path = os.path.join(self.root_dir, file_name[:-4] + '.tgt.zst')
+          if not os.path.exists(surv_path):
+            if _TPG_TARGET_SIDECAR_MODE == 'required':
+              raise FileNotFoundError(f'CERES_TPG_TARGET_SIDECAR=1 but sidecar missing: {surv_path}')
+            # mode=auto: shard has no sidecar -> its batches carry no survival targets.
+          else:
+            surv_file = open(surv_path, 'rb')
+            surv_reader = zstandard.ZstdDecompressor().stream_reader(surv_file)
+            hdr = _read_exact(surv_reader, 16)
+            if hdr[:4] != b'TPGT' or hdr[4] != 1 or hdr[5] != 1:
+              raise ValueError(f'bad survival sidecar header in {surv_path}: {hdr[:8].hex()}')
+            surv_sidecar_K = hdr[6]
+            if surv_sidecar_K < _SURVIVAL_HORIZON:
+              # Upward is impossible without regen: "survives beyond sidecar-K" cannot be
+              # split into captured-later vs survives-longer.
+              raise ValueError(f'survival sidecar K={surv_sidecar_K} < CERES_SURVIVAL_HORIZON={_SURVIVAL_HORIZON} '
+                               f'in {surv_path}: shrinking K is lossless, growing K requires gen-tpg regen')
+            # surv_sidecar_K > _SURVIVAL_HORIZON is allowed: labels are remapped losslessly
+            # below (captured at ply > K == survived the K-ply horizon). Enables K sweeps
+            # on one K=8 corpus without regeneration.
+
         with open(os.path.join(self.root_dir, file_name),'rb') as file:
           dctx = zstandard.ZstdDecompressor()
           stream_reader = dctx.stream_reader(file)
 
+          leftover = b''
           while True:
-            decompressed_data = stream_reader.read(BYTES_PER_BLOCK)
-            if (not decompressed_data) or len(decompressed_data) < BYTES_PER_BLOCK:
-              break
+            chunk = stream_reader.read(BYTES_PER_BLOCK)
+            if not chunk:
+              break  # true end of stream; any leftover is < one batch and is dropped (as before)
+            # NOTE: a short read does NOT mean end of stream — zstandard's stream_reader
+            # stops at zstd FRAME boundaries (read_across_frames defaults to False), so a
+            # multi-frame shard returns short chunks mid-stream. Carry the sub-batch
+            # remainder across reads so record alignment is preserved and no data is
+            # silently dropped mid-stream. This also makes shards smaller than one block
+            # (small corpora) and BATCH_SIZE values that do not divide POS_PER_BLOCK work.
+            decompressed_data = leftover + chunk if leftover else chunk
+            usable_bytes = (len(decompressed_data) // (BATCH_SIZE * BYTES_PER_POS)) * (BATCH_SIZE * BYTES_PER_POS)
+            leftover = decompressed_data[usable_bytes:]
+            if usable_bytes == 0:
+              continue
 
-            dd = np.frombuffer(decompressed_data, dtype=np.uint8)
+            dd = np.frombuffer(decompressed_data, dtype=np.uint8, count=usable_bytes)  # zero-copy prefix view
             batches = dd.reshape(-1, BATCH_SIZE, BYTES_PER_POS)
+
+            # Survival sidecar rows for exactly the records consumed this iteration,
+            # read in lockstep so record order stays aligned with the main stream.
+            surv_batches = None
+            if surv_reader is not None:
+              num_records_this_block = usable_bytes // BYTES_PER_POS
+              surv_bytes = _read_exact(surv_reader, num_records_this_block * 64)
+              surv_batches = np.frombuffer(surv_bytes, dtype=np.uint8).reshape(-1, BATCH_SIZE, 64)
+              if surv_sidecar_K > _SURVIVAL_HORIZON:
+                # Lossless downward remap to the configured horizon K': captured at ply
+                # d <= K' keeps its label; captured later or survives-beyond-sidecar-K
+                # both mean "survived the K'-ply horizon" = class K'+1. Empty (0) unchanged.
+                surv_batches = surv_batches.copy()
+                surv_batches[surv_batches > _SURVIVAL_HORIZON] = _SURVIVAL_HORIZON + 1
+
             for batch_num in range(batches.shape[0]):
               this_batch = batches[batch_num,:,:]
+              survival = surv_batches[batch_num] if surv_batches is not None else None
               
               offset = 0 # running offset of where we are within the record
 
@@ -344,10 +469,10 @@ class TPGDataset(Dataset):
                   pv32[active] = pv32[active] / row_sum
                   policies_values = pv32.astype(np.float16)
 
-              # V3 TPG layout: 141 bytes per square (137 base + 4 aux features baked
-              # in by Ceres's TPGSquareRecord.WritePosPieces). For 137-channel models,
-              # slice off the trailing 4 aux bytes per square here.
-              SIZE_SQUARE = _SIZE_SQUARE_ONDISK
+              # Square records: 141 bytes/sq for V3 shards (137 base + 4 baked aux),
+              # 137 for upstream V2 shards (per-dataset self.square_bytes). For
+              # 137-channel models reading V3 shards, the aux tail is sliced below.
+              SIZE_SQUARE = self.square_bytes
               squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
               DIVISOR = 100
               squares = np.divide(squares, DIVISOR).astype(DTYPE)
@@ -355,24 +480,45 @@ class TPGDataset(Dataset):
 
               assert offset == BYTES_PER_POS, f"Layout mismatch: offset={offset} expected={BYTES_PER_POS}"
 
-              # Drop unused trailing aux channels. V3 carries 4 aux bytes; trainers using
-              # CERES_AUX_FEATURES_PER_SQUARE < 4 slice the tail.
+              # Drop unused trailing aux channels (V3 shards only; V2 shards have none).
+              # V3 carries 4 aux bytes; trainers using CERES_AUX_FEATURES_PER_SQUARE < 4
+              # slice the tail.
               #   0 = legacy 137-channel model (no aux)
               #   4 = full V3 (mobility / defender / is_pinned / is_threatened)
               # CERES_AUX_CHANNEL_INDICES can override the default first-N selection
               # (cherry-pick specific channels for ablation; indices are into the 4-channel
               # aux slice, mapping to absolute positions 137..140).
-              if _AUX_CHANNEL_INDICES is not None:
-                idx_abs = [137 + i for i in _AUX_CHANNEL_INDICES]
-                squares = np.concatenate([squares[:, :, :137], squares[:, :, idx_abs]], axis=2)
-              else:
-                keep_channels = 137 + _NUM_AUX_FEATURES_PER_SQUARE
-                if keep_channels < SIZE_SQUARE:
-                  squares = squares[:, :, :keep_channels]
+              if SIZE_SQUARE > 137:
+                if _AUX_CHANNEL_INDICES is not None:
+                  idx_abs = [137 + i for i in _AUX_CHANNEL_INDICES]
+                  squares = np.concatenate([squares[:, :, :137], squares[:, :, idx_abs]], axis=2)
+                else:
+                  keep_channels = 137 + _NUM_AUX_FEATURES_PER_SQUARE
+                  if keep_channels < SIZE_SQUARE:
+                    squares = squares[:, :, :keep_channels]
+
+              # Decisive oversampling: drop a fraction of DRAW records (argmax(wdl_q)==1),
+              # keep all win/loss. Variable-size batch downstream is fine (pos counted as kept).
+              if _KEEP_DRAW_PROB < 1.0:
+                _is_draw = (wdl_q.argmax(axis=1) == 1)
+                _keep = (~_is_draw) | (np.random.random(_is_draw.shape[0]) < _KEEP_DRAW_PROB)
+                if not _keep.all():
+                  policies_indices = policies_indices[_keep]; policies_values = policies_values[_keep]
+                  wdl_deblundered = wdl_deblundered[_keep]; wdl_q = wdl_q[_keep]; mlh = mlh[_keep]
+                  uncertainty = uncertainty[_keep]; wdl_nondeblundered = wdl_nondeblundered[_keep]
+                  q_deviation_lower = q_deviation_lower[_keep]; q_deviation_upper = q_deviation_upper[_keep]
+                  squares = squares[_keep]; policy_index_in_parent = policy_index_in_parent[_keep]
+                  played_q_suboptimality = played_q_suboptimality[_keep]; uncertainty_policy = uncertainty_policy[_keep]
+                  if survival is not None:
+                    survival = survival[_keep]
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,
-                       uncertainty_policy))
+                       uncertainty_policy, survival))
+
+        if surv_file is not None:
+          surv_reader.close()
+          surv_file.close()
 
 
   def __getitem__(self, idx):
@@ -390,12 +536,14 @@ class TPGDataset(Dataset):
     policy_index_in_parent = batch[10]
     played_q_suboptimality = batch[11]
     uncertainty_policy = batch[12]
+    survival = batch[13] if len(batch) > 13 else None
     
-    policies_indices = torch.tensor(policies_indices, dtype=torch.int64).reshape(self.batch_size, MAX_MOVES)
-    policies_values  = torch.tensor(policies_values, dtype=torch.float16).reshape(self.batch_size, MAX_MOVES)
+    _nb = policies_indices.shape[0]   # actual row count (may be < batch_size after decisive draw-filtering)
+    policies_indices = torch.tensor(policies_indices, dtype=torch.int64).reshape(_nb, MAX_MOVES)
+    policies_values  = torch.tensor(policies_values, dtype=torch.float16).reshape(_nb, MAX_MOVES)
 
     # TO DO: do this on GPU?
-    policies = torch.zeros(self.batch_size, 1858, dtype=torch.float16)
+    policies = torch.zeros(_nb, 1858, dtype=torch.float16)
     policies.scatter_(1, policies_indices, policies_values)
 
    
@@ -420,7 +568,9 @@ class TPGDataset(Dataset):
           'policy_index_in_parent': filter_tensor(torch.tensor(policy_index_in_parent), mod_value),
           'played_q_suboptimality': filter_tensor(torch.tensor(played_q_suboptimality), mod_value),
           'uncertainty_policy': filter_tensor(torch.tensor(uncertainty_policy), mod_value)
-      }  
+      }
+      if survival is not None:
+        filtered_dict['survival'] = filter_tensor(torch.tensor(np.ascontiguousarray(survival), dtype=torch.uint8), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]
@@ -465,7 +615,13 @@ class TPGMixedDataset(Dataset):
     cycle_pos = self.counter % (self.ratio + 1)
     self.counter += 1
     if cycle_pos == self.ratio:
-      return self.secondary[idx]
+      item = self.secondary[idx]
+      # Tag so the trainer can apply per-stream loss multipliers (see train.py
+      # CERES_SECONDARY_LOSS_*_MULT). Plain bool survives DataLoader passthrough
+      # (batch_size=None) and _move_batch_to_device (non-tensor leaves returned as-is).
+      for board_dict in item:
+        board_dict['is_secondary'] = True
+      return item
     return self.primary[idx]
 
 

@@ -179,6 +179,33 @@ class CeresNet(nn.Module):
       self.qdev_upper = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
       self.qdev_lower = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
+    # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
+    # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
+    # each square's trunk embedding contributes a 3-vector of WDL logits; the position value is
+    # the SUM over the 64 contributions (+ learned bias). No cross-square mixing in the head, so
+    # to fit the value target the trunk must localize onto each square's embedding what the piece
+    # standing there contributes to the outcome — a learned, context-aware piece-square
+    # decomposition. Trained against the same value_target as value1 (wdl_q blend).
+    # The output is stashed on the module for the loss (GTAB gate pattern) and NEVER added to
+    # the forward return tuple, so the ONNX/TorchScript export signature is unchanged.
+    self.placement_value_weight = float(os.environ.get('CERES_PLACEMENT_VALUE_WEIGHT', '0') or 0)
+    if self.placement_value_weight > 0:
+      self.placement_value_head = nn.Linear(self.EMBEDDING_DIM, 3)
+      self.placement_value_bias = nn.Parameter(torch.zeros(3))
+      print(f'[ceres_net] PLACEMENT VALUE HEAD enabled: aux weight {self.placement_value_weight} '
+            f'(additive per-square WDL decomposition over trunk flow [64 x {self.EMBEDDING_DIM}])')
+
+    # K-ply survival head (AUXILIARY, training-only; SURVIVAL_TARGET_SPEC.md). Per-square
+    # fate classification: class d in 1..K = piece captured d plies later, K+1 = survives;
+    # class 0 (empty square) exists but is masked from the loss. Same export-safe stash
+    # pattern as the placement head. Requires sidecar targets (CERES_TPG_TARGET_SIDECAR=1).
+    self.survival_target_weight = float(os.environ.get('CERES_SURVIVAL_TARGET_WEIGHT', '0') or 0)
+    self.survival_horizon = int(os.environ.get('CERES_SURVIVAL_HORIZON', '8') or 8)
+    if self.survival_target_weight > 0:
+      self.survival_head = nn.Linear(self.EMBEDDING_DIM, self.survival_horizon + 2)
+      print(f'[ceres_net] SURVIVAL HEAD enabled: aux weight {self.survival_target_weight}, K={self.survival_horizon} '
+            f'(per-square fate classification over trunk flow [64 x {self.EMBEDDING_DIM}])')
+
 
 
     if self.DEEPNORM:     
@@ -432,6 +459,20 @@ class CeresNet(nn.Module):
       fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
       fS_value  = fS_others
 
+    # Placement value head (aux, training-only; see __init__). Per-square WDL-logit
+    # contributions summed over squares, stashed for compute_loss. Gated on
+    # self.training so ONNX/TorchScript export (which runs under eval()) never
+    # executes the attribute mutation — the PT2 dynamo export path rejects tensor
+    # attribute mutation in forward, and the swallowed exception would otherwise
+    # silently produce checkpoint-only runs with no .onnx.
+    if (self.placement_value_weight > 0 or self.survival_target_weight > 0) and self.training:
+      flow_aux_src = flow_value if (self.use_gtab and self.gtab_value_only) else flow
+      if self.placement_value_weight > 0:
+        pv_contrib = self.placement_value_head(flow_aux_src)                       # [B, 64, 3]
+        self._last_placement_value_out = pv_contrib.sum(dim=1) + self.placement_value_bias  # [B, 3]
+      if self.survival_target_weight > 0:
+        self._last_survival_out = self.survival_head(flow_aux_src)                 # [B, 64, K+2]
+
     # Heads. Policy reads fS_others (= orig in value-only mode); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_others)
     value_out = self.value_head(fS_value)
@@ -458,10 +499,23 @@ class CeresNet(nn.Module):
                     multiplier_action_loss,
                     num_pos, last_lr, log_stats):
 
-    # if we are logging statistics, make two passes, the first of which 
-    # calculates and logs individual gradient norms for each loss
-    LOG_PER_LOSS_GRADIENT_NORMS = False # N.B. this feature only works with non-compiled models run on a single GPU
-                                        #      and slows down training significantly, so only use for quick tests 
+    # If we are logging statistics, optionally make two passes, the first of which
+    # calculates and logs individual per-head gradient norms ("GRADNORM: <head> , raw , weighted"
+    # lines). Controlled by CERES_LOG_GRAD_NORMS_EVERY = N: run the diagnostic on every Nth
+    # stats interval (0/unset = off). N.B. only works with non-compiled models on a single GPU
+    # (backward-per-head desyncs DDP allreduce; compiled autograd rejects the retained graph),
+    # and each pass costs ~one extra backward per head — meant for short measurement runs.
+    if not hasattr(self, '_gradnorm_log_every'):
+      self._gradnorm_log_every = int(os.environ.get('CERES_LOG_GRAD_NORMS_EVERY', '0') or 0)
+      self._gradnorm_log_count = 0
+      if self._gradnorm_log_every > 0:
+        print(f'[ceres_net] per-head gradient-norm logging every {self._gradnorm_log_every} stats intervals '
+              f'(requires single GPU + PyTorchCompileMode off)')
+    LOG_PER_LOSS_GRADIENT_NORMS = False
+    if self._gradnorm_log_every > 0 and log_stats:
+      self._gradnorm_log_count += 1
+      if self._gradnorm_log_count % self._gradnorm_log_every == 0:
+        LOG_PER_LOSS_GRADIENT_NORMS = True
     if LOG_PER_LOSS_GRADIENT_NORMS and log_stats:
       self.compute_loss_or_gradnorm(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
                                     value2_out, q_deviation_lower_out, q_deviation_upper_out, uncertainty_policy_out,
@@ -538,6 +592,33 @@ class CeresNet(nn.Module):
 
     uncertainty_policy_loss = 0 if uncertainty_policy_out is None else loss_calc.uncertainty_policy_loss(uncertainty_policy_target, uncertainty_policy_out, gradient_norm_logging_mode, self.uncertainty_policy_weight)
 
+    # Placement value head (aux): same CE-minus-entropy as value_loss, against the same
+    # value_target, via LossCalculator (comparable magnitude + LAST_* interval averaging
+    # + correct behavior in gradient_norm_logging_mode). Consumes the output stashed by
+    # forward (never part of the export signature). Consume-and-clear so a stale stash
+    # can never be re-used by a later loss call whose forward opted out (e.g. the 4-board
+    # path's action-only board 4, which passes value_out=None).
+    placement_loss = 0
+    _pv_out = getattr(self, '_last_placement_value_out', None)
+    if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
+      self._last_placement_value_out = None
+      placement_loss = loss_calc.placement_value_loss(value_target, _pv_out.float(), SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.placement_value_weight)
+
+    # K-ply survival aux head: per-square fate CE against sidecar targets (empty squares
+    # masked inside loss_calc.survival_loss). Same consume-and-clear/value_out gating
+    # as the placement head.
+    survival_loss = 0
+    _sv_out = getattr(self, '_last_survival_out', None)
+    if self.survival_target_weight > 0 and _sv_out is not None and value_out is not None:
+      self._last_survival_out = None
+      survival_target = batch.get('survival', None)
+      # No 'survival' key = batch from a sidecar-less shard (CERES_TPG_TARGET_SIDECAR=auto
+      # mixed-corpus mode): skip the loss for this batch. train.py validates at startup
+      # that at least one dataset actually carries sidecars, so this cannot be a silent
+      # full-run no-op misconfiguration.
+      if survival_target is not None:
+        survival_loss = loss_calc.survival_loss(survival_target, _sv_out, gradient_norm_logging_mode, self.survival_target_weight)
+
     total_loss = (self.policy_loss_weight * p_loss
         + self.value_loss_weight * v_loss
         + self.value2_loss_weight * v2_loss
@@ -549,7 +630,9 @@ class CeresNet(nn.Module):
         + self.value2_diff_loss_weight * value2_diff_loss
         + self.action_loss_weight * action_loss
         + self.action_uncertainty_loss_weight * action_uncertainty_loss
-        + self.uncertainty_policy_weight * uncertainty_policy_loss)
+        + self.uncertainty_policy_weight * uncertainty_policy_loss
+        + self.placement_value_weight * placement_loss
+        + self.survival_target_weight * survival_loss)
         
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -588,6 +671,10 @@ class CeresNet(nn.Module):
       self._log("policy_loss" + stat_suffix, p_loss,  step=num_pos)
       self._log("value_loss" + stat_suffix, v_loss,  step=num_pos)
       self._log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
+      if self.placement_value_weight > 0 and not isinstance(placement_loss, int):
+        self._log("placement_value_loss" + stat_suffix, placement_loss, step=num_pos)
+      if self.survival_target_weight > 0 and not isinstance(survival_loss, int):
+        self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
       self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
       self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
       self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)

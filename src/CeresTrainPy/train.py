@@ -568,7 +568,7 @@ def Train():
   # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work
   # (zstd decompression + TPG parsing) is the bottleneck. Note: V3 aux features are baked
   # into the TPG record and read directly, so CERES_AUX_FEATURES_PER_SQUARE adds no recompute.
-  count_zst_files = len(fnmatch.filter(os.listdir(TPG_TRAIN_DIR), '*.zst'))
+  count_zst_files = len([f for f in fnmatch.filter(os.listdir(TPG_TRAIN_DIR), '*.zst') if not f.endswith('.tgt.zst')])
   _DEFAULT_NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1
   NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))
   if NUM_DATASET_WORKERS != _DEFAULT_NUM_DATASET_WORKERS:
@@ -591,14 +591,85 @@ def Train():
   secondary_dataset = None
   if (getattr(config, 'Data_TrainingFilesDirectory2', None)
       and int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0) > 0):
+    # Secondary corpus may use a different shard record format than the primary
+    # (e.g. V3 1.6B-position primary + V2 survival-labeled secondary):
+    # CERES_TPG_SQUARE_BYTES2 overrides for the secondary only (default = primary's).
+    _sec_square_bytes = os.environ.get('CERES_TPG_SQUARE_BYTES2')
+    _sec_square_bytes = int(_sec_square_bytes) if _sec_square_bytes not in (None, '') else None
+    if _sec_square_bytes is not None:
+      print(f'[mixed-dataset] secondary shard format override: {_sec_square_bytes} bytes/square')
     secondary_dataset = TPGDataset(config.Data_TrainingFilesDirectory2,
                                    batch_size_forward // world_size,
                                    config.Data_WDLLabelSmoothing,
                                    rank, world_size, NUM_DATASET_WORKERS,
-                                   BOARDS_PER_BATCH, 0, config.Exec_TestFlag)
+                                   BOARDS_PER_BATCH, 0, config.Exec_TestFlag,
+                                   square_bytes=_sec_square_bytes)
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
     print(f'[mixed-dataset] ratio = {config.Data_RatioSet1ToSet2}:1 (primary:secondary batches)')
+
+  # Per-stream loss routing: optional loss-weight OVERRIDES applied only to batches
+  # from the SECONDARY corpus (tagged by TPGMixedDataset). Unset = secondary batches
+  # use the same weights as primary (legacy behavior). Example: a puzzle secondary
+  # whose degenerate value labels must not reach the value heads:
+  #   CERES_SECONDARY_LOSS_VALUE_MULT=0 CERES_SECONDARY_LOSS_VALUE2_MULT=0 CERES_SECONDARY_LOSS_AUX_MULT=0
+  def _opt_env_float(name):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, '') else None
+  SECONDARY_POLICY_MULT    = _opt_env_float('CERES_SECONDARY_LOSS_POLICY_MULT')
+  SECONDARY_VALUE_MULT     = _opt_env_float('CERES_SECONDARY_LOSS_VALUE_MULT')
+  SECONDARY_VALUE2_MULT    = _opt_env_float('CERES_SECONDARY_LOSS_VALUE2_MULT')
+  SECONDARY_AUX_MULT       = _opt_env_float('CERES_SECONDARY_LOSS_AUX_MULT')       # unc + qdev + unc_policy + mlh together
+  SECONDARY_PLACEMENT_MULT = _opt_env_float('CERES_SECONDARY_LOSS_PLACEMENT_MULT')
+  SECONDARY_SURVIVAL_MULT  = _opt_env_float('CERES_SECONDARY_LOSS_SURVIVAL_MULT')
+
+  # Single source of truth: attr name on `core` -> override value. Save/apply/restore
+  # all iterate this dict, so adding a weight cannot desynchronize the three steps.
+  SECONDARY_WEIGHT_OVERRIDES = {}
+  if SECONDARY_POLICY_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['policy_loss_weight']  = SECONDARY_POLICY_MULT
+  if SECONDARY_VALUE_MULT     is not None: SECONDARY_WEIGHT_OVERRIDES['value_loss_weight']   = SECONDARY_VALUE_MULT
+  if SECONDARY_VALUE2_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['value2_loss_weight']  = SECONDARY_VALUE2_MULT
+  if SECONDARY_AUX_MULT is not None:
+    for _aux_attr in ('unc_loss_weight', 'q_deviation_loss_weight', 'uncertainty_policy_weight', 'moves_left_loss_weight'):
+      SECONDARY_WEIGHT_OVERRIDES[_aux_attr] = SECONDARY_AUX_MULT
+  if SECONDARY_PLACEMENT_MULT is not None: SECONDARY_WEIGHT_OVERRIDES['placement_value_weight'] = SECONDARY_PLACEMENT_MULT
+  if SECONDARY_SURVIVAL_MULT  is not None: SECONDARY_WEIGHT_OVERRIDES['survival_target_weight'] = SECONDARY_SURVIVAL_MULT
+
+  if SECONDARY_WEIGHT_OVERRIDES:
+    # Fail loudly on configurations where routing would be a silent no-op.
+    if secondary_dataset is None:
+      raise ValueError('CERES_SECONDARY_LOSS_*_MULT set but no secondary corpus is configured '
+                       '(needs TrainingFilesDirectory2 and RatioSet1ToSet2 > 0)')
+    if BOARDS_PER_BATCH != 1:
+      raise NotImplementedError('per-stream loss routing (CERES_SECONDARY_LOSS_*_MULT) is only implemented for '
+                                'BOARDS_PER_BATCH==1; the 4-board action path would silently ignore it')
+    if SECONDARY_WEIGHT_OVERRIDES.get('placement_value_weight', 0) > 0 and core.placement_value_weight == 0:
+      raise ValueError('CERES_SECONDARY_LOSS_PLACEMENT_MULT > 0 requires the placement head to be enabled '
+                       '(CERES_PLACEMENT_VALUE_WEIGHT > 0), otherwise the head does not exist and the '
+                       'override is a silent no-op')
+    print(f'[mixed-dataset] SECONDARY loss overrides: {SECONDARY_WEIGHT_OVERRIDES} (heads not listed inherit primary weights)')
+
+  # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
+  # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
+  if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0) and WORLD_SIZE > 1:
+    raise NotImplementedError('placement/survival aux heads are single-GPU only for now: '
+                              'the stashed aux output is invisible to DDP\'s reducer')
+
+  # Survival head requires sidecar targets in (at least some of) the batches.
+  if getattr(core, 'survival_target_weight', 0) > 0:
+    _sidecar_mode = (os.environ.get('CERES_TPG_TARGET_SIDECAR', '0') or '0').strip().lower()
+    if _sidecar_mode in ('0', ''):
+      raise ValueError('CERES_SURVIVAL_TARGET_WEIGHT > 0 requires CERES_TPG_TARGET_SIDECAR=1 or auto '
+                       '(and a corpus generated with gen-tpg --survival-horizon)')
+    if _sidecar_mode == 'auto':
+      # Fail loudly if NO dataset dir contains any sidecar at all — the head would
+      # silently receive zero supervision for the whole run.
+      _dirs = [TPG_TRAIN_DIR]
+      if getattr(config, 'Data_TrainingFilesDirectory2', None):
+        _dirs.append(config.Data_TrainingFilesDirectory2)
+      _any_sidecar = any(f.endswith('.tgt.zst') for d in _dirs for f in os.listdir(d))
+      if not _any_sidecar:
+        raise ValueError(f'CERES_TPG_TARGET_SIDECAR=auto but no .tgt.zst sidecars found in any dataset dir: {_dirs}')
 
   dataset = TPGMixedDataset(primary_dataset, secondary_dataset,
                             int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0))
@@ -644,6 +715,18 @@ def Train():
           f"to match the checkpoint, then re-run. "
           f"(checkpoint: {config.Opt_CheckpointResumeFromFileName})")
 
+    # QAT checkpoints carry fake-quant buffers (`<module>._fq_act_range`) that the
+    # freshly-built (pre-convert) model does not have yet — convert_to_fake_quant()
+    # re-creates and re-calibrates them after this load. Strip them so the
+    # strict=True resume path below doesn't reject them as unexpected keys. No-op
+    # for non-QAT checkpoints (which have no such keys).
+    _fq_keys = [k for k in loaded["model"] if "._fq_" in k]
+    if _fq_keys:
+      for k in _fq_keys:
+        del loaded["model"][k]
+      print(f"INFO: QAT_RESUME stripped {len(_fq_keys)} fake-quant buffer keys "
+            f"from checkpoint (ranges will be re-calibrated)", flush=True)
+
     # name adjustment sometimes needed for reload
     # loaded["model"] = {f'_orig_mod.{key}': value for key, value in loaded["model"].items()}
 
@@ -668,8 +751,29 @@ def Train():
     # model_nocompile sidesteps the prefix mismatch and updates the underlying
     # parameters that `model` shares.
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
-      # load checkpoint parameters, expect all to match (strict = True)
-      model_nocompile.load_state_dict(loaded["model"], strict = True)
+      # Placement value head is env-gated (CERES_PLACEMENT_VALUE_WEIGHT), so its params
+      # can exist on exactly one side of a resume. Handle both directions LOUDLY here
+      # instead of dying in the strict load (the head is auxiliary/training-only, so
+      # dropping or fresh-initializing it never corrupts the served heads).
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.')
+      _ckpt_model_sd = loaded["model"]
+      _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
+      _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
+      _model_aux_keys = {k for k in model_nocompile.state_dict() if k.startswith(_AUX_HEAD_PREFIXES)}
+      _dropped = [k for k in _ckpt_placement_keys if k not in _model_aux_keys]
+      if _dropped:
+        print(f"INFO: AUX_HEAD checkpoint keys dropped (env var not set this run): {_dropped}")
+        _ckpt_model_sd = {k: v for k, v in _ckpt_model_sd.items() if k not in _dropped}
+      _fresh = [k for k in _model_aux_keys if k not in _ckpt_model_sd]
+      if _fresh:
+        print(f"INFO: AUX_HEAD newly enabled on resume; params start fresh-initialized: {sorted(_fresh)}")
+        _pl_res = model_nocompile.load_state_dict(_ckpt_model_sd, strict=False)
+        _missing_other = [k for k in _pl_res.missing_keys if not k.startswith(_AUX_HEAD_PREFIXES)]
+        if _missing_other or _pl_res.unexpected_keys:
+          raise RuntimeError(f"Resume mismatch beyond aux heads: missing={_missing_other} unexpected={_pl_res.unexpected_keys}")
+      else:
+        # load checkpoint parameters, expect all to match (strict = True)
+        model_nocompile.load_state_dict(_ckpt_model_sd, strict = True)
     else:
       # Rebuild new state dictionary.
       # Mostly copy over parameters from the checkpoint with same name,
@@ -818,6 +922,37 @@ def Train():
   # DDP wrapper would not expose CeresNet's custom attributes).
   loss_calc = LossCalculator(core)
 
+  # INT8 Quantization-Aware Training (QAT). Env-gated (CERES_QAT_INT8) so no
+  # config-schema / C# change. Swaps every nn.Linear -> FakeQuantLinear in place
+  # (preserves Parameter identity, so the already-built optimizer is unaffected;
+  # frozen-range mode adds no new params). Fake-quant is gated on training mode,
+  # so save_model()'s eval() export stays clean FP16; the real INT8 QDQ is then
+  # applied by scripts/qdq_export.py at deploy. Intended use: short KL-anchor
+  # distillation fine-tune (Opt_KLAnchorRefCheckpoint = the FP teacher) of the
+  # from_onnx flagship checkpoint, so the weights become INT8-robust. The
+  # reference/teacher model is NOT converted (only model_nocompile).
+  QAT_ENABLED = int(os.environ.get('CERES_QAT_INT8', '0') or 0) > 0
+  QAT_CALIB_POS = int(os.environ.get('CERES_QAT_CALIB_POS', '200000') or 200000)
+  # Calibrate for CERES_QAT_CALIB_POS positions measured FROM THE CURRENT num_pos
+  # (0 on a fresh run, the checkpoint step on a resume). Without the resume offset
+  # a resumed QAT run would freeze on step 0 (num_pos already >> calib_pos) with
+  # uncalibrated (range=1.0) activation buffers.
+  QAT_FREEZE_AT = num_pos + QAT_CALIB_POS
+  if QAT_ENABLED:
+    import fake_quant
+    _qat_pct = float(os.environ.get('CERES_QAT_PERCENTILE', '99.999') or 99.999)
+    _qat_excl = [s for s in os.environ.get('CERES_QAT_EXCLUDE', '').split(',') if s]
+    _qat_wonly = int(os.environ.get('CERES_QAT_WEIGHTS_ONLY', '0') or 0) > 0
+    _qat_wfrozen = int(os.environ.get('CERES_QAT_FROZEN_WSCALE', '0') or 0) > 0
+    _nq, _ne = fake_quant.convert_to_fake_quant(
+        model_nocompile, percentile=_qat_pct, exclude=_qat_excl,
+        quant_weights=True, quant_acts=(not _qat_wonly),
+        freeze_weight_scales=_qat_wfrozen)
+    print(f"INFO: QAT_INT8 enabled — converted {_nq} nn.Linear "
+          f"(excluded {_ne}); percentile={_qat_pct} weights_only={_qat_wonly} "
+          f"frozen_wscale={_qat_wfrozen} "
+          f"calib_pos={QAT_CALIB_POS} freeze_at_pos={QAT_FREEZE_AT}", flush=True)
+
   model.train()
 
   wdl_reverse = torch.tensor([2, 1, 0]) # for reversing perspective on WDL
@@ -834,6 +969,11 @@ def Train():
 
     fraction_complete = num_pos / MAX_POSITIONS
     model.train()
+
+    # QAT: observe activation ranges for the first CERES_QAT_CALIB_POS positions,
+    # then freeze them (cheap no-op after the one-time freeze).
+    if QAT_ENABLED:
+      fake_quant.freeze_if_ready(model_nocompile, num_pos, QAT_FREEZE_AT)
 
     # Periodically log statistics
     show_losses = (num_pos % (1024 * 64) == 0)
@@ -868,14 +1008,29 @@ def Train():
         
       if BOARDS_PER_BATCH == 1:
         batch = batch[0]
+        is_secondary_batch = bool(batch.pop('is_secondary', False))
         num_processing_now = batch['squares'].shape[0]
         policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, _, _, _ = model(batch['squares'], None)
-        loss = core.compute_loss(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
-                                  value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, 
-                                  None, None, 
-                                  None, None,
-                                  None,
-                                  0, num_pos, this_lr, show_losses)
+
+        # Per-stream loss routing: for secondary-corpus batches, temporarily swap the
+        # loss weights on `core` (compute_loss reads self.*_loss_weight at call time;
+        # the forward above already ran, so head construction/routing is unaffected).
+        _use_overrides = is_secondary_batch and bool(SECONDARY_WEIGHT_OVERRIDES)
+        if _use_overrides:
+          _saved_w = {attr: getattr(core, attr) for attr in SECONDARY_WEIGHT_OVERRIDES}
+          for attr, value in SECONDARY_WEIGHT_OVERRIDES.items():
+            setattr(core, attr, value)
+        try:
+          loss = core.compute_loss(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
+                                    value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out,
+                                    None, None,
+                                    None, None,
+                                    None,
+                                    0, num_pos, this_lr, show_losses)
+        finally:
+          if _use_overrides:
+            for attr, value in _saved_w.items():
+              setattr(core, attr, value)
 
       else:
         assert BOARDS_PER_BATCH == 4
@@ -1146,6 +1301,13 @@ def Train():
             loss_calc.LAST_ACTION_UNCERTAINTY_LOSS if config.Opt_LossActionUncertaintyMultiplier > 0 else 0, ",",
               
             scheduler.get_last_lr()[0], flush=True)
+      # Placement value head (aux) loss on its own line — the TRAIN line format is
+      # parsed by C# (CeresTrainProgressLoggingLine.cs) and must not change shape.
+      # Interval average via LossCalculator, same semantics as the TRAIN-line losses.
+      if getattr(core, 'placement_value_weight', 0) > 0 and loss_calc.PENDING_COUNT > 0:
+        print("PLACEV:", num_pos, ",", loss_calc.LAST_PLACEMENT_VALUE_LOSS, flush=True)
+      if getattr(core, 'survival_target_weight', 0) > 0 and loss_calc.PENDING_COUNT > 0:
+        print("SURV:", num_pos, ",", loss_calc.LAST_SURVIVAL_LOSS, ",", loss_calc.LAST_SURVIVAL_ACC, flush=True)
       loss_calc.reset_counters()
       time_last_status_update = datetime.datetime.now()
 
