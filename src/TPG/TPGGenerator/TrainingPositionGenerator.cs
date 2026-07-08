@@ -493,9 +493,21 @@ namespace CeresTrain.TPG.TPGGenerator
 
           // K-ply piece-survival target labels for this game (real-board square indexing;
           // remapped to record slots in PreparePosition). See SURVIVAL_TARGET_SPEC.md.
-          byte[][] gameSurvival = Options.SurvivalTargetHorizon > 0
-                                ? SurvivalLabeler.ComputeGameSurvival(in game, Options.SurvivalTargetHorizon)
-                                : null;
+          // Blunder-truncation (default on for game corpora): mask survival captures that occur
+          // at or after an injected NOISE blunder, so the fate labels reflect clean play rather
+          // than exploration-noise artifacts. Uses noise blunders only (not unintended) — those
+          // are position-independent, avoiding a bias against sharp positions. gameAnalyzer has
+          // already computed the per-move suboptimality in CalcBlundersAndTablebaseLookups above.
+          byte[][] gameSurvival = null;
+          if (Options.SurvivalTargetHorizon > 0)
+          {
+            bool[] isNoiseBlunderMove = new bool[game.NumPositions];
+            for (int m = 0; m < game.NumPositions && m < gameAnalyzer.suboptimalityNoiseBlunder.Length; m++)
+            {
+              isNoiseBlunderMove[m] = gameAnalyzer.suboptimalityNoiseBlunder[m] > gameAnalyzer.SUBOPTIMAL_NOISE_BLUNDER_THRESHOLD;
+            }
+            gameSurvival = SurvivalLabeler.ComputeGameSurvival(in game, Options.SurvivalTargetHorizon, isNoiseBlunderMove);
+          }
 
           // Update statistics.
           Interlocked.Add(ref numTBLookup, gameAnalyzer.numTBLookup);

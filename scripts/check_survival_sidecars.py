@@ -78,15 +78,22 @@ for shard in shards:
         empty = onehot[:, :, 0] == 100                   # [n, 64]
         king = (onehot[:, :, 6] == 100) | (onehot[:, :, 12] == 100)
 
-        # ALL-ZERO rows = deliberately unsupervised records (no observed continuation);
-        # every square is masked from the loss, so exclude them from structural checks.
+        # ALL-ZERO rows = deliberately unsupervised records (no observed continuation).
         supervised = labels.any(axis=1)                  # [n]
         tot.setdefault("masked", 0)
         tot["masked"] += int((~supervised).sum())
 
         tot["recs"] += n
-        tot["empty_mismatch"] += int((((labels == 0) != empty) & supervised[:, None]).sum())
+        # Empty squares MUST carry label 0 (one-directional check). The reverse — an OCCUPIED
+        # square carrying 0 — is now legal: it is a blunder-truncation-masked capture (or a fully
+        # unsupervised row). The empty->0 direction still catches any record-order desync or
+        # orientation flip (an empty square with a nonzero fate label is a real bug).
+        tot["empty_mismatch"] += int((empty & (labels != 0)).sum())
+        # Kings are never captured, hence never truncated -> always K+1 in any supervised row.
         tot["king_bad"] += int((labels[king & supervised[:, None]] != K + 1).sum())
+        # Occupied squares carrying 0 in an otherwise-supervised row = blunder-truncation masks.
+        tot.setdefault("masked_occ", 0)
+        tot["masked_occ"] += int(((~empty) & (labels == 0) & supervised[:, None]).sum())
 
         occ = labels[~empty]
         hist += np.bincount(occ, minlength=K + 2)
@@ -102,6 +109,7 @@ for shard in shards:
 
 print(f"\nTOTAL records: {tot['recs']}")
 print(f"unsupervised (all-zero) rows: {tot.get('masked', 0)}")
+print(f"blunder-truncation masked squares (occupied, label 0): {tot.get('masked_occ', 0)}")
 print(f"empty-square mismatches: {tot['empty_mismatch']}  (MUST be 0)")
 print(f"king label violations:   {tot['king_bad']}  (MUST be 0)")
 print(f"label histogram (piece squares): d=1..{K} then survive:")

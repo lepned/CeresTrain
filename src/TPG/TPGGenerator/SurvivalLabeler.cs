@@ -48,7 +48,13 @@ namespace CeresTrain.TPG.TPGGenerator
     /// remap to record slots: slot = sq if White to move, else sq ^ 56 (RANK flip,
     /// file preserved — NOT 63-sq; validated empirically, see call sites).
     /// </summary>
-    public static byte[][] ComputeGameSurvival(in EncodedTrainingPositionGame game, int horizonPlies)
+    /// <param name="isBlunderMove">optional per-move noise-blunder flags (index m = the move played
+    /// from position m to m+1). When supplied, captures occurring at or after the first flagged move
+    /// within a position's K-ply window are MASKED (label 0 = unsupervised) rather than trusted,
+    /// because a noise blunder makes the observed capture non-representative of clean play. null =
+    /// no truncation (puzzle solver lines / tablebase perfect play, which carry no blunders).</param>
+    public static byte[][] ComputeGameSurvival(in EncodedTrainingPositionGame game, int horizonPlies,
+                                               bool[] isBlunderMove = null)
     {
       int numPos = game.NumPositions;
       Position[] positions = new Position[numPos];
@@ -56,7 +62,7 @@ namespace CeresTrain.TPG.TPGGenerator
       {
         positions[t] = game.PositionAtIndex(t).FinalPosition;
       }
-      return ComputeSurvivalForLine(positions, horizonPlies);
+      return ComputeSurvivalForLine(positions, horizonPlies, isBlunderMove);
     }
 
 
@@ -65,7 +71,8 @@ namespace CeresTrain.TPG.TPGGenerator
     /// solution line: current position followed by the forced continuation). A sequence of
     /// length 1 yields a row where every piece "survives" (no continuation to observe).
     /// </summary>
-    public static byte[][] ComputeSurvivalForLine(IReadOnlyList<Position> positionsList, int horizonPlies)
+    public static byte[][] ComputeSurvivalForLine(IReadOnlyList<Position> positionsList, int horizonPlies,
+                                                  bool[] isBlunderMove = null)
     {
       if (horizonPlies <= 0 || horizonPlies > 254)
       {
@@ -203,6 +210,29 @@ namespace CeresTrain.TPG.TPGGenerator
         ids[t + 1] = nxt;
       }
 
+      // Blunder-truncation: for each position, find the earliest subsequent noise-blunder move
+      // (nextBlunderMove[t] = smallest move index m >= t flagged, else int.MaxValue). Captures
+      // occurring at or after that move are treated as blunder-contaminated and masked (label 0).
+      // Only captures are truncated — "survives" is kept, because a blunder that CAUSES a capture
+      // corrupts a capture label, whereas a piece not captured at all is a clean observation
+      // (residual: a blunder that MISSES a capture leaves a slightly-wrong "survives", unfixable
+      // without search). Skipped entirely when isBlunderMove is null (puzzle / tablebase paths),
+      // in which case the labels are bit-identical to the pre-truncation behaviour.
+      int[] nextBlunderMove = null;
+      if (isBlunderMove != null)
+      {
+        nextBlunderMove = new int[numPos];
+        int nb = int.MaxValue;
+        for (int t = numPos - 1; t >= 0; t--)
+        {
+          if (t < numPos - 1 && t < isBlunderMove.Length && isBlunderMove[t])
+          {
+            nb = t;
+          }
+          nextBlunderMove[t] = nb;
+        }
+      }
+
       // Emit label bytes.
       byte[][] result = new byte[numPos][];
       for (int t = 0; t < numPos; t++)
@@ -220,7 +250,19 @@ namespace CeresTrain.TPG.TPGGenerator
           {
             int dp = deathPly[id];
             long d = dp == int.MaxValue ? long.MaxValue : (long)dp - t;
-            row[s] = (byte)(d >= 1 && d <= horizonPlies ? d : horizonPlies + 1);
+            if (d >= 1 && d <= horizonPlies)
+            {
+              // Captured within the horizon. The capture occurs during the move at index (dp - 1);
+              // mask it if that move is at or after the first noise blunder in this window.
+              int captureMoveIdx = dp - 1;
+              row[s] = (nextBlunderMove != null && captureMoveIdx >= nextBlunderMove[t])
+                     ? (byte)0                      // blunder-contaminated capture → unsupervised
+                     : (byte)d;                     // clean capture-at-ply-d
+            }
+            else
+            {
+              row[s] = (byte)(horizonPlies + 1);    // survives the horizon (kept regardless of blunders)
+            }
           }
         }
         result[t] = row;

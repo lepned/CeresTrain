@@ -89,12 +89,25 @@ to this piece", never "was that good". Three consequences:
    (checks/mate-within-K) covers part of the first; the rest is out of scope for
    this target and stays with wdl_q. This is a tactical-horizon target by design.
 
-Known label-noise sources (accepted for v1): the label reflects the single actual
-game continuation (including exploration blunders — noise 0.1/0.12, ptemp 1.45 in
-the kovax data); voluntary equal trades are labeled the same as material losses
-(descriptive semantics make this acceptable — trades are real capture dynamics).
-Mitigation available later: skip labels on positions the deblunderer flags
-(NoiseBlund), or teacher-verify a subsample.
+Known label-noise sources: the label reflects the single actual game continuation;
+voluntary equal trades are labeled the same as material losses (descriptive semantics
+make this acceptable — trades are real capture dynamics).
+
+**Blunder-truncation (IMPLEMENTED, default on for game corpora):** injected exploration
+(NoiseBlund) moves corrupt fate labels — a piece "captured in d" may have died only
+because the opponent blundered. For each position, captures occurring at or after the
+first NoiseBlund move within its K-ply window are MASKED (label 0 = unsupervised) rather
+than trusted. Only captures are truncated; "survives" is kept (a blunder that CAUSES a
+capture corrupts a capture label, whereas a piece never captured is a clean observation;
+residual: a blunder that MISSES a capture leaves a slightly-wrong "survives", unfixable
+without search). Uses NoiseBlund only (not unintended blunders) — noise is
+position-independent, avoiding a bias against sharp positions. `SurvivalLabeler` takes an
+optional per-move blunder-flag array (the game path always supplies it from
+`gameAnalyzer.suboptimalityNoiseBlunder > SUBOPTIMAL_NOISE_BLUNDER_THRESHOLD`; puzzle and
+tablebase paths pass null → no truncation, no blunders there anyway). Masked captures reuse
+the loss's existing `target > 0` masking → zero training-side change. Validator's structural
+check weakened from `empty ⟺ 0` to `empty → 0` (occupied-square 0 is now a legal mask) — still
+catches any desync/flip. Measured on T91 skip-1: ~1.9% of occupied squares masked.
 
 ## 3. Storage — sidecar stream (NOT a record-format change)
 
@@ -287,7 +300,7 @@ Design decisions:
 
 - ~~Distance-bucketed classes~~ → ADOPTED as default (§6.1, buckets + capture weight).
 - Channel A (king attack) — designed (§1), queued in the corpus-v2 regen bundle.
-- Blunder-TRUNCATED labels (cut fate windows at NoiseBlund plies; truncate, don't
+- ~~Blunder-TRUNCATED labels~~ → IMPLEMENTED (default on, see §2). Original note: (cut fate windows at NoiseBlund plies; truncate, don't
   discard — and only on noise_blund, since err_blund masking would bias against
   sharp positions; requires updating the validator's empty≡0 invariant).
 - Second horizon channel (game-end survival = positional variant), tournament-gated.
