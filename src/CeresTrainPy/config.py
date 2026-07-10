@@ -130,6 +130,13 @@ class Configuration:
     # (heads/embeddings/norms/biases); the Muon trunk keeps LearningRateBase.
     # None/absent = legacy single-rate. CONFIG-ONLY (no env override by design).
     self.Opt_LearningRateBaseHeads = config_opt.get('LearningRateBaseHeads', None)
+    # Muon partition scope (Muon only): which params the internal AdamW gets.
+    #   'all-non-trunk' (legacy default): everything outside transformer_layer —
+    #       whole heads (incl. hidden 2-D fc), embeddings, norms, biases.
+    #   'final-only' (dje-style): only final output layers (fcFinal / single-Linear
+    #       aux heads), embeddings, LoRA adapters and 1-D params; head hidden
+    #       matrices train under Muon like the trunk.
+    self.Opt_MuonAdamWScope = config_opt.get('MuonAdamWScope', 'all-non-trunk')
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)

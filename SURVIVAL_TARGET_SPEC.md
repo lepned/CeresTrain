@@ -165,6 +165,16 @@ any out-of-band ordering assumption wrong).
   shard must have `<shard>.tgt.zst`, hard error otherwise) · `auto` = per-shard
   (sidecar-less shards yield batches with NO 'survival' key and the loss skips them
   — enables a huge sidecar-less primary mixed with survival-labeled secondaries).
+- **Scope of `required`**: applies to the PRIMARY corpus only. A secondary corpus
+  (`TrainingFilesDirectory2`) is automatically demoted to `auto`, so a sidecar-less
+  puzzle secondary coexists with a strict survival primary. (Before this fix,
+  process-wide `=1` FileNotFoundError'd on the secondary's first batch — the s1
+  combined run died at ~500K positions this way.) Per-dataset override:
+  `TPGDataset(sidecar_mode=...)`.
+- Coverage visibility: every pass, each worker logs
+  `N/M shards carry survival sidecars (mode=...)` per corpus — check this line to
+  catch a missing/misnamed sidecar directory that `auto` would otherwise train
+  through silently with a starved survival head.
 - Sidecar streamed in lockstep with the shard via `read_exact` (zstd stream_reader
   stops at FRAME boundaries — a naive short-read check silently drops data; this bit
   us once). Header validated: magic/version/channels, and K per §6.1's remap rule.
@@ -349,7 +359,10 @@ legitimately asymmetric).
 **Train** (adopted env block, 2026-07-07):
 
 ```
-CERES_TPG_TARGET_SIDECAR=1        # or 'auto' for mixed sidecar-less primaries
+CERES_TPG_TARGET_SIDECAR=1        # required for the PRIMARY corpus only; a secondary
+                                  # (puzzle) dir auto-demotes to 'auto', so this is
+                                  # safe with the combined recipe below. Use 'auto'
+                                  # instead when the PRIMARY itself is sidecar-less.
 CERES_SURVIVAL_HORIZON=4          # trains K'=4 from K=8 sidecars (lossless remap)
 CERES_SURVIVAL_TARGET_WEIGHT=0.6
 CERES_SURVIVAL_LOSS_BUCKETS=2,4   # bounds MUST end at the configured horizon

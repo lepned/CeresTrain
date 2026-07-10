@@ -133,6 +133,9 @@ else:
 _SURVIVAL_HORIZON = int(os.environ.get('CERES_SURVIVAL_HORIZON', '8') or 8)
 if _TPG_TARGET_SIDECAR_MODE != 'off':
   print(f'[tpg_dataset] survival target sidecars ENABLED, mode={_TPG_TARGET_SIDECAR_MODE} (expect K={_SURVIVAL_HORIZON} in headers)')
+# Public alias (callers must not import the underscore name): the process-wide default
+# mode; per-dataset override via TPGDataset(sidecar_mode=...).
+TPG_TARGET_SIDECAR_MODE = _TPG_TARGET_SIDECAR_MODE
 
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
@@ -190,7 +193,8 @@ class TPGDataset(Dataset):
                boards_per_batch : int,
                num_files_to_skip : int = 0,
                test : bool = False,
-               square_bytes : int = None):
+               square_bytes : int = None,
+               sidecar_mode : str = None):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
@@ -203,6 +207,16 @@ class TPGDataset(Dataset):
     self.square_bytes = int(square_bytes) if square_bytes is not None else _TPG_SQUARE_BYTES
     if self.square_bytes not in (137, 141):
       raise ValueError(f'square_bytes must be 137 (V2) or 141 (V3), got {self.square_bytes}')
+    # Per-dataset survival-sidecar mode (default = process-wide CERES_TPG_TARGET_SIDECAR).
+    # Lets a combined recipe run the survival-labeled primary in 'required' (fail-loud on
+    # any missing sidecar) while a sidecar-less secondary (e.g. puzzle TPG) runs 'auto' —
+    # process-wide 'required' used to FileNotFoundError on the secondary's first batch.
+    self.sidecar_mode = sidecar_mode if sidecar_mode is not None else _TPG_TARGET_SIDECAR_MODE
+    if self.sidecar_mode not in ('off', 'required', 'auto'):
+      raise ValueError(f"sidecar_mode must be 'off', 'required' or 'auto', got {self.sidecar_mode!r}")
+    if self.sidecar_mode != _TPG_TARGET_SIDECAR_MODE:
+      print(f'[tpg_dataset] {root_dir}: survival sidecar mode override: '
+            f'{_TPG_TARGET_SIDECAR_MODE} -> {self.sidecar_mode}', flush=True)
     if self.square_bytes == 137 and _NUM_AUX_FEATURES_PER_SQUARE != 0:
       raise ValueError(f'dataset {root_dir}: 137-byte (V2) shards carry no aux bytes; '
                        f'CERES_AUX_FEATURES_PER_SQUARE must be 0 (got {_NUM_AUX_FEATURES_PER_SQUARE})')
@@ -290,6 +304,15 @@ class TPGDataset(Dataset):
               f'now has {len(my_files)} files (was {self._last_seen_count})')
         self._last_seen_count = len(my_files)
 
+      # Sidecar coverage visibility: in 'auto' a missing/misnamed sidecar dir trains
+      # silently with a starved survival head, so report the ratio once per pass.
+      if self.sidecar_mode != 'off' and my_files:
+        _n_sidecars = sum(1 for f in my_files
+                          if os.path.exists(os.path.join(self.root_dir, f[:-4] + '.tgt.zst')))
+        print(f'[tpg_dataset] worker {self.worker_id} {self.root_dir}: '
+              f'{_n_sidecars}/{len(my_files)} shards carry survival sidecars '
+              f'(mode={self.sidecar_mode})', flush=True)
+
       def _read_exact(reader, n):
         """Read exactly n bytes from a zstd stream_reader (short reads happen at
         frame boundaries and are NOT EOF). Raises on premature end of stream."""
@@ -309,11 +332,11 @@ class TPGDataset(Dataset):
 
         surv_file = None
         surv_reader = None
-        if _TPG_TARGET_SIDECAR_MODE != 'off':
+        if self.sidecar_mode != 'off':
           surv_path = os.path.join(self.root_dir, file_name[:-4] + '.tgt.zst')
           if not os.path.exists(surv_path):
-            if _TPG_TARGET_SIDECAR_MODE == 'required':
-              raise FileNotFoundError(f'CERES_TPG_TARGET_SIDECAR=1 but sidecar missing: {surv_path}')
+            if self.sidecar_mode == 'required':
+              raise FileNotFoundError(f'survival sidecar mode=required but sidecar missing: {surv_path}')
             # mode=auto: shard has no sidecar -> its batches carry no survival targets.
           else:
             surv_file = open(surv_path, 'rb')

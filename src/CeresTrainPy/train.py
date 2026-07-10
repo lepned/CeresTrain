@@ -35,7 +35,7 @@ from rms_norm import RMSNorm
 from derf_norm import DerfNorm
 from dyt_norm import DyTNorm
 from losses import LossCalculator
-from tpg_dataset import TPGDataset, TPGMixedDataset
+from tpg_dataset import TPGDataset, TPGMixedDataset, TPG_TARGET_SIDECAR_MODE
 from config import Configuration
 import lora
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
@@ -449,8 +449,28 @@ def Train():
     optimizer = SOAP(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), \
                      max_precond_size=999999, precondition_frequency=PRECONDITION_FREQUENCY)
   elif config.Opt_Optimizer == 'Muon':
-    muon_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embedding" not in n and "transformer_layer" in n and p.requires_grad] # 2D parameters can use Muon
-    adamw_params =[p for n, p in model.named_parameters() if (p.ndim < 2 or "embedding" in n or not "transformer_layer" in n) and p.requires_grad] # non-2D should not use Muon
+    _muon_scope = getattr(config, 'Opt_MuonAdamWScope', 'all-non-trunk')
+    if _muon_scope == 'final-only':
+      # dje-style partition: Muon drives ALL hidden 2-D matrices (trunk, headPremap,
+      # headSharedLinear, each Head's hidden fc, smolgen prep); the internal AdamW
+      # gets only final output layers (fcFinal, single-Linear aux heads), embeddings,
+      # LoRA adapters and 1-D params (norms/biases).
+      def _use_muon(n, p):
+        if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
+        if 'embedding' in n: return False         # lookup-table-like: AdamW
+        if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
+        if 'placement_value_head' in n or 'survival_head' in n: return False  # single-Linear aux heads ARE final layers
+        if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
+        return True
+    elif _muon_scope == 'all-non-trunk':
+      # Legacy partition: Muon only for 2-D trunk params; everything else AdamW.
+      def _use_muon(n, p):
+        return p.ndim >= 2 and 'embedding' not in n and 'transformer_layer' in n
+    else:
+      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk' or 'final-only')")
+    muon_params  = [p for n, p in model.named_parameters() if p.requires_grad and _use_muon(n, p)]
+    adamw_params = [p for n, p in model.named_parameters() if p.requires_grad and not _use_muon(n, p)]
+    print(f"[train] Muon partition scope={_muon_scope}: {len(muon_params)} muon / {len(adamw_params)} adamw params", flush=True)
     # Split-LR: separate rate for the internal-AdamW group (heads/embeddings/norms/biases)
     # while the Muon trunk keeps LearningRateBase. One knob was silently shared by two
     # optimizers with different natural scales; the fast trunk rate is needed by the trunk
@@ -614,12 +634,18 @@ def Train():
     _sec_square_bytes = int(_sec_square_bytes) if _sec_square_bytes not in (None, '') else None
     if _sec_square_bytes is not None:
       print(f'[mixed-dataset] secondary shard format override: {_sec_square_bytes} bytes/square')
+    # Strict sidecar mode ('required'/=1) is an assertion about the PRIMARY corpus;
+    # a sidecar-less secondary (e.g. puzzle TPG) is intended, so demote it to 'auto'
+    # there instead of dying on its first batch. Secondaries WITH sidecars still
+    # supply survival targets under 'auto'.
+    _sec_sidecar_mode = 'auto' if TPG_TARGET_SIDECAR_MODE == 'required' else None
     secondary_dataset = TPGDataset(config.Data_TrainingFilesDirectory2,
                                    batch_size_forward // world_size,
                                    config.Data_WDLLabelSmoothing,
                                    rank, world_size, NUM_DATASET_WORKERS,
                                    BOARDS_PER_BATCH, 0, config.Exec_TestFlag,
-                                   square_bytes=_sec_square_bytes)
+                                   square_bytes=_sec_square_bytes,
+                                   sidecar_mode=_sec_sidecar_mode)
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
     print(f'[mixed-dataset] ratio = {config.Data_RatioSet1ToSet2}:1 (primary:secondary batches)')
@@ -847,9 +873,56 @@ def Train():
             f"substituting current groups, starting optimizer state fresh")
       loaded_optimizer_state["param_groups"] = current_param_groups
       loaded_optimizer_state["state"] = {}
+    if config.Opt_Optimizer == 'Muon' and groups_match:
+      # Positional-state guard: optimizer state_dicts key per-param state by POSITION
+      # within the group, and the Muon group's order is muon_params + adamw_params.
+      # If the partition changed vs the checkpoint (e.g. new MuonAdamWScope), that
+      # order changes too, so a warm load would re-key moment buffers onto the WRONG
+      # params — silent corruption wherever shapes coincide. Detect via per-position
+      # use_muon flags; on mismatch start optimizer state fresh (model weights are
+      # unaffected; Muon momentum and Adam moments rebuild within a few hundred steps).
+      _ld_st = loaded_optimizer_state.get("state", {})
+      _cur_flags = [bool(optimizer.state[p]["use_muon"])
+                    for grp in optimizer.param_groups for p in grp["params"]]
+      _partition_changed = any(
+        (_ld_st.get(i, {}).get("use_muon") is not None)
+        and (bool(_ld_st[i]["use_muon"]) != cur)
+        for i, cur in enumerate(_cur_flags))
+      if _partition_changed:
+        print("[checkpoint-resume] Muon partition differs from checkpoint "
+              "(MuonAdamWScope change?) — starting optimizer state fresh to avoid "
+              "positional state misalignment", flush=True)
+        loaded_optimizer_state["state"] = {}
     optimizer.load_state_dict(loaded_optimizer_state)
-    
-    
+
+    # Re-assert construction-time Muon settings that load_state_dict clobbers
+    # (or drops entirely on the fresh-state paths above):
+    #   1) per-param use_muon flags — step() requires them; loaded positional flags
+    #      are stale across partition changes, and the fresh-state paths drop them
+    #      entirely (previously step() would have crashed with KeyError).
+    #   2) adamw_lr_ratio — a NEW LearningRateBaseHeads must take effect on resume
+    #      (the scheduler re-asserts 'lr' from base_lrs every step, but nothing
+    #      else re-reads the ratio).
+    if config.Opt_Optimizer == 'Muon':
+      for _p in muon_params:
+        _st = optimizer.state[_p]
+        if _st.get("use_muon") is False:  # moved AdamW->Muon: purge stale Adam moments
+          for _k in ("step", "moment1", "moment2"):
+            _st.pop(_k, None)
+        _st["use_muon"] = True
+      for _p in adamw_params:
+        _st = optimizer.state[_p]
+        if _st.get("use_muon") is True:   # moved Muon->AdamW: purge stale momentum
+          _st.pop("momentum_buffer", None)
+        _st["use_muon"] = False
+      _hl = getattr(config, 'Opt_LearningRateBaseHeads', None)
+      _new_ratio = (float(_hl) / LR) if _hl is not None else 1.0
+      for g in optimizer.param_groups:
+        if g.get('adamw_lr_ratio', 1.0) != _new_ratio:
+          print(f"[checkpoint-resume] re-asserting Muon adamw_lr_ratio "
+                f"{g.get('adamw_lr_ratio', 1.0)} -> {_new_ratio}", flush=True)
+          g['adamw_lr_ratio'] = _new_ratio
+
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
     print("INFO: LOAD_CHECKPOINT", config.Opt_CheckpointResumeFromFileName, num_pos)
 
