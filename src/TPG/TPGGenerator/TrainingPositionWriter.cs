@@ -108,6 +108,15 @@ namespace CeresTrain.TPG.TPGGenerator
 
     bool shutdown = false;
 
+    /// <summary>
+    /// Count of positions discarded at/after shutdown (buffered partials plus batches
+    /// arriving once the target was reached). These are positions BEYOND the requested
+    /// --num-pos target — expected and benign, reported for visibility at shutdown.
+    /// </summary>
+    long numPositionsDiscardedAfterShutdown = 0;
+
+    public long NumPositionsDiscardedAtShutdown => Interlocked.Read(ref numPositionsDiscardedAfterShutdown);
+
 
     /// <summary>
     /// Constructor.
@@ -281,6 +290,7 @@ namespace CeresTrain.TPG.TPGGenerator
     {
       if (shutdown)
       {
+        Interlocked.Increment(ref numPositionsDiscardedAfterShutdown);
         return;
       }
 
@@ -540,6 +550,14 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
       // postprocesses/writes to the same target set.
       lock (writingBuffersLocks[targetSetIndex])
       {
+        if (shutdown)
+        {
+          // Shutdown owns (or already released) this set's streams: they are being
+          // disposed or are gone. Drop the batch instead of writing to a dead stream —
+          // these positions are beyond the requested target count.
+          Interlocked.Add(ref numPositionsDiscardedAfterShutdown, positions.Length);
+          return;
+        }
         if (EvaluatorPostprocessor != null)
         {
           // Create a big batch out of all the positions collected.
@@ -673,29 +691,51 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
 
     public void Shutdown()
     {
-      shutdown = true;
-      if (outStreams != null)
+      lock (lockObj)
       {
-        lock (lockObj)
+        if (shutdown)
         {
-          if (outStreams != null)
+          return; // idempotent: every generator thread calls Shutdown on target-reached
+        }
+        // Stops NEW writes (Write early-returns; a ProcessWrite blocked on a per-set
+        // lock below re-checks this flag before touching its streams).
+        shutdown = true;
+
+        if (outStreams != null)
+        {
+          int numSets = outStreams.Length;
+          bool hadSidecars = survivalOutStreams != null;
+          long numDiscardedPartial = 0;
+
+          for (int i = 0; i < numSets; i++)
           {
-            for (int i = 0; i < outStreams.Length; i++)
+            // CRITICAL: serialize against any in-flight ProcessWrite on this set.
+            // Disposing a ZstandardStream mid-write truncates the final frame of the
+            // shard (and its .tgt.zst sidecar) while the process still exits 0 and
+            // TPGWRITER prints 100% — the 1B survival generation silently lost 2 of
+            // 16 shards (set0 + set15, cut at the identical byte offset) this way.
+            // Taking the same per-set lock the write path holds guarantees the frame
+            // in progress is fully written before the stream is finalized.
+            lock (writingBuffersLocks[i])
             {
-              outStreams[i].Dispose();
+              numDiscardedPartial += countsInBuffer[i]; // partial batch never flushed (positions beyond target)
+              outStreams[i]?.Dispose();
               outStreams[i] = null;
+              if (survivalOutStreams != null)
+              {
+                survivalOutStreams[i]?.Dispose();
+                survivalOutStreams[i] = null;
+              }
             }
           }
           outStreams = null;
+          survivalOutStreams = null;
 
-          if (survivalOutStreams != null)
+          long totalDiscarded = numDiscardedPartial + Interlocked.Read(ref numPositionsDiscardedAfterShutdown);
+          Console.WriteLine($"TPGWRITER : shutdown complete, {numSets} shard stream(s){(hadSidecars ? " + survival sidecars" : "")} flushed and closed.");
+          if (totalDiscarded > 0)
           {
-            for (int i = 0; i < survivalOutStreams.Length; i++)
-            {
-              survivalOutStreams[i]?.Dispose();
-              survivalOutStreams[i] = null;
-            }
-            survivalOutStreams = null;
+            Console.WriteLine($"TPGWRITER : {totalDiscarded} buffered position(s) beyond target discarded (expected; all closed frames are intact).");
           }
         }
       }
