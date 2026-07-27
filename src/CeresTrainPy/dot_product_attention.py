@@ -237,6 +237,26 @@ class DotProductAttention(torch.nn.Module):
       torch.nn.init.constant_(self.lambda_proj.bias, -2.2)
     self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
+    # Gated attention output (Kimi K3 "Gated MLA" / Qwen gated-attention family).
+    # Env-gated: CERES_GATED_ATTENTION_OUTPUT=1 (default 0 = exactly current behavior).
+    # Elementwise sigmoid gate computed from the attention INPUT, applied to the
+    # concatenated head outputs before W_h. Softmax forces every head to put its
+    # mass somewhere on every square; ungated heads therefore inject noise into the
+    # residual stream on positions where they have nothing to say. The gate gives
+    # each channel an explicit learned "stay silent here" option.
+    # Init: zero weight + bias 4.0 -> gate = sigmoid(4) ~ 0.982 everywhere at step 0,
+    # i.e. a near-identity, input-independent start (same pattern as lambda_proj);
+    # channels close only where gradients ask for it.
+    self.use_gated_attn_out = int(os.environ.get('CERES_GATED_ATTENTION_OUTPUT', '0') or 0) > 0
+    if self.use_gated_attn_out:
+      self.attn_out_gate = torch.nn.Linear(self.d_model, self.d_model * self.attention_multiplier, bias=True)
+      torch.nn.init.zeros_(self.attn_out_gate.weight)
+      torch.nn.init.constant_(self.attn_out_gate.bias, 4.0)
+      if not self.layer_num:  # print once (layer 0 or None), not per layer
+        print(f'[dot_product_attention] GATED ATTENTION OUTPUT enabled: elementwise sigmoid '
+              f'gate [{self.d_model} -> {self.d_model * self.attention_multiplier}] per layer, '
+              f'zero-init weight / bias 4.0 (gate~0.982 at step 0)')
+
     if self.use_nonlinear_attention:
       self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
       self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
@@ -525,8 +545,13 @@ class DotProductAttention(torch.nn.Module):
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)
-      
-    # Final linear layer  
+
+    # Gated attention output (see __init__): per-channel sigmoid gate from the
+    # attention input scales head outputs before the final projection.
+    if self.use_gated_attn_out:
+      H_cat = H_cat * torch.sigmoid(self.attn_out_gate(qkv_x))
+
+    # Final linear layer
     H = self.W_h(H_cat)
 
     return H
