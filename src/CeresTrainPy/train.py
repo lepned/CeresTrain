@@ -487,7 +487,48 @@ def Train():
     if _heads_lr is not None:
       print(f'[train] Muon SPLIT-LR: trunk (Muon 2-D) lr={LR}, heads/embeddings/norms (internal AdamW) lr={_heads_lr} '
             f'(ratio {_heads_lr / LR:.4g}, schedule-proportional); {len(muon_params)} muon / {len(adamw_params)} adamw params')
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=config.Opt_Beta1, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr)
+    # Per-head Muon (Kimi K3-style, config 'MuonPerHeadAttention'): orthogonalize each
+    # attention head's projection block independently instead of the full fused matrix,
+    # so gradient correlations across heads can't couple through one global NS step.
+    # Block layout is taken from how each weight is RESHAPED at use in
+    # DotProductAttention.forward, not guessed from shape:
+    #   qkv  linear path:    out rows are [H, qkv_mult*d_k*m] head-major -> per-head
+    #                        AND per-projection blocks (nb = qkv_mult*H, axis 0)
+    #   qkv  nonlinear path: out rows are [qkv_mult, d_model*m] — no head structure
+    #                        yet -> per-projection only (nb = qkv_mult, axis 0)
+    #   q2/k2/v2/q2b:        out rows head-major -> per-head (nb = H, axis 0)
+    #   W_h:                 input cols are concatenated head outputs -> per-head
+    #                        along columns (nb = H, axis 1)
+    # LoRA-wrapped layers are skipped (their base weights are frozen/adapted, and
+    # LoRA params never run under Muon anyway).
+    _phm_specs = {}
+    if getattr(config, 'Opt_MuonPerHeadAttention', False):
+      from dot_product_attention import DotProductAttention
+      _muon_ids = set(id(p) for p in muon_params)
+      def _plain_weight(sub):
+        return sub.weight if isinstance(sub, torch.nn.Linear) else None
+      for _mod in model.modules():
+        if not isinstance(_mod, DotProductAttention):
+          continue
+        _H = _mod.num_heads
+        _w = _plain_weight(_mod.qkv)
+        if _w is not None and id(_w) in _muon_ids:
+          _nb = _mod.qkv_multiplier * (1 if _mod.use_nonlinear_attention else _H)
+          if _nb > 1 and _w.shape[0] % _nb == 0:
+            _phm_specs[_w] = (0, _nb)
+        for _sname in ('q2', 'k2', 'v2', 'q2b'):
+          _s = getattr(_mod, _sname, None)
+          _w = _plain_weight(_s) if _s is not None else None
+          if _w is not None and id(_w) in _muon_ids and _w.shape[0] % _H == 0:
+            _phm_specs[_w] = (0, _H)
+        _w = _plain_weight(_mod.W_h)
+        if _w is not None and id(_w) in _muon_ids and _w.shape[1] % _H == 0:
+          _phm_specs[_w] = (1, _H)
+      if not _phm_specs:
+        raise ValueError('MuonPerHeadAttention=true but no eligible attention matrices found '
+                         '(LoRA-wrapped model, or attention params not under Muon scope?)')
+      print(f'[train] Muon PER-HEAD attention: {len(_phm_specs)} attention matrices head-split', flush=True)
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=config.Opt_Beta1, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None)
   elif config.Opt_Optimizer == 'AdEMAMix':
     optimizer = AdEMAMix(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), alpha=config.Opt_Alpha, T_alpha_beta3= STEPS_AdEMAMix_WARMUP)
   elif config.Opt_Optimizer == 'AdEMAMixShampoo':
@@ -942,6 +983,14 @@ def Train():
           for _k in ("step", "moment1", "moment2"):
             _st.pop(_k, None)
         _st["use_muon"] = True
+        # 3) head_split specs — construction-time truth (MuonPerHeadAttention) wins
+        #    over whatever the checkpoint carried, in both directions. Momentum
+        #    buffers are full-matrix under both modes, so they stay warm.
+        _spec = optimizer.head_split_specs.get(_p)
+        if _spec is not None:
+          _st["head_split"] = _spec
+        else:
+          _st.pop("head_split", None)
       for _p in adamw_params:
         _st = optimizer.state[_p]
         if _st.get("use_muon") is True:   # moved Muon->AdamW: purge stale momentum

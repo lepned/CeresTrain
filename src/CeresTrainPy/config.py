@@ -137,6 +137,12 @@ class Configuration:
     #       aux heads), embeddings, LoRA adapters and 1-D params; head hidden
     #       matrices train under Muon like the trunk.
     self.Opt_MuonAdamWScope = config_opt.get('MuonAdamWScope', 'all-non-trunk')
+    # Per-head Muon (Muon only, Kimi K3-style): orthogonalize each attention head's
+    # projection block independently (qkv per-head x per-projection on the linear
+    # path / per-projection on the nonlinear path; q2/k2/v2/q2b per-head rows;
+    # W_h per-head input columns) instead of one NS step over the full fused matrix.
+    # False/absent = legacy full-matrix orthogonalization.
+    self.Opt_MuonPerHeadAttention = bool(config_opt.get('MuonPerHeadAttention', False))
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)

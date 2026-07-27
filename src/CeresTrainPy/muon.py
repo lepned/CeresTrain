@@ -42,6 +42,30 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
+@torch.compile
+def zeropower_via_newtonschulz5_batched(G, steps):
+    """
+    Batched variant of zeropower_via_newtonschulz5 for a stack of equally-shaped
+    blocks [nb, r, c] (per-head Muon). Each block is normalized and orthogonalized
+    independently — identical math to running the 2-D version per block, but one
+    batched matmul chain instead of nb kernel launches.
+    """
+    assert len(G.shape) == 3
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    transposed = G.size(1) > G.size(2)
+    if transposed:
+        X = X.mT
+    X = X / (X.norm(dim=(1, 2), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.mT
+    return X
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -81,6 +105,7 @@ class Muon(torch.optim.Optimizer):
         adamw_betas=(0.95, 0.95),
         adamw_eps=1e-8,
         adamw_lr=None,
+        head_split_specs=None,
     ):
         # adamw_lr: separate learning rate for the internal-AdamW group (heads, embeddings,
         # norms, biases). The docstring always advertised it but it was never implemented -
@@ -113,6 +138,21 @@ class Muon(torch.optim.Optimizer):
         for p in adamw_params:
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
+
+        # Per-head Muon (Kimi K3-style): head_split_specs maps param -> (axis, nb).
+        # The gradient of such a param is split into nb equal blocks along `axis`
+        # (0 = row blocks, 1 = column blocks) and each block is orthogonalized
+        # INDEPENDENTLY, so heads stop sharing one global orthogonalization.
+        # Momentum stays full-matrix; only the NS post-processing is blockwise.
+        # LR scaling uses the BLOCK shape, so blocks get the spectral scaling
+        # appropriate to their own dimensions.
+        self.head_split_specs = dict(head_split_specs) if head_split_specs else {}
+        for p, spec in self.head_split_specs.items():
+            assert self.state[p].get("use_muon", False), "head_split only valid for Muon params"
+            axis, nb = spec
+            assert p.ndim == 2 and axis in (0, 1) and p.shape[axis] % nb == 0, \
+                f"bad head_split {spec} for param shape {tuple(p.shape)}"
+            self.state[p]["head_split"] = (int(axis), int(nb))
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -166,10 +206,28 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                head_split = state.get("head_split")
+                if head_split is not None:
+                    # Per-head Muon: orthogonalize each head's block independently.
+                    axis, nb = head_split
+                    rows, cols = g.shape
+                    if axis == 0:
+                        G3 = g.view(nb, rows // nb, cols)
+                    else:
+                        G3 = g.view(rows, nb, cols // nb).transpose(0, 1)
+                    U3 = zeropower_via_newtonschulz5_batched(G3, steps=group["ns_steps"])
+                    if axis == 0:
+                        u = U3.reshape(rows, cols)
+                        block_shape = (rows // nb, cols)
+                    else:
+                        u = U3.transpose(0, 1).reshape(rows, cols)
+                        block_shape = (rows, cols // nb)
+                    adjusted_lr = self.adjust_lr_for_muon(lr, block_shape)
+                else:
+                    u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
-                # scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
+                    # scale update
+                    adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
 
                 # apply weight decay
                 p.data.mul_(1 - lr * wd)
