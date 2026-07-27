@@ -206,6 +206,18 @@ class CeresNet(nn.Module):
       print(f'[ceres_net] SURVIVAL HEAD enabled: aux weight {self.survival_target_weight}, K={self.survival_horizon} '
             f'(per-square fate classification over trunk flow [64 x {self.EMBEDDING_DIM}])')
 
+    # Short-term value head (AUXILIARY, training-only; V7_EXTRAS_SIDECAR_SPEC.md).
+    # 3-logit WDL against the blunder-censored short-term EMA targets (censored q_st/d_st)
+    # carried by V7-extras sidecars — a "what happens over the next few moves" value signal
+    # that never blends across a detected blunder. Same additive per-square decomposition
+    # and export-safe stash pattern as the placement head. Requires CERES_TPG_V7X_SIDECAR.
+    self.stvalue_weight = float(os.environ.get('CERES_STVALUE_WEIGHT', '0') or 0)
+    if self.stvalue_weight > 0:
+      self.stvalue_head = nn.Linear(self.EMBEDDING_DIM, 3)
+      self.stvalue_bias = nn.Parameter(torch.zeros(3))
+      print(f'[ceres_net] SHORT-TERM VALUE HEAD enabled: aux weight {self.stvalue_weight} '
+            f'(WDL vs censored q_st/d_st from .v7x sidecars)')
+
 
 
     if self.DEEPNORM:     
@@ -465,13 +477,16 @@ class CeresNet(nn.Module):
     # executes the attribute mutation — the PT2 dynamo export path rejects tensor
     # attribute mutation in forward, and the swallowed exception would otherwise
     # silently produce checkpoint-only runs with no .onnx.
-    if (self.placement_value_weight > 0 or self.survival_target_weight > 0) and self.training:
+    if (self.placement_value_weight > 0 or self.survival_target_weight > 0 or self.stvalue_weight > 0) and self.training:
       flow_aux_src = flow_value if (self.use_gtab and self.gtab_value_only) else flow
       if self.placement_value_weight > 0:
         pv_contrib = self.placement_value_head(flow_aux_src)                       # [B, 64, 3]
         self._last_placement_value_out = pv_contrib.sum(dim=1) + self.placement_value_bias  # [B, 3]
       if self.survival_target_weight > 0:
         self._last_survival_out = self.survival_head(flow_aux_src)                 # [B, 64, K+2]
+      if self.stvalue_weight > 0:
+        st_contrib = self.stvalue_head(flow_aux_src)                               # [B, 64, 3]
+        self._last_stvalue_out = st_contrib.sum(dim=1) + self.stvalue_bias         # [B, 3]
 
     # Heads. Policy reads fS_others (= orig in value-only mode); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_others)
@@ -567,9 +582,13 @@ class CeresNet(nn.Module):
     wdl_blend = wdl_nondeblundered
     value_target = wdl_q * self.q_ratio + wdl_deblundered * (1 - self.q_ratio)
 
+    # z-provenance (v7x sidecar) for optional per-record value-loss weighting
+    # (CERES_VALUE_PROV_WEIGHTS); None when the batch carries no v7x keys.
+    z_provenance = batch.get('z_provenance', None)
+
     p_loss = 0 if policy_out is None else loss_calc.policy_loss(policy_target, policy_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.policy_loss_weight)
-    v_loss = 0 if value_out is None else loss_calc.value_loss(value_target, value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_loss_weight)
-    v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight)
+    v_loss = 0 if value_out is None else loss_calc.value_loss(value_target, value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_loss_weight, provenance=z_provenance)
+    v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
     q_deviation_lower_loss = 0 if q_deviation_lower_out is None else loss_calc.q_deviation_lower_loss(q_deviation_lower_target, q_deviation_lower_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
@@ -619,6 +638,20 @@ class CeresNet(nn.Module):
       if survival_target is not None:
         survival_loss = loss_calc.survival_loss(survival_target, _sv_out, gradient_norm_logging_mode, self.survival_target_weight)
 
+    # Short-term value aux head: CE against the WDL built from censored q_st/d_st
+    # (V7-extras sidecar; STM-relative, matching TPG conventions), optionally weighted
+    # per record by z-provenance. Missing keys = batch from a v7x-less shard
+    # (CERES_TPG_V7X_SIDECAR=auto mixed-corpus mode): skip, as with survival.
+    # Same consume-and-clear/value_out gating as the other aux heads.
+    stvalue_loss = 0
+    _st_out = getattr(self, '_last_stvalue_out', None)
+    if self.stvalue_weight > 0 and _st_out is not None and value_out is not None:
+      self._last_stvalue_out = None
+      _cens_q = batch.get('censored_q_st', None)
+      if _cens_q is not None:
+        stvalue_loss = loss_calc.stvalue_loss(_cens_q, batch['censored_d_st'], batch.get('z_provenance', None),
+                                              _st_out.float(), SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.stvalue_weight)
+
     total_loss = (self.policy_loss_weight * p_loss
         + self.value_loss_weight * v_loss
         + self.value2_loss_weight * v2_loss
@@ -632,7 +665,8 @@ class CeresNet(nn.Module):
         + self.action_uncertainty_loss_weight * action_uncertainty_loss
         + self.uncertainty_policy_weight * uncertainty_policy_loss
         + self.placement_value_weight * placement_loss
-        + self.survival_target_weight * survival_loss)
+        + self.survival_target_weight * survival_loss
+        + self.stvalue_weight * stvalue_loss)
         
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -675,6 +709,8 @@ class CeresNet(nn.Module):
         self._log("placement_value_loss" + stat_suffix, placement_loss, step=num_pos)
       if self.survival_target_weight > 0 and not isinstance(survival_loss, int):
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
+      if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int):
+        self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
       self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
       self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
       self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)

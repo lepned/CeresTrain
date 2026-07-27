@@ -41,6 +41,33 @@ if SURVIVAL_BUCKET_BOUNDS is not None:
 if SURVIVAL_CAPTURE_WEIGHT != 1.0:
   print(f'[losses] survival loss: capture-class weight {SURVIVAL_CAPTURE_WEIGHT}')
 
+# Short-term value head (V7_EXTRAS_SIDECAR_SPEC.md): optional per-record loss weighting
+# by z-provenance code (0=orig result, 1=syzygy, 2=deblunder-noise, 3=deblunder-unint,
+# 4=op1-8man). CERES_STVALUE_PROV_WEIGHTS="w0,w1,w2,w3,w4"; unset = uniform.
+_STVALUE_PROV_ENV = os.environ.get('CERES_STVALUE_PROV_WEIGHTS', '').strip()
+STVALUE_PROV_WEIGHTS = [float(x) for x in _STVALUE_PROV_ENV.split(',')] if _STVALUE_PROV_ENV else None
+if STVALUE_PROV_WEIGHTS is not None:
+  assert len(STVALUE_PROV_WEIGHTS) == 5, f'CERES_STVALUE_PROV_WEIGHTS needs 5 values, got {STVALUE_PROV_WEIGHTS}'
+  print(f'[losses] stvalue loss: per-provenance weights {STVALUE_PROV_WEIGHTS}')
+
+# Per-provenance weighting of the MAIN value/value2 losses (CERES_VALUE_PROV_WEIGHTS,
+# same 5-value format/codes as above). Weights records by how trustworthy their result
+# label is: e.g. "0.5,3,1,1,5" learns hardest from syzygy-proven (1) and op1-relabeled
+# (4) positions, whose labels are ground truth the net may genuinely disagree with.
+# Adds NO parameters (pure loss reweighting) so it composes with LoRA fine-tuning.
+# Requires v7x sidecars (batch['z_provenance']); silently inactive per-batch when the
+# key is absent, with a loud startup check in train.py against whole-run no-ops.
+_VALUE_PROV_ENV = os.environ.get('CERES_VALUE_PROV_WEIGHTS', '').strip()
+VALUE_PROV_WEIGHTS = [float(x) for x in _VALUE_PROV_ENV.split(',')] if _VALUE_PROV_ENV else None
+# Scope: 'both' (default) applies provenance weighting to value1 AND value2;
+# 'value2' restricts it to value2 only — the right setting when value1 trains
+# toward Q (FractionQ=1), since provenance describes the z labels, not Q.
+VALUE_PROV_SCOPE = (os.environ.get('CERES_VALUE_PROV_SCOPE', 'both') or 'both').strip().lower()
+if VALUE_PROV_WEIGHTS is not None:
+  assert len(VALUE_PROV_WEIGHTS) == 5, f'CERES_VALUE_PROV_WEIGHTS needs 5 values, got {VALUE_PROV_WEIGHTS}'
+  assert VALUE_PROV_SCOPE in ('both', 'value2'), f"CERES_VALUE_PROV_SCOPE must be 'both' or 'value2', got {VALUE_PROV_SCOPE!r}"
+  print(f'[losses] value loss provenance weights {VALUE_PROV_WEIGHTS} (scope: {VALUE_PROV_SCOPE})')
+
 
 
 class LossCalculator():
@@ -65,6 +92,7 @@ class LossCalculator():
     self.PENDING_PLACEMENT_VALUE_LOSS = 0
     self.PENDING_SURVIVAL_LOSS = 0
     self.PENDING_SURVIVAL_ACC = 0
+    self.PENDING_STVALUE_LOSS = 0
     self.PENDING_VALUE_ACC = 0
     self.PENDING_POLICY_ACC = 0
     self.PENDING_MLH_LOSS = 0
@@ -97,6 +125,10 @@ class LossCalculator():
   @property
   def LAST_SURVIVAL_ACC(self):
     return self.PENDING_SURVIVAL_ACC / self.PENDING_COUNT
+
+  @property
+  def LAST_STVALUE_LOSS(self):
+    return self.PENDING_STVALUE_LOSS / self.PENDING_COUNT
   
   @property
   def LAST_VALUE_DIFF_LOSS(self):
@@ -201,24 +233,39 @@ class LossCalculator():
     return self.calc_loss_grad_norm('policy', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
-  def value_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float):
+  def _prov_weighted_ce(self, target: torch.Tensor, output: torch.Tensor, provenance: torch.Tensor):
+    """Cross entropy with optional per-record z-provenance weighting
+    (CERES_VALUE_PROV_WEIGHTS). Falls back to plain mean CE when weighting is
+    off or the batch carries no provenance (v7x-less shard in auto mode)."""
+    if VALUE_PROV_WEIGHTS is not None and provenance is not None:
+      prov_wt = torch.tensor(VALUE_PROV_WEIGHTS, device=output.device, dtype=torch.float32)
+      rec_wt = prov_wt[provenance.reshape(-1).long()]
+      per_rec = F.cross_entropy(output, target, reduction='none')
+      return (per_rec * rec_wt).sum() / rec_wt.sum().clamp_min(1e-6)
+    return self.ce_loss.forward(output, target)
+
+
+  def value_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float, provenance: torch.Tensor = None):
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
+    # Entropy subtraction stays unweighted under provenance weighting (informational
+    # comparability of the logged number; the gradient comes from the CE term only).
     entropy = self.entropy(target) if subtract_entropy else 0.0
-    loss = self.ce_loss.forward(output, target) - entropy
+    _prov_v1 = provenance if VALUE_PROV_SCOPE == 'both' else None
+    loss = self._prov_weighted_ce(target, output, _prov_v1) - entropy
     # Guarded like the other heads: the grad-norm diagnostic pass must not double-count stats.
     self.PENDING_VALUE_LOSS += loss.item() if not calc_grad_norm_mode else 0
     self.PENDING_VALUE_ACC += self.calc_accuracy(target, output, False) if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('value', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
-  def value2_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float):
+  def value2_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float, provenance: torch.Tensor = None):
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
     entropy = self.entropy(target) if subtract_entropy else 0.0
-    loss = self.ce_loss.forward(output, target) - entropy
+    loss = self._prov_weighted_ce(target, output, provenance) - entropy
     self.PENDING_VALUE2_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('value2', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -301,6 +348,36 @@ class LossCalculator():
       self.PENDING_SURVIVAL_LOSS += loss.item()
       self.PENDING_SURVIVAL_ACC += 100.0 * (pred_graded == target_graded).float().mean().item()
     return self.calc_loss_grad_norm('survival', loss, loss_wt) if calc_grad_norm_mode else loss
+
+
+  def stvalue_loss(self, cens_q: torch.Tensor, cens_d: torch.Tensor, provenance: torch.Tensor,
+                   output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float):
+    """Short-term value aux head vs the blunder-censored q_st/d_st sidecar values
+    (V7_EXTRAS_SIDECAR_SPEC.md). Target WDL is built from the STM-relative pair as
+    w=(1-d+q)/2, l=(1-d-q)/2 (clamped >= 0 and renormalized against float drift).
+    Same CE-minus-entropy form as value_loss so the logged number is comparable.
+    Optional per-record weighting by z-provenance (CERES_STVALUE_PROV_WEIGHTS);
+    the subtracted entropy stays unweighted (informational comparability only)."""
+    if calc_grad_norm_mode:
+      self.model.zero_grad()
+
+    q = cens_q.reshape(-1).float()
+    d = cens_d.reshape(-1).float()
+    w = (1.0 - d + q) * 0.5
+    l = (1.0 - d - q) * 0.5
+    target = torch.stack((w, d, l), dim=1).clamp_min(0)
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    entropy = self.entropy(target) if subtract_entropy else 0.0
+    if STVALUE_PROV_WEIGHTS is not None and provenance is not None:
+      prov_wt = torch.tensor(STVALUE_PROV_WEIGHTS, device=output.device, dtype=torch.float32)
+      rec_wt = prov_wt[provenance.reshape(-1).long()]
+      per_rec = F.cross_entropy(output, target, reduction='none')
+      loss = (per_rec * rec_wt).sum() / rec_wt.sum().clamp_min(1e-6) - entropy
+    else:
+      loss = self.ce_loss.forward(output, target) - entropy
+    self.PENDING_STVALUE_LOSS += loss.item() if not calc_grad_norm_mode else 0
+    return self.calc_loss_grad_norm('stvalue', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
   def value_diff_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float):

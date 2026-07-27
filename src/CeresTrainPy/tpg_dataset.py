@@ -137,6 +137,30 @@ if _TPG_TARGET_SIDECAR_MODE != 'off':
 # mode; per-dataset override via TPGDataset(sidecar_mode=...).
 TPG_TARGET_SIDECAR_MODE = _TPG_TARGET_SIDECAR_MODE
 
+# V7-extras sidecars (V7_EXTRAS_SIDECAR_SPEC.md): companion '<shard minus .zst>.v7x.zst'
+# files with a 16-byte header (TPGX|ver|rowBytes|reserved) followed by 9-byte rows
+# (censored q_st f32 LE, censored d_st f32 LE, z-provenance u8) in the SAME record order.
+# Exposed as batch['censored_q_st'] / batch['censored_d_st'] / batch['z_provenance'].
+# Modes (CERES_TPG_V7X_SIDECAR) mirror the survival sidecar modes:
+#   0 / unset : off — sidecars ignored entirely
+#   1         : required — EVERY shard must have a .v7x sidecar (hard error otherwise)
+#   auto      : per-shard — shards without a sidecar yield batches without the v7x keys.
+_TPG_V7X_SIDECAR_ENV = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
+if _TPG_V7X_SIDECAR_ENV in ('0', ''):
+  _TPG_V7X_SIDECAR_MODE = 'off'
+elif _TPG_V7X_SIDECAR_ENV == '1':
+  _TPG_V7X_SIDECAR_MODE = 'required'
+elif _TPG_V7X_SIDECAR_ENV == 'auto':
+  _TPG_V7X_SIDECAR_MODE = 'auto'
+else:
+  raise ValueError(f"CERES_TPG_V7X_SIDECAR must be 0, 1 or 'auto', got {_TPG_V7X_SIDECAR_ENV!r}")
+_V7X_ROW_BYTES = 9
+_V7X_DTYPE = np.dtype([('cens_q', '<f4'), ('cens_d', '<f4'), ('prov', 'u1')])
+if _TPG_V7X_SIDECAR_MODE != 'off':
+  print(f'[tpg_dataset] V7-extras sidecars ENABLED, mode={_TPG_V7X_SIDECAR_MODE} '
+        f'(censored q_st/d_st + z-provenance per position)')
+TPG_V7X_SIDECAR_MODE = _TPG_V7X_SIDECAR_MODE
+
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
 _POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
@@ -194,7 +218,8 @@ class TPGDataset(Dataset):
                num_files_to_skip : int = 0,
                test : bool = False,
                square_bytes : int = None,
-               sidecar_mode : str = None):
+               sidecar_mode : str = None,
+               v7x_mode : str = None):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
@@ -217,6 +242,14 @@ class TPGDataset(Dataset):
     if self.sidecar_mode != _TPG_TARGET_SIDECAR_MODE:
       print(f'[tpg_dataset] {root_dir}: survival sidecar mode override: '
             f'{_TPG_TARGET_SIDECAR_MODE} -> {self.sidecar_mode}', flush=True)
+    # Per-dataset V7-extras sidecar mode (default = process-wide CERES_TPG_V7X_SIDECAR),
+    # same override rationale as sidecar_mode above.
+    self.v7x_mode = v7x_mode if v7x_mode is not None else _TPG_V7X_SIDECAR_MODE
+    if self.v7x_mode not in ('off', 'required', 'auto'):
+      raise ValueError(f"v7x_mode must be 'off', 'required' or 'auto', got {self.v7x_mode!r}")
+    if self.v7x_mode != _TPG_V7X_SIDECAR_MODE:
+      print(f'[tpg_dataset] {root_dir}: V7-extras sidecar mode override: '
+            f'{_TPG_V7X_SIDECAR_MODE} -> {self.v7x_mode}', flush=True)
     if self.square_bytes == 137 and _NUM_AUX_FEATURES_PER_SQUARE != 0:
       raise ValueError(f'dataset {root_dir}: 137-byte (V2) shards carry no aux bytes; '
                        f'CERES_AUX_FEATURES_PER_SQUARE must be 0 (got {_NUM_AUX_FEATURES_PER_SQUARE})')
@@ -246,8 +279,9 @@ class TPGDataset(Dataset):
     of each pass through the data so that new .zst files dropped into root_dir
     during a long run get included automatically."""
     all_files = fnmatch.filter(os.listdir(self.root_dir), '*.zst')
-    # Survival target sidecars (<shard>.tgt.zst) are companion label files, never shards.
-    all_files = [f for f in all_files if not f.endswith('.tgt.zst')]
+    # Sidecars (<shard>.tgt.zst survival, <shard>.v7x.zst V7-extras) are companion
+    # label files, never shards — exclude unconditionally (regardless of mode).
+    all_files = [f for f in all_files if not f.endswith('.tgt.zst') and not f.endswith('.v7x.zst')]
     all_files.sort(key=lambda f: stable_str_hash(f))  # deterministic shuffle
     if initial:
       assert len(all_files) >= self.num_files_to_skip + self.num_workers, f"Trying to skip more files than available: {len(all_files)} available, {self.num_files_to_skip} to skip, {self.num_workers} workers"
@@ -312,6 +346,12 @@ class TPGDataset(Dataset):
         print(f'[tpg_dataset] worker {self.worker_id} {self.root_dir}: '
               f'{_n_sidecars}/{len(my_files)} shards carry survival sidecars '
               f'(mode={self.sidecar_mode})', flush=True)
+      if self.v7x_mode != 'off' and my_files:
+        _n_v7x = sum(1 for f in my_files
+                     if os.path.exists(os.path.join(self.root_dir, f[:-4] + '.v7x.zst')))
+        print(f'[tpg_dataset] worker {self.worker_id} {self.root_dir}: '
+              f'{_n_v7x}/{len(my_files)} shards carry V7-extras sidecars '
+              f'(mode={self.v7x_mode})', flush=True)
 
       def _read_exact(reader, n):
         """Read exactly n bytes from a zstd stream_reader (short reads happen at
@@ -321,7 +361,7 @@ class TPGDataset(Dataset):
         while remaining > 0:
           piece = reader.read(remaining)
           if not piece:
-            raise RuntimeError(f'survival sidecar ended prematurely ({remaining} of {n} bytes missing)')
+            raise RuntimeError(f'sidecar stream ended prematurely ({remaining} of {n} bytes missing)')
           parts.append(piece)
           remaining -= len(piece)
         return b''.join(parts) if len(parts) != 1 else parts[0]
@@ -353,6 +393,21 @@ class TPGDataset(Dataset):
             # surv_sidecar_K > _SURVIVAL_HORIZON is allowed: labels are remapped losslessly
             # below (captured at ply > K == survived the K-ply horizon). Enables K sweeps
             # on one K=8 corpus without regeneration.
+
+        v7x_file = None
+        v7x_reader = None
+        if self.v7x_mode != 'off':
+          v7x_path = os.path.join(self.root_dir, file_name[:-4] + '.v7x.zst')
+          if not os.path.exists(v7x_path):
+            if self.v7x_mode == 'required':
+              raise FileNotFoundError(f'V7-extras sidecar mode=required but sidecar missing: {v7x_path}')
+            # mode=auto: shard has no sidecar -> its batches carry no v7x keys.
+          else:
+            v7x_file = open(v7x_path, 'rb')
+            v7x_reader = zstandard.ZstdDecompressor().stream_reader(v7x_file)
+            hdr = _read_exact(v7x_reader, 16)
+            if hdr[:4] != b'TPGX' or hdr[4] != 1 or hdr[5] != _V7X_ROW_BYTES:
+              raise ValueError(f'bad V7-extras sidecar header in {v7x_path}: {hdr[:8].hex()}')
 
         with open(os.path.join(self.root_dir, file_name),'rb') as file:
           dctx = zstandard.ZstdDecompressor()
@@ -392,9 +447,25 @@ class TPGDataset(Dataset):
                 surv_batches = surv_batches.copy()
                 surv_batches[surv_batches > _SURVIVAL_HORIZON] = _SURVIVAL_HORIZON + 1
 
+            # V7-extras sidecar rows in lockstep with the records consumed this iteration
+            # (same alignment mechanism as the survival sidecar above).
+            v7x_batches = None
+            if v7x_reader is not None:
+              num_records_this_block = usable_bytes // BYTES_PER_POS
+              v7x_bytes = _read_exact(v7x_reader, num_records_this_block * _V7X_ROW_BYTES)
+              v7x_batches = np.frombuffer(v7x_bytes, dtype=_V7X_DTYPE).reshape(-1, BATCH_SIZE)
+
             for batch_num in range(batches.shape[0]):
               this_batch = batches[batch_num,:,:]
               survival = surv_batches[batch_num] if surv_batches is not None else None
+              if v7x_batches is not None:
+                _v7x_rows = v7x_batches[batch_num]
+                # Field extraction copies out of the structured view (contiguous plain arrays).
+                v7x = (_v7x_rows['cens_q'].astype(np.float32).reshape(-1, 1),
+                       _v7x_rows['cens_d'].astype(np.float32).reshape(-1, 1),
+                       _v7x_rows['prov'].copy().reshape(-1, 1))
+              else:
+                v7x = None
               
               offset = 0 # running offset of where we are within the record
 
@@ -534,14 +605,19 @@ class TPGDataset(Dataset):
                   played_q_suboptimality = played_q_suboptimality[_keep]; uncertainty_policy = uncertainty_policy[_keep]
                   if survival is not None:
                     survival = survival[_keep]
+                  if v7x is not None:
+                    v7x = tuple(a[_keep] for a in v7x)
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,
-                       uncertainty_policy, survival))
+                       uncertainty_policy, survival, v7x))
 
         if surv_file is not None:
           surv_reader.close()
           surv_file.close()
+        if v7x_file is not None:
+          v7x_reader.close()
+          v7x_file.close()
 
 
   def __getitem__(self, idx):
@@ -560,6 +636,7 @@ class TPGDataset(Dataset):
     played_q_suboptimality = batch[11]
     uncertainty_policy = batch[12]
     survival = batch[13] if len(batch) > 13 else None
+    v7x = batch[14] if len(batch) > 14 else None
     
     _nb = policies_indices.shape[0]   # actual row count (may be < batch_size after decisive draw-filtering)
     policies_indices = torch.tensor(policies_indices, dtype=torch.int64).reshape(_nb, MAX_MOVES)
@@ -594,6 +671,14 @@ class TPGDataset(Dataset):
       }
       if survival is not None:
         filtered_dict['survival'] = filter_tensor(torch.tensor(np.ascontiguousarray(survival), dtype=torch.uint8), mod_value)
+      if v7x is not None:
+        # V7-extras sidecar values (V7_EXTRAS_SIDECAR_SPEC.md), each [B, 1]:
+        # censored q_st/d_st are STM-relative (TPG convention); z-provenance codes
+        # 0=orig result, 1=syzygy, 2=deblunder-noise, 3=deblunder-unintended, 4=op1-8man.
+        cens_q, cens_d, prov = v7x
+        filtered_dict['censored_q_st'] = filter_tensor(torch.tensor(cens_q, dtype=torch.float32), mod_value)
+        filtered_dict['censored_d_st'] = filter_tensor(torch.tensor(cens_d, dtype=torch.float32), mod_value)
+        filtered_dict['z_provenance'] = filter_tensor(torch.tensor(prov, dtype=torch.uint8), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

@@ -459,7 +459,7 @@ def Train():
         if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
         if 'embedding' in n: return False         # lookup-table-like: AdamW
         if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
-        if 'placement_value_head' in n or 'survival_head' in n: return False  # single-Linear aux heads ARE final layers
+        if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n: return False  # single-Linear aux heads ARE final layers
         if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
         return True
     elif _muon_scope == 'all-non-trunk':
@@ -664,6 +664,7 @@ def Train():
   SECONDARY_AUX_MULT       = _opt_env_float('CERES_SECONDARY_LOSS_AUX_MULT')       # unc + qdev + unc_policy + mlh together
   SECONDARY_PLACEMENT_MULT = _opt_env_float('CERES_SECONDARY_LOSS_PLACEMENT_MULT')
   SECONDARY_SURVIVAL_MULT  = _opt_env_float('CERES_SECONDARY_LOSS_SURVIVAL_MULT')
+  SECONDARY_STVALUE_MULT   = _opt_env_float('CERES_SECONDARY_LOSS_STVALUE_MULT')
 
   # Single source of truth: attr name on `core` -> override value. Save/apply/restore
   # all iterate this dict, so adding a weight cannot desynchronize the three steps.
@@ -676,6 +677,7 @@ def Train():
       SECONDARY_WEIGHT_OVERRIDES[_aux_attr] = SECONDARY_AUX_MULT
   if SECONDARY_PLACEMENT_MULT is not None: SECONDARY_WEIGHT_OVERRIDES['placement_value_weight'] = SECONDARY_PLACEMENT_MULT
   if SECONDARY_SURVIVAL_MULT  is not None: SECONDARY_WEIGHT_OVERRIDES['survival_target_weight'] = SECONDARY_SURVIVAL_MULT
+  if SECONDARY_STVALUE_MULT   is not None: SECONDARY_WEIGHT_OVERRIDES['stvalue_weight'] = SECONDARY_STVALUE_MULT
 
   if SECONDARY_WEIGHT_OVERRIDES:
     # Fail loudly on configurations where routing would be a silent no-op.
@@ -693,8 +695,9 @@ def Train():
 
   # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
   # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
-  if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0) and WORLD_SIZE > 1:
-    raise NotImplementedError('placement/survival aux heads are single-GPU only for now: '
+  if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
+      or getattr(core, 'stvalue_weight', 0) > 0) and WORLD_SIZE > 1:
+    raise NotImplementedError('placement/survival/stvalue aux heads are single-GPU only for now: '
                               'the stashed aux output is invisible to DDP\'s reducer')
 
   # Survival head requires sidecar targets in (at least some of) the batches.
@@ -712,6 +715,35 @@ def Train():
       _any_sidecar = any(f.endswith('.tgt.zst') for d in _dirs for f in os.listdir(d))
       if not _any_sidecar:
         raise ValueError(f'CERES_TPG_TARGET_SIDECAR=auto but no .tgt.zst sidecars found in any dataset dir: {_dirs}')
+
+  # Provenance-weighted value loss (CERES_VALUE_PROV_WEIGHTS) needs the v7x sidecars
+  # actually loaded, else the weighting is a silent whole-run no-op.
+  if (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip():
+    _v7x_mode_pw = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
+    if _v7x_mode_pw in ('0', ''):
+      raise ValueError('CERES_VALUE_PROV_WEIGHTS set but CERES_TPG_V7X_SIDECAR is off — '
+                       'z_provenance would never reach the loss (set CERES_TPG_V7X_SIDECAR=1 or auto)')
+    if _v7x_mode_pw == 'auto':
+      _dirs_pw = [TPG_TRAIN_DIR]
+      if getattr(config, 'Data_TrainingFilesDirectory2', None):
+        _dirs_pw.append(config.Data_TrainingFilesDirectory2)
+      if not any(f.endswith('.v7x.zst') for d in _dirs_pw for f in os.listdir(d)):
+        raise ValueError('CERES_VALUE_PROV_WEIGHTS set with CERES_TPG_V7X_SIDECAR=auto but no '
+                         f'.v7x.zst sidecars found in any dataset dir: {_dirs_pw}')
+
+  # Short-term value head requires V7-extras sidecar targets (censored q_st/d_st).
+  if getattr(core, 'stvalue_weight', 0) > 0:
+    _v7x_mode = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
+    if _v7x_mode in ('0', ''):
+      raise ValueError('CERES_STVALUE_WEIGHT > 0 requires CERES_TPG_V7X_SIDECAR=1 or auto '
+                       '(and a corpus generated with gen-tpg --v7-extras)')
+    if _v7x_mode == 'auto':
+      _dirs = [TPG_TRAIN_DIR]
+      if getattr(config, 'Data_TrainingFilesDirectory2', None):
+        _dirs.append(config.Data_TrainingFilesDirectory2)
+      _any_v7x = any(f.endswith('.v7x.zst') for d in _dirs for f in os.listdir(d))
+      if not _any_v7x:
+        raise ValueError(f'CERES_TPG_V7X_SIDECAR=auto but no .v7x.zst sidecars found in any dataset dir: {_dirs}')
 
   dataset = TPGMixedDataset(primary_dataset, secondary_dataset,
                             int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0))
@@ -797,7 +829,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -1397,13 +1429,21 @@ def Train():
         print("PLACEV:", num_pos, ",", loss_calc.LAST_PLACEMENT_VALUE_LOSS, flush=True)
       if getattr(core, 'survival_target_weight', 0) > 0 and loss_calc.PENDING_COUNT > 0:
         print("SURV:", num_pos, ",", loss_calc.LAST_SURVIVAL_LOSS, ",", loss_calc.LAST_SURVIVAL_ACC, flush=True)
+      if getattr(core, 'stvalue_weight', 0) > 0 and loss_calc.PENDING_COUNT > 0:
+        print("STVAL:", num_pos, ",", loss_calc.LAST_STVALUE_LOSS, flush=True)
       loss_calc.reset_counters()
       time_last_status_update = datetime.datetime.now()
 
   # final save and convert to Torchscript (rank 0 only; weights are DDP-synced).
+  # Skipped when the interval save already wrote this exact position count
+  # (checkpoint frequency == run length) — the redundant re-save is wasted work
+  # and, pre-2026-07-22, overwrote the .lora bin with an empty one post-merge.
   if IS_MASTER:
-    save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
-    save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+    if config.Opt_CheckpointFrequencyNumPositions > 0 and last_save_model_pos == num_pos:
+      print(f"INFO: final save skipped (checkpoint already written at {num_pos})")
+    else:
+      save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
+      save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
 
   writer.flush()
   writer.close()

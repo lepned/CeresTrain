@@ -100,6 +100,21 @@ def save_model(NAME : str,
       # Bin is saved from the live (unmerged) adapter params above; now fold the
       # adapters into the base weights so the .onnx exported below is merged and
       # runs at full (base-net) speed.
+      # CRITICAL: merge on a DEEP COPY, not the live model. merge_lora_to_model
+      # mutates the base weights and disables the adapters, so merging the live
+      # model kills continued adapter training after any mid-run (interval or
+      # transient "last") save, and makes a second save at the same step
+      # serialize an empty .lora bin (observed 2026-07-22, k2hstd probe).
+      # The SummaryWriter is detached during the copy (not deep-copyable);
+      # the export copy never logs.
+      import copy as _copy
+      _live_model = model_nocompile
+      _writer = getattr(_live_model, 'writer', None)
+      _live_model.writer = None
+      try:
+        model_nocompile = _copy.deepcopy(_live_model)
+      finally:
+        _live_model.writer = _writer
       merge_lora_to_model(model_nocompile)
 
     convert_type = _model_dtype
