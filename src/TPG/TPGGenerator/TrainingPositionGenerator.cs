@@ -165,7 +165,8 @@ namespace CeresTrain.TPG.TPGGenerator
                                           Options.EmitPlySinceLastMovePerSquare,
                                           Options.FillInHistoryPlanes,
                                           VALIDATE_BEFORE_WRITE,
-                                          Options.SurvivalTargetHorizon);
+                                          Options.SurvivalTargetHorizon,
+                                          emitV7ExtrasSidecar: Options.EmitV7ExtrasSidecar);
 
       if (Options.CeresJSONFileName == null)
       {
@@ -211,6 +212,9 @@ namespace CeresTrain.TPG.TPGGenerator
 
       ConcurrentDictionary<ulong, int> writtenPositionHashes = new();
 
+      // Capture the source file count for corpus-exhaustion detection (see RunGeneratorThread).
+      numSourceFiles = Options.FilesToProcess.Count;
+
       // Launch all threads.
       int numThreadsToUse = Math.Min(Options.FilesToProcess.Count, Options.NumThreads);
       Task[] threads = new Task[numThreadsToUse];
@@ -238,14 +242,23 @@ namespace CeresTrain.TPG.TPGGenerator
     }
 
 
-    private void RunGeneratorThread(ConcurrentQueue<string> files, 
-                                    ConcurrentDictionary<ulong, int> writtenPositionHashes, 
+    // Corpus-exhaustion termination state: the files queue is cyclic (each file is
+    // re-enqueued after processing), so a NumPositionsTotal above the corpus's actual
+    // unique yield would otherwise spin forever re-scanning fully-deduplicated files
+    // (observed 2026-07-21: 12 passes, 2.7B positions scanned, 74% dup rate).
+    long numSourceFiles;
+    long numConsecutiveFilesWithoutNewPositions = 0;
+    volatile bool sourceExhausted = false;
+
+    private void RunGeneratorThread(ConcurrentQueue<string> files,
+                                    ConcurrentDictionary<ulong, int> writtenPositionHashes,
                                     Random rand)
     {
       while (true)
       {
-        // Check if we have already written as many positions as requested.
-        if (writer.NumPositionsWritten >= Options.NumPositionsTotal)
+        // Check if we have already written as many positions as requested
+        // (or another thread detected the source is exhausted).
+        if (sourceExhausted || writer.NumPositionsWritten >= Options.NumPositionsTotal)
         {
           writer.Shutdown();
           return;
@@ -257,8 +270,25 @@ namespace CeresTrain.TPG.TPGGenerator
           throw new Exception("No input files available to process (are you using too many reader threads?).");
         }
 
-        // Actually process all positions in file.
+        // Actually process all positions in file, tracking whether ANY new positions
+        // (from any thread) were sent to the writer while it was being processed.
+        long posSentBefore = Interlocked.Read(ref numPosSentToWriter);
         DoProcessFN(fn, writtenPositionHashes);
+
+        if (Interlocked.Read(ref numPosSentToWriter) > posSentBefore)
+        {
+          Interlocked.Exchange(ref numConsecutiveFilesWithoutNewPositions, 0);
+        }
+        else if (Interlocked.Increment(ref numConsecutiveFilesWithoutNewPositions) >= numSourceFiles)
+        {
+          // A full pass over every source file produced nothing new: dedup is
+          // rejecting the entire corpus, so further passes cannot add positions.
+          Console.WriteLine($"TPGWRITER : source exhausted ({numSourceFiles} consecutive files with no new positions); "
+                          + $"finalizing at {writer.NumPositionsWritten:N0} positions.");
+          sourceExhausted = true;
+          writer.Shutdown();
+          return;
+        }
 
         // Replace the file in the set of files to process (at the end of the queue).
         files.Enqueue(fn);
@@ -304,7 +334,15 @@ namespace CeresTrain.TPG.TPGGenerator
     // steady count: 100M crosses only the ~67M->134M bucket growth (~1GB, mid-run) then
     // freezes, whereas growth attempted near ~190M entries needs a 3+GB single allocation on
     // an already-large heap (OOM'd three T91 skip-1 runs at 200M).
-    private const long MAX_DEDUP_HASHES = 100_000_000;
+    // (Raised 100M->120M 2026-07-21: hitting the cap mid-run disables dedup, letting the
+    // cyclic file queue pad the corpus with duplicate copies. 120M stays below the next
+    // table-doubling hazard on a 64GB box. Env TPG_MAX_DEDUP_HASHES overrides per run —
+    // size to comfortably exceed the corpus's expected UNIQUE position count, mindful
+    // that dictionary table-doubling transiently allocates multiple GB at ~134M/~268M.)
+    private static readonly long MAX_DEDUP_HASHES =
+      long.TryParse(Environment.GetEnvironmentVariable("TPG_MAX_DEDUP_HASHES"), out long cap) && cap > 0
+        ? cap
+        : 120_000_000;
     private static long dedupHashCount = 0;
     private static volatile bool dedupCapReached = false;
 
@@ -415,9 +453,12 @@ namespace CeresTrain.TPG.TPGGenerator
 
       int numGamesReadThisThread = 0;
 
-      // To enhance random sampling, skip each thread skips a random number
-      // of games from beginning of each file.
-      int numGamesToSkipAtBeginningOfFile = (int)(threadRandom.Value.NextInt64() % 100);
+      // To enhance random sampling, each thread skips a random number of games
+      // at the beginning of each file. Only meaningful when subsampling
+      // (PositionSkipCount > 1); at skip-count 1 (keep every position) it would
+      // silently drop ~50 games per file, so it is disabled there.
+      int numGamesToSkipAtBeginningOfFile = Options.PositionSkipCount <= 1 ? 0
+                                                                           : (int)(threadRandom.Value.NextInt64() % 100);
 
       try
       {
@@ -463,6 +504,13 @@ namespace CeresTrain.TPG.TPGGenerator
           }
 
           Interlocked.Add(ref numPosScanned, game.NumPositions);
+
+          // V7 extras sidecar requires every source game to carry the 40-byte V7 record
+          // tails; a V6 game in the corpus means the sidecar would emit garbage — hard fail.
+          if (Options.EmitV7ExtrasSidecar && !game.HasExtraV7)
+          {
+            throw new Exception($"EmitV7ExtrasSidecar set but game without V7 extras encountered (version {game.Version}) in {fn}.");
+          }
 
           if (gameAnalyzer == null)
           {
@@ -680,7 +728,7 @@ const bool TEST = false;
                     } 
 
                     // Construct tuple of information to be passed to the Write method.
-                    (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares) pos2Tuple = default;
+                    (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares, byte[] v7ExtrasRow) pos2Tuple = default;
                     pos2Tuple.targetInfo = randomTargetInfo;
                     pos2Tuple.record = randomPos;
                     pos2Tuple.indexMoveInGame = pendingItem.indexMoveInGame;
@@ -712,7 +760,7 @@ const bool TEST = false;
               MGPosition startMGPos = game.PositionAtIndex(i).FinalPosition.ToMGPosition;
 
               // Helper method which creates new training data for position after specified move.
-              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[])
+              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[], byte[])
                 MakeForDrawIndex(EncodedMove encodedMove)
               {
                 //                short moveIndex = policyMoves[drawIndex].IndexNeuralNet;
@@ -725,10 +773,10 @@ const bool TEST = false;
                 target3.ForwardSumNegativeBlunders = item1.targetInfo.ForwardSumNegativeBlunders;
 
                 EncodedTrainingPosition pos3 = TrainingPositionAfterMove(game.TrainingPositionAtIndex(i), move3);
-                return (pos3, target3, -1, null, null);
+                return (pos3, target3, -1, null, null, null);
               }
 
-              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[]) item4;
+              (EncodedTrainingPosition, TPGTrainingTargetNonPolicyInfo, int, short[], byte[], byte[]) item4;
               if (policyLen == 1)
               {
                 // Only one move choice, must use this a second time.
@@ -846,7 +894,7 @@ const bool TEST = false;
     }
 
 
-    private (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares)
+    private (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo, int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares, byte[] v7ExtrasRow)
       PreparePosition(string fn, in EncodedTrainingPositionGame game, int i, byte[][] gameSurvival = null)
     {
       // Extract the position from the raw data.
@@ -935,10 +983,23 @@ const bool TEST = false;
         }
       }
 
+      // V7-extras sidecar row: censored q_st (f32 LE), censored d_st (f32 LE), z-provenance (u8).
+      // The censored values are STM-relative in the source record, matching TPG conventions,
+      // so they pass through without transformation (scalars — no board indexing to remap).
+      byte[] v7ExtrasRow = null;
+      if (Options.EmitV7ExtrasSidecar)
+      {
+        EncodedTrainingPositionExtraV7 extra = game.ExtraV7AtIndex(i);
+        v7ExtrasRow = new byte[TrainingPositionWriter.V7_EXTRAS_ROW_BYTES];
+        BitConverter.TryWriteBytes(v7ExtrasRow.AsSpan(0, 4), extra.CensoredQShortTerm);
+        BitConverter.TryWriteBytes(v7ExtrasRow.AsSpan(4, 4), extra.CensoredDShortTerm);
+        v7ExtrasRow[8] = (byte)extra.ZProvenance;
+      }
+
       // TODO: avoid calling PositionAdIndex here
       EncodedTrainingPosition saveTrainingPos = new EncodedTrainingPosition(game.Version, game.InputFormat,
                                                                             game.PositionAtIndex(i), game.PolicyAtIndex(i));
-      return (saveTrainingPos, targetInfo, i, gameAnalyzer.lastMoveIndexBySquare?[i], survivalBySquares);
+      return (saveTrainingPos, targetInfo, i, gameAnalyzer.lastMoveIndexBySquare?[i], survivalBySquares, v7ExtrasRow);
     }
 
 

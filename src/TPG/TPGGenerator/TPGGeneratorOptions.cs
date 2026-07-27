@@ -189,6 +189,14 @@ namespace CeresTrain.TPG.TPGGenerator
     public int SurvivalTargetHorizon { init; get; } = 0;
 
     /// <summary>
+    /// If true, per-position V7 rescorer fields (censored q_st, censored d_st, z-provenance)
+    /// are written to sidecar files (one "&lt;shard&gt;.v7x.zst" per output set;
+    /// see V7_EXTRAS_SIDECAR_SPEC.md). Requires V7 source data (8396-byte records);
+    /// V6 games cause a hard failure. false = off (no sidecars, legacy output).
+    /// </summary>
+    public bool EmitV7ExtrasSidecar { init; get; } = false;
+
+    /// <summary>
     /// If number of ply since last move on each square is emitted.
     /// </summary>
     public bool EmitPlySinceLastMovePerSquare = false;
@@ -383,17 +391,17 @@ namespace CeresTrain.TPG.TPGGenerator
         throw new Exception("PositionMaxFraction must be greater than 0 (use 1.0 to disable filtering).");
       }
 
-      if (SurvivalTargetHorizon > 0)
+      if (SurvivalTargetHorizon > 0 || EmitV7ExtrasSidecar)
       {
         // Sidecar row ordering mirrors the main record stream 1:1; paths that reorder,
         // synthesize, or omit records after buffering are not supported with sidecars.
         if (NumRelatedPositionsPerBlock != 1)
         {
-          throw new Exception("SurvivalTargetHorizon requires NumRelatedPositionsPerBlock == 1 (multiboard blocks unsupported).");
+          throw new Exception("Sidecar emission (SurvivalTargetHorizon/EmitV7ExtrasSidecar) requires NumRelatedPositionsPerBlock == 1 (multiboard blocks unsupported).");
         }
         if (AnnotationNNEvaluator != null || AnnotationPostprocessor != null)
         {
-          throw new Exception("SurvivalTargetHorizon is incompatible with AnnotationNNEvaluator/AnnotationPostprocessor (record omission would desync sidecars).");
+          throw new Exception("Sidecar emission (SurvivalTargetHorizon/EmitV7ExtrasSidecar) is incompatible with AnnotationNNEvaluator/AnnotationPostprocessor (record omission would desync sidecars).");
         }
         if (SurvivalTargetHorizon > 254)
         {
@@ -434,6 +442,8 @@ namespace CeresTrain.TPG.TPGGenerator
       writer.WriteLine($"  AnnotationNNEvaluator         : {AnnotationNNEvaluator}");
       writer.WriteLine($"  AnnotationPostprocessor       : {(AnnotationPostprocessor != null ? "*Yes* " : "No")}");
       writer.WriteLine($"  EmitPlySinceLastMovePerSquare : {(EmitPlySinceLastMovePerSquare ? "*Yes* " : "No")}");
+      writer.WriteLine($"  SurvivalTargetHorizon         : {(SurvivalTargetHorizon > 0 ? SurvivalTargetHorizon.ToString() : "(off)")}");
+      writer.WriteLine($"  EmitV7ExtrasSidecar           : {(EmitV7ExtrasSidecar ? "*Yes* " : "No")}");
 
       Console.WriteLine();
       writer.WriteLine($"  NumRelatedPositionsPerBlock   : {NumRelatedPositionsPerBlock}");

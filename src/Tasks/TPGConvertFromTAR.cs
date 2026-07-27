@@ -68,7 +68,8 @@ namespace CeresTrain.Tasks
                                    int positionSkipCount = 20,
                                    bool extractOnlyFRC = false,
                                    bool includeAllVariants = false,
-                                   int survivalTargetHorizon = 0)
+                                   int survivalTargetHorizon = 0,
+                                   bool emitV7Extras = false)
     {
       for (int i = 0; i < numSetsToGenerate; i++)
       {
@@ -78,7 +79,8 @@ namespace CeresTrain.Tasks
                     positionSkipCount: positionSkipCount,
                     extractOnlyFRC: extractOnlyFRC,
                     includeAllVariants: includeAllVariants,
-                    survivalTargetHorizon: survivalTargetHorizon);
+                    survivalTargetHorizon: survivalTargetHorizon,
+                    emitV7Extras: emitV7Extras);
       }
     }
 
@@ -127,7 +129,8 @@ namespace CeresTrain.Tasks
                                    bool emitPriorMoveWinLoss = false,
                                    bool extractOnlyFRC = false,
                                    bool includeAllVariants = false,
-                                   int survivalTargetHorizon = 0)
+                                   int survivalTargetHorizon = 0,
+                                   bool emitV7Extras = false)
     {
       ArgumentNullException.ThrowIfNullOrEmpty(sourceDirectoryTARsOrZSTs, nameof(sourceDirectoryTARsOrZSTs));
       ArgumentNullException.ThrowIfNullOrEmpty(targetDirectoryTPGs, nameof(targetDirectoryTPGs));
@@ -147,6 +150,24 @@ namespace CeresTrain.Tasks
       {
         useTablebases = false;
         ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "TPG_NO_TABLEBASE_RESCORE=1: tablebase rescoring DISABLED (experiment).");
+      }
+
+      // Position-focus filter (drops extreme blunder-impacted positions). Env off-switch for
+      // corpora whose result targets were already deblunder-rescored upstream (e.g. k2hybrid V7,
+      // where the filter rejected ~50% of standard positions due to FE forced-exploration noise)
+      // and which carry per-position provenance for train-time weighting instead.
+      bool enablePositionFocus = Environment.GetEnvironmentVariable("TPG_NO_POSITION_FOCUS") != "1";
+      if (!enablePositionFocus)
+      {
+        ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, "TPG_NO_POSITION_FOCUS=1: position-focus filter DISABLED (blunder-impacted positions retained).");
+      }
+
+      // Minimum game ply (default 6 skips the overrepresented first plies of every game).
+      int minPositionGamePly = 6;
+      if (int.TryParse(Environment.GetEnvironmentVariable("TPG_MIN_GAME_PLY"), out int minPlyOverride) && minPlyOverride >= 0)
+      {
+        minPositionGamePly = minPlyOverride;
+        ConsoleUtils.WriteLineColored(ConsoleColor.Yellow, $"TPG_MIN_GAME_PLY={minPlyOverride}: overriding default MinPositionGamePly of 6.");
       }
       if (!useTablebases)
       {
@@ -204,11 +225,13 @@ namespace CeresTrain.Tasks
           Verbose = debugMode,
           TargetFileNameBase = Path.Combine(targetDirectoryTPGs, @$"TPG_{DateTime.Now.Ticks % 100000}"),
 
-          EnablePositionFocus = true, // Currently this simply filters out extreme blunder-impacted postions
+          EnablePositionFocus = enablePositionFocus, // filters out extreme blunder-impacted positions (env TPG_NO_POSITION_FOCUS=1 disables)
+          MinPositionGamePly = minPositionGamePly, // default 6; env TPG_MIN_GAME_PLY overrides
 
           ExtractOnlyFRC = extractOnlyFRC, // when true, inverts variant filter: keep FRC, drop standard
           IncludeAllVariants = includeAllVariants, // when true, disables variant filter entirely (keeps both standard and FRC)
           SurvivalTargetHorizon = survivalTargetHorizon, // >0: emit K-ply survival sidecar files (SURVIVAL_TARGET_SPEC.md)
+          EmitV7ExtrasSidecar = emitV7Extras, // emit censored q_st/d_st + z-provenance sidecars (V7_EXTRAS_SIDECAR_SPEC.md)
         };
 
         // Create the generator and run

@@ -91,6 +91,17 @@ namespace CeresTrain.TPG.TPGGenerator
     byte[][][] bufferSurvivalBySquare;
     Stream[] survivalOutStreams;
 
+    /// <summary>
+    /// V7-extras sidecar support (EmitV7ExtrasSidecar): per-record 9-byte rows
+    /// (censored q_st f32 LE, censored d_st f32 LE, z-provenance u8) buffered in
+    /// lockstep with the main buffers and flushed to parallel "<shard>.v7x.zst"
+    /// streams at the same append point. See V7_EXTRAS_SIDECAR_SPEC.md.
+    /// </summary>
+    public const int V7_EXTRAS_ROW_BYTES = 9;
+    readonly bool EmitV7ExtrasSidecar;
+    byte[][][] bufferV7ExtrasRows;
+    Stream[] v7ExtrasOutStreams;
+
     public TPGTrainingTargetNonPolicyInfo[][] buffersTargets;
     CompressedPolicyVector?[][] buffersOverridePolicies;
 
@@ -148,19 +159,21 @@ namespace CeresTrain.TPG.TPGGenerator
                                   bool emitHistory,
                                   bool validateBeforeWrite,
                                   int survivalTargetHorizon = 0,
-                                  Func<TPGRecord[], byte[][], bool> batchPostprocessorWithTargetsDelegate = null)
+                                  Func<TPGRecord[], byte[][], bool> batchPostprocessorWithTargetsDelegate = null,
+                                  bool emitV7ExtrasSidecar = false)
     {
       BUFFER_SIZE = batchSize;
       SurvivalTargetHorizon = survivalTargetHorizon;
+      EmitV7ExtrasSidecar = emitV7ExtrasSidecar;
       BatchPostprocessorWithTargetsDelegate = batchPostprocessorWithTargetsDelegate;
 
-      if (survivalTargetHorizon > 0 && (evaluator != null || evaluatorPostprocessor != null))
+      if ((survivalTargetHorizon > 0 || emitV7ExtrasSidecar) && (evaluator != null || evaluatorPostprocessor != null))
       {
-        throw new ArgumentException("Survival target sidecars are incompatible with evaluator/postprocessor record omission.");
+        throw new ArgumentException("Sidecars are incompatible with evaluator/postprocessor record omission.");
       }
-      if (survivalTargetHorizon > 0 && !useZstandard)
+      if ((survivalTargetHorizon > 0 || emitV7ExtrasSidecar) && !useZstandard)
       {
-        throw new ArgumentException("Survival target sidecars require Zstandard output.");
+        throw new ArgumentException("Sidecars require Zstandard output.");
       }
 
       if (totalNumPositionsToBeWritten % BUFFER_SIZE != 0)
@@ -199,6 +212,12 @@ namespace CeresTrain.TPG.TPGGenerator
         survivalOutStreams = outputFileNameBase == null ? null : new Stream[numSets];
       }
 
+      if (emitV7ExtrasSidecar)
+      {
+        bufferV7ExtrasRows = new byte[numSets][][];
+        v7ExtrasOutStreams = outputFileNameBase == null ? null : new Stream[numSets];
+      }
+
       for (int i = 0; i < numSets; i++)
       {
         // Allocate buffers for this set.
@@ -222,6 +241,15 @@ namespace CeresTrain.TPG.TPGGenerator
           for (int b = 0; b < BUFFER_SIZE; b++)
           {
             bufferSurvivalBySquare[i][b] = new byte[64];
+          }
+        }
+
+        if (emitV7ExtrasSidecar)
+        {
+          bufferV7ExtrasRows[i] = new byte[BUFFER_SIZE][];
+          for (int b = 0; b < BUFFER_SIZE; b++)
+          {
+            bufferV7ExtrasRows[i][b] = new byte[V7_EXTRAS_ROW_BYTES];
           }
         }
 
@@ -253,6 +281,22 @@ namespace CeresTrain.TPG.TPGGenerator
             survCompressed.Write(header);
             survivalOutStreams[i] = survCompressed;
           }
+
+          if (emitV7ExtrasSidecar)
+          {
+            // Parallel sidecar stream with 16-byte header (see V7_EXTRAS_SIDECAR_SPEC.md):
+            // magic "TPGX" | version=1 | rowBytes=9 | 10 reserved zeros.
+            string v7xFN = outputFileNameBase + "_set" + i + ".v7x.zst";
+            Stream v7xOutStream = new FileStream(v7xFN, FileMode.Create);
+            Stream v7xCompressed = new ZstandardStream(v7xOutStream, zStdCompressionEquivalents[(int)compressionLevel]);
+            Span<byte> header = stackalloc byte[16];
+            header.Clear();
+            header[0] = (byte)'T'; header[1] = (byte)'P'; header[2] = (byte)'G'; header[3] = (byte)'X';
+            header[4] = 1;                              // format version
+            header[5] = V7_EXTRAS_ROW_BYTES;            // bytes per row
+            v7xCompressed.Write(header);
+            v7ExtrasOutStreams[i] = v7xCompressed;
+          }
         }
       }
     }
@@ -260,7 +304,7 @@ namespace CeresTrain.TPG.TPGGenerator
 
     public void Write(int targetSetIndex, float minLegalMoveProbability,
                       params (EncodedTrainingPosition record, TPGTrainingTargetNonPolicyInfo targetInfo,
-                      int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares)[] items)
+                      int indexMoveInGame, short[] indexLastMoveBySquares, byte[] survivalBySquares, byte[] v7ExtrasRow)[] items)
     {
       // Take the lock on the buffer associated with this target set
       // so that we can't have two concurrent writes to the same target set.
@@ -268,7 +312,7 @@ namespace CeresTrain.TPG.TPGGenerator
       {
         foreach (var item in items)
         {
-          Write(item.record, item.targetInfo, item.indexMoveInGame, item.indexLastMoveBySquares, minLegalMoveProbability, targetSetIndex, item.survivalBySquares);
+          Write(item.record, item.targetInfo, item.indexMoveInGame, item.indexLastMoveBySquares, minLegalMoveProbability, targetSetIndex, item.survivalBySquares, item.v7ExtrasRow);
         }
       }
     }
@@ -286,7 +330,7 @@ namespace CeresTrain.TPG.TPGGenerator
     /// <param name="emitMoves"></param>
     public void Write(in EncodedTrainingPosition record, in TPGTrainingTargetNonPolicyInfo targetInfo,
                       int indexMoveInGame, short[] indexLastMoveBySquares, float minLegalMoveProbability,
-                      int targetSetIndex, byte[] survivalBySquares = null)
+                      int targetSetIndex, byte[] survivalBySquares = null, byte[] v7ExtrasRow = null)
     {
       if (shutdown)
       {
@@ -331,34 +375,57 @@ namespace CeresTrain.TPG.TPGGenerator
           Array.Copy(survivalBySquares, bufferSurvivalBySquare[targetSetIndex][thisBufferIndex], 64);
         }
 
+        if (EmitV7ExtrasSidecar)
+        {
+          if (v7ExtrasRow == null)
+          {
+            throw new ArgumentException("EmitV7ExtrasSidecar but record arrived without V7 extras row.");
+          }
+          Array.Copy(v7ExtrasRow, bufferV7ExtrasRows[targetSetIndex][thisBufferIndex], V7_EXTRAS_ROW_BYTES);
+        }
+
         countsInBuffer[targetSetIndex]++;
 
         if (countsInBuffer[targetSetIndex] == BUFFER_SIZE)
         {
-          if (Evaluator == null)
+          // A ProcessWrite exception must be FATAL: if it were swallowed upstream
+          // (the generator catches per-file exceptions), countsInBuffer would stay
+          // at BUFFER_SIZE and every subsequent Write on this set would throw
+          // IndexOutOfRange — the run then continues for hours producing 0-byte
+          // shards (2026-07 t91/k2hyb postmortems). Fail loud instead.
+          try
           {
-            // No NN evaluation needed, we can synchronously do the batch writing.
-            ProcessWrite(buffers[targetSetIndex], buffersTargets[targetSetIndex], buffersOverridePolicies[targetSetIndex],
-                         minLegalMoveProbability, bufferPliesSinceLastPieceMoveBySquare[targetSetIndex], targetSetIndex);
-          }
-          else
-          {
-            // NN evaluation and postprocessing needed, most do asynchronously.
+            if (Evaluator == null)
+            {
+              // No NN evaluation needed, we can synchronously do the batch writing.
+              ProcessWrite(buffers[targetSetIndex], buffersTargets[targetSetIndex], buffersOverridePolicies[targetSetIndex],
+                           minLegalMoveProbability, bufferPliesSinceLastPieceMoveBySquare[targetSetIndex], targetSetIndex);
+            }
+            else
+            {
+              // NN evaluation and postprocessing needed, most do asynchronously.
 
-            // Extract the array with these positions so they are not overwritten
-            // and create a new array to receive future positions which arrive
-            // before the postprocessing is complete.
-            EncodedTrainingPosition[] positions = buffers[targetSetIndex];
-            buffers[targetSetIndex] = new EncodedTrainingPosition[BUFFER_SIZE];
+              // Extract the array with these positions so they are not overwritten
+              // and create a new array to receive future positions which arrive
+              // before the postprocessing is complete.
+              EncodedTrainingPosition[] positions = buffers[targetSetIndex];
+              buffers[targetSetIndex] = new EncodedTrainingPosition[BUFFER_SIZE];
 
-            ProcessWrite(positions, buffersTargets[targetSetIndex], buffersOverridePolicies[targetSetIndex],
-                         minLegalMoveProbability, bufferPliesSinceLastPieceMoveBySquare[targetSetIndex], targetSetIndex);
+              ProcessWrite(positions, buffersTargets[targetSetIndex], buffersOverridePolicies[targetSetIndex],
+                           minLegalMoveProbability, bufferPliesSinceLastPieceMoveBySquare[targetSetIndex], targetSetIndex);
 
 #if NOT
 Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks grows without bound.
-            // Spin off as a separate task.
-            Task.Run(() => ProcessWrite(positions, targetSetIndex));
+              // Spin off as a separate task.
+              Task.Run(() => ProcessWrite(positions, targetSetIndex));
 #endif
+            }
+          }
+          catch (Exception exc)
+          {
+            Console.Error.WriteLine($"TPGWRITER FATAL: flush of set {targetSetIndex} failed, aborting run (shards would silently corrupt): {exc}");
+            Console.Error.Flush();
+            Environment.FailFast($"TPGWRITER flush failed for set {targetSetIndex}", exc);
           }
 
           countsInBuffer[targetSetIndex] = 0;
@@ -670,6 +737,16 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
           }
         }
 
+        // V7-extras sidecar: same ordering guarantee, same flush point.
+        if (EmitV7ExtrasSidecar && v7ExtrasOutStreams != null)
+        {
+          byte[][] v7Rows = bufferV7ExtrasRows[targetSetIndex];
+          for (int i = 0; i < positions.Length; i++)
+          {
+            v7ExtrasOutStreams[targetSetIndex].Write(v7Rows[i], 0, V7_EXTRAS_ROW_BYTES);
+          }
+        }
+
         // Record fact that records actually written.
         numRecordsWritten[targetSetIndex] += positions.Length;
 
@@ -704,7 +781,7 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
         if (outStreams != null)
         {
           int numSets = outStreams.Length;
-          bool hadSidecars = survivalOutStreams != null;
+          bool hadSidecars = survivalOutStreams != null || v7ExtrasOutStreams != null;
           long numDiscardedPartial = 0;
 
           for (int i = 0; i < numSets; i++)
@@ -726,13 +803,19 @@ Disabled for now. If the NN evaluator can't keep up, the set of pending Tasks gr
                 survivalOutStreams[i]?.Dispose();
                 survivalOutStreams[i] = null;
               }
+              if (v7ExtrasOutStreams != null)
+              {
+                v7ExtrasOutStreams[i]?.Dispose();
+                v7ExtrasOutStreams[i] = null;
+              }
             }
           }
           outStreams = null;
           survivalOutStreams = null;
+          v7ExtrasOutStreams = null;
 
           long totalDiscarded = numDiscardedPartial + Interlocked.Read(ref numPositionsDiscardedAfterShutdown);
-          Console.WriteLine($"TPGWRITER : shutdown complete, {numSets} shard stream(s){(hadSidecars ? " + survival sidecars" : "")} flushed and closed.");
+          Console.WriteLine($"TPGWRITER : shutdown complete, {numSets} shard stream(s){(hadSidecars ? " + sidecars" : "")} flushed and closed.");
           if (totalDiscarded > 0)
           {
             Console.WriteLine($"TPGWRITER : {totalDiscarded} buffered position(s) beyond target discarded (expected; all closed frames are intact).");

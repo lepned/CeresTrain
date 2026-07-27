@@ -46,6 +46,7 @@ namespace CeresTrain.TrainCommands
     static Option<bool> includeFrcOption;     // gen-tpg: when true, keep BOTH standard and FRC games (mixed-variant corpus)
     static Option<int> skipCountOption;       // gen-tpg: position skip modulus (1 = keep every position)
     static Option<int> survivalHorizonOption; // gen-tpg: K-ply survival target sidecars (0 = off)
+    static Option<bool> v7ExtrasOption;       // gen-tpg: emit censored q_st/d_st + z-provenance sidecars (requires V7 source data)
     static Option<string> piecesOptionRequired;
     static Option<string> piecesOptionOptional;
     static Option<string> netSpecificationOption;
@@ -113,6 +114,7 @@ namespace CeresTrain.TrainCommands
       includeFrcOption = new Option<bool>("--include-frc", () => true, "If true (DEFAULT, production parity), keep BOTH standard and FRC games. Pass '--include-frc false' for the legacy standard-only filter. An explicit --frc-only overrides this.") { };
       skipCountOption = new Option<int>("--skip-count", () => 20, "Position skip modulus: keep ~1 of every N positions per game (default 20). Use 1 to keep ALL positions (positions within a game are highly correlated).") { };
       survivalHorizonOption = new Option<int>("--survival-horizon", () => 0, "If > 0, also emit K-ply piece-survival target sidecar files (<shard>.tgt.zst) for auxiliary-head training (see SURVIVAL_TARGET_SPEC.md). 0 = off.") { };
+      v7ExtrasOption = new Option<bool>("--v7-extras", () => false, "Also emit V7-extras sidecar files (<shard>.v7x.zst: censored q_st/d_st + z-provenance per position; see V7_EXTRAS_SIDECAR_SPEC.md). Requires V7 source data (fails hard on V6 games).") { };
       piecesOptionRequired = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = true };
       piecesOptionOptional = new Option<string>("--pieces", "Chess pieces (e.g. KRPkrp)") { IsRequired = false };
       netSpecificationOption = new Option<string>("--net-spec", "LC0 network specification in Ceres format, e.g. LC0:703810") { IsRequired = true };
@@ -148,7 +150,7 @@ namespace CeresTrain.TrainCommands
       evalLC0Command = new Command("eval-lc0", "Evaluate vs LC0 with specific pieces and network.               [pieces] [net-spec] [num-pos] [search-limit] [pos-fn] [verbose]") { piecesOptionRequired, netSpecificationOption, numPosOption, searchLimitOption, epdOrPgnFnOption, verboseOption };
       extractPositionsCommand = new Command("extract-pos", "Generate EPD/PGN file with positions from specified PGN/EPD     [pieces] [num-pos] [pos-fn] [pos-out-fn]") { piecesOptionRequired, numPosOption, epdOrPgnFnOption, epdOrPgnOutputFileNameOption };
       generateEndgameTPGCommand = new Command("gen-endgame-tpg", "Generate TPG files with positions from specified pieces or \"*\"  [pieces] [num-pos] [tar-dir] [tpg-dir] [--survival-horizon K]") { piecesOptionRequired, numPosOption, tarDirOption, tpgDirOption, survivalHorizonOption };
-      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc] [--skip-count N] [--survival-horizon K]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption };
+      generateTPGCommand = new Command("gen-tpg", "Generate TPG files from TAR files.                              [tar-dir] [tpg-dir] [num-sets|num-pos] [--frc-only|--include-frc] [--skip-count N] [--survival-horizon K] [--v7-extras]") { tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption, v7ExtrasOption };
       convertTARToPackedZSTCommand = new Command("convert-tar-to-zst", "Convert TAR files to packed ZST files.                          [tar-dir] [zst-dir]") { tarDirOption, packedZSTDirOption };
       upgradeTPGV2ToV3Command = new Command("upgrade-tpg-v2-v3", "In-place upgrade V2 TPG shards (137 byte/sq) to V3 (141 byte/sq) by computing 4 aux feature bytes per square (mobility, defender_count, is_pinned, is_threatened) from existing piece data. Preserves labels — no re-search/re-labeling.  [tpg-dir-in] [tpg-dir-out] [--zstd-level N] [--max-files-parallel N]") { tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption };
 
@@ -272,8 +274,19 @@ namespace CeresTrain.TrainCommands
       }, tpgDirInOption, tpgDirOutOption, zstdLevelOption, maxFilesParallelOption);
 
 
-      generateTPGCommand.SetHandler((sourceDir, targetDir, numSets, numPos, frcOnly, includeFrc, skipCount, survivalHorizon) =>
+      // NOTE: uses the InvocationContext handler form (the generic SetHandler overloads max out at 8 bound options).
+      generateTPGCommand.SetHandler((System.CommandLine.Invocation.InvocationContext context) =>
       {
+        string sourceDir = context.ParseResult.GetValueForOption(tarDirOption);
+        string targetDir = context.ParseResult.GetValueForOption(tpgDirOption);
+        int numSets = context.ParseResult.GetValueForOption(numTPGSetsOption);
+        long numPos = context.ParseResult.GetValueForOption(genTpgNumPosOption);
+        bool frcOnly = context.ParseResult.GetValueForOption(frcOnlyOption);
+        bool includeFrc = context.ParseResult.GetValueForOption(includeFrcOption);
+        int skipCount = context.ParseResult.GetValueForOption(skipCountOption);
+        int survivalHorizon = context.ParseResult.GetValueForOption(survivalHorizonOption);
+        bool v7Extras = context.ParseResult.GetValueForOption(v7ExtrasOption);
+
         // Precedence: an EXPLICIT --frc-only wins over include-frc (which now defaults
         // true) — otherwise --frc-only alone would silently produce an all-variants
         // corpus. '--include-frc false' restores the legacy standard-only filter.
@@ -282,20 +295,22 @@ namespace CeresTrain.TrainCommands
         else if (includeFrc) variantSuffix = " (all-variants: standard + FRC)";
         else variantSuffix = "";
         string survivalSuffix = survivalHorizon > 0 ? $" (+survival K={survivalHorizon})" : "";
+        string v7Suffix = v7Extras ? " (+v7-extras)" : "";
 
         if (numPos > 0)
         {
           // explicit position count overrides numSets — emit exactly numPos positions.
-          // GenerateTPGCustomSize doesn't take variant/survival args; if any is set
+          // GenerateTPGCustomSize doesn't take variant/survival/v7 args; if any is set
           // route through the long-form GenerateTPG entry which does accept them.
-          if (frcOnly || includeFrc || survivalHorizon > 0)
+          if (frcOnly || includeFrc || survivalHorizon > 0 || v7Extras)
           {
             TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numPos, debugMode: false,
-                                          description: $"Custom-size extraction{variantSuffix}{survivalSuffix} ({numPos} positions, skip {skipCount})",
+                                          description: $"Custom-size extraction{variantSuffix}{survivalSuffix}{v7Suffix} ({numPos} positions, skip {skipCount})",
                                           positionSkipCount: skipCount,
                                           extractOnlyFRC: frcOnly,
                                           includeAllVariants: includeFrc && !frcOnly,
-                                          survivalTargetHorizon: survivalHorizon);
+                                          survivalTargetHorizon: survivalHorizon,
+                                          emitV7Extras: v7Extras);
           }
           else
           {
@@ -304,13 +319,14 @@ namespace CeresTrain.TrainCommands
         }
         else
         {
-          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix + survivalSuffix,
+          TPGConvertFromTAR.GenerateTPG(sourceDir, targetDir, numSets, "Converted using TPGConvertFromTAR.GenerateTPG" + variantSuffix + survivalSuffix + v7Suffix,
                                         positionSkipCount: skipCount,
                                         extractOnlyFRC: frcOnly,
                                         includeAllVariants: includeFrc && !frcOnly,
-                                        survivalTargetHorizon: survivalHorizon);
+                                        survivalTargetHorizon: survivalHorizon,
+                                        emitV7Extras: v7Extras);
         }
-      }, tarDirOption, tpgDirOption, numTPGSetsOption, genTpgNumPosOption, frcOnlyOption, includeFrcOption, skipCountOption, survivalHorizonOption);
+      });
 
 
       generateEndgameTPGCommand.SetHandler((piecesStr, numPos, tarDirectory, outDirectory, survivalHorizon) =>
