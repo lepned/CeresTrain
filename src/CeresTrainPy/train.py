@@ -396,6 +396,8 @@ def Train():
               pass
           elif "alphas" in fpn: # for Denseformer
               decay.add(fpn)
+          elif "vda_query" in fpn: # depth-attention pseudo-query (bare 1-D vector, bias-like)
+              no_decay.add(fpn)
           elif ".mem_" in fpn:
               decay.add(fpn)
           elif "mlp.linear" in fpn:

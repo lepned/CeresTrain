@@ -179,6 +179,28 @@ class CeresNet(nn.Module):
       self.qdev_upper = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
       self.qdev_lower = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
+    # Depth-attending value head (AttnRes-inspired, Kimi K3 / arXiv 2603.15031).
+    # Env-gated: CERES_VALUE_DEPTH_ATTENTION=1 (default 0 = fully off, exactly current
+    # behavior). Motivation: the value head reads only the FINAL trunk layer, whose
+    # features are policy-shaped; value estimation may want earlier-depth features
+    # (material/structure) that later layers abstract away. Mechanism: mean-pool each
+    # depth state over squares -> [B, L+1, D] (post-embedding + each layer), RMSNorm,
+    # then a learned pseudo-query attends over depth; the mixed vector is projected
+    # into head space and ADDED to fS_value only (policy path untouched).
+    # Zero-init query -> uniform depth weights at step 0; zero-init projection ->
+    # exact no-op at step 0 (GTAB pattern). NOT training-only: it feeds value_out,
+    # so it is part of the export graph (simple matmul/softmax ops, export-safe).
+    self.use_value_depth_attention = int(os.environ.get('CERES_VALUE_DEPTH_ATTENTION', '0') or 0) > 0
+    if self.use_value_depth_attention:
+      self.vda_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+      self.vda_query = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
+      self.vda_proj = nn.Linear(self.EMBEDDING_DIM, self.HEAD_IN_SIZE)
+      nn.init.zeros_(self.vda_proj.weight)
+      nn.init.zeros_(self.vda_proj.bias)
+      print(f'[ceres_net] VALUE DEPTH ATTENTION enabled: pseudo-query over '
+            f'{self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}] -> fS_value add '
+            f'({self.EMBEDDING_DIM * self.HEAD_IN_SIZE + 2 * self.EMBEDDING_DIM + self.HEAD_IN_SIZE} params, zero-init no-op)')
+
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
     # each square's trunk embedding contributes a 3-vector of WDL logits; the position value is
@@ -411,6 +433,12 @@ class CeresNet(nn.Module):
     if self.denseformer:
       all_previous_x = [flow]
 
+    # Depth-attention state collection: mean-pool over squares at each depth.
+    # References only (activations are alive for backward anyway) + one [B, D]
+    # pooled vector per depth — negligible memory.
+    if self.use_value_depth_attention:
+      vda_states = [flow.mean(dim=1)]  # post-embedding state
+
     # Main transformer body (stack of encoder layers).
     # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
     # giving total effective depth = NUM_LAYERS. Default LoopCount=1 reduces
@@ -426,6 +454,8 @@ class CeresNet(nn.Module):
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
+        if self.use_value_depth_attention:
+          vda_states.append(flow.mean(dim=1))  # post-layer (post-DWA if denseformer)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
     if self.trunk_end_norm is not None:
@@ -470,6 +500,19 @@ class CeresNet(nn.Module):
     else:
       fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
       fS_value  = fS_others
+
+    # Depth-attending value context (see __init__). Non-in-place add creates a NEW
+    # fS_value tensor, so fS_others (often the same object) is untouched — policy
+    # and all other heads are bit-identical to the baseline path.
+    if self.use_value_depth_attention:
+      _vda_h = self.vda_norm(torch.stack(vda_states, dim=1))               # [B, L+1, D]
+      _vda_scores = torch.matmul(_vda_h, self.vda_query) * (self.EMBEDDING_DIM ** -0.5)
+      _vda_alpha = torch.softmax(_vda_scores, dim=1).unsqueeze(-1)         # [B, L+1, 1]
+      fS_value = fS_value + self.vda_proj((_vda_alpha * _vda_h).sum(dim=1))
+      if self.training:
+        # Stash for diagnostics (same training-gated attribute-mutation pattern as
+        # the placement head — keeps the dynamo/ONNX export path mutation-free).
+        self._last_vda_alpha = _vda_alpha.detach()
 
     # Placement value head (aux, training-only; see __init__). Per-square WDL-logit
     # contributions summed over squares, stashed for compute_loss. Gated on
