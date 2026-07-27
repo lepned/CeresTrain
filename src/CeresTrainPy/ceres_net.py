@@ -754,6 +754,24 @@ class CeresNet(nn.Module):
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
       if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int):
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
+      if not gradient_norm_logging_mode:
+        # Depth-attending value head diagnostics (see forward): WHICH depths does the
+        # value head read? Logs batch-mean attention weight per depth state
+        # (vda_alpha_d00 = post-embedding ... d<L> = final layer), plus per-sample
+        # entropy (uniform over 11 states = ln 11 ~ 2.398 nats; falling entropy =
+        # sharpening depth preference) and the expected depth index. Consume-and-clear,
+        # same stash pattern as the placement head.
+        _vda_a = getattr(self, '_last_vda_alpha', None)
+        if self.use_value_depth_attention and _vda_a is not None:
+          self._last_vda_alpha = None
+          _a = _vda_a.float().squeeze(-1)                    # [B, L+1]
+          _a_mean = _a.mean(dim=0)                           # [L+1]
+          for _d in range(_a_mean.shape[0]):
+            self._log(f"vda_alpha_d{_d:02d}", _a_mean[_d], step=num_pos)
+          _ent = -(_a * (_a + 1e-9).log()).sum(dim=1).mean()
+          _depth = (_a * torch.arange(_a.shape[1], device=_a.device, dtype=_a.dtype)).sum(dim=1).mean()
+          self._log("vda_alpha_entropy", _ent, step=num_pos)
+          self._log("vda_alpha_mean_depth", _depth, step=num_pos)
       self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
       self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
       self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
