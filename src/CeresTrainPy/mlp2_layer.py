@@ -86,6 +86,25 @@ class MLP2Layer(torch.nn.Module):
 
     self.activation_fn = to_activation(activation_type)
 
+    # SiTU-GLU (Kimi K3 report §2.3.2, arXiv 2607.24653): both multiplicative
+    # branches of SwiGLU are unbounded, so coincident large coordinates create
+    # activation outliers / low-precision overflow. SiTU bounds each branch with
+    # the smooth cap softcap(z, b) = b*tanh(z/b):
+    #   Swish(z) = z*sigmoid(z)   ->   softcap(z, b1)*sigmoid(z)
+    #   up branch u              ->   softcap(u, b2)
+    # Near the origin softcap(z,b) ~ z, so normal-range behavior matches SwiGLU;
+    # only outliers are compressed. Env CERES_FFN_SOFTCAP: unset/'0' = off
+    # (exact legacy SwiGLU), '1' = K3 defaults b1=4 (gate), b2=25 (up), or
+    # explicit 'b1,b2'. SwiGLU-only; other activations ignore the knob.
+    _sc = os.environ.get('CERES_FFN_SOFTCAP', '0') or '0'
+    self.ffn_softcap = None
+    if activation_type == 'SwiGLU' and _sc != '0':
+      self.ffn_softcap = (4.0, 25.0) if _sc == '1' else tuple(float(v) for v in _sc.split(','))
+      assert len(self.ffn_softcap) == 2 and all(b > 0 for b in self.ffn_softcap)
+      if not self.layer_num:  # print once (layer 0 or None)
+        print(f'[mlp2_layer] SiTU-GLU FFN softcap enabled: b1={self.ffn_softcap[0]} (gate branch), '
+              f'b2={self.ffn_softcap[1]} (up branch)')
+
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     if self.use_te:
@@ -105,9 +124,15 @@ class MLP2Layer(torch.nn.Module):
       # input before linear1 overwrites it.
       x_in = x
       x = self.linear1(x_in)
-      before_linear2 = self.activation_fn(x)
-      if (self.activation_type == 'SwiGLU'):
-          before_linear2 = before_linear2 * self.linear3(x_in)
+      if self.ffn_softcap is not None:
+        # SiTU-GLU (see __init__): capped Swish gate x capped up branch.
+        b1, b2 = self.ffn_softcap
+        up = self.linear3(x_in)
+        before_linear2 = (b1 * torch.tanh(x / b1)) * torch.sigmoid(x) * (b2 * torch.tanh(up / b2))
+      else:
+        before_linear2 = self.activation_fn(x)
+        if (self.activation_type == 'SwiGLU'):
+            before_linear2 = before_linear2 * self.linear3(x_in)
 
       x_out = self.linear2(before_linear2)
 
