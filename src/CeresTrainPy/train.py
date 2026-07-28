@@ -366,6 +366,29 @@ def Train():
       if not keep_trainable:
         param.requires_grad = False
    
+  # Per-head QK-clip (config 'QKClipTau', see config.py): arm the per-module
+  # max-logit monitors BEFORE torch.compile so the training-only stash branch
+  # specializes into the compiled graph. Module refs kept for the post-step clip.
+  QK_CLIP_TAU = float(getattr(config, 'Opt_QKClipTau', 0) or 0)
+  _qk_clip_mods = []
+  _qk_clip_last_report = [-10**18]  # mutable so the train loop can throttle QKCLIP prints
+  if QK_CLIP_TAU > 0:
+    if IS_DISTRIBUTED:
+      # Each rank sees different data -> different per-head maxima -> different
+      # weight rescales -> silent replica divergence. Needs an all-reduce(max)
+      # on the stashes before this is DDP-safe; loud error until then.
+      raise ValueError('QKClipTau is single-GPU only for now (per-rank clipping would '
+                       'silently diverge DDP replicas)')
+    from dot_product_attention import DotProductAttention
+    for _mod in model.modules():
+      if isinstance(_mod, DotProductAttention):
+        _mod.qk_clip_monitor = True
+        _qk_clip_mods.append(_mod)
+    if not _qk_clip_mods:
+      raise ValueError('QKClipTau set but no DotProductAttention modules found')
+    print(f'[train] QK-CLIP armed: tau={QK_CLIP_TAU}, {len(_qk_clip_mods)} attention modules '
+          f'(per-head weight rescale after optimizer step)', flush=True)
+
   # Possibly compile model (as recommended by Lightning docs, comile should appear before fabric.setup).
   # N.B. when debugging, may be helpful to disable this line (otherwise breakpoints relating to graph evaluation will not be hit).
   model_nocompile = model
@@ -1381,6 +1404,20 @@ def Train():
 
       optimizer.step()
       optimizer.zero_grad()
+
+      # Per-head QK-clip: rescale Q/K rows of any head whose max logit exceeded
+      # tau this step (weight-level; no-op once training is stable). Throttled
+      # QKCLIP log line + TB scalar so clip activity is visible/greppable.
+      if QK_CLIP_TAU > 0:
+        _clip_total = 0
+        for _m in _qk_clip_mods:
+          _clip_total += _m.apply_qk_clip(QK_CLIP_TAU)
+        if _clip_total > 0:
+          if num_pos - _qk_clip_last_report[0] > 1_000_000:
+            _qk_clip_last_report[0] = num_pos
+            print(f'QKCLIP: {num_pos} , {_clip_total} heads clipped (tau {QK_CLIP_TAU})', flush=True)
+          if writer is not None:
+            writer.add_scalar('qk_clip_heads', _clip_total, num_pos)
 
     batch_accumulation_counter = batch_accumulation_counter + 1
 

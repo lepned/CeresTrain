@@ -326,6 +326,55 @@ class DotProductAttention(torch.nn.Module):
     # ("Cannot take content out from the FakeTensor ... lifted_tensor_0").
     return self.wrapped_rpe_factor_shared.parameter
 
+  # Per-head QK-clip (Kimi K2 "MuonClip", retained in the K3 recipe): if a head's
+  # observed max attention logit exceeds tau, rescale that head's Q and K
+  # projection rows by sqrt(tau/max) so the QK^T logits shrink by tau/max.
+  # Weight-level: zero inference-graph footprint, no train/export divergence,
+  # inert once training is stable (gamma clamps to 1). Called from train.py
+  # after optimizer.step(); consumes the _last_max_logit stash.
+  # Layout notes (mirrors the per-head Muon spec builder):
+  #   nonlinear path: q2/k2 rows are head-major blocks of d_k*mult
+  #   linear path:    fused qkv rows are per-head [Q|K|V] (or [Q1|Q2|K|V]) chunks
+  #                   of d_k*mult each — scale all chunks except the final V chunk
+  #   V-only path (no QK) and LoRA-wrapped layers: skipped
+  # Known partial coverage: RPE/smolgen/rel-bias additive logit terms are not
+  # rescaled (Q/K scaling shrinks the RPE cross terms by sqrt(gamma) only);
+  # the monitored max is the FULL pre-softcap logit, so clipping is conservative.
+  @torch.no_grad()
+  def apply_qk_clip(self, tau):
+    """Returns number of heads clipped this call (0 if none / not applicable)."""
+    m = getattr(self, '_last_max_logit', None)
+    if m is None or not self.use_qkv:
+      return 0
+    if self.use_qk_norm:
+      # qLN/kLN renormalize Q/K after projection, so weight scaling cannot
+      # change the logits — QK-clip is structurally ineffective here.
+      return 0
+    self._last_max_logit = None
+    gamma = (tau / m.clamp(min=1e-6)).clamp(max=1.0)
+    clipped = int((gamma < 0.9999).sum().item())
+    if clipped == 0:
+      return 0
+    s = gamma.sqrt()
+    dkm = self.d_k * self.attention_multiplier
+    if self.use_nonlinear_attention:
+      layers = [self.q2, self.k2] + ([self.q2b] if self.use_diff_attention else [])
+      if not all(isinstance(l, torch.nn.Linear) for l in layers):
+        return 0  # LoRA-wrapped: skip rather than corrupt adapter/base split
+      for lin in layers:
+        for h in range(self.num_heads):
+          lin.weight[h * dkm:(h + 1) * dkm].mul_(s[h])
+    else:
+      if not isinstance(self.qkv, torch.nn.Linear):
+        return 0
+      w = self.qkv.weight
+      per_head = self.qkv_multiplier * dkm
+      for h in range(self.num_heads):
+        base = h * per_head
+        for j in range(self.qkv_multiplier - 1):  # every Q and K chunk, never V
+          w[base + j * dkm: base + (j + 1) * dkm].mul_(s[h])
+    return clipped
+
   # Function to cap logit scores (as used in the grok and gemma models).
   def soft_cap(self, score, softcap):
     score = score / softcap
@@ -410,6 +459,13 @@ class DotProductAttention(torch.nn.Module):
     # encoder layer's attention. Shape [B, num_heads, 64, 64], same as scores.
     if piece_relation_bias is not None:
       scores = scores + piece_relation_bias.to(scores.dtype)
+
+    # QK-clip monitor (K2 MuonClip / K3 recipe): stash the per-head max PRE-softcap
+    # logit for the weight-level clip applied after the optimizer step (train.py).
+    # Training-only attribute stash (placement-head pattern) — contributes NOTHING
+    # to the eval/export graph, which is the whole point of weight-level clipping.
+    if self.training and getattr(self, 'qk_clip_monitor', False):
+      self._last_max_logit = scores.detach().amax(dim=(0, 2, 3))  # [num_heads]
 
     if self.softcap_cutoff > 0:
       #softcap logits for enhanced training stability

@@ -143,6 +143,13 @@ class Configuration:
     # W_h per-head input columns) instead of one NS step over the full fused matrix.
     # False/absent = legacy full-matrix orthogonalization.
     self.Opt_MuonPerHeadAttention = bool(config_opt.get('MuonPerHeadAttention', False))
+    # Per-head QK-clip (Kimi K2 MuonClip, kept in the K3 recipe): after each
+    # optimizer step, any attention head whose max pre-softcap logit exceeded
+    # this threshold gets its Q/K projection rows rescaled by sqrt(tau/max).
+    # Weight-level -> zero inference cost, no export divergence, inert once
+    # training is stable. 0/null/absent = off. Typical tau ~ SoftCapCutoff
+    # territory (e.g. 100); ineffective (and skipped) under UseQKNorm.
+    self.Opt_QKClipTau = float(config_opt.get('QKClipTau', 0) or 0)
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)
