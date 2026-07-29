@@ -190,16 +190,42 @@ class CeresNet(nn.Module):
     # Zero-init query -> uniform depth weights at step 0; zero-init projection ->
     # exact no-op at step 0 (GTAB pattern). NOT training-only: it feeds value_out,
     # so it is part of the export graph (simple matmul/softmax ops, export-safe).
-    self.use_value_depth_attention = int(os.environ.get('CERES_VALUE_DEPTH_ATTENTION', '0') or 0) > 0
+    # Modes: 0 = off, 1 = pooled (board mean-pooled per depth, context added to
+    # fS_value after the head front-end), 2 = PER-SQUARE (each square attends over
+    # its OWN depth trajectory; context added to the value-side flow BEFORE
+    # headPremap, GTAB-style). Mode 2 preserves square-localized information
+    # (e.g. a specific pawn's early-layer identity) that mode 1's pooling loses.
+    # Mode 3 = BOTH pathways combined: they inject on opposite sides of the head
+    # front-end bottleneck (premap compresses 256->16 per square), so they carry
+    # non-nested information — per-square = spatially resolved but bottlenecked,
+    # pooled = global but full-bandwidth post-bottleneck. All modes now collect
+    # RAW references and compute at the tail (deferred pooling): identical math
+    # (mean commutes) but no fusion-breaking taps in the trunk — measured worth
+    # ~18% NPS at MCTS batch sizes.
+    self.vda_mode = int(os.environ.get('CERES_VALUE_DEPTH_ATTENTION', '0') or 0)
+    assert self.vda_mode in (0, 1, 2, 3), f'CERES_VALUE_DEPTH_ATTENTION must be 0/1/2/3, got {self.vda_mode}'
+    self.use_value_depth_attention = self.vda_mode > 0
     if self.use_value_depth_attention:
+      _MODE_NAMES = {1: 'pooled', 2: 'per-square', 3: 'combined (per-square + pooled)'}
       self.vda_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
       self.vda_query = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
-      self.vda_proj = nn.Linear(self.EMBEDDING_DIM, self.HEAD_IN_SIZE)
+      _vda_out = self.HEAD_IN_SIZE if self.vda_mode == 1 else self.EMBEDDING_DIM
+      self.vda_proj = nn.Linear(self.EMBEDDING_DIM, _vda_out)
       nn.init.zeros_(self.vda_proj.weight)
       nn.init.zeros_(self.vda_proj.bias)
-      print(f'[ceres_net] VALUE DEPTH ATTENTION enabled: pseudo-query over '
-            f'{self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}] -> fS_value add '
-            f'({self.EMBEDDING_DIM * self.HEAD_IN_SIZE + 2 * self.EMBEDDING_DIM + self.HEAD_IN_SIZE} params, zero-init no-op)')
+      _n_params = self.EMBEDDING_DIM * _vda_out + 2 * self.EMBEDDING_DIM + _vda_out
+      if self.vda_mode == 3:
+        # Global/pooled branch: own query + own post-front-end projection.
+        # 'vda_query' substring in the name keeps it in train.py's no_decay rule.
+        self.vda_query_g = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
+        self.vda_proj_g = nn.Linear(self.EMBEDDING_DIM, self.HEAD_IN_SIZE)
+        nn.init.zeros_(self.vda_proj_g.weight)
+        nn.init.zeros_(self.vda_proj_g.bias)
+        _n_params += self.EMBEDDING_DIM * self.HEAD_IN_SIZE + self.EMBEDDING_DIM + self.HEAD_IN_SIZE
+      print(f'[ceres_net] VALUE DEPTH ATTENTION enabled (mode {self.vda_mode} = '
+            f'{_MODE_NAMES[self.vda_mode]}): pseudo-query over '
+            f'{self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}], deferred pooling '
+            f'({_n_params} params, zero-init no-op)')
 
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
@@ -433,11 +459,11 @@ class CeresNet(nn.Module):
     if self.denseformer:
       all_previous_x = [flow]
 
-    # Depth-attention state collection: mean-pool over squares at each depth.
-    # References only (activations are alive for backward anyway) + one [B, D]
-    # pooled vector per depth — negligible memory.
+    # Depth-attention state collection: RAW references for ALL modes (deferred
+    # pooling — zero ops in the trunk, all compute at the tail; activations are
+    # alive for backward anyway so collection is free).
     if self.use_value_depth_attention:
-      vda_states = [flow.mean(dim=1)]  # post-embedding state
+      vda_states = [flow]  # post-embedding state
 
     # Main transformer body (stack of encoder layers).
     # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
@@ -455,7 +481,7 @@ class CeresNet(nn.Module):
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
         if self.use_value_depth_attention:
-          vda_states.append(flow.mean(dim=1))  # post-layer (post-DWA if denseformer)
+          vda_states.append(flow)  # post-layer (post-DWA if denseformer)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
     if self.trunk_end_norm is not None:
@@ -501,11 +527,15 @@ class CeresNet(nn.Module):
       fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
       fS_value  = fS_others
 
-    # Depth-attending value context (see __init__). Non-in-place add creates a NEW
-    # fS_value tensor, so fS_others (often the same object) is untouched — policy
-    # and all other heads are bit-identical to the baseline path.
-    if self.use_value_depth_attention:
-      _vda_h = self.vda_norm(torch.stack(vda_states, dim=1))               # [B, L+1, D]
+    # Depth-attending value context (see __init__). Non-in-place adds create NEW
+    # tensors, so fS_others (often the same object as fS_value) is untouched —
+    # policy and all other heads are bit-identical to the baseline path.
+    if self.vda_mode == 1:
+      # Deferred pooling at the tail (identical math to pooling at collection —
+      # mean over squares commutes). Mean-then-stack: avoids materializing a
+      # [B, L+1, 64, D] tensor that stack-then-mean would keep for backward.
+      _vda_pooled = torch.stack([_hs.mean(dim=1) for _hs in vda_states], dim=1)  # [B, L+1, D]
+      _vda_h = self.vda_norm(_vda_pooled)
       _vda_scores = torch.matmul(_vda_h, self.vda_query) * (self.EMBEDDING_DIM ** -0.5)
       _vda_alpha = torch.softmax(_vda_scores, dim=1).unsqueeze(-1)         # [B, L+1, 1]
       fS_value = fS_value + self.vda_proj((_vda_alpha * _vda_h).sum(dim=1))
@@ -513,6 +543,38 @@ class CeresNet(nn.Module):
         # Stash for diagnostics (same training-gated attribute-mutation pattern as
         # the placement head — keeps the dynamo/ONNX export path mutation-free).
         self._last_vda_alpha = _vda_alpha.detach()
+    elif self.vda_mode in (2, 3):
+      # Per-square: each square attends over its OWN depth trajectory. Depth loop
+      # (static unroll under compile) avoids materializing a [B, L+1, 64, D] stack.
+      _hn = [self.vda_norm(_hs) for _hs in vda_states]                     # (L+1) x [B, 64, D]
+      _vda_scores = torch.stack([torch.matmul(_h, self.vda_query) for _h in _hn],
+                                dim=-1) * (self.EMBEDDING_DIM ** -0.5)     # [B, 64, L+1]
+      _vda_alpha = torch.softmax(_vda_scores, dim=-1)                      # [B, 64, L+1]
+      _ctx = _vda_alpha[..., 0:1] * _hn[0]
+      for _i in range(1, len(_hn)):
+        _ctx = _ctx + _vda_alpha[..., _i:_i + 1] * _hn[_i]                 # [B, 64, D]
+      # Inject into the value-side flow BEFORE the head front-end (GTAB pattern);
+      # zero-init vda_proj -> _flow_v == the branch flow -> fS_value recomputes to
+      # bit-identical values at init. In gtab_value_only mode this recompute
+      # replaces the fS_value computed above (redundant pass, rare mode, harmless).
+      _flow_v = (flow_value if (self.use_gtab and self.gtab_value_only) else flow) + self.vda_proj(_ctx)
+      fS_value = self.headSharedLinear(self.headPremap(_flow_v).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      if self.vda_mode == 3:
+        # Combined mode: ALSO the pooled/global branch (full-bandwidth add AFTER
+        # the head front-end bottleneck). Reuses the per-square normed states —
+        # pooling normed states differs from norming pooled states, but both are
+        # valid parameterizations and this saves a second norm pass.
+        _hg = torch.stack([_h.mean(dim=1) for _h in _hn], dim=1)           # [B, L+1, D] (mean-then-stack, no big transient)
+        _g_scores = torch.matmul(_hg, self.vda_query_g) * (self.EMBEDDING_DIM ** -0.5)
+        _g_alpha = torch.softmax(_g_scores, dim=1).unsqueeze(-1)           # [B, L+1, 1]
+        fS_value = fS_value + self.vda_proj_g((_g_alpha * _hg).sum(dim=1))
+        if self.training:
+          self._last_vda_alpha_g = _g_alpha.detach()
+      if self.training:
+        # Square-averaged profile keeps the compute_loss logging block shape-
+        # compatible ([B, L+1, 1]); entropy there is entropy-of-mean, a coarser
+        # diagnostic than per-square entropy but comparable across modes.
+        self._last_vda_alpha = _vda_alpha.detach().mean(dim=1).unsqueeze(-1)
 
     # Placement value head (aux, training-only; see __init__). Per-square WDL-logit
     # contributions summed over squares, stashed for compute_loss. Gated on
@@ -772,6 +834,15 @@ class CeresNet(nn.Module):
           _depth = (_a * torch.arange(_a.shape[1], device=_a.device, dtype=_a.dtype)).sum(dim=1).mean()
           self._log("vda_alpha_entropy", _ent, step=num_pos)
           self._log("vda_alpha_mean_depth", _depth, step=num_pos)
+        # Mode 3: the pooled/global branch gets its own profile (vda_alpha_g_*).
+        _vda_ag = getattr(self, '_last_vda_alpha_g', None)
+        if _vda_ag is not None:
+          self._last_vda_alpha_g = None
+          _ag = _vda_ag.float().squeeze(-1)
+          _ag_mean = _ag.mean(dim=0)
+          for _d in range(_ag_mean.shape[0]):
+            self._log(f"vda_alpha_g_d{_d:02d}", _ag_mean[_d], step=num_pos)
+          self._log("vda_alpha_g_entropy", -(_ag * (_ag + 1e-9).log()).sum(dim=1).mean(), step=num_pos)
       self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
       self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
       self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
