@@ -895,7 +895,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -911,6 +911,14 @@ def Train():
         _missing_other = [k for k in _pl_res.missing_keys if not k.startswith(_AUX_HEAD_PREFIXES)]
         if _missing_other or _pl_res.unexpected_keys:
           raise RuntimeError(f"Resume mismatch beyond aux heads: missing={_missing_other} unexpected={_pl_res.unexpected_keys}")
+        # vda mode-3 -> mode-4 warm start: the aux value head sees exactly the
+        # augmented input the checkpoint's value_head was trained on, so inherit
+        # those weights instead of fresh-initializing (the SERVED value_head also
+        # keeps them and re-adapts to the plain input).
+        if getattr(model_nocompile, 'vda_mode', 0) == 4 and any(k.startswith('vda_aux_head.') for k in _fresh):
+          _vh_sd = model_nocompile.value_head.state_dict()
+          model_nocompile.vda_aux_head.load_state_dict(_vh_sd)
+          print("INFO: VDA mode-4 warm start — vda_aux_head inherited value_head weights", flush=True)
       else:
         # load checkpoint parameters, expect all to match (strict = True)
         model_nocompile.load_state_dict(_ckpt_model_sd, strict = True)

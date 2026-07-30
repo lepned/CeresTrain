@@ -202,11 +202,21 @@ class CeresNet(nn.Module):
     # RAW references and compute at the tail (deferred pooling): identical math
     # (mean commutes) but no fusion-breaking taps in the trunk — measured worth
     # ~18% NPS at MCTS batch sizes.
+    # Mode 4 = TRAINING-ONLY AUXILIARY: the served value head reads the plain
+    # final-layer path (exact novda export graph — zero serving cost), while the
+    # full mode-3 machinery + an auxiliary value head run only under
+    # self.training with their own loss (CERES_VDA_AUX_WEIGHT, default 1.0).
+    # Preserves the deep-supervision benefit (gradients reach every trunk layer)
+    # without any inference footprint. Warm-startable from a mode-3 checkpoint:
+    # vda_* transfer unchanged; vda_aux_head inherits value_head's weights
+    # (train.py resume handles the copy).
     self.vda_mode = int(os.environ.get('CERES_VALUE_DEPTH_ATTENTION', '0') or 0)
-    assert self.vda_mode in (0, 1, 2, 3), f'CERES_VALUE_DEPTH_ATTENTION must be 0/1/2/3, got {self.vda_mode}'
+    assert self.vda_mode in (0, 1, 2, 3, 4), f'CERES_VALUE_DEPTH_ATTENTION must be 0-4, got {self.vda_mode}'
     self.use_value_depth_attention = self.vda_mode > 0
+    self.vda_aux_weight = float(os.environ.get('CERES_VDA_AUX_WEIGHT', '1.0') or 1.0)
     if self.use_value_depth_attention:
-      _MODE_NAMES = {1: 'pooled', 2: 'per-square', 3: 'combined (per-square + pooled)'}
+      _MODE_NAMES = {1: 'pooled', 2: 'per-square', 3: 'combined (per-square + pooled)',
+                     4: 'training-only auxiliary (combined machinery, novda serving graph)'}
       self.vda_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
       self.vda_query = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
       _vda_out = self.HEAD_IN_SIZE if self.vda_mode == 1 else self.EMBEDDING_DIM
@@ -214,7 +224,12 @@ class CeresNet(nn.Module):
       nn.init.zeros_(self.vda_proj.weight)
       nn.init.zeros_(self.vda_proj.bias)
       _n_params = self.EMBEDDING_DIM * _vda_out + 2 * self.EMBEDDING_DIM + _vda_out
-      if self.vda_mode == 3:
+      if self.vda_mode == 4:
+        # Auxiliary value head (training-only): same structure as value_head, fed
+        # by the mode-3-augmented front-end. Inherits value_head weights on
+        # mode-3 warm-start (they were trained on exactly this augmented input).
+        self.vda_aux_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, 0)
+      if self.vda_mode in (3, 4):
         # Global/pooled branch: own query + own post-front-end projection.
         # 'vda_query' substring in the name keeps it in train.py's no_decay rule.
         self.vda_query_g = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
@@ -543,7 +558,9 @@ class CeresNet(nn.Module):
         # Stash for diagnostics (same training-gated attribute-mutation pattern as
         # the placement head — keeps the dynamo/ONNX export path mutation-free).
         self._last_vda_alpha = _vda_alpha.detach()
-    elif self.vda_mode in (2, 3):
+    elif self.vda_mode == 4 and not self.training:
+      pass  # serving graph is EXACTLY novda — no vda ops exported
+    elif self.vda_mode in (2, 3, 4):
       # Per-square: each square attends over its OWN depth trajectory. Depth loop
       # (static unroll under compile) avoids materializing a [B, L+1, 64, D] stack.
       _hn = [self.vda_norm(_hs) for _hs in vda_states]                     # (L+1) x [B, 64, D]
@@ -558,8 +575,10 @@ class CeresNet(nn.Module):
       # bit-identical values at init. In gtab_value_only mode this recompute
       # replaces the fS_value computed above (redundant pass, rare mode, harmless).
       _flow_v = (flow_value if (self.use_gtab and self.gtab_value_only) else flow) + self.vda_proj(_ctx)
-      fS_value = self.headSharedLinear(self.headPremap(_flow_v).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
-      if self.vda_mode == 3:
+      _fS_aug = self.headSharedLinear(self.headPremap(_flow_v).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      if self.vda_mode != 4:
+        fS_value = _fS_aug   # modes 2/3: the served value head reads the augmented path
+      if self.vda_mode in (3, 4):
         # Combined mode: ALSO the pooled/global branch (full-bandwidth add AFTER
         # the head front-end bottleneck). Reuses the per-square normed states —
         # pooling normed states differs from norming pooled states, but both are
@@ -567,9 +586,18 @@ class CeresNet(nn.Module):
         _hg = torch.stack([_h.mean(dim=1) for _h in _hn], dim=1)           # [B, L+1, D] (mean-then-stack, no big transient)
         _g_scores = torch.matmul(_hg, self.vda_query_g) * (self.EMBEDDING_DIM ** -0.5)
         _g_alpha = torch.softmax(_g_scores, dim=1).unsqueeze(-1)           # [B, L+1, 1]
-        fS_value = fS_value + self.vda_proj_g((_g_alpha * _hg).sum(dim=1))
+        _g_ctx = self.vda_proj_g((_g_alpha * _hg).sum(dim=1))
+        if self.vda_mode == 4:
+          _fS_aug = _fS_aug + _g_ctx
+        else:
+          fS_value = fS_value + _g_ctx
         if self.training:
           self._last_vda_alpha_g = _g_alpha.detach()
+      if self.vda_mode == 4:
+        # Auxiliary value head on the augmented path (training-only reach — this
+        # whole branch is skipped in eval by the guard above). Stash for the aux
+        # loss in compute_loss; served value_head reads the untouched fS_value.
+        self._last_vda_aux_out = self.vda_aux_head(_fS_aug)
       if self.training:
         # Square-averaged profile keeps the compute_loss logging block shape-
         # compatible ([B, L+1, 1]); entropy there is entropy-of-mean, a coarser
@@ -723,6 +751,18 @@ class CeresNet(nn.Module):
     # can never be re-used by a later loss call whose forward opted out (e.g. the 4-board
     # path's action-only board 4, which passes value_out=None).
     placement_loss = 0
+    # vda mode-4 auxiliary value loss (training-only deep-supervision path).
+    # Same CE-minus-entropy form as value_loss against the same target, weighted
+    # by CERES_VDA_AUX_WEIGHT; consume-and-clear stash pattern. Not consumed on
+    # the grad-norm diagnostic pass (it contributes no GRADNORM line, and this
+    # keeps the loss intact for the real pass that follows).
+    vda_aux_loss = 0
+    _vda_aux = getattr(self, '_last_vda_aux_out', None)
+    if _vda_aux is not None and value_out is not None and not gradient_norm_logging_mode:
+      self._last_vda_aux_out = None
+      _aux_entropy = loss_calc.entropy(value_target) if SUBTRACT_ENTROPY else 0.0
+      vda_aux_loss = loss_calc.ce_loss.forward(_vda_aux.float(), value_target) - _aux_entropy
+
     _pv_out = getattr(self, '_last_placement_value_out', None)
     if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
       self._last_placement_value_out = None
@@ -771,7 +811,8 @@ class CeresNet(nn.Module):
         + self.uncertainty_policy_weight * uncertainty_policy_loss
         + self.placement_value_weight * placement_loss
         + self.survival_target_weight * survival_loss
-        + self.stvalue_weight * stvalue_loss)
+        + self.stvalue_weight * stvalue_loss
+        + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0))
         
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -816,6 +857,8 @@ class CeresNet(nn.Module):
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
       if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int):
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
+      if self.vda_mode == 4 and not isinstance(vda_aux_loss, int):
+        self._log("vda_aux_value_loss" + stat_suffix, vda_aux_loss, step=num_pos)
       if not gradient_norm_logging_mode:
         # Depth-attending value head diagnostics (see forward): WHICH depths does the
         # value head read? Logs batch-mean attention weight per depth state
