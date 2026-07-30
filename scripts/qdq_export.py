@@ -230,6 +230,12 @@ def main():
                          'GEMMs (nn.Linear), so quantizing these at export is '
                          'train/deploy skew; excluding them deploys exactly what QAT '
                          'trained against.')
+    ap.add_argument('--exclude_pattern', default=None,
+                    help='exclude MatMuls whose node name or any input name contains '
+                         'this substring (e.g. "vda" keeps the depth-attention value '
+                         'head FP16: tiny GEMMs with no INT8 upside whose Q/DQ pairs '
+                         'and per-layer trunk taps break TRT fusions in strongly-typed '
+                         'builds -> speed loss).')
     ap.add_argument('--out', default=None,
                     help='explicit path for the deployable fp16io onnx (default: '
                          '<base>.<tag>.fp16io.onnx). Use to keep A/B export variants '
@@ -241,6 +247,9 @@ def main():
                          'clip pattern; recalibration breaks it (KL 0.02 -> 0.32). '
                          'Modules are matched to MatMuls by fp16 weight-content hash '
                          '(dynamo anonymizes initializer names).')
+    ap.add_argument('--fp8_per_tensor', action='store_true',
+                    help='FP8 only: per-TENSOR weight scales (TRT FP8-dequant-compliant) '
+                         'instead of per-channel (which TRT mishandles -> garbage engine).')
     ap.add_argument('--precision', choices=['int8', 'fp8'], default='int8',
                     help='int8 = fixed-point (erases small value signal); fp8 = E4M3 '
                          'floating-point (preserves small magnitudes -> value should survive)')
@@ -267,8 +276,13 @@ def main():
     # per-channel for FP8 as well (round 2).
     FP8 = args.precision == 'fp8'
     qtype = QuantType.QFLOAT8E4M3FN if FP8 else QuantType.QInt8
-    per_channel = True
-    tag = 'qdqfp8' if FP8 else 'qdq'
+    # Round-3 (2026-07-28): per-CHANNEL FP8 QDQ produced total garbage in-engine
+    # (both heads dead) — TRT's FP8 dequant support is effectively per-TENSOR only,
+    # so per-channel FP8 scales get mishandled graph-wide. --fp8_per_tensor selects
+    # the TRT-compliant per-tensor form (the only remaining FP8 combination when
+    # paired with the now-working strongly-typed build).
+    per_channel = not (FP8 and args.fp8_per_tensor)
+    tag = ('qdqfp8pt' if args.fp8_per_tensor else 'qdqfp8') if FP8 else 'qdq'
 
     base = os.path.splitext(args.onnx)[0]
     fp32_path = base + '.fp32.onnx'
@@ -302,7 +316,8 @@ def main():
                        input_name=in_name, channels=in_channels, byte_div=args.byte_divisor)
     # Exclude the last N MatMuls (the value-feeding late trunk) from quantization.
     nodes_to_exclude = []
-    _m = onnx.load(quant_input) if (args.exclude_tail > 0 or args.exclude_act_matmuls) else None
+    _m = onnx.load(quant_input) if (args.exclude_tail > 0 or args.exclude_act_matmuls
+                                    or args.exclude_pattern) else None
     if args.exclude_tail > 0:
         _mm = [n.name for n in _m.graph.node if n.op_type == 'MatMul']
         nodes_to_exclude = _mm[-args.exclude_tail:]
@@ -324,6 +339,13 @@ def main():
         nodes_to_exclude += [n for n in act_mm if n not in nodes_to_exclude]
         print(f'[qdq] excluding {len(act_mm)}/{_total} activation*activation MatMuls '
               f'(attention QK^T/A*V) from quant')
+    if args.exclude_pattern:
+        pat = args.exclude_pattern
+        pat_mm = [n.name for n in _m.graph.node
+                  if n.op_type == 'MatMul'
+                  and (pat in n.name or any(pat in i for i in n.input))]
+        nodes_to_exclude += [n for n in pat_mm if n not in nodes_to_exclude]
+        print(f'[qdq] excluding {len(pat_mm)} MatMuls matching "{pat}" from quant')
     # FP8 in ORT requires Distribution calibration (histogram-based scale).
     if FP8:
         cmethod = CalibrationMethod.Distribution
