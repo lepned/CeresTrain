@@ -33,7 +33,7 @@ from rms_norm import RMSNorm, make_norm
 from lora import LoRALinear
 from utils import DWA
 from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
-from chess_geometry import PieceRelationBias
+from chess_geometry import PieceRelationBias, RayAttentionBias
 
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
 
@@ -242,6 +242,56 @@ class CeresNet(nn.Module):
             f'{self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}], deferred pooling '
             f'({_n_params} params, zero-init no-op)')
 
+    # Policy depth attention (PDA, tier 1 = shared states). CERES_POLICY_DEPTH_ATTENTION=1
+    # gives the POLICY path a per-square depth read mirroring vda mode 2's injection
+    # (context added to the policy-side flow BEFORE the head front-end). Sharing:
+    # reuses vda_norm and — when vda modes 2/3 already computed them — the normed
+    # per-square depth states, so the state reads (the dominant serving cost of
+    # depth attention) are paid once for both heads. Own pseudo-query + zero-init
+    # projection: the policy path is bit-identical at init. Parameter names keep
+    # the 'vda_' prefix deliberately: train.py's partition rule ('vda_query' ->
+    # no_decay) and the aux-head resume prefixes ('vda_') then apply unchanged.
+    self.pda_mode = int(os.environ.get('CERES_POLICY_DEPTH_ATTENTION', '0') or 0)
+    assert self.pda_mode in (0, 1), f'CERES_POLICY_DEPTH_ATTENTION must be 0/1, got {self.pda_mode}'
+    if self.pda_mode:
+      if not self.use_value_depth_attention:
+        self.vda_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+      self.vda_query_p = nn.Parameter(torch.zeros(self.EMBEDDING_DIM))
+      self.vda_proj_p = nn.Linear(self.EMBEDDING_DIM, self.EMBEDDING_DIM)
+      nn.init.zeros_(self.vda_proj_p.weight)
+      nn.init.zeros_(self.vda_proj_p.bias)
+      print(f'[ceres_net] POLICY DEPTH ATTENTION enabled (tier-1 shared-states'
+            f'{" with vda" if self.use_value_depth_attention else ""}): per-square '
+            f'pseudo-query over {self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}], '
+            f'zero-init no-op')
+
+    # Depth probes (CERES_DEPTH_PROBES=1): per-depth deep supervision + in-process
+    # control heads (adapted from the T1 vda+pda package, 2026-08 — its TB evidence:
+    # ~2x early sample efficiency measured via a last-layer-only control head).
+    # TRAINING-ONLY (self.training gated, stash pattern) -> export graph unchanged,
+    # zero serving cost, no Ceres-side changes.
+    #   depth_probe_policy: ONE weight-shared Linear D->1858 read from each pooled
+    #     depth state (weight sharing keeps params ~= one small head and makes the
+    #     per-depth loss curves directly comparable); depth_probe_value: shared
+    #     Linear D->3 (WDL). Losses = mean-over-depths CE at weights
+    #     CERES_DEPTH_PROBE_POLICY_WEIGHT / _VALUE_WEIGHT (default 0.05 each).
+    #   depth_ctl_policy / depth_ctl_value: identical-shape heads reading ONLY the
+    #     final state through a DETACHED input — pure measurement apparatus for
+    #     paired in-process reads (they train themselves, never shape the trunk).
+    self.depth_probes_enabled = int(os.environ.get('CERES_DEPTH_PROBES', '0') or 0) > 0
+    if self.depth_probes_enabled:
+      self.depth_probe_policy_weight = float(os.environ.get('CERES_DEPTH_PROBE_POLICY_WEIGHT', '0.05') or 0.05)
+      self.depth_probe_value_weight = float(os.environ.get('CERES_DEPTH_PROBE_VALUE_WEIGHT', '0.05') or 0.05)
+      self.depth_probe_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+      self.depth_probe_policy = nn.Linear(self.EMBEDDING_DIM, 1858)
+      self.depth_probe_value = nn.Linear(self.EMBEDDING_DIM, 3)
+      self.depth_ctl_policy = nn.Linear(self.EMBEDDING_DIM, 1858)
+      self.depth_ctl_value = nn.Linear(self.EMBEDDING_DIM, 3)
+      _n = (self.EMBEDDING_DIM + 1) * (1858 + 3) * 2 + 2 * self.EMBEDDING_DIM
+      print(f'[ceres_net] DEPTH PROBES enabled: shared policy/value probes over '
+            f'{self.NUM_LAYERS + 1} pooled depth states (w_p={self.depth_probe_policy_weight}, '
+            f'w_v={self.depth_probe_value_weight}) + detached ctl heads ({_n} params, training-only)')
+
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
     # each square's trunk embedding contributes a 3-vector of WDL logits; the position value is
@@ -394,6 +444,70 @@ class CeresNet(nn.Module):
     if self.use_piece_relation_bias:
       self.piece_relation_bias_module = PieceRelationBias(num_heads=self.NUM_HEADS)
 
+    # Ray attention bias (CERES_RAY_ATTENTION_BIAS=1): blocker-aware sliding-piece
+    # attack + x-ray channels as additive attention bias, computed in-graph from
+    # the piece one-hots (see chess_geometry.RayAttentionBias). Motivation from the
+    # 2026-08 mechanism decomposition: RPE's geometry-in-attention delivered the
+    # OOD generalization (+126) but its Q·R wiring costs ~23% NPS (fused-MHA break);
+    # this delivers RESOLVED geometry (pins/x-rays included, which RPE cannot see)
+    # through the cheap additive-bias pattern. Composes additively with PRB.
+    # RPE-from-embedding experiment (CERES_RPE_FROM_EMBEDDING=1, requires UseRPE):
+    # RPE einsums read the post-embedding state through each layer's own qkv
+    # weights instead of the layer's live Q/K. Zero new params; measures how much
+    # of RPE's win requires LAYER-COMPUTED content (the discriminator between
+    # cheap once-materialized geometry conditioning and per-layer schemes).
+    self.rpe_from_embedding = int(os.environ.get('CERES_RPE_FROM_EMBEDDING', '0') or 0) > 0
+    if self.rpe_from_embedding:
+      print('[ceres_net] RPE-FROM-EMBEDDING experiment enabled: RPE terms read static '
+            'post-embedding content (zero new params)')
+    # ARCHITECTED serving graph for RPE-fromEmb (CERES_RPE_GENPHASE=1, requires
+    # CERES_RPE_FROM_EMBEDDING=1): since the coupling content is STATIC per
+    # position, each layer's QK-rpe contribution is computed ONCE in a generator
+    # phase at forward start and delivered as a per-layer ADDITIVE score bias —
+    # the attention kernels keep a plain fusable QK^T(+bias) and the in-attention
+    # rpe einsums are skipped. Mathematically identical for the QK terms (bias is
+    # pre-divided by sqrt(d_k) to match the entry point after score scaling);
+    # rpe_v intentionally dropped (measured dead weight, pvsmoke8).
+    self.rpe_genphase = int(os.environ.get('CERES_RPE_GENPHASE', '0') or 0) > 0
+    if self.rpe_genphase:
+      assert self.rpe_from_embedding, 'CERES_RPE_GENPHASE requires CERES_RPE_FROM_EMBEDDING=1'
+      print('[ceres_net] RPE GENERATOR-PHASE serving graph enabled: per-layer QK-rpe '
+            'biases precomputed from static embedding; in-attention einsums + rpe_v skipped')
+
+    self.use_ray_bias = int(os.environ.get('CERES_RAY_ATTENTION_BIAS', '0') or 0) > 0
+    if self.use_ray_bias:
+      self.ray_bias_module = RayAttentionBias(num_heads=self.NUM_HEADS)
+      print(f'[ceres_net] RAY ATTENTION BIAS enabled: 6 blocker-aware slider/x-ray '
+            f'channels -> per-head additive bias ({6 * self.NUM_HEADS} params)')
+
+    # Phase-FiLM (CERES_PHASE_FILM=1): phase-conditioned per-layer FFN modulation.
+    # Rationale: a small net averages one circuit over opening/middlegame/endgame;
+    # FiLM gives it phase-specialized sub-circuits at elementwise cost (MoE-without-
+    # routing). Conditioning = the position's piece census (sum over squares of the
+    # 13-channel one-hot, the same planes PieceRelationBias reads) + a material
+    # scalar, normalized to O(1) -> tiny MLP -> per-DISTINCT-layer (gamma, beta) of
+    # width D, applied to each layer's FFN output as out*(1+gamma)+beta (broadcast
+    # over squares). Final projection zero-init => exact no-op at step 0.
+    # 'phase_film' prefix is in train.py's aux-resume prefixes (ckpt-compatible in
+    # both directions). Serving cost ~nil: MLP runs once per position (~0.4M MACs),
+    # application is elementwise (same op class as the measured-free attention gate).
+    self.use_phase_film = int(os.environ.get('CERES_PHASE_FILM', '0') or 0) > 0
+    if self.use_phase_film:
+      _film_hidden = 64
+      self.phase_film_mlp = nn.Sequential(
+        nn.Linear(14, _film_hidden),
+        self.Activation,
+        nn.Linear(_film_hidden, self.NUM_DISTINCT_LAYERS * 2 * self.EMBEDDING_DIM))
+      nn.init.zeros_(self.phase_film_mlp[2].weight)
+      nn.init.zeros_(self.phase_film_mlp[2].bias)
+      # Material weights per one-hot channel: empty,P,N,B,R,Q,K (white then black).
+      self.register_buffer('phase_film_matw',
+                           torch.tensor([0., 1., 3., 3., 5., 9., 0., 1., 3., 3., 5., 9., 0.]),
+                           persistent=False)
+      _n = 14 * _film_hidden + _film_hidden + _film_hidden * self.NUM_DISTINCT_LAYERS * 2 * self.EMBEDDING_DIM + self.NUM_DISTINCT_LAYERS * 2 * self.EMBEDDING_DIM
+      print(f'[ceres_net] PHASE-FILM enabled: piece-census -> per-layer FFN (gamma, beta) '
+            f'[{self.NUM_DISTINCT_LAYERS} x 2 x {self.EMBEDDING_DIM}] ({_n} params, zero-init no-op)')
+
     # GTAB (Gated Tactical Adapter Branch) — optional parallel mini-transformer
     # that contributes additively to the post-body flow, gated by a learned
     # position classifier. Zero-init by construction: orig is recovered exactly
@@ -413,6 +527,37 @@ class CeresNet(nn.Module):
     self.use_tsb = bool(getattr(config, 'NetDef_TSB_Enabled', False))
     self._last_tsb_gates = None  # set in forward() when TSB is active
 
+
+  def _rpe_genphase_biases(self, emb):
+    """RPE-fromEmb architected graph (see __init__): per-layer QK-rpe score biases
+    computed once from the static post-embedding state. Returns a list of
+    [B, H, 64, 64] tensors, one per distinct layer."""
+    biases = []
+    # fp32 throughout the generator: keeps the exported graph free of BF16-typed
+    # ops (TRT's Mish importer rejects BF16); the bias is cast to the score dtype
+    # at the add site anyway.
+    emb = emb.to(torch.float32)
+    B = emb.shape[0]
+    for layer in self.transformer_layer:
+      att = layer.attention
+      if att.use_nonlinear_attention:
+        qkv_e = att.qkv(emb).reshape(B, -1, 3, att.d_model * att.attention_multiplier)
+        qkv_e = torch.nn.functional.mish(att.qkvLN(qkv_e))
+        _qe, _ke, _ = torch.unbind(qkv_e, dim=-2)
+        Qe = att.q2(_qe).reshape(B, -1, att.num_heads, att.d_k * att.attention_multiplier).permute(0, 2, 1, 3)
+        Ke = att.k2(_ke).reshape(B, -1, att.num_heads, att.d_k * att.attention_multiplier).permute(0, 2, 1, 3)
+      else:
+        qkv_e = att.qkv(emb).reshape(B, -1, att.num_heads, 3 * att.d_k * att.attention_multiplier).permute(0, 2, 1, 3)
+        Qe, Ke, _ = qkv_e.chunk(3, dim=-1)
+      if att.use_qk_norm:
+        Qe = att.qLN(Qe)
+        Ke = att.kLN(Ke)
+      _d = att.d_k * att.attention_multiplier
+      rpe_q = (att.rpe_q @ att.rpeFactorShared).reshape(_d, att.num_heads, 64, 64)
+      rpe_k = (att.rpe_k @ att.rpeFactorShared).reshape(_d, att.num_heads, 64, 64)
+      _bias = torch.einsum('bhqd,dhqk->bhqk', Qe, rpe_q) + torch.einsum('bhkd,dhqk->bhqk', Ke, rpe_k)
+      biases.append(_bias / (att.d_k ** 0.5))
+    return biases
 
   def _log(self, name, value, step):
     """Log a scalar metric to tensorboard. Replaces former fabric.log() call.
@@ -439,6 +584,21 @@ class CeresNet(nn.Module):
     if self.use_piece_relation_bias:
       piece_type_curr = squares[:, :, 0:13]  # [B, 64, 13]
       piece_relation_bias_tensor = self.piece_relation_bias_module(piece_type_curr)
+    if self.use_ray_bias:
+      _ray_bias = self.ray_bias_module(squares[:, :, 0:13])
+      piece_relation_bias_tensor = _ray_bias if piece_relation_bias_tensor is None \
+          else piece_relation_bias_tensor + _ray_bias
+
+    # Phase-FiLM conditioning (see __init__): piece census + material scalar from
+    # the same one-hot planes PRB reads, computed ONCE per forward. Normalization:
+    # counts x0.1 (piece counts 0..8 -> ~O(1)), material x0.025 (0..78 -> ~O(1)).
+    phase_film_tensor = None
+    if self.use_phase_film:
+      _pf_census = squares[:, :, 0:13].sum(dim=1)                              # [B, 13]
+      _pf_mat = (_pf_census * self.phase_film_matw).sum(dim=-1, keepdim=True)  # [B, 1]
+      _pf_feat = torch.cat((_pf_census * 0.1, _pf_mat * 0.025), dim=-1)        # [B, 14]
+      phase_film_tensor = self.phase_film_mlp(_pf_feat.to(self.phase_film_mlp[0].weight.dtype)) \
+          .reshape(-1, self.NUM_DISTINCT_LAYERS, 2, self.EMBEDDING_DIM)        # [B, L, 2, D]
 
     # save a copy of the qblunders (2 bytes) for later use in value 2 head (only)
     QBLUNDER_SLICE_BEGIN = 119
@@ -477,8 +637,10 @@ class CeresNet(nn.Module):
     # Depth-attention state collection: RAW references for ALL modes (deferred
     # pooling — zero ops in the trunk, all compute at the tail; activations are
     # alive for backward anyway so collection is free).
-    if self.use_value_depth_attention:
+    if self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training):
       vda_states = [flow]  # post-embedding state
+    rpe_src_tensor = flow if (self.rpe_from_embedding and not self.rpe_genphase) else None  # post-embedding, pre-layer-1
+    rpe_gen_biases = self._rpe_genphase_biases(flow) if (self.rpe_from_embedding and self.rpe_genphase) else None
 
     # Main transformer body (stack of encoder layers).
     # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
@@ -490,12 +652,20 @@ class CeresNet(nn.Module):
       raise NotImplementedError("DenseFormer is not supported with LoopCount > 1.")
     for loop_iter in range(self.LOOP_COUNT):
       for i in range(self.NUM_DISTINCT_LAYERS):
-        flow = self.transformer_layer[i](flow, piece_relation_bias=piece_relation_bias_tensor)
+        _prb_l = piece_relation_bias_tensor
+        if rpe_gen_biases is not None:
+          _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]
+        flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l,
+                                         film=None if phase_film_tensor is None else
+                                              (phase_film_tensor[:, i, 0].unsqueeze(1),
+                                               phase_film_tensor[:, i, 1].unsqueeze(1)),
+                                         rpe_src=rpe_src_tensor,
+                                         rpe_precomputed=rpe_gen_biases is not None)
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
-        if self.use_value_depth_attention:
+        if self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training):
           vda_states.append(flow)  # post-layer (post-DWA if denseformer)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
@@ -545,6 +715,7 @@ class CeresNet(nn.Module):
     # Depth-attending value context (see __init__). Non-in-place adds create NEW
     # tensors, so fS_others (often the same object as fS_value) is untouched —
     # policy and all other heads are bit-identical to the baseline path.
+    _hn_shared = None  # normed per-square depth states, shared by vda modes 2/3/4 and pda
     if self.vda_mode == 1:
       # Deferred pooling at the tail (identical math to pooling at collection —
       # mean over squares commutes). Mean-then-stack: avoids materializing a
@@ -564,6 +735,7 @@ class CeresNet(nn.Module):
       # Per-square: each square attends over its OWN depth trajectory. Depth loop
       # (static unroll under compile) avoids materializing a [B, L+1, 64, D] stack.
       _hn = [self.vda_norm(_hs) for _hs in vda_states]                     # (L+1) x [B, 64, D]
+      _hn_shared = _hn
       _vda_scores = torch.stack([torch.matmul(_h, self.vda_query) for _h in _hn],
                                 dim=-1) * (self.EMBEDDING_DIM ** -0.5)     # [B, 64, L+1]
       _vda_alpha = torch.softmax(_vda_scores, dim=-1)                      # [B, 64, L+1]
@@ -604,6 +776,39 @@ class CeresNet(nn.Module):
         # diagnostic than per-square entropy but comparable across modes.
         self._last_vda_alpha = _vda_alpha.detach().mean(dim=1).unsqueeze(-1)
 
+    # Policy depth attention (tier 1; see __init__). Reuses the vda-normed depth
+    # states when the vda branch already computed them (state reads paid once);
+    # otherwise norms them here (pda without vda, or vda mode 4 in eval). The
+    # policy-side flow gets its own depth context and a separate front-end pass
+    # produces fS_policy for the POLICY head only — mlh/unc/action/etc stay on
+    # fS_others. Zero-init vda_proj_p => fS_policy == fS_others at init.
+    fS_policy = fS_others
+    if self.pda_mode:
+      if _hn_shared is None:
+        _hn_shared = [self.vda_norm(_hs) for _hs in vda_states]
+      _pda_scores = torch.stack([torch.matmul(_h, self.vda_query_p) for _h in _hn_shared],
+                                dim=-1) * (self.EMBEDDING_DIM ** -0.5)     # [B, 64, L+1]
+      _pda_alpha = torch.softmax(_pda_scores, dim=-1)
+      _pctx = _pda_alpha[..., 0:1] * _hn_shared[0]
+      for _i in range(1, len(_hn_shared)):
+        _pctx = _pctx + _pda_alpha[..., _i:_i + 1] * _hn_shared[_i]        # [B, 64, D]
+      _flow_p = flow + self.vda_proj_p(_pctx)
+      fS_policy = self.headSharedLinear(self.headPremap(_flow_p).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      if self.training:
+        self._last_pda_alpha = _pda_alpha.detach().mean(dim=1).unsqueeze(-1)
+
+    # Depth probes (training-only; see __init__). Pooled per-depth states through
+    # the SHARED probe heads; final state (detached) through the ctl heads. Stash
+    # pattern — never part of the export signature.
+    if self.depth_probes_enabled and self.training:
+      _dp_pooled = torch.stack([_hs.mean(dim=1) for _hs in vda_states], dim=1)   # [B, L+1, D]
+      _dp_n = self.depth_probe_norm(_dp_pooled)
+      self._last_depth_probe_policy = self.depth_probe_policy(_dp_n)             # [B, L+1, 1858]
+      self._last_depth_probe_value = self.depth_probe_value(_dp_n)               # [B, L+1, 3]
+      _dp_fin = _dp_n[:, -1].detach()   # ctl heads: final state only, trunk NEVER shaped by them
+      self._last_depth_ctl_policy = self.depth_ctl_policy(_dp_fin)               # [B, 1858]
+      self._last_depth_ctl_value = self.depth_ctl_value(_dp_fin)                 # [B, 3]
+
     # Placement value head (aux, training-only; see __init__). Per-square WDL-logit
     # contributions summed over squares, stashed for compute_loss. Gated on
     # self.training so ONNX/TorchScript export (which runs under eval()) never
@@ -621,8 +826,8 @@ class CeresNet(nn.Module):
         st_contrib = self.stvalue_head(flow_aux_src)                               # [B, 64, 3]
         self._last_stvalue_out = st_contrib.sum(dim=1) + self.stvalue_bias         # [B, 3]
 
-    # Heads. Policy reads fS_others (= orig in value-only mode); value reads fS_value (with adapter).
-    policy_out = self.policy_head(fS_others)
+    # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
+    policy_out = self.policy_head(fS_policy)
     value_out = self.value_head(fS_value)
     value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_others)
@@ -763,6 +968,40 @@ class CeresNet(nn.Module):
       _aux_entropy = loss_calc.entropy(value_target) if SUBTRACT_ENTROPY else 0.0
       vda_aux_loss = loss_calc.ce_loss.forward(_vda_aux.float(), value_target) - _aux_entropy
 
+    # Depth probes (see __init__): mean-over-depths CE for the shared probes
+    # (weighted into total) + ctl-head losses (detached input -> gradients reach
+    # ONLY the ctl heads; added unweighted since they cannot touch the trunk).
+    # Same consume-and-clear + skip-on-gradnorm-pass conventions as vda_aux.
+    depth_probe_ploss = 0; depth_probe_vloss = 0; depth_ctl_ploss = 0; depth_ctl_vloss = 0
+    _dpp = getattr(self, '_last_depth_probe_policy', None)
+    if _dpp is not None and policy_out is not None and value_out is not None and not gradient_norm_logging_mode:
+      self._last_depth_probe_policy = None
+      _dpv = self._last_depth_probe_value; self._last_depth_probe_value = None
+      _dcp = self._last_depth_ctl_policy; self._last_depth_ctl_policy = None
+      _dcv = self._last_depth_ctl_value; self._last_depth_ctl_value = None
+      _L1 = _dpp.shape[1]
+      _legal = policy_target.greater(0)
+      _p_ent = loss_calc.entropy(policy_target) if SUBTRACT_ENTROPY else 0.0
+      _v_ent = loss_calc.entropy(value_target) if SUBTRACT_ENTROPY else 0.0
+      _dpp_m = torch.where(_legal.unsqueeze(1), _dpp, torch.full_like(_dpp, loss_calc.MASK_POLICY_VALUE))
+      _pt_rep = policy_target.unsqueeze(1).expand(-1, _L1, -1).reshape(-1, policy_target.shape[-1])
+      depth_probe_ploss = loss_calc.ce_loss.forward(_dpp_m.reshape(-1, _dpp.shape[-1]).float(), _pt_rep) - _p_ent
+      _vt_rep = value_target.unsqueeze(1).expand(-1, _L1, -1).reshape(-1, 3)
+      depth_probe_vloss = loss_calc.ce_loss.forward(_dpv.reshape(-1, 3).float(), _vt_rep) - _v_ent
+      _dcp_m = torch.where(_legal, _dcp, torch.full_like(_dcp, loss_calc.MASK_POLICY_VALUE))
+      depth_ctl_ploss = loss_calc.ce_loss.forward(_dcp_m.float(), policy_target) - _p_ent
+      depth_ctl_vloss = loss_calc.ce_loss.forward(_dcv.float(), value_target) - _v_ent
+      if log_stats:
+        # Per-depth curves — the core diagnostic: WHERE in the trunk does
+        # policy/value information become linearly decodable, and how does the
+        # profile move over training.
+        with torch.no_grad():
+          for _d in range(_L1):
+            self._log(f"depth_probe_policy_d{_d:02d}",
+                      loss_calc.ce_loss.forward(_dpp_m[:, _d].float(), policy_target) - _p_ent, step=num_pos)
+            self._log(f"depth_probe_value_d{_d:02d}",
+                      loss_calc.ce_loss.forward(_dpv[:, _d].float(), value_target) - _v_ent, step=num_pos)
+
     _pv_out = getattr(self, '_last_placement_value_out', None)
     if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
       self._last_placement_value_out = None
@@ -812,7 +1051,11 @@ class CeresNet(nn.Module):
         + self.placement_value_weight * placement_loss
         + self.survival_target_weight * survival_loss
         + self.stvalue_weight * stvalue_loss
-        + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0))
+        + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0)
+        + ((self.depth_probe_policy_weight * depth_probe_ploss
+            + self.depth_probe_value_weight * depth_probe_vloss
+            + depth_ctl_ploss + depth_ctl_vloss)
+           if not isinstance(depth_probe_ploss, int) else 0))
         
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -859,6 +1102,11 @@ class CeresNet(nn.Module):
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
       if self.vda_mode == 4 and not isinstance(vda_aux_loss, int):
         self._log("vda_aux_value_loss" + stat_suffix, vda_aux_loss, step=num_pos)
+      if not isinstance(depth_probe_ploss, int):
+        self._log("depth_probe_policy_loss" + stat_suffix, depth_probe_ploss, step=num_pos)
+        self._log("depth_probe_value_loss" + stat_suffix, depth_probe_vloss, step=num_pos)
+        self._log("depth_ctl_policy_loss" + stat_suffix, depth_ctl_ploss, step=num_pos)
+        self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
       if not gradient_norm_logging_mode:
         # Depth-attending value head diagnostics (see forward): WHICH depths does the
         # value head read? Logs batch-mean attention weight per depth state
@@ -886,6 +1134,16 @@ class CeresNet(nn.Module):
           for _d in range(_ag_mean.shape[0]):
             self._log(f"vda_alpha_g_d{_d:02d}", _ag_mean[_d], step=num_pos)
           self._log("vda_alpha_g_entropy", -(_ag * (_ag + 1e-9).log()).sum(dim=1).mean(), step=num_pos)
+        # PDA: policy-side depth profile (pda_alpha_*), square-averaged like vda's.
+        _pda_a = getattr(self, '_last_pda_alpha', None)
+        if _pda_a is not None:
+          self._last_pda_alpha = None
+          _pa = _pda_a.float().squeeze(-1)                   # [B, L+1]
+          _pa_mean = _pa.mean(dim=0)
+          for _d in range(_pa_mean.shape[0]):
+            self._log(f"pda_alpha_d{_d:02d}", _pa_mean[_d], step=num_pos)
+          self._log("pda_alpha_entropy", -(_pa * (_pa + 1e-9).log()).sum(dim=1).mean(), step=num_pos)
+          self._log("pda_alpha_mean_depth", (_pa * torch.arange(_pa.shape[1], device=_pa.device, dtype=_pa.dtype)).sum(dim=1).mean(), step=num_pos)
       self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
       self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
       self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)

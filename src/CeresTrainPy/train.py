@@ -309,7 +309,9 @@ def Train():
   if IS_DISTRIBUTED:
     device = torch.device(f"cuda:{DDP_LOCAL_GPU}")
   else:
-    device = torch.device(f"{accelerator}:{devices[0]}" if accelerator != 'cpu' else 'cpu')
+    # ExportOnly collapses `devices` to a bare int (line ~131, Fabric-era convention).
+    _dev0 = devices[0] if isinstance(devices, (list, tuple)) else devices
+    device = torch.device(f"{accelerator}:{_dev0}" if accelerator != 'cpu' else 'cpu')
   # Only rank 0 writes tensorboard/console; other ranks get a silent no-op writer.
   writer = SummaryWriter(os.path.join(OUTPUTS_DIR, 'tblogs', NAME)) if IS_MASTER else _NoOpWriter()
   # bf16-mixed: model weights are fp32, forward runs under autocast
@@ -762,7 +764,7 @@ def Train():
   # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
   # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
   if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
-      or getattr(core, 'stvalue_weight', 0) > 0) and WORLD_SIZE > 1:
+      or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)) and WORLD_SIZE > 1:
     raise NotImplementedError('placement/survival/stvalue aux heads are single-GPU only for now: '
                               'the stashed aux output is invisible to DDP\'s reducer')
 
@@ -895,7 +897,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -1198,7 +1200,11 @@ def Train():
       if config.Exec_ExportOnly:
         assert config.Opt_CheckpointResumeFromFileName is not None, "ExportOnly specified but no checkpoint file specified"
         print("Exporting to files with postexport suffix....")
-        save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, "postexport", True)
+        # Export OUTSIDE autocast: tracing under autocast(bf16) bakes BF16-typed
+        # ops into the ONNX graph (TRT's Mish importer rejects BF16); the regular
+        # interval saves run outside the autocast region and are clean.
+        with torch.amp.autocast('cuda', enabled=False):
+          save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, "postexport", True)
         print("INFO: EXIT_STATUS", "SUCCESS")
         exit(3)
 

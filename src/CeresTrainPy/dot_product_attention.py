@@ -420,7 +420,9 @@ class DotProductAttention(torch.nn.Module):
     H = torch.matmul(attn, V)
     return H, attn
 
-  def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None): # -> torch.Tensor, torch.Tensor:
+  def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None,
+                          Q_rpe:torch.Tensor = None, K_rpe:torch.Tensor = None,
+                          rpe_precomputed:bool = False): # -> torch.Tensor, torch.Tensor:
     # Note that scaling could be done separately on Q and K to possibly improve stability. See:
     #   https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/118
     #scaleDivisor = 1 # math.pow(self.d_k, 0.25) # apply sqrt twice since we are dividing twice
@@ -430,15 +432,28 @@ class DotProductAttention(torch.nn.Module):
     if self.use_qkv:
       scores = torch.matmul(Q, K.transpose(2, 3))
 
-    if self.use_rpe:
+    # rpe_precomputed (RPE-fromEmb ARCHITECTED serving graph): the QK rpe terms
+    # were computed in a generator phase by the parent (from static embedding
+    # content) and arrive via piece_relation_bias — skip the in-attention einsums
+    # entirely so the score path stays a plain fusable QK^T (+bias). rpe_v is
+    # intentionally skipped too (measured dead weight, pvsmoke8).
+    if self.use_rpe and not rpe_precomputed:
       rpe_q = self.rpe_q @ self.rpeFactorShared
       rpe_q = rpe_q.reshape(self.d_k * self.attention_multiplier, self.num_heads, 64, 64)
 
       rpe_k = self.rpe_k @ self.rpeFactorShared
       rpe_k = rpe_k.reshape(self.d_k * self.attention_multiplier, self.num_heads, 64, 64)
       
-      scores = scores + einsum(Q, rpe_q, "b h q d, d h q k->b h q k")
-      scores = scores + einsum(K, rpe_k, "b h k d, d h q k->b h q k")
+      # RPE-from-embedding experiment (2026-08): when Q_rpe/K_rpe are supplied
+      # (projections of the LAYER-0 embedding through this layer's own qkv
+      # weights), the RPE content-coupling reads STATIC input content instead of
+      # layer-computed content. Measures how much of RPE's win needs per-layer
+      # content — the discriminator between cheap once-materialized geometry
+      # gating and expensive per-layer schemes.
+      _Qr = Q if Q_rpe is None else Q_rpe
+      _Kr = K if K_rpe is None else K_rpe
+      scores = scores + einsum(_Qr, rpe_q, "b h q d, d h q k->b h q k")
+      scores = scores + einsum(_Kr, rpe_k, "b h k d, d h q k->b h q k")
       # consider using scaling below as (3 * self.d_k) due to extra terms
        
     if self.use_qkv:
@@ -476,7 +491,7 @@ class DotProductAttention(torch.nn.Module):
     # Get the weighted average of the values
     H = torch.matmul(A, V)
 
-    if self.use_rpe and self.use_rpe_v:
+    if self.use_rpe and self.use_rpe_v and not rpe_precomputed:
       rpe_v = self.rpe_v @ self.rpeFactorShared
       rpe_v = rpe_v.reshape(self.d_k * self.attention_multiplier, self.num_heads, 64, 64)
       
@@ -515,7 +530,8 @@ class DotProductAttention(torch.nn.Module):
 
 
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-              piece_relation_bias: torch.Tensor = None) -> torch.Tensor:
+              piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
+              rpe_precomputed: bool = False) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -569,6 +585,27 @@ class DotProductAttention(torch.nn.Module):
       Q = self.qLN(Q)
       K = self.kLN(K)
 
+    # RPE-from-embedding experiment: project the layer-0 embedding through THIS
+    # layer's own qkv weights and route the results into the RPE einsums only
+    # (zero new params; standard-path only). See sdp_and_smol_or_rpe.
+    Q_rpe = None; K_rpe = None
+    if self.use_rpe and rpe_src is not None:
+      assert self.use_qkv and not self.use_diff_attention, \
+        'rpe_src experiment: standard or nonlinear QKV paths only'
+      if self.use_nonlinear_attention:
+        qkv_e = self.qkv(rpe_src).reshape(batch_size, -1, 3, self.d_model * self.attention_multiplier)
+        qkv_e = torch.nn.functional.mish(self.qkvLN(qkv_e))
+        _qe, _ke, _ = torch.unbind(qkv_e, dim=-2)
+        Q_rpe = self.q2(_qe).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        K_rpe = self.k2(_ke).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+      else:
+        qkv_e = self.qkv(rpe_src)
+        qkv_e = qkv_e.reshape(batch_size, -1, self.num_heads, 3*self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+        Q_rpe, K_rpe, _ = qkv_e.chunk(3, dim=-1)
+      if self.use_qk_norm:
+        Q_rpe = self.qLN(Q_rpe)
+        K_rpe = self.kLN(K_rpe)
+
     if self.use_rope:
       # Apply rotation to Q and K (not V). Position info is intrinsic to
       # rotated Q/K — no bias addition needed. Stays on the fast SDPA path.
@@ -582,7 +619,7 @@ class DotProductAttention(torch.nn.Module):
         Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias)
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed)
     else:
       # Always route through the explicit Q·Kᵀ → softmax → ·V form. The previous
       # branch called torch.nn.functional.scaled_dot_product_attention, which
@@ -597,7 +634,7 @@ class DotProductAttention(torch.nn.Module):
         Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, None, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias)
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed)
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)

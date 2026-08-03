@@ -287,3 +287,93 @@ class PieceRelationBias(nn.Module):
         # Static bias is shape [num_heads, 64, 64] — broadcast-add to [B, ...].
         bias = dyn_bias + self.static_bias.unsqueeze(0).to(dtype)
         return bias
+
+
+def _build_ray_tables():
+    """Constants for blocker-aware ray attention:
+      ROOK_LINE  [64, 64]: i, j distinct and on the same rank or file
+      BISH_LINE  [64, 64]: i, j distinct and on the same diagonal/anti-diagonal
+      BETWEEN_T  [64, 4096]: BETWEEN_T[k, i*64+j] = 1 iff square k lies STRICTLY
+                 between i and j on a rook or bishop line (0 for non-colinear pairs).
+    """
+    rook = torch.zeros(64, 64)
+    bish = torch.zeros(64, 64)
+    between_t = torch.zeros(64, 64 * 64)
+    for i in range(64):
+        fi, ri = i % 8, i // 8
+        for j in range(64):
+            if i == j:
+                continue
+            fj, rj = j % 8, j // 8
+            df, dr = fj - fi, rj - ri
+            on_rook = (df == 0) or (dr == 0)
+            on_bish = abs(df) == abs(dr)
+            if not (on_rook or on_bish):
+                continue
+            if on_rook:
+                rook[i, j] = 1.0
+            else:
+                bish[i, j] = 1.0
+            sf = (df > 0) - (df < 0)
+            sr = (dr > 0) - (dr < 0)
+            f, r = fi + sf, ri + sr
+            while (f, r) != (fj, rj):
+                between_t[r * 8 + f, i * 64 + j] = 1.0
+                f, r = f + sf, r + sr
+    return rook, bish, between_t
+
+
+class RayAttentionBias(nn.Module):
+    """Blocker-aware sliding-piece attention bias, computed IN-GRAPH from the
+    13-channel piece one-hot (no new inputs -> no inference-side changes).
+
+    Six type-resolved dynamic channels per square pair (i, j):
+      w/b rook-line REAL attack   (R or Q on i, colinear, line clear)
+      w/b bishop-line REAL attack (B or Q on i, colinear, line clear)
+      w/b X-RAY                   (matching slider on i, colinear, EXACTLY ONE
+                                   blocker between -> the pin/skewer/discovery channel)
+
+    Blocker resolution is exact via integer counting: occ @ BETWEEN_T gives the
+    number of occupied squares strictly between each pair, so relu(1 - n) is a
+    0/1 'line clear' indicator and relu(1 - |n - 1|) is a 0/1 'exactly one
+    blocker' indicator. One [B,64]x[64,4096] matmul + elementwise ops; the bias
+    adds to attention logits like PieceRelationBias (fused-MHA-friendly).
+    """
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        rook, bish, between_t = _build_ray_tables()
+        self.register_buffer('ray_rook_line', rook, persistent=False)
+        self.register_buffer('ray_bish_line', bish, persistent=False)
+        self.register_buffer('ray_between_t', between_t, persistent=False)
+        self.ray_proj = nn.Linear(6, num_heads, bias=False)
+        nn.init.normal_(self.ray_proj.weight, mean=0.0, std=0.01)
+        self.num_heads = num_heads
+
+    def forward(self, piece_type_onehot: torch.Tensor) -> torch.Tensor:
+        """piece_type_onehot: [B, 64, 13] -> bias [B, num_heads, 64, 64]."""
+        dtype = piece_type_onehot.dtype
+        pt = piece_type_onehot
+        occ = 1.0 - pt[:, :, 0]                                    # [B, 64]
+        blocked = torch.matmul(occ, self.ray_between_t.to(dtype))  # [B, 4096] integer counts
+        clear = torch.relu(1.0 - blocked).reshape(-1, 64, 64)      # exactly 0 blockers
+        one_bl = torch.relu(1.0 - torch.abs(blocked - 1.0)).reshape(-1, 64, 64)  # exactly 1
+
+        rook_line = self.ray_rook_line.to(dtype)                   # [64, 64]
+        bish_line = self.ray_bish_line.to(dtype)
+        # sliders on i (one-hot channels: 1..6 = WP WN WB WR WQ WK, 7..12 = black)
+        w_rook = (pt[:, :, 4] + pt[:, :, 5]).unsqueeze(2)          # [B, 64, 1] (R + Q)
+        w_bish = (pt[:, :, 3] + pt[:, :, 5]).unsqueeze(2)          # (B + Q)
+        b_rook = (pt[:, :, 10] + pt[:, :, 11]).unsqueeze(2)
+        b_bish = (pt[:, :, 9] + pt[:, :, 11]).unsqueeze(2)
+
+        ch = torch.stack([
+            w_rook * rook_line * clear,
+            w_bish * bish_line * clear,
+            b_rook * rook_line * clear,
+            b_bish * bish_line * clear,
+            (w_rook * rook_line + w_bish * bish_line) * one_bl,
+            (b_rook * rook_line + b_bish * bish_line) * one_bl,
+        ], dim=3)                                                  # [B, 64, 64, 6]
+        bias = self.ray_proj(ch).permute(0, 3, 1, 2).contiguous()  # [B, H, 64, 64]
+        return bias
