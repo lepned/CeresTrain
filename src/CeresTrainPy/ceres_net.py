@@ -292,6 +292,39 @@ class CeresNet(nn.Module):
             f'{self.NUM_LAYERS + 1} pooled depth states (w_p={self.depth_probe_policy_weight}, '
             f'w_v={self.depth_probe_value_weight}) + detached ctl heads ({_n} params, training-only)')
 
+    # Ray-Context factored policy term (campaign idea 17 + reviewer fixes;
+    # CERES_RAY_CONTEXT: 1 = from-to bilinear + per-move bias only (de-confound
+    # arm), 2 = + ray terms). Added ZERO-INIT on top of the dense MLP policy
+    # head (rc_WT/u/v/w/btype all start 0 => exact no-op at init, no in-dist
+    # memorization regression risk). r_m pools LIVE post-norm square states over
+    # the move's between+behind line (R: pin/skewer/x-ray); d_m pools the rays
+    # VACATED by the move (R2: the reviewer's corrected discovery operator —
+    # non-collinear rays through from, since a move never vacates its own line).
+    # Constant-index Gathers + matmuls only: TRT/INT8-clean, no attention change.
+    self.ray_context_mode = int(os.environ.get('CERES_RAY_CONTEXT', '0') or 0)
+    if self.ray_context_mode > 0:
+      self.rc_dh = int(os.environ.get('CERES_RAY_CONTEXT_DH', '64') or 64)
+      from lc0_moves_1858 import FROM_1858, TO_1858
+      self.register_buffer('rc_from', torch.tensor(FROM_1858, dtype=torch.long), persistent=False)
+      self.register_buffer('rc_to', torch.tensor(TO_1858, dtype=torch.long), persistent=False)
+      self.rc_WF = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
+      self.rc_WT = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
+      nn.init.zeros_(self.rc_WT.weight)
+      self.rc_btype = nn.Parameter(torch.zeros(1858))
+      if self.ray_context_mode >= 2:
+        from chess_geometry import build_ray_context_tables
+        _R, _R2 = build_ray_context_tables(FROM_1858, TO_1858)
+        self.register_buffer('rc_R', _R, persistent=False)
+        self.register_buffer('rc_R2', _R2, persistent=False)
+        self.rc_WR = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
+        self.rc_WD = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
+        self.rc_u = nn.Parameter(torch.zeros(self.rc_dh))
+        self.rc_v = nn.Parameter(torch.zeros(self.rc_dh))
+        self.rc_w = nn.Parameter(torch.zeros(self.rc_dh))
+      print(f'[ceres_net] RAY-CONTEXT policy term enabled: mode {self.ray_context_mode} '
+            f'({"bilinear-only" if self.ray_context_mode == 1 else "bilinear+ray+discovery"}), '
+            f'dh={self.rc_dh}, zero-init additive')
+
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
     # each square's trunk embedding contributes a 3-vector of WDL logits; the position value is
@@ -828,6 +861,23 @@ class CeresNet(nn.Module):
 
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
+    if self.ray_context_mode > 0:
+      # Ray-context factored term (see __init__): every move's logit reads its
+      # own from/to square states — and in mode 2 the live contents of its ray
+      # (between+behind) and of the rays it vacates (discovery). `flow` here is
+      # the post-trunk_end_norm [B, 64, D] square state the heads read.
+      _rcF = self.rc_WF(flow)                                       # [B, 64, dh]
+      _rcT = self.rc_WT(flow)
+      _Fm = _rcF[:, self.rc_from]                                   # [B, 1858, dh]
+      _Tm = _rcT[:, self.rc_to]
+      _rc_add = (_Fm * _Tm).sum(-1) * (self.rc_dh ** -0.5) + self.rc_btype
+      if self.ray_context_mode >= 2:
+        _r = torch.matmul(self.rc_R.to(_rcF.dtype), self.rc_WR(flow))   # [B, 1858, dh]
+        _d = torch.matmul(self.rc_R2.to(_rcF.dtype), self.rc_WD(flow))
+        _rc_add = _rc_add + (_Fm * _r * self.rc_u).sum(-1) \
+                          + (_Tm * _r * self.rc_v).sum(-1) \
+                          + (_Fm * _d * self.rc_w).sum(-1)
+      policy_out = policy_out + _rc_add
     value_out = self.value_head(fS_value)
     value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_others)

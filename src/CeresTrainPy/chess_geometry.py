@@ -377,3 +377,54 @@ class RayAttentionBias(nn.Module):
         ], dim=3)                                                  # [B, 64, 64, 6]
         bias = self.ray_proj(ch).permute(0, 3, 1, 2).contiguous()  # [B, H, 64, 64]
         return bias
+
+
+def build_ray_context_tables(from_idx, to_idx):
+  """Constant per-move square-pooling operators for the ray-context policy term.
+
+  R  [1858, 64]: for collinear (queen-line) moves, the squares strictly BETWEEN
+     from and to plus the collinear extension BEHIND the from-square (pin/skewer/
+     x-ray geometry along the move's own line). All-zero for knight moves.
+  R2 [1858, 64]: the rays through the from-square NOT collinear with the move
+     direction — the rays actually VACATED by the move (discovery geometry; a
+     move never vacates its own line). For knights: all 8 rays.
+
+  Rows are mean-normalized; empty rows stay zero (clamp avoids 0/0 for the
+  knight/adjacent-move cases flagged in the campaign review).
+  Squares use lc0 indexing: a1=0 .. h8=63 (rank*8 + file).
+  """
+  DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+  n = len(from_idx)
+  R = torch.zeros(n, 64)
+  R2 = torch.zeros(n, 64)
+  for m in range(n):
+    fr, ff = divmod(from_idx[m], 8)
+    tr, tf = divmod(to_idx[m], 8)
+    dr, df = tr - fr, tf - ff
+    coll = None
+    if dr == 0 and df != 0:
+      coll = (0, 1 if df > 0 else -1)
+    elif df == 0 and dr != 0:
+      coll = (1 if dr > 0 else -1, 0)
+    elif dr != 0 and abs(dr) == abs(df):
+      coll = (1 if dr > 0 else -1, 1 if df > 0 else -1)
+    if coll is not None:
+      sr, sf = coll
+      r_, f_ = fr + sr, ff + sf
+      while (r_, f_) != (tr, tf):
+        R[m, r_ * 8 + f_] = 1.0
+        r_ += sr; f_ += sf
+      r_, f_ = fr - sr, ff - sf
+      while 0 <= r_ < 8 and 0 <= f_ < 8:
+        R[m, r_ * 8 + f_] = 1.0
+        r_ -= sr; f_ -= sf
+    for sr, sf in DIRS:
+      if coll is not None and (sr, sf) in (coll, (-coll[0], -coll[1])):
+        continue
+      r_, f_ = fr + sr, ff + sf
+      while 0 <= r_ < 8 and 0 <= f_ < 8:
+        R2[m, r_ * 8 + f_] = 1.0
+        r_ += sr; f_ += sf
+  R = R / R.sum(dim=1, keepdim=True).clamp(min=1.0)
+  R2 = R2 / R2.sum(dim=1, keepdim=True).clamp(min=1.0)
+  return R, R2

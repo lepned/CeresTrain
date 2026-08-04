@@ -423,6 +423,10 @@ def Train():
               decay.add(fpn)
           elif "vda_query" in fpn: # depth-attention pseudo-query (bare 1-D vector, bias-like)
               no_decay.add(fpn)
+          elif "rc_btype" in fpn or "rc_u" in fpn or "rc_v" in fpn or "rc_w" in fpn: # ray-context bare vectors (bias-like)
+              no_decay.add(fpn)
+          elif "rc_W" in fpn: # ray-context projections (plain Linear weights)
+              decay.add(fpn)
           elif ".mem_" in fpn:
               decay.add(fpn)
           elif "mlp.linear" in fpn:
@@ -897,7 +901,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
