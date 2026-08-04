@@ -325,6 +325,33 @@ class CeresNet(nn.Module):
             f'({"bilinear-only" if self.ray_context_mode == 1 else "bilinear+ray+discovery"}), '
             f'dh={self.rc_dh}, zero-init additive')
 
+    # Value-discrimination mechanisms for sharp/decisive corpora (value head
+    # collapses on puzzle-only data: near-uniform "decisive" labels destroy
+    # calibration, gates degenerate to ~1400-1700). Both are training-only.
+    #
+    # CERES_VALUE_RANK_WEIGHT: in-batch pairwise RANKING loss on value1 —
+    # calibration-free discrimination: positions whose targets differ must be
+    # ORDERED correctly by E[V], regardless of absolute probabilities. Solution
+    # lines alternate STM so puzzle batches contain abundant W/L contrast pairs.
+    #
+    # CERES_VALUE_CONTRAST_WEIGHT: aux per-move WDL head ("policy teaches
+    # value"): the solution move inherits the record's (search-)WDL, every
+    # other LEGAL move is labeled pure LOSS-for-STM (correct across win,
+    # draw-defense, and defender-side records of solution-line expansion —
+    # see the label-rule comment in compute_loss). Gives the trunk per-move
+    # outcome contrast the plain value CE never provides; value1/value2 read
+    # the shaped trunk. Head is training-only (never in the export graph).
+    # NB: measured NEUTRAL on the puzzle value gate at 10M (but that gate
+    # evaluates depth-1 child positions the corpus never trains on).
+    self.value_rank_weight = float(os.environ.get('CERES_VALUE_RANK_WEIGHT', '0') or 0)
+    if self.value_rank_weight > 0:
+      print(f'[ceres_net] VALUE RANK loss enabled: in-batch pairwise ordering, w={self.value_rank_weight}')
+    self.value_contrast_weight = float(os.environ.get('CERES_VALUE_CONTRAST_WEIGHT', '0') or 0)
+    if self.value_contrast_weight > 0:
+      self.vc_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 1858 * 3, 0)
+      print(f'[ceres_net] VALUE CONTRAST aux head enabled: per-move WDL from puzzle '
+            f'policy targets (training-only), w={self.value_contrast_weight}')
+
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
     # each square's trunk embedding contributes a 3-vector of WDL logits; the position value is
@@ -859,6 +886,11 @@ class CeresNet(nn.Module):
         st_contrib = self.stvalue_head(flow_aux_src)                               # [B, 64, 3]
         self._last_stvalue_out = st_contrib.sum(dim=1) + self.stvalue_bias         # [B, 3]
 
+    # Value-contrast aux head (see __init__): training-only stash, never in the
+    # export graph (same gating pattern as the placement/survival aux heads).
+    if self.value_contrast_weight > 0 and self.training:
+      self._last_vc_out = self.vc_head(fS_others).reshape(-1, 1858, 3)
+
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
     if self.ray_context_mode > 0:
@@ -976,6 +1008,44 @@ class CeresNet(nn.Module):
 
     p_loss = 0 if policy_out is None else loss_calc.policy_loss(policy_target, policy_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.policy_loss_weight)
     v_loss = 0 if value_out is None else loss_calc.value_loss(value_target, value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_loss_weight, provenance=z_provenance)
+
+    # Value RANK loss (see __init__): calibration-free in-batch ordering of
+    # E[V] = p(w) - p(l) against the target margin. Only pairs whose targets
+    # genuinely differ (|dt| > 0.2) participate; hinge margin 0.1.
+    value_rank_loss = 0
+    if self.value_rank_weight > 0 and value_out is not None and not gradient_norm_logging_mode:
+      _vr_p = torch.softmax(value_out.float(), dim=-1)
+      _vr_s = _vr_p[:, 0] - _vr_p[:, 2]
+      _vr_t = (value_target[:, 0] - value_target[:, 2]).float()
+      _vr_dt = _vr_t.unsqueeze(0) - _vr_t.unsqueeze(1)                       # [B, B]
+      _vr_ds = _vr_s.unsqueeze(0) - _vr_s.unsqueeze(1)
+      _vr_m = (_vr_dt.abs() > 0.2).float()
+      value_rank_loss = (torch.relu(0.1 - _vr_ds * torch.sign(_vr_dt)) * _vr_m).sum() \
+          / _vr_m.sum().clamp(min=1.0)
+
+    # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
+    # the record's WDL, every other legal move is labeled LOSS-for-STM.
+    # The loss-vector label (not a flip of the record WDL) is correct across
+    # all three record classes in solution-line-expanded puzzle data: winning
+    # side deviates -> ~loss (sharp positions); drawish DEFENSE puzzles (~5%,
+    # user obs.) -> failing the only defense loses (a flip of a draw would
+    # wrongly stay a draw); defender-side records in the line -> every move
+    # still loses (a flip would wrongly label them WINS). Non-solution moves
+    # are the heuristic side of the label, so they get 1/4 weight.
+    vc_loss = 0
+    _vc = getattr(self, '_last_vc_out', None)
+    if _vc is not None and not gradient_norm_logging_mode:
+      self._last_vc_out = None
+      _vc_legal = policy_target > 0                                          # [B, 1858]
+      _vc_sol = policy_target.argmax(dim=-1)                                 # [B]
+      _vc_lab = torch.zeros_like(value_target).unsqueeze(1).expand(-1, 1858, -1).clone()
+      _vc_lab[:, :, 2] = 1.0                                                 # loss-for-STM everywhere...
+      _vc_ar = torch.arange(_vc_lab.shape[0], device=_vc_lab.device)
+      _vc_lab[_vc_ar, _vc_sol] = value_target                                # ...except the solution
+      _vc_ce = -(_vc_lab * torch.log_softmax(_vc.float(), dim=-1)).sum(-1)   # [B, 1858]
+      _vc_w = _vc_legal.float() * 0.25
+      _vc_w[_vc_ar, _vc_sol] = 1.0
+      vc_loss = (_vc_ce * _vc_w).sum() / _vc_w.sum().clamp(min=1.0)
     v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
@@ -1105,7 +1175,9 @@ class CeresNet(nn.Module):
         + ((self.depth_probe_policy_weight * depth_probe_ploss
             + self.depth_probe_value_weight * depth_probe_vloss
             + depth_ctl_ploss + depth_ctl_vloss)
-           if not isinstance(depth_probe_ploss, int) else 0))
+           if not isinstance(depth_probe_ploss, int) else 0)
+        + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
+        + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0))
         
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -1155,6 +1227,10 @@ class CeresNet(nn.Module):
       if not isinstance(depth_probe_ploss, int):
         self._log("depth_probe_policy_loss" + stat_suffix, depth_probe_ploss, step=num_pos)
         self._log("depth_probe_value_loss" + stat_suffix, depth_probe_vloss, step=num_pos)
+      if not isinstance(value_rank_loss, int):
+        self._log("value_rank_loss" + stat_suffix, value_rank_loss, step=num_pos)
+      if not isinstance(vc_loss, int):
+        self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
         self._log("depth_ctl_policy_loss" + stat_suffix, depth_ctl_ploss, step=num_pos)
         self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
       if not gradient_norm_logging_mode:

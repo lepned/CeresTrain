@@ -182,6 +182,40 @@ if _POLICY_TARGET_ALPHA > 0:
 # probability CERES_KEEP_DRAW_PROB (default 1.0 = off). Counters draw-saturation of strong
 # self-play data (e.g. 0.40 lifts decisive share ~28% -> ~50%). Draw class = argmax(wdl_q)==1.
 _KEEP_DRAW_PROB = float(os.environ.get('CERES_KEEP_DRAW_PROB', '1.0'))
+
+# File-mirror augmentation (CERES_FILE_MIRROR_AUG = per-record probability,
+# default 0 = off). Mirrors files a<->h: genuinely NEW input planes (unlike
+# color-flip augmentation, which the side-to-move-relative encoding cancels to
+# byte-identical inputs — measured 52% input-plane duplicates in the _aug
+# puzzle corpus). Gated per record on castling rights: any of the four
+# castling-rights flags set => record passes through unmirrored (castling
+# geometry is not file-symmetric; rights can never return, so a no-rights
+# position is exactly mirror-symmetric in value and policy). Measured 95%
+# of the puzzle corpus eligible. Transform: permute squares (r,f)->(r,7-f),
+# reverse the file-encoding one-hot (channels 129..136), remap sparse policy
+# indices through the mirrored lc0-1858 move table. Rank encoding, WDL and
+# all scalar targets are unchanged.
+_FILE_MIRROR_PROB = float(os.environ.get('CERES_FILE_MIRROR_AUG', '0') or 0)
+_MIRROR_PERM64 = None
+_MIRROR_PERM1858 = None
+
+def _ensure_mirror_tables():
+  global _MIRROR_PERM64, _MIRROR_PERM1858
+  if _MIRROR_PERM64 is not None:
+    return
+  from lc0_moves_1858 import MOVES_1858
+  _MIRROR_PERM64 = np.array([(sq // 8) * 8 + (7 - sq % 8) for sq in range(64)], dtype=np.int64)
+  _mf = {c: chr(ord('a') + ord('h') - ord(c)) for c in 'abcdefgh'}
+  _midx = {m: i for i, m in enumerate(MOVES_1858)}
+  def _mirror_uci(u):
+    return _mf[u[0]] + u[1] + _mf[u[2]] + u[3] + (u[4:] if len(u) > 4 else '')
+  _MIRROR_PERM1858 = np.array([_midx[_mirror_uci(m)] for m in MOVES_1858], dtype=np.int64)
+  assert (_MIRROR_PERM1858[_MIRROR_PERM1858] == np.arange(1858)).all(), 'mirror perm must be an involution'
+
+if _FILE_MIRROR_PROB > 0.0:
+  _ensure_mirror_tables()
+  print(f'[tpg_dataset] FILE-MIRROR augmentation enabled (module default): p={_FILE_MIRROR_PROB} '
+        f'(castling-rights records exempt)')
 if _KEEP_DRAW_PROB < 1.0:
   print(f"[tpg_dataset] decisive oversampling: keep_draw_prob = {_KEEP_DRAW_PROB}")
 
@@ -219,12 +253,22 @@ class TPGDataset(Dataset):
                test : bool = False,
                square_bytes : int = None,
                sidecar_mode : str = None,
-               v7x_mode : str = None):
+               v7x_mode : str = None,
+               file_mirror_prob : float = None):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
     self.wdl_smoothing = wdl_smoothing
     self.num_workers = num_workers
+    # Per-dataset file-mirror probability (default = process-wide
+    # CERES_FILE_MIRROR_AUG). Lets a mixed recipe mirror the puzzle secondary
+    # while leaving the game primary untouched (mirror on game data is
+    # theoretically sound but untested at scale).
+    self.file_mirror_prob = float(file_mirror_prob) if file_mirror_prob is not None else _FILE_MIRROR_PROB
+    if self.file_mirror_prob > 0.0:
+      _ensure_mirror_tables()
+      if self.file_mirror_prob != _FILE_MIRROR_PROB:
+        print(f'[tpg_dataset] {root_dir}: file-mirror override: p={self.file_mirror_prob}')
     # Per-dataset shard record format (137 = upstream V2, 141 = V3 with baked aux).
     # Default = the process-wide CERES_TPG_SQUARE_BYTES; override per dataset to mix
     # e.g. a V3 primary with a V2 secondary. A 137-byte dataset carries no aux bytes,
@@ -608,6 +652,24 @@ class TPGDataset(Dataset):
                   if v7x is not None:
                     v7x = tuple(a[_keep] for a in v7x)
 
+              # File-mirror augmentation (see module header). Eligibility read
+              # from square 0's castling flags (channels 112-115, replicated
+              # across squares; post-DIVISOR floats, zero iff no rights).
+              if self.file_mirror_prob > 0.0:
+                _elig = squares[:, 0, 112:116].sum(axis=-1) == 0
+                _sel = _elig & (np.random.random(squares.shape[0]) < self.file_mirror_prob)
+                if _sel.any():
+                  _ms = squares[_sel][:, _MIRROR_PERM64, :]
+                  _ms[:, :, 129:137] = _ms[:, :, 129:137][:, :, ::-1]
+                  squares[_sel] = _ms
+                  policies_indices[_sel] = _MIRROR_PERM1858[policies_indices[_sel]].astype(np.int16)
+                  _pip = policy_index_in_parent[_sel]
+                  _pipv = (_pip >= 0) & (_pip < 1858)
+                  _pip[_pipv] = _MIRROR_PERM1858[_pip[_pipv]].astype(np.int16)
+                  policy_index_in_parent[_sel] = _pip
+                  if survival is not None:
+                    survival[_sel] = survival[_sel][:, _MIRROR_PERM64]
+
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,
                        uncertainty_policy, survival, v7x))
@@ -698,7 +760,8 @@ class TPGMixedDataset(Dataset):
   shared). At the dataset level the ratio is honoured per-worker; aggregate ratio
   across all workers is the same.
   """
-  def __init__(self, primary, secondary=None, ratio_1_to_2: int = 0):
+  def __init__(self, primary, secondary=None, ratio_1_to_2: int = 0,
+               prologue_batches_per_worker: int = 0):
     self.primary = primary
     if secondary is not None and ratio_1_to_2 > 0:
       self.secondary = secondary
@@ -707,6 +770,13 @@ class TPGMixedDataset(Dataset):
       self.secondary = None
       self.ratio = 0
     self.counter = 0
+    # Curriculum prologue: each worker serves ONLY secondary batches for its
+    # first N batches (single-run puzzle-first curriculum — no restart between
+    # prologue and main phase; combined with CERES_SECONDARY_LOSS_*_MULT the
+    # prologue is e.g. policy-only automatically). Computed by the trainer as
+    # prologue_positions / (batch_size * world_size * num_workers); boundary
+    # precision is ± a few prefetched batches, which is immaterial.
+    self.prologue = int(prologue_batches_per_worker) if self.secondary is not None else 0
 
   def __len__(self):
     return self.primary.__len__()
@@ -716,20 +786,26 @@ class TPGMixedDataset(Dataset):
     if self.secondary is not None:
       self.secondary.set_worker_id(worker_id)
 
+  def _tagged_secondary(self, idx):
+    item = self.secondary[idx]
+    # Tag so the trainer can apply per-stream loss multipliers (see train.py
+    # CERES_SECONDARY_LOSS_*_MULT). Plain bool survives DataLoader passthrough
+    # (batch_size=None) and _move_batch_to_device (non-tensor leaves returned as-is).
+    for board_dict in item:
+      board_dict['is_secondary'] = True
+    return item
+
   def __getitem__(self, idx):
     if self.secondary is None:
       return self.primary[idx]
+    if self.counter < self.prologue:
+      self.counter += 1
+      return self._tagged_secondary(idx)
     # Cycle of length (ratio+1): positions 0..ratio-1 are primary; position ratio is secondary.
-    cycle_pos = self.counter % (self.ratio + 1)
+    cycle_pos = (self.counter - self.prologue) % (self.ratio + 1)
     self.counter += 1
     if cycle_pos == self.ratio:
-      item = self.secondary[idx]
-      # Tag so the trainer can apply per-stream loss multipliers (see train.py
-      # CERES_SECONDARY_LOSS_*_MULT). Plain bool survives DataLoader passthrough
-      # (batch_size=None) and _move_batch_to_device (non-tensor leaves returned as-is).
-      for board_dict in item:
-        board_dict['is_secondary'] = True
-      return item
+      return self._tagged_secondary(idx)
     return self.primary[idx]
 
 

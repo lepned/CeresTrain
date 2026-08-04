@@ -12,6 +12,7 @@ If not, see <http://www.gnu.org/licenses/>.
 # End of License Notice
 
 import os
+import re
 import fnmatch
 import sys
 import socket
@@ -690,9 +691,19 @@ def Train():
   # Requires batch_size_forward divisible by world_size and >= world_size files.
   world_size = WORLD_SIZE
   rank = RANK
+  # Per-stream file-mirror override (default: both streams inherit the global
+  # CERES_FILE_MIRROR_AUG). E.g. mirror only the puzzle secondary in a mixed run:
+  #   CERES_FILE_MIRROR_AUG_PRIMARY=0 CERES_FILE_MIRROR_AUG_SECONDARY=0.5
+  def _opt_env_float0(name):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, '') else None
+  _MIRROR_PRIMARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_PRIMARY')
+  _MIRROR_SECONDARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_SECONDARY')
+
   primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
                                rank, world_size, NUM_DATASET_WORKERS,
-                               BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag)
+                               BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
+                               file_mirror_prob=_MIRROR_PRIMARY)
 
   # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
   # Triggered when both Data_TrainingFilesDirectory2 is set AND Data_RatioSet1ToSet2 > 0.
@@ -717,7 +728,8 @@ def Train():
                                    rank, world_size, NUM_DATASET_WORKERS,
                                    BOARDS_PER_BATCH, 0, config.Exec_TestFlag,
                                    square_bytes=_sec_square_bytes,
-                                   sidecar_mode=_sec_sidecar_mode)
+                                   sidecar_mode=_sec_sidecar_mode,
+                                   file_mirror_prob=_MIRROR_SECONDARY)
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
     print(f'[mixed-dataset] ratio = {config.Data_RatioSet1ToSet2}:1 (primary:secondary batches)')
@@ -817,8 +829,37 @@ def Train():
       if not _any_v7x:
         raise ValueError(f'CERES_TPG_V7X_SIDECAR=auto but no .v7x.zst sidecars found in any dataset dir: {_dirs}')
 
+  # Curriculum prologue (CERES_MIX_PROLOGUE_POSITIONS): serve ONLY secondary
+  # (e.g. puzzle) batches for the first N positions, then switch to the normal
+  # ratio cycle — single-run curriculum, no restart. Combined with
+  # CERES_SECONDARY_LOSS_VALUE_MULT=0 etc., the prologue (and all later replay
+  # batches) are automatically policy-only. On RESUME the already-trained
+  # position count is parsed from the checkpoint filename's trailing number and
+  # subtracted; if parsing fails the prologue is SKIPPED entirely (safe default:
+  # resumes virtually always happen after the prologue, and replaying puzzle-only
+  # batches mid-main-phase would be far worse than skipping).
+  _PROLOGUE_POS = int(float(os.environ.get('CERES_MIX_PROLOGUE_POSITIONS', '0') or 0))
+  _prologue_per_worker = 0
+  if _PROLOGUE_POS > 0 and secondary_dataset is not None:
+    _resume_pos = 0
+    _resume_fn = getattr(config, 'Opt_CheckpointResumeFromFileName', None)
+    if _resume_fn:
+      _m = re.search(r'_(\d+)$', os.path.basename(_resume_fn))
+      if _m:
+        _resume_pos = int(_m.group(1))
+      else:
+        print(f'[mixed-dataset] WARNING: cannot parse position count from resume checkpoint '
+              f'{_resume_fn!r} — SKIPPING prologue on this (re)start.')
+        _resume_pos = _PROLOGUE_POS
+    _remaining = max(0, _PROLOGUE_POS - _resume_pos)
+    _workers_eff = max(1, NUM_DATASET_WORKERS)
+    _prologue_per_worker = _remaining // (batch_size_forward * _workers_eff)
+    print(f'[mixed-dataset] curriculum prologue: {_remaining} positions secondary-only '
+          f'({_prologue_per_worker} batches/worker x {_workers_eff} workers x {world_size} ranks)')
+
   dataset = TPGMixedDataset(primary_dataset, secondary_dataset,
-                            int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0))
+                            int(getattr(config, 'Data_RatioSet1ToSet2', 0) or 0),
+                            prologue_batches_per_worker=_prologue_per_worker)
 
   dataloader = DataLoader(dataset, batch_size=None, pin_memory=True, num_workers=NUM_DATASET_WORKERS, worker_init_fn=worker_init_fn, prefetch_factor=PREFETCH_FACTOR)
   # NOTE: previously wrapped with fabric.setup_dataloaders to auto-move batches to
@@ -901,7 +942,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
