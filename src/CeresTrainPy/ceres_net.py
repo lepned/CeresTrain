@@ -1210,7 +1210,12 @@ class CeresNet(nn.Module):
         _op_masked = torch.where(_op_legal, _opt.float(), torch.full_like(_opt.float(), -1e4))
         _op_lp = torch.log_softmax(_op_masked, dim=-1)
         _op_ce = -(policy_target.float() * _op_lp).sum(-1)
-        opt_loss = (_op_w * _op_ce).sum() / _op_w.sum().clamp_min(1e-6)
+        # lc0 semantics: plain mean of w*CE — SELF-GATING (mean weight ~0.003
+        # early, so the term is nearly silent until genuinely many positions
+        # are undervalued). The earlier weight-NORMALIZED mean turned this
+        # into a full-CE-scale term from step one (~3.0 weighted mass, 2x the
+        # policy loss) and destabilized the s7 preflight at peak LR.
+        opt_loss = (_op_w * _op_ce).mean()
 
     v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)

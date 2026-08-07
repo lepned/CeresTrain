@@ -674,7 +674,7 @@ def Train():
     # After warmup phase, the LR is held constant until some fraction of training is complete
     # and thereafter ramps down using a truncated consine decay, terminating around 0.10
     FRAC_START_DECAY = config.Opt_LRBeginDecayAtFractionComplete
-    MIN_LR = 0.05
+    MIN_LR = float(getattr(config, 'Opt_LRMinFactor', 0.05) or 0.05)
     WARMUP_POS = num_warmup_positions()
 
     if num_pos < WARMUP_POS:
@@ -683,6 +683,11 @@ def Train():
       return 1.0
     elif fraction_complete > 1:
       return MIN_LR # shouldn't happen
+    elif getattr(config, 'Opt_LRDecayShape', 'linear') == 'cosine':
+      # half-cosine decay to MIN_LR (reference no-plateau shape when
+      # FRAC_START_DECAY == 0: warmup then cosine over the entire run)
+      _prog = (fraction_complete - FRAC_START_DECAY) / (1.0 - FRAC_START_DECAY)
+      return MIN_LR + (1.0 - MIN_LR) * 0.5 * (1.0 + math.cos(math.pi * _prog))
     else:
       # linear deacay to MIN_LR
       slope = (MIN_LR - 1.0) / (1.0 - FRAC_START_DECAY)

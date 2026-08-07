@@ -126,6 +126,16 @@ class Configuration:
     self.Opt_PyTorchCompileMode = config_opt.get('PyTorchCompileMode', "max-autotune")
     self.Opt_WeightDecay = config_opt.get('WeightDecay', 0.01)
     self.Opt_LearningRateBase = config_opt.get('LearningRateBase', 0.0005)
+    # LR-decay shape and floor (TRAINING_RECOMMENDATIONS.md §4). 'linear'
+    # (default) = legacy behavior; 'cosine' = half-cosine from the decay start
+    # to the floor — combined with LRBeginDecayAtFractionComplete 0.0 this is
+    # the reference no-plateau shape (warmup, then cosine over the whole run).
+    # LRMinFactor = floor as a fraction of peak (legacy hardcoded 0.05;
+    # reference practice 0.10).
+    self.Opt_LRDecayShape = (config_opt.get('LRDecayShape', 'linear') or 'linear').strip().lower()
+    assert self.Opt_LRDecayShape in ('linear', 'cosine'), f"LRDecayShape must be 'linear' or 'cosine', got {self.Opt_LRDecayShape!r}"
+    _lrmf = config_opt.get('LRMinFactor')   # (_cfg_num is defined further down)
+    self.Opt_LRMinFactor = 0.05 if _lrmf is None else float(_lrmf)
     # Split-LR (Muon only): separate absolute rate for the internal-AdamW group
     # (heads/embeddings/norms/biases); the Muon trunk keeps LearningRateBase.
     # None/absent = legacy single-rate. CONFIG-ONLY (no env override by design).
