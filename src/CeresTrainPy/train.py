@@ -31,6 +31,7 @@ import json as _bootstrap_json
 # mismatch). Precedence: a key PRESENT in the config overrides the env
 # (config authoritative); absent keys leave the env untouched (fallback).
 _BOOTSTRAP_ENV_MAP = {
+    # data format / sidecars
     'TPGV3': 'CERES_TPG_V3',
     'AuxFeaturesPerSquare': 'CERES_AUX_FEATURES_PER_SQUARE',
     'TargetSidecar': 'CERES_TPG_TARGET_SIDECAR',
@@ -39,6 +40,17 @@ _BOOTSTRAP_ENV_MAP = {
     'SurvivalTargetWeight': 'CERES_SURVIVAL_TARGET_WEIGHT',
     'SurvivalLossBuckets': 'CERES_SURVIVAL_LOSS_BUCKETS',
     'SurvivalCaptureWeight': 'CERES_SURVIVAL_CAPTURE_WEIGHT',
+    # stream routing / data augmentation
+    'SecondaryLossPolicyMult': 'CERES_SECONDARY_LOSS_POLICY_MULT',
+    'SecondaryLossValueMult': 'CERES_SECONDARY_LOSS_VALUE_MULT',
+    'SecondaryLossValue2Mult': 'CERES_SECONDARY_LOSS_VALUE2_MULT',
+    'SecondaryLossAuxMult': 'CERES_SECONDARY_LOSS_AUX_MULT',
+    'SecondaryLossPlacementMult': 'CERES_SECONDARY_LOSS_PLACEMENT_MULT',
+    'SecondaryLossSurvivalMult': 'CERES_SECONDARY_LOSS_SURVIVAL_MULT',
+    'SecondaryLossStvalueMult': 'CERES_SECONDARY_LOSS_STVALUE_MULT',
+    'MixProloguePositions': 'CERES_MIX_PROLOGUE_POSITIONS',
+    'FileMirrorAug': 'CERES_FILE_MIRROR_AUG',
+    'KeepDrawProb': 'CERES_KEEP_DRAW_PROB',
 }
 try:
   if len(sys.argv) > 2:
@@ -49,6 +61,14 @@ try:
         if _bs_key in _bs_cfg and _bs_cfg[_bs_key] is not None:
           os.environ[_bs_env] = str(_bs_cfg[_bs_key])
           print(f'[bootstrap] {_bs_env}={_bs_cfg[_bs_key]} (from config {_bs_key})')
+      # Generic escape hatch: an "Env" dict in the config is bridged verbatim
+      # (applied AFTER the friendly names, so Env wins on collision). Lets ANY
+      # env-gated knob — arch flags, probes, one-off experiment switches —
+      # live in the run's config without per-variable mapping maintenance.
+      for _bs_k, _bs_v in (_bs_cfg.get('Env') or {}).items():
+        if _bs_v is not None:
+          os.environ[str(_bs_k)] = str(_bs_v)
+          print(f'[bootstrap] {_bs_k}={_bs_v} (from config Env)')
 except Exception as _bs_e:  # never let the bootstrap kill a legacy env-driven run
   print(f'[bootstrap] WARNING: config->env bridge failed ({_bs_e}); using env as-is')
 # ---------------------------------------------------------------------------
