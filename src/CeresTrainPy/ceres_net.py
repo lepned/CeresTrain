@@ -343,9 +343,12 @@ class CeresNet(nn.Module):
     # CERES_SOFT_POLICY_TEMP, default 4): dense gradient on the move-ordering
     # tail + anti-overconfidence regularization, inherited by the main policy
     # head through the shared trunk. Training-only; never in the export graph.
-    self.soft_policy_weight = float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0)
+    # Config-first, env-fallback (same contract as mirror/focal — config.py).
+    self.soft_policy_weight = (float(getattr(config, 'Opt_SoftPolicyWeight', 0) or 0)
+                               or float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0))
     if self.soft_policy_weight > 0:
-      self.soft_policy_temp = float(os.environ.get('CERES_SOFT_POLICY_TEMP', '4') or 4)
+      self.soft_policy_temp = (float(getattr(config, 'Opt_SoftPolicyTemp', 0) or 0)
+                               or float(os.environ.get('CERES_SOFT_POLICY_TEMP', '4') or 4))
       self.sp_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, 0)
       print(f'[ceres_net] SOFT-POLICY aux head enabled: T={self.soft_policy_temp}, '
             f'w={self.soft_policy_weight} (training-only)')
@@ -386,6 +389,33 @@ class CeresNet(nn.Module):
     # sigma = SigmaScale * bucket_width smooths the target over neighboring
     # buckets (the "HL-Gauss" part — lc0's one-hot bucket variant is the
     # degenerate sigma->0 case). No new data: target derives from wdl_q blend.
+    # Optimistic-policy aux head (config: OptimisticPolicyWeight/Strength/
+    # Alpha — see config.py). Separate training-only policy head (the vanilla
+    # policy head keeps its full CE): per-sample weight sigmoid((z-S)*A),
+    # z = (target_q - q_pred)/(sigma + 1e-5), sigma from the unc head
+    # (assumed |error|-scale; a scale mismatch only shifts effective S).
+    # Both q_pred and sigma are DETACHED (lc0 propagate_value_gradients=false).
+    self.opt_policy_weight = float(getattr(config, 'Opt_OptimisticPolicyWeight', 0) or 0)
+    self.opt_serve_blend = float(getattr(config, 'Opt_OptimisticPolicyServeBlend', 0) or 0)
+    assert self.opt_serve_blend == 0 or self.opt_policy_weight > 0, \
+      'OptimisticPolicyServeBlend requires OptimisticPolicyWeight > 0 (the head must exist)'
+    # Soft-policy serve blend: same mechanism for the KataGo soft-policy head.
+    # The two compose as a three-way logit blend:
+    #   policy = (1 - l_opt - l_soft)*vanilla + l_opt*optimistic + l_soft*soft
+    self.soft_serve_blend = float(getattr(config, 'Opt_SoftPolicyServeBlend', 0) or 0)
+    assert self.soft_serve_blend == 0 or self.soft_policy_weight > 0, \
+      'SoftPolicyServeBlend requires SoftPolicyWeight/CERES_SOFT_POLICY_WEIGHT > 0 (the head must exist)'
+    assert 0.0 <= self.opt_serve_blend and 0.0 <= self.soft_serve_blend \
+        and self.opt_serve_blend + self.soft_serve_blend <= 1.0, \
+      'OptimisticPolicyServeBlend + SoftPolicyServeBlend must lie in [0, 1]'
+    if self.opt_policy_weight > 0:
+      self.opt_strength = float(getattr(config, 'Opt_OptimisticPolicyStrength', 2.0))
+      self.opt_alpha = float(getattr(config, 'Opt_OptimisticPolicyAlpha', 3.0))
+      self.opt_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, 0)
+      _serve_txt = f', SERVE-BLEND lambda={self.opt_serve_blend} (in export graph!)' if self.opt_serve_blend > 0 else ' (training-only)'
+      print(f'[ceres_net] OPTIMISTIC-POLICY aux head enabled: w={self.opt_policy_weight}, '
+            f'strength={self.opt_strength}, alpha={self.opt_alpha}{_serve_txt}')
+
     self.hlg_weight = float(getattr(config, 'Opt_HLGaussWeight', 0) or 0)
     if self.hlg_weight > 0:
       self.hlg_buckets = int(getattr(config, 'Opt_HLGaussBuckets', 32) or 32)
@@ -944,8 +974,23 @@ class CeresNet(nn.Module):
     if self.hlg_weight > 0 and self.training:
       self._last_hlg_out = self.hlg_head(fS_value)
 
+    # Optimistic-policy aux head (see __init__): training-only stash.
+    if self.opt_policy_weight > 0 and self.training:
+      self._last_opt_out = self.opt_head(fS_policy)
+
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
+
+    # Policy SERVE blend (see __init__): eval/export mode only — three-way
+    # logit-space mix of vanilla / optimistic / soft heads, applied BEFORE the
+    # ray-context add so rc stays unscaled at any lambda. Training untouched.
+    if (self.opt_serve_blend > 0 or self.soft_serve_blend > 0) and not self.training:
+      _pol_blend = (1.0 - self.opt_serve_blend - self.soft_serve_blend) * policy_out
+      if self.opt_serve_blend > 0:
+        _pol_blend = _pol_blend + self.opt_serve_blend * self.opt_head(fS_policy)
+      if self.soft_serve_blend > 0:
+        _pol_blend = _pol_blend + self.soft_serve_blend * self.sp_head(fS_policy)
+      policy_out = _pol_blend
     if self.ray_context_mode > 0:
       # Ray-context factored term (see __init__): every move's logit reads its
       # own from/to square states — and in mode 2 the live contents of its ray
@@ -1145,6 +1190,28 @@ class CeresNet(nn.Module):
       _hpc = _hp.clamp_min(1e-9)
       hlg_loss = (-(_hp * _hlp).sum(-1) + (_hpc * _hpc.log()).sum(-1)).mean()
 
+    # Optimistic-policy aux loss (see __init__): masked per-sample CE on the
+    # aux head, weighted toward positions where value1 UNDERESTIMATES the
+    # target in units of the unc head's predicted error. Weight-normalized so
+    # the logged number stays a per-effective-sample CE.
+    opt_loss = 0
+    _opt = getattr(self, '_last_opt_out', None)
+    if _opt is not None and not gradient_norm_logging_mode:
+      self._last_opt_out = None
+      if value_out is not None and unc_out is not None and policy_out is not None:
+        with torch.no_grad():
+          _op_p = torch.softmax(value_out.float(), dim=-1)
+          _op_qpred = _op_p[:, 0] - _op_p[:, 2]
+          _op_tq = (value_target[:, 0] - value_target[:, 2]).float()
+          _op_sigma = unc_out.float().abs().reshape(-1) + 1e-5
+          _op_z = (_op_tq - _op_qpred) / _op_sigma
+          _op_w = torch.sigmoid((_op_z - self.opt_strength) * self.opt_alpha)
+        _op_legal = policy_target > 0
+        _op_masked = torch.where(_op_legal, _opt.float(), torch.full_like(_opt.float(), -1e4))
+        _op_lp = torch.log_softmax(_op_masked, dim=-1)
+        _op_ce = -(policy_target.float() * _op_lp).sum(-1)
+        opt_loss = (_op_w * _op_ce).sum() / _op_w.sum().clamp_min(1e-6)
+
     v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
@@ -1299,6 +1366,7 @@ class CeresNet(nn.Module):
         + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
         + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
+        + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
         
     if (log_stats):
@@ -1377,6 +1445,8 @@ class CeresNet(nn.Module):
         self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
       if not isinstance(hlg_loss, int):
         self._log("hlgauss_value_loss" + stat_suffix, hlg_loss, step=num_pos)
+      if not isinstance(opt_loss, int):
+        self._log("optimistic_policy_loss" + stat_suffix, opt_loss, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not gradient_norm_logging_mode:

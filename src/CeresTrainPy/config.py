@@ -187,6 +187,28 @@ class Configuration:
     # mirror loss WITH enforcement active was 0.0035 — so High sits just below
     # that (drift alarm before reaching known-bad territory) and Low well
     # below the normal operating level.
+    # Optimistic-policy aux head (lc0 vdapda-branch port; 0 = off): a separate
+    # training-only policy head whose CE is weighted sigmoid((z - Strength) *
+    # Alpha) with z = (target_q - predicted_q) / (predicted_sigma + 1e-5) —
+    # i.e. trained only where the value head UNDERESTIMATES the outcome,
+    # in units of the net's own uncertainty (unc head). lc0 defaults 2.0/3.0.
+    self.Opt_OptimisticPolicyWeight = float(config_opt.get('OptimisticPolicyWeight', 0) or 0)
+    self.Opt_OptimisticPolicyStrength = _cfg_num('OptimisticPolicyStrength', 2.0)
+    self.Opt_OptimisticPolicyAlpha = _cfg_num('OptimisticPolicyAlpha', 3.0)
+    # Serve-time blend of the optimistic head into the exported policy output
+    # (0 = pure vanilla, 1 = full swap — what lc0 ships). Logit-space blend
+    # applied ONLY in eval/export mode, BEFORE any ray-context add (rc stays
+    # unscaled). Training is untouched. Baked into the ONNX graph at export,
+    # so per-lambda comparisons = re-export the same checkpoint with different
+    # values (ExportOnly). Requires OptimisticPolicyWeight > 0 (head must
+    # exist and be trained).
+    self.Opt_OptimisticPolicyServeBlend = _cfg_num('OptimisticPolicyServeBlend', 0.0)
+    # Soft-policy aux head (KataGo "auxiliary soft policy target"): config-first
+    # with env fallback (CERES_SOFT_POLICY_WEIGHT/_TEMP). ServeBlend composes
+    # with the optimistic blend as a three-way logit mix (sum of blends <= 1).
+    self.Opt_SoftPolicyWeight = float(config_opt.get('SoftPolicyWeight', 0) or 0)
+    self.Opt_SoftPolicyTemp = float(config_opt.get('SoftPolicyTemp', 0) or 0)  # 0 = env/default 4
+    self.Opt_SoftPolicyServeBlend = _cfg_num('SoftPolicyServeBlend', 0.0)
     self.Opt_MirrorConsProbeSteps = int(config_opt.get('MirrorConsProbeSteps', 0) or 0)
     self.Opt_MirrorConsAutoLow = _cfg_num('MirrorConsAutoLow', 0.0015)
     self.Opt_MirrorConsAutoHigh = _cfg_num('MirrorConsAutoHigh', 0.003)

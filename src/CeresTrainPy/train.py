@@ -761,6 +761,15 @@ def Train():
   # labels into the trunk through the hlg head.
   if SECONDARY_VALUE_MULT is not None and float(getattr(config, 'Opt_HLGaussWeight', 0) or 0) > 0:
     SECONDARY_WEIGHT_OVERRIDES['hlg_weight'] = SECONDARY_VALUE_MULT * float(config.Opt_HLGaussWeight)
+  # Optimistic-policy is policy-family: follow the policy override, same scaled-
+  # multiplier convention as hlg above.
+  if SECONDARY_POLICY_MULT is not None and float(getattr(config, 'Opt_OptimisticPolicyWeight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['opt_policy_weight'] = SECONDARY_POLICY_MULT * float(config.Opt_OptimisticPolicyWeight)
+  # Soft-policy is policy-family too (same gap existed for it since the s5 era;
+  # closed here for consistency with the hlg/opt review fixes). Base weight may
+  # come from env fallback, so read the resolved value off the core module.
+  if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'soft_policy_weight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['soft_policy_weight'] = SECONDARY_POLICY_MULT * float(core.soft_policy_weight)
   if SECONDARY_VALUE2_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['value2_loss_weight']  = SECONDARY_VALUE2_MULT
   if SECONDARY_AUX_MULT is not None:
     for _aux_attr in ('unc_loss_weight', 'q_deviation_loss_weight', 'uncertainty_policy_weight', 'moves_left_loss_weight'):
@@ -1031,7 +1040,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
