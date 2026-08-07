@@ -203,6 +203,14 @@ class Configuration:
     # values (ExportOnly). Requires OptimisticPolicyWeight > 0 (head must
     # exist and be trained).
     self.Opt_OptimisticPolicyServeBlend = _cfg_num('OptimisticPolicyServeBlend', 0.0)
+    # Data-format / survival-sidecar settings (TPGV3, AuxFeaturesPerSquare,
+    # TargetSidecar, V7XSidecar, SurvivalHorizon, SurvivalTargetWeight,
+    # SurvivalLossBuckets, SurvivalCaptureWeight) are NOT parsed here: they are
+    # consumed at import time by module-level reads, so train.py bridges them
+    # from this JSON into os.environ BEFORE importing those modules (see the
+    # config->env bootstrap at the top of train.py). Put them in this file to
+    # make them travel with the run across resume/export; the CERES_* env vars
+    # remain as fallback for keys absent from the config.
     # Soft-policy aux head (KataGo "auxiliary soft policy target"): config-first
     # with env fallback (CERES_SOFT_POLICY_WEIGHT/_TEMP). ServeBlend composes
     # with the optimistic blend as a three-way logit mix (sum of blends <= 1).

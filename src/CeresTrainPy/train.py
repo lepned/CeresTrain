@@ -19,6 +19,40 @@ import socket
 import datetime
 import math
 import contextlib
+import json as _bootstrap_json
+
+# ---- Config -> env bootstrap (BEFORE the heavy imports) -------------------
+# The data-format and survival-sidecar settings below are consumed at IMPORT
+# time by module-level reads (config.py, tpg_dataset.py, losses.py), so plain
+# Configuration fields would arrive too late. Bridging them from the run's
+# _ceres_opt.json into os.environ here makes them travel WITH the run/
+# checkpoint across resume and ExportOnly (the 2026-08-07 export incident:
+# an export shell without CERES_AUX_FEATURES_PER_SQUARE=0 crashed on width
+# mismatch). Precedence: a key PRESENT in the config overrides the env
+# (config authoritative); absent keys leave the env untouched (fallback).
+_BOOTSTRAP_ENV_MAP = {
+    'TPGV3': 'CERES_TPG_V3',
+    'AuxFeaturesPerSquare': 'CERES_AUX_FEATURES_PER_SQUARE',
+    'TargetSidecar': 'CERES_TPG_TARGET_SIDECAR',
+    'V7XSidecar': 'CERES_TPG_V7X_SIDECAR',
+    'SurvivalHorizon': 'CERES_SURVIVAL_HORIZON',
+    'SurvivalTargetWeight': 'CERES_SURVIVAL_TARGET_WEIGHT',
+    'SurvivalLossBuckets': 'CERES_SURVIVAL_LOSS_BUCKETS',
+    'SurvivalCaptureWeight': 'CERES_SURVIVAL_CAPTURE_WEIGHT',
+}
+try:
+  if len(sys.argv) > 2:
+    _bs_path = os.path.join(sys.argv[2], 'configs', sys.argv[1] + '_ceres_opt.json')
+    if os.path.isfile(_bs_path):
+      _bs_cfg = _bootstrap_json.load(open(_bs_path))
+      for _bs_key, _bs_env in _BOOTSTRAP_ENV_MAP.items():
+        if _bs_key in _bs_cfg and _bs_cfg[_bs_key] is not None:
+          os.environ[_bs_env] = str(_bs_cfg[_bs_key])
+          print(f'[bootstrap] {_bs_env}={_bs_cfg[_bs_key]} (from config {_bs_key})')
+except Exception as _bs_e:  # never let the bootstrap kill a legacy env-driven run
+  print(f'[bootstrap] WARNING: config->env bridge failed ({_bs_e}); using env as-is')
+# ---------------------------------------------------------------------------
+
 import numpy as np
 from typing import Dict, Any
 
