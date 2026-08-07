@@ -137,6 +137,60 @@ class Configuration:
     #       aux heads), embeddings, LoRA adapters and 1-D params; head hidden
     #       matrices train under Muon like the trunk.
     self.Opt_MuonAdamWScope = config_opt.get('MuonAdamWScope', 'all-non-trunk')
+    # Hard-position replay buffer (0 = off). An online ring buffer of the
+    # highest-value-KL batch rows (measured by the LIVE net each step); a
+    # fraction of every subsequent batch is replaced with buffered hard rows so
+    # difficult positions are revisited under evolving trunk states instead of
+    # seen once. Buffer churns continuously (unlike a fixed replay set, which
+    # is the known puzzle-overfit failure mode). CONFIG-ONLY by design.
+    #   HardReplayBufferSize: max rows held (CPU memory ~40KB/row).
+    #   HardReplayFraction:   share of each batch replaced by replayed rows.
+    #   HardReplayMaxReuse:   evict an entry after this many replays.
+    # NOTE on parsing: `x or default` is only used where 0 IS the off-switch;
+    # parameters where an explicit 0 is a plausible intentional value use
+    # None-checked parsing so user zeros are respected.
+    def _cfg_num(key, default, cast=float):
+      _v = config_opt.get(key)
+      return cast(default if _v is None else _v)
+    self.Opt_HardReplayBufferSize = int(config_opt.get('HardReplayBufferSize', 0) or 0)
+    self.Opt_HardReplayFraction = _cfg_num('HardReplayFraction', 0.125)
+    self.Opt_HardReplayMaxReuse = _cfg_num('HardReplayMaxReuse', 8, int)
+    # EMA / SWA weight averaging (lc0-style capped running average; 0 = off).
+    # Every EMAPeriodSteps optimizer steps: ema = ema*(n/(n+1)) + w*(1/(n+1)),
+    # n = min(n+1, EMAMaxN) — i.e. an EMA whose momentum saturates at
+    # 1 - 1/(EMAMaxN+1). Each checkpoint additionally exports the EMA weights
+    # as <name>_<numpos>ema.onnx alongside the raw ones. lc0's TF reference
+    # ships swa_steps=100 / swa_max_n=10 and PUBLISHES the averaged nets
+    # ("-swa-" files); our post-hoc 3-ckpt averaging measured +34/+29 Elo value
+    # at zero policy cost on collapse-phase endpoints (2026-08-06). EMA state
+    # is NOT persisted across resume (re-warms from current weights, ~1k steps).
+    self.Opt_EMAPeriodSteps = int(config_opt.get('EMAPeriodSteps', 0) or 0)
+    self.Opt_EMAMaxN = _cfg_num('EMAMaxN', 10, int)
+    # HL-Gauss categorical value head (0 = off): auxiliary softmax-CE over a
+    # Gaussian histogram of q = w - l in [-1,1] — fine-grained value-resolution
+    # signal (see ceres_net.py). Training-only head, stripped at export.
+    self.Opt_HLGaussWeight = float(config_opt.get('HLGaussWeight', 0) or 0)
+    self.Opt_HLGaussBuckets = int(config_opt.get('HLGaussBuckets', 32) or 32)
+    self.Opt_HLGaussSigmaScale = _cfg_num('HLGaussSigmaScale', 0.75)  # explicit 0 = one-hot buckets (lc0 degenerate case)
+    # Mirror-consistency value regularizer + focal value weighting: config is
+    # authoritative; the CERES_VALUE_MIRROR_CONS_* / CERES_VALUE_FOCAL_GAMMA
+    # env vars remain as FALLBACK (used only when the config field is 0/absent)
+    # so launch scripts from the env era keep working across resumes.
+    self.Opt_MirrorConsWeight = float(config_opt.get('MirrorConsistencyWeight', 0) or 0)
+    self.Opt_MirrorConsFraction = float(config_opt.get('MirrorConsistencyFraction', 0) or 0)
+    # Mirror-consistency HYSTERESIS controller ("symmetry thermostat"; 0 =
+    # static always-on). When the smoothed mirror loss falls below AutoLow the
+    # term drops to a probe every ProbeSteps optimizer steps (~0.1-0.5% cost);
+    # if a probe's smoothed level exceeds AutoHigh (e.g. decay-phase sharpening
+    # reintroduces asymmetry) full per-step enforcement resumes automatically.
+    # Thresholds calibrated against s6 (2026-08-07): highest observed smoothed
+    # mirror loss WITH enforcement active was 0.0035 — so High sits just below
+    # that (drift alarm before reaching known-bad territory) and Low well
+    # below the normal operating level.
+    self.Opt_MirrorConsProbeSteps = int(config_opt.get('MirrorConsProbeSteps', 0) or 0)
+    self.Opt_MirrorConsAutoLow = _cfg_num('MirrorConsAutoLow', 0.0015)
+    self.Opt_MirrorConsAutoHigh = _cfg_num('MirrorConsAutoHigh', 0.003)
+    self.Opt_ValueFocalGamma = float(config_opt.get('ValueFocalGamma', 0) or 0)
     # Per-head Muon (Muon only, Kimi K3-style): orthogonalize each attention head's
     # projection block independently (qkv per-head x per-projection on the linear
     # path / per-projection on the nonlinear path; q2/k2/v2/q2b per-head rows;

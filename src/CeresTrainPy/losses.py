@@ -68,6 +68,20 @@ if VALUE_PROV_WEIGHTS is not None:
   assert VALUE_PROV_SCOPE in ('both', 'value2'), f"CERES_VALUE_PROV_SCOPE must be 'both' or 'value2', got {VALUE_PROV_SCOPE!r}"
   print(f'[losses] value loss provenance weights {VALUE_PROV_WEIGHTS} (scope: {VALUE_PROV_SCOPE})')
 
+# CERES_VALUE_FOCAL_GAMMA: hardness-weighted value1 loss (default 0 = off).
+# Late in training the batch-mean value KL sits at the teacher-noise floor:
+# most samples contribute pure label-noise gradient while a minority carry the
+# remaining real signal. Reweight each sample by its own (detached) KL^gamma,
+# normalized to keep the loss scale comparable: gradient budget moves from
+# noise-fitting the solved samples to the genuinely-wrong ones. value1 only —
+# value2 targets are one-hot outcomes where "hard" = mislabeled (blunders),
+# exactly the samples NOT to upweight.
+VALUE_FOCAL_GAMMA = float(os.environ.get('CERES_VALUE_FOCAL_GAMMA', '0') or 0)
+if VALUE_FOCAL_GAMMA > 0:
+  assert VALUE_PROV_WEIGHTS is None or VALUE_PROV_SCOPE == 'value2', \
+    'CERES_VALUE_FOCAL_GAMMA and value1-scope provenance weighting are mutually exclusive'
+  print(f'[losses] value1 FOCAL hardness weighting enabled: gamma={VALUE_FOCAL_GAMMA}')
+
 
 
 class LossCalculator():
@@ -252,8 +266,19 @@ class LossCalculator():
     # Entropy subtraction stays unweighted under provenance weighting (informational
     # comparability of the logged number; the gradient comes from the CE term only).
     entropy = self.entropy(target) if subtract_entropy else 0.0
-    _prov_v1 = provenance if VALUE_PROV_SCOPE == 'both' else None
-    loss = self._prov_weighted_ce(target, output, _prov_v1) - entropy
+    if VALUE_FOCAL_GAMMA > 0:
+      # Hardness-weighted per-sample KL (see module header). Per-sample entropy
+      # is subtracted BEFORE weighting so the hardness measure is the true KL,
+      # not inflated by high-entropy (drawish) targets.
+      _ce_i = F.cross_entropy(output, target, reduction='none')
+      _t = torch.clamp(target.float() + 1e-6, min=1e-6)
+      _h_i = -(_t * torch.log(_t)).sum(dim=-1)
+      _kl_i = _ce_i - _h_i
+      _w_i = (_kl_i.detach().clamp_min(0) + 1e-3) ** VALUE_FOCAL_GAMMA
+      loss = (_w_i * _kl_i).sum() / _w_i.sum().clamp_min(1e-6)
+    else:
+      _prov_v1 = provenance if VALUE_PROV_SCOPE == 'both' else None
+      loss = self._prov_weighted_ce(target, output, _prov_v1) - entropy
     # Guarded like the other heads: the grad-norm diagnostic pass must not double-count stats.
     self.PENDING_VALUE_LOSS += loss.item() if not calc_grad_norm_mode else 0
     self.PENDING_VALUE_ACC += self.calc_accuracy(target, output, False) if not calc_grad_norm_mode else 0

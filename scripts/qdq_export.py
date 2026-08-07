@@ -46,6 +46,39 @@ from tpg_dataset import TPGDataset
 from onnxruntime.quantization import (quantize_static, QuantType, QuantFormat,
                                       CalibrationDataReader, CalibrationMethod)
 
+# Compat shim: onnx >= 1.17 removed the deprecated `onnx.mapping` module, but
+# onnxruntime 1.18's quantizer still imports TENSOR_TYPE_TO_NP_TYPE from it.
+import onnx as _onnx_pkg
+if not hasattr(_onnx_pkg, 'mapping'):
+    import types as _types
+    from onnx import helper as _onnx_helper
+    _shim = _types.ModuleType('onnx.mapping')
+    _shim.TENSOR_TYPE_TO_NP_TYPE = {}
+    for _dt in _onnx_pkg.TensorProto.DataType.values():
+        try:
+            _shim.TENSOR_TYPE_TO_NP_TYPE[_dt] = _onnx_helper.tensor_dtype_to_np_dtype(_dt)
+        except Exception:
+            pass
+    _onnx_pkg.mapping = _shim
+    sys.modules['onnx.mapping'] = _shim
+
+# ORT quirk with dynamo-exported graphs (torch >= 2.10 naming): the quantizer's
+# adjust_tensor_ranges() force-sets [0,1] ranges on EVERY Softmax output, but
+# the calibrator may not have recorded those tensors -> RuntimeError "Only an
+# existing tensor can be modified". Softmax is never quantized here
+# (op_types_to_quantize=['MatMul']), so skipping unknown tensors is safe.
+from onnxruntime.quantization import calibrate as _ort_calibrate
+_orig_tensorsdata_setitem = _ort_calibrate.TensorsData.__setitem__
+def _lenient_setitem(self, key, value):
+    try:
+        _orig_tensorsdata_setitem(self, key, value)
+    except RuntimeError as e:
+        if 'Only an existing tensor can be modified' in str(e):
+            print(f'[qdq] note: skipping range for uncalibrated tensor {key!r}')
+        else:
+            raise
+_ort_calibrate.TensorsData.__setitem__ = _lenient_setitem
+
 
 def fp16_to_fp32(in_path, out_path):
     """Lossless FP16->FP32 cast of a whole ONNX graph (FP16 subset of FP32)."""

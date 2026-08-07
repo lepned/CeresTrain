@@ -755,6 +755,12 @@ def Train():
   SECONDARY_WEIGHT_OVERRIDES = {}
   if SECONDARY_POLICY_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['policy_loss_weight']  = SECONDARY_POLICY_MULT
   if SECONDARY_VALUE_MULT     is not None: SECONDARY_WEIGHT_OVERRIDES['value_loss_weight']   = SECONDARY_VALUE_MULT
+  # HL-Gauss trains on the same value labels, so it must follow the value
+  # override (scaled by its own base weight — the MULT is a multiplier here):
+  # otherwise a "value-off" secondary stream still leaks its degenerate value
+  # labels into the trunk through the hlg head.
+  if SECONDARY_VALUE_MULT is not None and float(getattr(config, 'Opt_HLGaussWeight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['hlg_weight'] = SECONDARY_VALUE_MULT * float(config.Opt_HLGaussWeight)
   if SECONDARY_VALUE2_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['value2_loss_weight']  = SECONDARY_VALUE2_MULT
   if SECONDARY_AUX_MULT is not None:
     for _aux_attr in ('unc_loss_weight', 'q_deviation_loss_weight', 'uncertainty_policy_weight', 'moves_left_loss_weight'):
@@ -776,6 +782,89 @@ def Train():
                        '(CERES_PLACEMENT_VALUE_WEIGHT > 0), otherwise the head does not exist and the '
                        'override is a silent no-op')
     print(f'[mixed-dataset] SECONDARY loss overrides: {SECONDARY_WEIGHT_OVERRIDES} (heads not listed inherit primary weights)')
+
+  # Mirror-consistency value regularizer (CERES_VALUE_MIRROR_CONS_WEIGHT, default
+  # 0 = off): label-free variance reduction on value1. A fixed-size subset of each
+  # batch (castling-rights-free records only — the file-mirror-aug eligibility
+  # rule) is mirrored a<->h and forwarded again; a symmetric KL between the two
+  # value distributions penalizes self-disagreement on positions that are exactly
+  # value-symmetric. Subset size is FIXED (frac * batch, resampled with
+  # replacement if few eligible) so torch.compile sees one extra static shape.
+  # BOARDS_PER_BATCH==1 path only. Adds no parameters; export graph unchanged.
+  # Config-first, env-fallback (see config.py note).
+  MIRROR_CONS_WEIGHT = (float(getattr(config, 'Opt_MirrorConsWeight', 0) or 0)
+                        or float(os.environ.get('CERES_VALUE_MIRROR_CONS_WEIGHT', '0') or 0))
+  MIRROR_CONS_FRAC = (float(getattr(config, 'Opt_MirrorConsFraction', 0) or 0)
+                      or float(os.environ.get('CERES_VALUE_MIRROR_CONS_FRAC', '0.25') or 0.25))
+  _cfg_focal = float(getattr(config, 'Opt_ValueFocalGamma', 0) or 0)
+  if _cfg_focal > 0:
+    import losses as _losses_module
+    # Re-assert the focal/provenance mutual exclusion here: the import-time
+    # assert in losses.py only sees the env var, and this config path would
+    # otherwise silently drop value1 provenance weighting.
+    assert _losses_module.VALUE_PROV_WEIGHTS is None or _losses_module.VALUE_PROV_SCOPE == 'value2', \
+      'ValueFocalGamma (config) and value1-scope provenance weighting are mutually exclusive'
+    _losses_module.VALUE_FOCAL_GAMMA = _cfg_focal
+    print(f'[train] value1 FOCAL gamma set from config: {_cfg_focal}')
+  _mirror_perm64_t = None
+  # Hysteresis controller state (see config.py): mode starts ACTIVE; smoothed
+  # level tracks the term with momentum 0.98 (~50-batch horizon).
+  MIRROR_PROBE_STEPS = int(getattr(config, 'Opt_MirrorConsProbeSteps', 0) or 0)
+  MIRROR_AUTO_LOW = float(getattr(config, 'Opt_MirrorConsAutoLow', 0.003))
+  MIRROR_AUTO_HIGH = float(getattr(config, 'Opt_MirrorConsAutoHigh', 0.008))
+  _mirror_active = True
+  _mirror_level = None
+  _mirror_step = 0
+  if MIRROR_CONS_WEIGHT > 0:
+    if BOARDS_PER_BATCH != 1:
+      raise NotImplementedError('CERES_VALUE_MIRROR_CONS_WEIGHT is only implemented for BOARDS_PER_BATCH==1')
+    if WORLD_SIZE > 1:
+      raise NotImplementedError('CERES_VALUE_MIRROR_CONS_WEIGHT is single-GPU only: the second forward '
+                                'through the DDP-wrapped model would break reducer bookkeeping')
+    import tpg_dataset as _tpgds
+    _tpgds._ensure_mirror_tables()
+    _mirror_perm64_t = torch.tensor(_tpgds._MIRROR_PERM64, dtype=torch.long)
+    print(f'[train] VALUE MIRROR-CONSISTENCY enabled: w={MIRROR_CONS_WEIGHT}, frac={MIRROR_CONS_FRAC} '
+          f'(castling-rights records exempt; value1 sym-KL)')
+
+  # Hard-position replay buffer (config: HardReplayBufferSize/Fraction/MaxReuse —
+  # see config.py). Flow per primary batch: (1) BEFORE forward, replace a fixed
+  # number of rows with sampled buffer entries; (2) after the loss, measure
+  # per-sample value1-KL on the NON-replayed rows and push the hardest ones
+  # (top inject-count) into the buffer; (3) evict entries after MaxReuse
+  # replays (plus FIFO when full). Secondary-stream batches are untouched.
+  HARD_REPLAY_SIZE = int(getattr(config, 'Opt_HardReplayBufferSize', 0) or 0)
+  HARD_REPLAY_FRAC = float(getattr(config, 'Opt_HardReplayFraction', 0.125))
+  HARD_REPLAY_MAX_REUSE = int(getattr(config, 'Opt_HardReplayMaxReuse', 8))
+  _hard_replay_buf = []   # list of {'rows': {key: cpu tensor}, 'uses': int}
+  if HARD_REPLAY_SIZE > 0:
+    if BOARDS_PER_BATCH != 1:
+      raise NotImplementedError('HardReplayBufferSize > 0 is only implemented for BOARDS_PER_BATCH==1')
+    if WORLD_SIZE > 1:
+      raise NotImplementedError('HardReplayBufferSize > 0 is single-GPU only for now')
+    print(f'[train] HARD-REPLAY buffer enabled: size={HARD_REPLAY_SIZE}, '
+          f'fraction={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}')
+
+  # EMA / SWA shadow weights (config: EMAPeriodSteps/EMAMaxN — see config.py).
+  # Shadow copies of all floating-point state tensors live on the model's
+  # device; updated every EMAPeriodSteps optimizer steps with the lc0 capped
+  # running average. Deliberately NOT persisted across resume: re-initialized
+  # from the live weights at boot (n=0) and re-warmed within ~EMAMaxN periods.
+  EMA_PERIOD = int(getattr(config, 'Opt_EMAPeriodSteps', 0) or 0)
+  EMA_MAX_N = int(getattr(config, 'Opt_EMAMaxN', 10) or 10)
+  _ema_sd = None
+  _ema_n = 0
+  _ema_opt_steps = 0
+  if EMA_PERIOD > 0:
+    if WORLD_SIZE > 1:
+      raise NotImplementedError('EMAPeriodSteps > 0 is single-GPU only for now')
+    # Shadow kept in fp32 regardless of model precision: under BFloat16Pure a
+    # bf16 shadow's ~8-bit mantissa would swallow the w/(n+1) increments late
+    # in training, exactly when averaging matters most. copy_ casts on export.
+    _ema_sd = {k: v.detach().clone().float() for k, v in model_nocompile.state_dict().items()
+               if torch.is_floating_point(v)}
+    print(f'[train] EMA weight averaging enabled: period={EMA_PERIOD} opt-steps, '
+          f'max_n={EMA_MAX_N} ({len(_ema_sd)} tensors; dual export <ckpt>ema.onnx)')
 
   # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
   # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
@@ -942,7 +1031,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -1264,6 +1353,44 @@ def Train():
         batch = batch[0]
         is_secondary_batch = bool(batch.pop('is_secondary', False))
         num_processing_now = batch['squares'].shape[0]
+
+        # Hard-replay INJECTION (see setup block): swap a fixed share of this
+        # primary batch for buffered hard rows before the forward pass.
+        # Batched per KEY (one stack + one H2D transfer per tensor key) instead
+        # of per row x key — the naive loop cost ~1000 small dispatches/step.
+        _replay_slots = None
+        if HARD_REPLAY_SIZE > 0 and not is_secondary_batch and _hard_replay_buf:
+          _rb = batch['squares'].shape[0]
+          _rk = min(int(_rb * HARD_REPLAY_FRAC), len(_hard_replay_buf))
+          if _rk > 0:
+            # Key-signature matching: under sidecar 'auto' modes, batches from
+            # different shards can carry different target-key sets — an entry
+            # may only be injected into a batch with the SAME tensor keys
+            # (otherwise the victim row's survival/censored/provenance targets
+            # would silently label the replayed position).
+            _bsig = frozenset(_k for _k, _v in batch.items() if torch.is_tensor(_v))
+            _picks0 = torch.randint(len(_hard_replay_buf), (_rk,)).tolist()
+            _sel = [(_bi, _hard_replay_buf[_bi]) for _bi in _picks0
+                    if _hard_replay_buf[_bi]['sig'] == _bsig]
+            if _sel:
+              _picks = [_bi for _bi, _ in _sel]
+              _entries = [_e for _, _e in _sel]
+              _replay_slots = torch.randperm(_rb)[:len(_entries)]
+              _slots_dev = _replay_slots.to(batch['squares'].device)
+              for _k in _entries[0]['rows']:
+                _stk = torch.stack([_e['rows'][_k] for _e in _entries])
+                batch[_k][_slots_dev] = _stk.to(batch[_k].device, non_blocking=True)
+              for _e in _entries:
+                _e['uses'] += 1
+            else:
+              _picks = []
+            # O(1) swap-remove of spent entries (unique indices, descending so
+            # tail moves never disturb an index still to be processed).
+            for _bi in sorted(set(_picks), reverse=True):
+              if _hard_replay_buf[_bi]['uses'] >= HARD_REPLAY_MAX_REUSE:
+                _hard_replay_buf[_bi] = _hard_replay_buf[-1]
+                _hard_replay_buf.pop()
+
         policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, _, _, _ = model(batch['squares'], None)
 
         # Per-stream loss routing: for secondary-corpus batches, temporarily swap the
@@ -1285,6 +1412,119 @@ def Train():
           if _use_overrides:
             for attr, value in _saved_w.items():
               setattr(core, attr, value)
+
+        # Mirror-consistency value regularizer (see setup block above).
+        # PRIMARY batches only: secondary (puzzle) batches must neither receive
+        # value-side mirror gradients (policy-only phases!) nor feed the
+        # thermostat's level with a different distribution. Hysteresis: in
+        # dormant mode the term runs (and enforces) only on the final
+        # micro-batch of every MIRROR_PROBE_STEPS-th OPTIMIZER step (counter
+        # deliberately matches the config doc's units under grad accumulation).
+        _mirror_run_now = MIRROR_CONS_WEIGHT > 0 and not is_secondary_batch
+        if MIRROR_PROBE_STEPS > 0:
+          if not is_accumulating:
+            _mirror_step += 1
+          if _mirror_run_now and not _mirror_active:
+            _mirror_run_now = (not is_accumulating) and (_mirror_step % MIRROR_PROBE_STEPS == 0)
+        if _mirror_run_now:
+          _sq = batch['squares']
+          _elig = (_sq[:, 0, 112:116].sum(dim=-1) == 0).nonzero(as_tuple=True)[0]
+          if _elig.numel() > 0:
+            _k = max(1, int(_sq.shape[0] * MIRROR_CONS_FRAC))
+            _pick = _elig[torch.randint(_elig.numel(), (_k,), device=_elig.device)]
+            if _mirror_perm64_t.device != _sq.device:
+              _mirror_perm64_t = _mirror_perm64_t.to(_sq.device)
+            _msq = _sq[_pick][:, _mirror_perm64_t, :]
+            _msq[:, :, 129:137] = torch.flip(_msq[:, :, 129:137], dims=[-1])
+            # The second forward re-stashes gate/TSB diagnostics with the
+            # mirror-subset shapes; the gate-sparsity regularizers consume them
+            # AFTER this block, so preserve the main-batch stashes across it.
+            _sav_gate = getattr(core, '_last_gate_value', None)
+            _sav_tsb = getattr(core, '_last_tsb_gates', None)
+            _, _mv_out, _, _, _, _, _, _, _, _, _ = model(_msq, None)
+            core._last_gate_value = _sav_gate
+            core._last_tsb_gates = _sav_tsb
+            _lp_o = torch.log_softmax(value_out[_pick].float(), dim=-1)
+            _lp_m = torch.log_softmax(_mv_out.float(), dim=-1)
+            _p_o, _p_m = _lp_o.exp(), _lp_m.exp()
+            _mc_loss = 0.5 * ((_p_o * (_lp_o - _lp_m)).sum(-1) + (_p_m * (_lp_m - _lp_o)).sum(-1)).mean()
+            loss = loss + MIRROR_CONS_WEIGHT * _mc_loss
+            if MIRROR_PROBE_STEPS > 0:
+              _mcv = float(_mc_loss.detach())
+              # Active mode: slow smoothing over per-step measurements.
+              # Dormant mode: probes are sparse — blend fast AND let a single
+              # raw probe above High reactivate immediately (a 0.98-smoothed
+              # level would need ~85 probes to cross the threshold).
+              _mom = 0.98 if _mirror_active else 0.5
+              _mirror_level = _mcv if _mirror_level is None else _mom * _mirror_level + (1 - _mom) * _mcv
+              if _mirror_active and _mirror_level < MIRROR_AUTO_LOW:
+                _mirror_active = False
+                print(f'[train] mirror-consistency DORMANT (level {_mirror_level:.5f} < {MIRROR_AUTO_LOW}); probing every {MIRROR_PROBE_STEPS} steps')
+              elif not _mirror_active and _mcv > MIRROR_AUTO_HIGH:
+                _mirror_active = True
+                print(f'[train] mirror-consistency REACTIVATED (probe {_mcv:.5f} > {MIRROR_AUTO_HIGH})')
+            if show_losses:
+              core._log("value_mirror_cons_loss", _mc_loss, step=num_pos)
+              if MIRROR_PROBE_STEPS > 0 and _mirror_level is not None:
+                core._log("value_mirror_cons_level", _mirror_level, step=num_pos)
+                core._log("value_mirror_cons_active", 1.0 if _mirror_active else 0.0, step=num_pos)
+
+        # Hard-replay INTAKE: measure per-sample value1-KL on the fresh
+        # (non-replayed) rows and buffer the hardest ones. CPU copies, ~40KB/row.
+        if HARD_REPLAY_SIZE > 0 and not is_secondary_batch:
+          with torch.no_grad():
+            _vt = (batch['wdl_q'].float() * core.q_ratio
+                   + batch['wdl_deblundered'].float() * (1.0 - core.q_ratio))
+            _hce = torch.nn.functional.cross_entropy(value_out.float(), _vt, reduction='none')
+            _htt = torch.clamp(_vt + 1e-6, min=1e-6)
+            _hkl = _hce + (_htt * torch.log(_htt)).sum(dim=-1)
+
+            # Separate fresh-vs-replayed diagnostics: batch metrics are
+            # composition-shifted by the injected hard rows, so log each subset
+            # on its own. The fresh numbers are the ones comparable to other
+            # runs; the replay-vs-fresh gap shows what the revisits teach.
+            if show_losses:
+              _vmatch = (value_out.argmax(dim=-1) == _vt.argmax(dim=-1)).float() * 100.0
+              if _replay_slots is not None:
+                _repm = torch.zeros(_hkl.shape[0], dtype=torch.bool, device=_hkl.device)
+                _repm[_replay_slots.to(_hkl.device)] = True
+                core._log("value_kl_fresh", _hkl[~_repm].mean(), step=num_pos)
+                core._log("value_kl_replay", _hkl[_repm].mean(), step=num_pos)
+                core._log("value_acc_fresh", _vmatch[~_repm].mean(), step=num_pos)
+                core._log("value_acc_replay", _vmatch[_repm].mean(), step=num_pos)
+              else:
+                core._log("value_kl_fresh", _hkl.mean(), step=num_pos)
+                core._log("value_acc_fresh", _vmatch.mean(), step=num_pos)
+
+            if _replay_slots is not None:
+              _hkl[_replay_slots.to(_hkl.device)] = -1.0      # replayed rows never re-enter
+            _hnk = max(1, int(_hkl.shape[0] * HARD_REPLAY_FRAC))
+            _hv, _hi = torch.topk(_hkl, min(_hnk, _hkl.shape[0]))
+            _hvk = _hv[_hv > 0].cpu()
+            _hi = _hi[_hv > 0]
+            if _hi.numel() > 0:
+              # One indexed gather + one D2H transfer per key; per-row entries
+              # hold zero-copy CPU views into the shared intake tensors.
+              _rows_cpu = {_k: _t[_hi].detach().to('cpu', copy=True)
+                           for _k, _t in batch.items() if torch.is_tensor(_t)}
+              _rsig = frozenset(_rows_cpu)
+              for _j in range(_hi.numel()):
+                _entry = {'uses': 0, 'kl': float(_hvk[_j]), 'sig': _rsig,
+                          'rows': {_k: _v[_j] for _k, _v in _rows_cpu.items()}}
+                if len(_hard_replay_buf) >= HARD_REPLAY_SIZE:
+                  # random replacement at cap (buffer churns; strict FIFO not needed)
+                  _hard_replay_buf[int(torch.randint(len(_hard_replay_buf), (1,)))] = _entry
+                else:
+                  _hard_replay_buf.append(_entry)
+            if show_losses:
+              core._log("hard_replay_buffer_fill", float(len(_hard_replay_buf)), step=num_pos)
+              if _hard_replay_buf:
+                # Buffer population stats (logging cadence only): how hard the
+                # current population is, and typical reuse progress.
+                core._log("hard_replay_buffer_kl_mean",
+                          sum(_e['kl'] for _e in _hard_replay_buf) / len(_hard_replay_buf), step=num_pos)
+                core._log("hard_replay_buffer_uses_mean",
+                          sum(_e['uses'] for _e in _hard_replay_buf) / len(_hard_replay_buf), step=num_pos)
 
       else:
         assert BOARDS_PER_BATCH == 4
@@ -1478,6 +1718,20 @@ def Train():
           if writer is not None:
             writer.add_scalar('qk_clip_heads', _clip_total, num_pos)
 
+      # EMA shadow update (see setup block): lc0 capped running average.
+      # Runs AFTER the QK-clip rescale so the shadow never integrates weight
+      # states the live net was explicitly corrected away from.
+      if _ema_sd is not None:
+        _ema_opt_steps += 1
+        if _ema_opt_steps % EMA_PERIOD == 0:
+          with torch.no_grad():
+            _msd = model_nocompile.state_dict()
+            _a = _ema_n / (_ema_n + 1.0)
+            _b = 1.0 / (_ema_n + 1.0)
+            for _k, _ev in _ema_sd.items():
+              _ev.mul_(_a).add_(_msd[_k], alpha=_b)
+          _ema_n = min(_ema_n + 1, EMA_MAX_N)
+
     batch_accumulation_counter = batch_accumulation_counter + 1
 
     # Update GLOBAL positions processed. num_processing_now is this rank's share
@@ -1505,6 +1759,22 @@ def Train():
       if IS_MASTER:
         save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
         save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+        # EMA dual export: temporarily swap the shadow weights into the live
+        # module (state_dict tensors are shared with the compiled model, so
+        # in-place copy + restore keeps training untouched), export with an
+        # 'ema' label suffix, restore the raw weights.
+        if _ema_sd is not None and _ema_n > 0:
+          with torch.no_grad():
+            _msd = model_nocompile.state_dict()
+            _raw_backup = {_k: _msd[_k].detach().clone() for _k in _ema_sd}
+            for _k, _ev in _ema_sd.items():
+              _msd[_k].copy_(_ev)
+          try:
+            save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos) + 'ema', True)
+          finally:
+            with torch.no_grad():
+              for _k, _bv in _raw_backup.items():
+                _msd[_k].copy_(_bv)
       last_save_model_pos = num_pos
 
     current_time = datetime.datetime.now()
@@ -1591,6 +1861,21 @@ def Train():
     else:
       save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
       save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
+      # Final EMA export — without this, an off-cadence run end (or a run with
+      # interval checkpointing disabled) would silently discard the freshest —
+      # i.e. most valuable — averaged weights.
+      if _ema_sd is not None and _ema_n > 0:
+        with torch.no_grad():
+          _msd = model_nocompile.state_dict()
+          _raw_backup = {_k: _msd[_k].detach().clone() for _k in _ema_sd}
+          for _k, _ev in _ema_sd.items():
+            _msd[_k].copy_(_ev)
+        try:
+          save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos) + 'ema', True)
+        finally:
+          with torch.no_grad():
+            for _k, _bv in _raw_backup.items():
+              _msd[_k].copy_(_bv)
 
   writer.flush()
   writer.close()

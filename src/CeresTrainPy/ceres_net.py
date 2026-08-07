@@ -304,9 +304,20 @@ class CeresNet(nn.Module):
     self.ray_context_mode = int(os.environ.get('CERES_RAY_CONTEXT', '0') or 0)
     if self.ray_context_mode > 0:
       self.rc_dh = int(os.environ.get('CERES_RAY_CONTEXT_DH', '64') or 64)
+      # Memory-lean serving formulation (CERES_RAY_CONTEXT_CHUNKED=N, export-time
+      # only): mathematically identical rewrite that avoids the naive path's
+      # [B,1858,dh] intermediates (~243MB each at B=1024 fp16, several live at
+      # once). Bilinear becomes F@T^T ([B,64,64]) + flat pair-gather; ray terms
+      # become tiny [B,64,64] H-matrices with the single remaining [1858]-axis
+      # matmul processed in N chunks (peak [B,1858/N,dh]). Set only in the
+      # ExportOnly process — the trainer keeps the fused path.
+      self.rc_chunks = int(os.environ.get('CERES_RAY_CONTEXT_CHUNKED', '0') or 0)
       from lc0_moves_1858 import FROM_1858, TO_1858
       self.register_buffer('rc_from', torch.tensor(FROM_1858, dtype=torch.long), persistent=False)
       self.register_buffer('rc_to', torch.tensor(TO_1858, dtype=torch.long), persistent=False)
+      if self.rc_chunks > 0:
+        _ft_flat = [f * 64 + t for f, t in zip(FROM_1858, TO_1858)]
+        self.register_buffer('rc_ft_flat', torch.tensor(_ft_flat, dtype=torch.long), persistent=False)
       self.rc_WF = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
       self.rc_WT = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
       nn.init.zeros_(self.rc_WT.weight)
@@ -324,6 +335,20 @@ class CeresNet(nn.Module):
       print(f'[ceres_net] RAY-CONTEXT policy term enabled: mode {self.ray_context_mode} '
             f'({"bilinear-only" if self.ray_context_mode == 1 else "bilinear+ray+discovery"}), '
             f'dh={self.rc_dh}, zero-init additive')
+
+    # Soft-policy auxiliary head (KataGo "auxiliary soft policy target", via
+    # lc0/Monroe: +10% convergence; CERES_SOFT_POLICY_WEIGHT > 0 enables).
+    # An extra policy-shaped head trained on a TEMPERATURE-FLATTENED version of
+    # the same policy target (p^(1/T) over legal moves, renormalized; T =
+    # CERES_SOFT_POLICY_TEMP, default 4): dense gradient on the move-ordering
+    # tail + anti-overconfidence regularization, inherited by the main policy
+    # head through the shared trunk. Training-only; never in the export graph.
+    self.soft_policy_weight = float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0)
+    if self.soft_policy_weight > 0:
+      self.soft_policy_temp = float(os.environ.get('CERES_SOFT_POLICY_TEMP', '4') or 4)
+      self.sp_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, 0)
+      print(f'[ceres_net] SOFT-POLICY aux head enabled: T={self.soft_policy_temp}, '
+            f'w={self.soft_policy_weight} (training-only)')
 
     # Value-discrimination mechanisms for sharp/decisive corpora (value head
     # collapses on puzzle-only data: near-uniform "decisive" labels destroy
@@ -351,6 +376,25 @@ class CeresNet(nn.Module):
       self.vc_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 1858 * 3, 0)
       print(f'[ceres_net] VALUE CONTRAST aux head enabled: per-move WDL from puzzle '
             f'policy targets (training-only), w={self.value_contrast_weight}')
+
+    # HL-Gauss categorical value head (config: HLGaussWeight/Buckets/SigmaScale;
+    # 0 = off). Softmax-CE against a Gaussian histogram target over the scalar
+    # q = w - l in [-1,1] (Farebrother et al. 2024, "Stop Regressing"): forces
+    # FINE-GRAINED value resolution that the 3-class WDL CE never demands
+    # (+0.3 vs +0.5 must land in different buckets). Reads fS_value like the
+    # main value head; training-only stash head, never in the export graph.
+    # sigma = SigmaScale * bucket_width smooths the target over neighboring
+    # buckets (the "HL-Gauss" part — lc0's one-hot bucket variant is the
+    # degenerate sigma->0 case). No new data: target derives from wdl_q blend.
+    self.hlg_weight = float(getattr(config, 'Opt_HLGaussWeight', 0) or 0)
+    if self.hlg_weight > 0:
+      self.hlg_buckets = int(getattr(config, 'Opt_HLGaussBuckets', 32) or 32)
+      _hlg_sigma_scale = float(getattr(config, 'Opt_HLGaussSigmaScale', 0.75) or 0.75)
+      self.hlg_sigma = _hlg_sigma_scale * (2.0 / self.hlg_buckets)
+      self.hlg_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, self.hlg_buckets, 0)
+      self.register_buffer('hlg_edges', torch.linspace(-1.0, 1.0, self.hlg_buckets + 1), persistent=False)
+      print(f'[ceres_net] HL-GAUSS categorical value head enabled: w={self.hlg_weight}, '
+            f'buckets={self.hlg_buckets}, sigma={self.hlg_sigma:.4f} (training-only)')
 
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
@@ -891,6 +935,15 @@ class CeresNet(nn.Module):
     if self.value_contrast_weight > 0 and self.training:
       self._last_vc_out = self.vc_head(fS_others).reshape(-1, 1858, 3)
 
+    # Soft-policy aux head (see __init__): reads the same features as the main
+    # policy head; training-only stash.
+    if self.soft_policy_weight > 0 and self.training:
+      self._last_sp_out = self.sp_head(fS_policy)
+
+    # HL-Gauss categorical value head (see __init__): training-only stash.
+    if self.hlg_weight > 0 and self.training:
+      self._last_hlg_out = self.hlg_head(fS_value)
+
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
     if self.ray_context_mode > 0:
@@ -900,15 +953,45 @@ class CeresNet(nn.Module):
       # the post-trunk_end_norm [B, 64, D] square state the heads read.
       _rcF = self.rc_WF(flow)                                       # [B, 64, dh]
       _rcT = self.rc_WT(flow)
-      _Fm = _rcF[:, self.rc_from]                                   # [B, 1858, dh]
-      _Tm = _rcT[:, self.rc_to]
-      _rc_add = (_Fm * _Tm).sum(-1) * (self.rc_dh ** -0.5) + self.rc_btype
-      if self.ray_context_mode >= 2:
-        _r = torch.matmul(self.rc_R.to(_rcF.dtype), self.rc_WR(flow))   # [B, 1858, dh]
-        _d = torch.matmul(self.rc_R2.to(_rcF.dtype), self.rc_WD(flow))
-        _rc_add = _rc_add + (_Fm * _r * self.rc_u).sum(-1) \
-                          + (_Tm * _r * self.rc_v).sum(-1) \
-                          + (_Fm * _d * self.rc_w).sum(-1)
+      if getattr(self, 'rc_chunks', 0) > 0:
+        # Memory-lean serving formulation (see __init__). Identity:
+        #   bilinear_m = <F[from_m], T[to_m]> = (F @ T^T)[from_m, to_m]
+        #   sum_d F[from_m,d]*u_d*(R@G)[m,d] = (R @ (G @ (F*u)^T))[m, from_m]
+        # so all cross terms reduce to [B,64,64] H-matrices; only the final
+        # R/R2 matmul spans the 1858 axis, and it is processed in chunks.
+        _FT = torch.matmul(_rcF, _rcT.transpose(1, 2))              # [B, 64, 64]
+        _rc_add = _FT.reshape(-1, 4096)[:, self.rc_ft_flat] * (self.rc_dh ** -0.5) + self.rc_btype
+        if self.ray_context_mode >= 2:
+          _G_R = self.rc_WR(flow)                                   # [B, 64, dh]
+          _G_D = self.rc_WD(flow)
+          _H1 = torch.matmul(_G_R, (_rcF * self.rc_u).transpose(1, 2))  # [B, 64, 64] (s x from)
+          _H2 = torch.matmul(_G_R, (_rcT * self.rc_v).transpose(1, 2))  # (s x to)
+          _H3 = torch.matmul(_G_D, (_rcF * self.rc_w).transpose(1, 2))  # (s x from)
+          _parts = []
+          _csz = (1858 + self.rc_chunks - 1) // self.rc_chunks
+          for _c0 in range(0, 1858, _csz):
+            _c1 = min(_c0 + _csz, 1858)
+            _Rc = self.rc_R[_c0:_c1].to(_rcF.dtype)                 # [C, 64]
+            _R2c = self.rc_R2[_c0:_c1].to(_rcF.dtype)
+            _n = _c1 - _c0
+            _ar = torch.arange(_n, device=flow.device) * 64
+            _if = _ar + self.rc_from[_c0:_c1]                       # flat [C] into [C*64]
+            _it = _ar + self.rc_to[_c0:_c1]
+            _t1 = torch.matmul(_Rc, _H1).reshape(-1, _n * 64)[:, _if]    # [B, C]
+            _t2 = torch.matmul(_Rc, _H2).reshape(-1, _n * 64)[:, _it]
+            _t3 = torch.matmul(_R2c, _H3).reshape(-1, _n * 64)[:, _if]
+            _parts.append(_t1 + _t2 + _t3)
+          _rc_add = _rc_add + torch.cat(_parts, dim=1)
+      else:
+        _Fm = _rcF[:, self.rc_from]                                 # [B, 1858, dh]
+        _Tm = _rcT[:, self.rc_to]
+        _rc_add = (_Fm * _Tm).sum(-1) * (self.rc_dh ** -0.5) + self.rc_btype
+        if self.ray_context_mode >= 2:
+          _r = torch.matmul(self.rc_R.to(_rcF.dtype), self.rc_WR(flow))   # [B, 1858, dh]
+          _d = torch.matmul(self.rc_R2.to(_rcF.dtype), self.rc_WD(flow))
+          _rc_add = _rc_add + (_Fm * _r * self.rc_u).sum(-1) \
+                            + (_Tm * _r * self.rc_v).sum(-1) \
+                            + (_Fm * _d * self.rc_w).sum(-1)
       policy_out = policy_out + _rc_add
     value_out = self.value_head(fS_value)
     value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
@@ -1046,6 +1129,22 @@ class CeresNet(nn.Module):
       _vc_w = _vc_legal.float() * 0.25
       _vc_w[_vc_ar, _vc_sol] = 1.0
       vc_loss = (_vc_ce * _vc_w).sum() / _vc_w.sum().clamp(min=1.0)
+    # HL-Gauss categorical value loss (see __init__): KL between the Gaussian
+    # histogram of the scalar q-target and the bucket softmax. CE minus target
+    # entropy, per the file convention, so the logged number is a true KL.
+    hlg_loss = 0
+    _hlg = getattr(self, '_last_hlg_out', None)
+    if _hlg is not None and not gradient_norm_logging_mode:
+      self._last_hlg_out = None
+      _hq = (value_target[:, 0] - value_target[:, 2]).float().clamp(-1.0, 1.0)
+      _hz = (self.hlg_edges.unsqueeze(0) - _hq.unsqueeze(1)) / self.hlg_sigma      # [B, N+1]
+      _hcdf = torch.special.ndtr(_hz)
+      _hp = _hcdf[:, 1:] - _hcdf[:, :-1]
+      _hp = _hp / _hp.sum(dim=-1, keepdim=True).clamp_min(1e-9)                    # renormalize edge truncation
+      _hlp = torch.log_softmax(_hlg.float(), dim=-1)
+      _hpc = _hp.clamp_min(1e-9)
+      hlg_loss = (-(_hp * _hlp).sum(-1) + (_hpc * _hpc.log()).sum(-1)).mean()
+
     v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
@@ -1122,9 +1221,28 @@ class CeresNet(nn.Module):
             self._log(f"depth_probe_value_d{_d:02d}",
                       loss_calc.ce_loss.forward(_dpv[:, _d].float(), value_target) - _v_ent, step=num_pos)
 
+    # Soft-policy aux CE (see __init__): target = p^(1/T) over legal moves,
+    # renormalized. Same legality masking as the main policy loss; consume-and-
+    # clear; skipped on the gradnorm pass.
+    soft_policy_loss = 0
+    _sp = getattr(self, '_last_sp_out', None)
+    if _sp is not None and not gradient_norm_logging_mode:
+      self._last_sp_out = None
+      _sp_legal = policy_target > 0
+      _sp_t = torch.where(_sp_legal, policy_target.float(), torch.zeros_like(policy_target, dtype=torch.float32))
+      _sp_t = _sp_t.pow(1.0 / self.soft_policy_temp)
+      _sp_t = _sp_t / _sp_t.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+      _sp_m = torch.where(_sp_legal, _sp, torch.full_like(_sp, loss_calc.MASK_POLICY_VALUE))
+      soft_policy_loss = loss_calc.ce_loss.forward(_sp_m.float(), _sp_t) \
+          - (loss_calc.entropy(_sp_t) if SUBTRACT_ENTROPY else 0.0)
+
     _pv_out = getattr(self, '_last_placement_value_out', None)
     if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
-      self._last_placement_value_out = None
+      # Consume-and-clear only on the REAL pass: the grad-norm diagnostic pass
+      # must not eat the stash the real pass needs (pre-existing bug, fixed
+      # 2026-08-07 review round — same guard as the hlg/sp/vc consumers).
+      if not gradient_norm_logging_mode:
+        self._last_placement_value_out = None
       placement_loss = loss_calc.placement_value_loss(value_target, _pv_out.float(), SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.placement_value_weight)
 
     # K-ply survival aux head: per-square fate CE against sidecar targets (empty squares
@@ -1133,7 +1251,8 @@ class CeresNet(nn.Module):
     survival_loss = 0
     _sv_out = getattr(self, '_last_survival_out', None)
     if self.survival_target_weight > 0 and _sv_out is not None and value_out is not None:
-      self._last_survival_out = None
+      if not gradient_norm_logging_mode:
+        self._last_survival_out = None
       survival_target = batch.get('survival', None)
       # No 'survival' key = batch from a sidecar-less shard (CERES_TPG_TARGET_SIDECAR=auto
       # mixed-corpus mode): skip the loss for this batch. train.py validates at startup
@@ -1150,7 +1269,8 @@ class CeresNet(nn.Module):
     stvalue_loss = 0
     _st_out = getattr(self, '_last_stvalue_out', None)
     if self.stvalue_weight > 0 and _st_out is not None and value_out is not None:
-      self._last_stvalue_out = None
+      if not gradient_norm_logging_mode:
+        self._last_stvalue_out = None
       _cens_q = batch.get('censored_q_st', None)
       if _cens_q is not None:
         stvalue_loss = loss_calc.stvalue_loss(_cens_q, batch['censored_d_st'], batch.get('z_provenance', None),
@@ -1177,13 +1297,35 @@ class CeresNet(nn.Module):
             + depth_ctl_ploss + depth_ctl_vloss)
            if not isinstance(depth_probe_ploss, int) else 0)
         + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
-        + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0))
+        + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
+        + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
+        + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
         
     if (log_stats):
       if not gradient_norm_logging_mode:
         stat_suffix = ""
         policy_accuracy = 0 if policy_out is None else loss_calc.calc_accuracy(policy_target, policy_out, True)
         value_accuracy = 0 if value_out is None else loss_calc.calc_accuracy(value_target, value_out, False)
+
+        # Cheap logging-cadence diagnostics (computed only every ~10s, zero
+        # steady-state training cost):
+        # - policy_entropy: mean softmax entropy over LEGAL moves — the
+        #   late-phase policy sprint that eats value is literally this curve
+        #   falling (over-peaking watch; lc0 logs the same).
+        # - value1_value2_kl: disagreement between the Q-trained and z-trained
+        #   value heads — rising divergence signals target tension.
+        with torch.no_grad():
+          if policy_out is not None:
+            _pe_legal = policy_target > 0
+            _pe_masked = torch.where(_pe_legal, policy_out.float(), torch.full_like(policy_out.float(), -1e4))
+            _pe_lp = torch.log_softmax(_pe_masked, dim=-1)
+            _pe = -(_pe_lp.exp() * _pe_lp).sum(-1).mean()
+            self._log("policy_entropy", _pe, step=num_pos)
+          if value_out is not None and value2_out is not None and self.value2_loss_weight > 0:
+            _v1_lp = torch.log_softmax(value_out.float(), dim=-1)
+            _v2_lp = torch.log_softmax(value2_out.float(), dim=-1)
+            _v12 = (_v1_lp.exp() * (_v1_lp - _v2_lp)).sum(-1).mean()
+            self._log("value1_value2_kl", _v12, step=num_pos)
         self._log("pos_mm", num_pos // 1000000., step=num_pos)
         self._log("LR", last_lr, step=num_pos)
         self._log("total_loss", total_loss, step=num_pos)
@@ -1227,12 +1369,16 @@ class CeresNet(nn.Module):
       if not isinstance(depth_probe_ploss, int):
         self._log("depth_probe_policy_loss" + stat_suffix, depth_probe_ploss, step=num_pos)
         self._log("depth_probe_value_loss" + stat_suffix, depth_probe_vloss, step=num_pos)
+        self._log("depth_ctl_policy_loss" + stat_suffix, depth_ctl_ploss, step=num_pos)
+        self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
       if not isinstance(value_rank_loss, int):
         self._log("value_rank_loss" + stat_suffix, value_rank_loss, step=num_pos)
       if not isinstance(vc_loss, int):
         self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
-        self._log("depth_ctl_policy_loss" + stat_suffix, depth_ctl_ploss, step=num_pos)
-        self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
+      if not isinstance(hlg_loss, int):
+        self._log("hlgauss_value_loss" + stat_suffix, hlg_loss, step=num_pos)
+      if not isinstance(soft_policy_loss, int):
+        self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not gradient_norm_logging_mode:
         # Depth-attending value head diagnostics (see forward): WHICH depths does the
         # value head read? Logs batch-mean attention weight per depth state
