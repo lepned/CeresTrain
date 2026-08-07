@@ -52,23 +52,58 @@ _BOOTSTRAP_ENV_MAP = {
     'FileMirrorAug': 'CERES_FILE_MIRROR_AUG',
     'KeepDrawProb': 'CERES_KEEP_DRAW_PROB',
 }
+def _bs_norm(_v):
+  # Normalize JSON literals to the string forms the env consumers actually
+  # parse (2026-08-07 review): booleans -> '1'/'0' (consumers compare == '0'
+  # or int(); str(True) would silently select the WRONG branch), integral
+  # floats -> int string (int('4.0') raises), lists -> comma-join (the
+  # natural JSON spelling of e.g. SurvivalLossBuckets [2,4] -> '2,4').
+  if isinstance(_v, bool):
+    return '1' if _v else '0'
+  if isinstance(_v, float) and _v.is_integer():
+    return str(int(_v))
+  if isinstance(_v, (list, tuple)):
+    return ','.join(_bs_norm(_x) for _x in _v)
+  return str(_v)
+
 try:
   if len(sys.argv) > 2:
     _bs_path = os.path.join(sys.argv[2], 'configs', sys.argv[1] + '_ceres_opt.json')
     if os.path.isfile(_bs_path):
-      _bs_cfg = _bootstrap_json.load(open(_bs_path))
+      with open(_bs_path, encoding='utf-8') as _bs_f:
+        _bs_cfg = _bootstrap_json.load(_bs_f)
+      # Collect EVERYTHING first, apply atomically afterwards — a malformed
+      # "Env" section must not leave a half-bridged environment behind.
+      _bs_pending = {}
       for _bs_key, _bs_env in _BOOTSTRAP_ENV_MAP.items():
         if _bs_key in _bs_cfg and _bs_cfg[_bs_key] is not None:
-          os.environ[_bs_env] = str(_bs_cfg[_bs_key])
-          print(f'[bootstrap] {_bs_env}={_bs_cfg[_bs_key]} (from config {_bs_key})')
-      # Generic escape hatch: an "Env" dict in the config is bridged verbatim
-      # (applied AFTER the friendly names, so Env wins on collision). Lets ANY
-      # env-gated knob — arch flags, probes, one-off experiment switches —
-      # live in the run's config without per-variable mapping maintenance.
-      for _bs_k, _bs_v in (_bs_cfg.get('Env') or {}).items():
-        if _bs_v is not None:
-          os.environ[str(_bs_k)] = str(_bs_v)
-          print(f'[bootstrap] {_bs_k}={_bs_v} (from config Env)')
+          if _bs_cfg[_bs_key] == '':
+            print(f'[bootstrap] WARNING: {_bs_key} is an empty string; skipped (use null/omit to fall back to env)')
+            continue
+          _bs_pending[_bs_env] = _bs_norm(_bs_cfg[_bs_key])
+      # Generic escape hatch: an "Env" dict in the config is bridged with the
+      # same normalization (applied AFTER the friendly names, so Env wins on
+      # collision). Lets ANY env-gated knob — arch flags, probes, one-off
+      # switches — live in the run's config without mapping maintenance.
+      _bs_envsec = _bs_cfg.get('Env')
+      if _bs_envsec is not None:
+        if not isinstance(_bs_envsec, dict):
+          # Hard failure by design: the config EXISTS and is wrong — running
+          # on with silently dropped settings is worse than stopping.
+          print(f'[bootstrap] ERROR: "Env" must be a JSON object of VAR: value, got {type(_bs_envsec).__name__}')
+          sys.exit(1)
+        for _bs_k, _bs_v in _bs_envsec.items():
+          if _bs_v is None or _bs_v == '':
+            print(f'[bootstrap] WARNING: Env.{_bs_k} is null/empty; skipped')
+            continue
+          _bs_pending[str(_bs_k)] = _bs_norm(_bs_v)
+      for _bs_k, _bs_v in _bs_pending.items():
+        os.environ[_bs_k] = _bs_v
+        print(f'[bootstrap] {_bs_k}={_bs_v} (from config)')
+    else:
+      print(f'[bootstrap] no opt-config at {_bs_path}; env-only run')
+except SystemExit:
+  raise
 except Exception as _bs_e:  # never let the bootstrap kill a legacy env-driven run
   print(f'[bootstrap] WARNING: config->env bridge failed ({_bs_e}); using env as-is')
 # ---------------------------------------------------------------------------

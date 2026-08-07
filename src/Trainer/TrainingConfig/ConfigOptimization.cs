@@ -101,6 +101,16 @@ namespace CeresTrain.Trainer
     }
 
     /// <summary>
+    /// Round-trip preservation of config keys not modeled by this record
+    /// (e.g. the Python trainer's bootstrap keys such as TPGV3, Survival*,
+    /// SecondaryLoss*Mult and the generic "Env" section). Without this,
+    /// AdjustAndLoadConfig's read-modify-write of _ceres_opt.json would
+    /// silently DELETE any hand-added keys before train.py could see them.
+    /// </summary>
+    [JsonExtensionData]
+    public System.Collections.Generic.Dictionary<string, System.Text.Json.JsonElement> ExtensionData { get; init; }
+
+    /// <summary>
     /// If nonzero, LoRA fine-tuning mode is enabled.
     /// See: "LoRA: Low-Rank Adaptation of Large Language Models" by Hu et. al. (https://arxiv.org/abs/2106.09685)
     /// The model parameters are frozen except for some inserted LoRA layers.
