@@ -1254,6 +1254,13 @@ def Train():
     #   2) adamw_lr_ratio — a NEW LearningRateBaseHeads must take effect on resume
     #      (the scheduler re-asserts 'lr' from base_lrs every step, but nothing
     #      else re-reads the ratio).
+    #   4) momentum / adamw_betas / adamw_eps / wd — same class of problem: these
+    #      live in the Muon param_groups, so load_state_dict replaces them with
+    #      whatever the checkpoint carried whenever the groups match positionally
+    #      (the mismatch path above already substitutes current_param_groups).
+    #      Without this, changing MuonMomentum/MuonAdamWEps/Beta*/WeightDecay and
+    #      resuming silently keeps the OLD values, while the construction-time
+    #      print ~600 lines up claims the new ones. Config wins on resume.
     if config.Opt_Optimizer == 'Muon':
       for _p in muon_params:
         _st = optimizer.state[_p]
@@ -1276,11 +1283,19 @@ def Train():
         _st["use_muon"] = False
       _hl = getattr(config, 'Opt_LearningRateBaseHeads', None)
       _new_ratio = (float(_hl) / LR) if _hl is not None else 1.0
+      _muon_hparams = {
+        'adamw_lr_ratio': _new_ratio,
+        'momentum': _muon_mom,
+        'adamw_betas': (config.Opt_Beta1, config.Opt_Beta2),
+        'adamw_eps': _muon_aeps,
+        'wd': WEIGHT_DECAY,
+      }
       for g in optimizer.param_groups:
-        if g.get('adamw_lr_ratio', 1.0) != _new_ratio:
-          print(f"[checkpoint-resume] re-asserting Muon adamw_lr_ratio "
-                f"{g.get('adamw_lr_ratio', 1.0)} -> {_new_ratio}", flush=True)
-          g['adamw_lr_ratio'] = _new_ratio
+        for _k, _v in _muon_hparams.items():
+          if g.get(_k) != _v:
+            print(f"[checkpoint-resume] re-asserting Muon {_k} "
+                  f"{g.get(_k)} -> {_v}", flush=True)
+            g[_k] = _v
 
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
     print("INFO: LOAD_CHECKPOINT", config.Opt_CheckpointResumeFromFileName, num_pos)
