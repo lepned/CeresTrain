@@ -649,7 +649,13 @@ def Train():
         raise ValueError('MuonPerHeadAttention=true but no eligible attention matrices found '
                          '(LoRA-wrapped model, or attention params not under Muon scope?)')
       print(f'[train] Muon PER-HEAD attention: {len(_phm_specs)} attention matrices head-split', flush=True)
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=config.Opt_Beta1, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None)
+    # MuonMomentum decouples the Muon SGD-momentum from the internal-AdamW
+    # beta1 (see config.py) — reference combo is momentum 0.95 / adam beta1 0.9.
+    _muon_mom = config.Opt_MuonMomentum if getattr(config, 'Opt_MuonMomentum', None) is not None else config.Opt_Beta1
+    _muon_aeps = config.Opt_MuonAdamWEps if getattr(config, 'Opt_MuonAdamWEps', None) is not None else 1e-8
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None)
+    if getattr(config, 'Opt_MuonMomentum', None) is not None or getattr(config, 'Opt_MuonAdamWEps', None) is not None:
+      print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':
     optimizer = AdEMAMix(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), alpha=config.Opt_Alpha, T_alpha_beta3= STEPS_AdEMAMix_WARMUP)
   elif config.Opt_Optimizer == 'AdEMAMixShampoo':

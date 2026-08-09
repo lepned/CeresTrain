@@ -140,6 +140,16 @@ class Configuration:
     # (heads/embeddings/norms/biases); the Muon trunk keeps LearningRateBase.
     # None/absent = legacy single-rate. CONFIG-ONLY (no env override by design).
     self.Opt_LearningRateBaseHeads = config_opt.get('LearningRateBaseHeads', None)
+    # Muon momentum decoupling (Muon only): historically Beta1 fed BOTH the
+    # Muon SGD-momentum and the internal-AdamW beta1, so the reference combo
+    # (Muon momentum 0.95 + Adam beta1 0.9, Kovax live configs) was
+    # inexpressible. MuonMomentum overrides the Muon side only; None/absent =
+    # legacy coupling (momentum = Beta1). MuonAdamWEps exposes the internal
+    # AdamW epsilon (legacy hardcoded 1e-8; reference uses 1e-7).
+    _mm = config_opt.get('MuonMomentum')
+    self.Opt_MuonMomentum = None if _mm is None else float(_mm)
+    _mae = config_opt.get('MuonAdamWEps')
+    self.Opt_MuonAdamWEps = None if _mae is None else float(_mae)
     # Muon partition scope (Muon only): which params the internal AdamW gets.
     #   'all-non-trunk' (legacy default): everything outside transformer_layer —
     #       whole heads (incl. hidden 2-D fc), embeddings, norms, biases.
