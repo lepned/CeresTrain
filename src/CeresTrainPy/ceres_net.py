@@ -128,6 +128,26 @@ class CeresNet(nn.Module):
     self.HEAD_IN_SIZE = 64 * (self.HEAD_PREMAP_PER_SQUARE // HEAD_SHARED_LINEAR_DIV)
     self.headSharedLinear = nn.Linear(64 * self.HEAD_PREMAP_PER_SQUARE, self.HEAD_IN_SIZE)
 
+    # PRIVATE VALUE FRONT-END (config ValueHeadChannels; see config.py): the
+    # value family gets its own per-square projection D -> C, flattened to
+    # 64*C, bypassing the policy-shared bottleneck entirely (lc0-style).
+    self.value_head_channels = int(getattr(config, 'Opt_ValueHeadChannels', 0) or 0)
+    if self.value_head_channels > 0:
+      # LoRA head-front adapters wrap only headPremap/headSharedLinear, which
+      # the value family BYPASSES in private mode — a head-front fine-tune
+      # would silently become policy-only. Fail loudly instead.
+      assert int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0) == 0,         'CERES_LORA_HEADFRONT_RANK_DIV is incompatible with ValueHeadChannels (value_premap has no adapter)'
+      self.value_premap = nn.Linear(self.EMBEDDING_DIM, self.value_head_channels)
+      self.VALUE_IN_SIZE = 64 * self.value_head_channels
+      print(f'[ceres_net] PRIVATE VALUE FRONT-END enabled: {self.value_head_channels} ch/square '
+            f'-> {self.VALUE_IN_SIZE}-dim private value input (shared front-end bypassed for value family)')
+    else:
+      self.VALUE_IN_SIZE = self.HEAD_IN_SIZE
+    self.unc_self_error = bool(int(getattr(config, 'Opt_UncSelfError', 0) or 0))
+    if self.unc_self_error:
+      print("[ceres_net] UNC SELF-ERROR mode: unc trains toward the student's own "
+            "(q_pred - q_target)^2 (detached); sigma consumers use sqrt(unc)")
+
     # Optional LoRA wrap of the head front-end (the per-position vector that
     # feeds every head). Gated by CERES_LORA_HEADFRONT_RANK_DIV — sits
     # downstream of body, upstream of all heads. Lets fine-tunes refine what
@@ -163,11 +183,14 @@ class CeresNet(nn.Module):
     if action_uncertainty_loss_weight > 0:
       self.action_uncertainty_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _other_rd)
 
-    self.value_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, _val_rd)
-    self.unc_head = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
+    self.value_head = Head(self.Activation, self.VALUE_IN_SIZE, 64 * HEAD_MULT, 3, _val_rd)
+    # unc follows the value family: on the private path it reads the private
+    # value features (audit finding #4 — error-family heads should enrich the
+    # value representation, not the shared bottleneck).
+    self.unc_head = Head(self.Activation, self.VALUE_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
     if self.value2_loss_weight > 0:
-      self.value2_head = Head(self.Activation, 2 + self.HEAD_IN_SIZE, 64 * HEAD_MULT, 3, _other_rd)
+      self.value2_head = Head(self.Activation, 2 + self.VALUE_IN_SIZE, 64 * HEAD_MULT, 3, _other_rd)
 
     if self.uncertainty_policy_weight > 0:
       self.unc_policy = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
@@ -421,7 +444,7 @@ class CeresNet(nn.Module):
       self.hlg_buckets = int(getattr(config, 'Opt_HLGaussBuckets', 32) or 32)
       _hlg_sigma_scale = float(getattr(config, 'Opt_HLGaussSigmaScale', 0.75) or 0.75)
       self.hlg_sigma = _hlg_sigma_scale * (2.0 / self.hlg_buckets)
-      self.hlg_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, self.hlg_buckets, 0)
+      self.hlg_head = Head(self.Activation, self.VALUE_IN_SIZE, 64 * HEAD_MULT, self.hlg_buckets, 0)
       self.register_buffer('hlg_edges', torch.linspace(-1.0, 1.0, self.hlg_buckets + 1), persistent=False)
       print(f'[ceres_net] HL-GAUSS categorical value head enabled: w={self.hlg_weight}, '
             f'buckets={self.hlg_buckets}, sigma={self.hlg_sigma:.4f} (training-only)')
@@ -647,6 +670,7 @@ class CeresNet(nn.Module):
     # position classifier. Zero-init by construction: orig is recovered exactly
     # at training step 0. See tactical_adapter.py for details.
     self.use_gtab = gtab_enabled()
+    assert self.value_head_channels == 0 or (self.vda_mode == 0 and not self.use_gtab),       'ValueHeadChannels (private value front-end) is incompatible with vda/gtab modes'
     self.gtab_value_only = self.use_gtab and (int(os.environ.get('CERES_GTAB_VALUE_ONLY', '0') or 0) > 0)
     if self.use_gtab:
       self.tactical_adapter = TacticalAdapter(in_dim=self.EMBEDDING_DIM)
@@ -846,6 +870,12 @@ class CeresNet(nn.Module):
       fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
       fS_value  = fS_others
 
+    # PRIVATE VALUE FRONT-END (see __init__): the value family reads its own
+    # per-square projection, bypassing the policy-shared bottleneck. gtab/vda
+    # are asserted off in this mode, so `flow` is the correct source tensor.
+    if self.value_head_channels > 0:
+      fS_value = self.value_premap(flow).reshape(-1, self.VALUE_IN_SIZE)
+
     # Depth-attending value context (see __init__). Non-in-place adds create NEW
     # tensors, so fS_others (often the same object as fS_value) is untouched —
     # policy and all other heads are bit-identical to the baseline path.
@@ -1040,7 +1070,7 @@ class CeresNet(nn.Module):
       policy_out = policy_out + _rc_add
     value_out = self.value_head(fS_value)
     value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
-    unc_out = self.unc_head(fS_others)
+    unc_out = self.unc_head(fS_value if self.value_head_channels > 0 else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
     action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if self.action_loss_weight > 0 else unc_out
@@ -1203,7 +1233,10 @@ class CeresNet(nn.Module):
           _op_p = torch.softmax(value_out.float(), dim=-1)
           _op_qpred = _op_p[:, 0] - _op_p[:, 2]
           _op_tq = (value_target[:, 0] - value_target[:, 2]).float()
-          _op_sigma = unc_out.float().abs().reshape(-1) + 1e-5
+          if getattr(self, 'unc_self_error', False):
+            _op_sigma = unc_out.float().abs().reshape(-1).sqrt() + 1e-5   # unc predicts sigma^2
+          else:
+            _op_sigma = unc_out.float().abs().reshape(-1) + 1e-5
           _op_z = (_op_tq - _op_qpred) / _op_sigma
           _op_w = torch.sigmoid((_op_z - self.opt_strength) * self.opt_alpha)
         _op_legal = policy_target > 0
@@ -1219,6 +1252,15 @@ class CeresNet(nn.Module):
 
     v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
     ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
+    # UNC SELF-ERROR mode (config UncSelfError; see config.py): train unc toward
+    # the STUDENT's own realized squared value error (lc0 ValueErrorLoss
+    # semantics) instead of the teacher-time |DeltaQVersusV| data field.
+    if getattr(self, 'unc_self_error', False) and unc_out is not None and value_out is not None:
+      with torch.no_grad():
+        _ue_p = torch.softmax(value_out.float(), dim=-1)
+        _ue_qp = _ue_p[:, 0] - _ue_p[:, 2]
+        _ue_qt = (value_target[:, 0] - value_target[:, 2]).float()
+        unc_target = ((_ue_qp - _ue_qt) ** 2).unsqueeze(-1)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
     q_deviation_lower_loss = 0 if q_deviation_lower_out is None else loss_calc.q_deviation_lower_loss(q_deviation_lower_target, q_deviation_lower_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
     q_deviation_upper_loss = 0 if q_deviation_upper_out is None else loss_calc.q_deviation_upper_loss(q_deviation_upper_target, q_deviation_upper_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)

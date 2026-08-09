@@ -207,6 +207,25 @@ class Configuration:
     # mirror loss WITH enforcement active was 0.0035 — so High sits just below
     # that (drift alarm before reaching known-bad territory) and Low well
     # below the normal operating level.
+    # PRIVATE VALUE FRONT-END (2026-08-09 comparative audit, finding #1;
+    # 0 = legacy shared front-end). When > 0, the value family (value1,
+    # value2, unc, hlg) reads its OWN per-square projection D -> C channels
+    # (flattened 64*C), lc0-style, instead of the policy-shared doubly-
+    # compressed headPremap/headSharedLinear vector. The shared front-end is
+    # optimized predominantly by the policy gradient, so the legacy value
+    # head drinks through policy's straw (typ. 256-dim shared vs lc0's 2048
+    # private) — the suspected structural seat of the value deficit.
+    # Reference C=32. Incompatible with vda/gtab modes (asserted).
+    self.Opt_ValueHeadChannels = int(config_opt.get('ValueHeadChannels', 0) or 0)
+    # Uncertainty head SELF-ERROR mode (audit finding #2; 0 = legacy): train
+    # unc toward the STUDENT's own realized squared value error
+    # (q_pred - q_target)^2, detached — lc0 semantics — instead of the
+    # teacher-time |DeltaQVersusV| data field. Self-calibrating; downstream
+    # sigma consumers (optimistic policy) then use sqrt(unc). SERVING NOTE:
+    # the exported ONNX 'unc' output changes UNITS in this mode (sigma^2, not
+    # |dQ| sigma-scale) with no marker in the artifact — any serving-side
+    # UncertaintyV consumer must sqrt() it. Document per-net when serving.
+    self.Opt_UncSelfError = int(config_opt.get('UncSelfError', 0) or 0)
     # Optimistic-policy aux head (lc0 vdapda-branch port; 0 = off): a separate
     # training-only policy head whose CE is weighted sigmoid((z - Strength) *
     # Alpha) with z = (target_q - predicted_q) / (predicted_sigma + 1e-5) —

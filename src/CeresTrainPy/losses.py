@@ -251,6 +251,12 @@ class LossCalculator():
     """Cross entropy with optional per-record z-provenance weighting
     (CERES_VALUE_PROV_WEIGHTS). Falls back to plain mean CE when weighting is
     off or the batch carries no provenance (v7x-less shard in auto mode)."""
+    # fp32 cast on the logits (2026-08-09 comparative audit vs lc0, row 8):
+    # under BFloat16Pure the value logits would otherwise enter the CE already
+    # quantized to bf16 (~±0.004), non-negligible at the late-run 0.01-nat KL
+    # scale. lc0 guards this with an explicit fp32 cast in the value head.
+    output = output.float()
+    target = target.float()
     if VALUE_PROV_WEIGHTS is not None and provenance is not None:
       prov_wt = torch.tensor(VALUE_PROV_WEIGHTS, device=output.device, dtype=torch.float32)
       rec_wt = prov_wt[provenance.reshape(-1).long()]
@@ -270,7 +276,7 @@ class LossCalculator():
       # Hardness-weighted per-sample KL (see module header). Per-sample entropy
       # is subtracted BEFORE weighting so the hardness measure is the true KL,
       # not inflated by high-entropy (drawish) targets.
-      _ce_i = F.cross_entropy(output, target, reduction='none')
+      _ce_i = F.cross_entropy(output.float(), target.float(), reduction='none')
       _t = torch.clamp(target.float() + 1e-6, min=1e-6)
       _h_i = -(_t * torch.log(_t)).sum(dim=-1)
       _kl_i = _ce_i - _h_i
