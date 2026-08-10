@@ -451,10 +451,16 @@ def Train():
     #   - LoRA (head LoRA via Opt_LoRARankDivisor and/or env-var LoRA)
     #   - GTAB tactical adapter and gate (when CERES_GTAB=1)
     #   - TSB tactical FFN and gate (when NetDef_TSB_Enabled=true)
+    #   - private value front-end in 'inject' mode (value_premap + the zero-init
+    #     injectors). These are NEW modules with no base weights to protect, and
+    #     they contribute exactly zero at step 0, so they train at full rank
+    #     rather than through an adapter — rank-limiting them would throttle the
+    #     very pathway the run is testing. See config ValueHeadChannelsMode.
     for name, param in model.named_parameters():
       keep_trainable = ("lora_A" in name or "lora_B" in name or "lora_alpha" in name
                         or "tactical_adapter" in name or "tactical_gate" in name
-                        or "tactical_ffn" in name or ".tsb." in name)
+                        or "tactical_ffn" in name or ".tsb." in name
+                        or "value_premap" in name or "_priv_inject" in name)
       if not keep_trainable:
         param.requires_grad = False
    
@@ -1140,7 +1146,15 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.',
+                            # Private value front-end: new modules that can legitimately exist
+                            # on one side of a resume ('inject' mode is bit-identical to the
+                            # base at step 0, so fresh-initializing them is correct). These
+                            # prefixes also match under 'replace', but that mode ADDITIONALLY
+                            # resizes value_head/value2/unc/hlg, and load_state_dict raises on
+                            # a size mismatch even with strict=False — so a replace-mode
+                            # resume across the toggle still fails loudly, as intended.
+                            'value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -1182,6 +1196,10 @@ def Train():
           pass # GTAB modules are new — not in orig ckpt; keep their init values
         elif "tactical_ffn" in name or ".tsb." in name:
           pass # TSB modules are new — not in orig ckpt; keep their init values
+        elif "value_premap" in name or "_priv_inject" in name:
+          pass # private value front-end ('inject' mode) is new — not in orig ckpt.
+               # Injectors are zero-init, so keeping their init values is exactly
+               # what reproduces the base net at step 0.
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name

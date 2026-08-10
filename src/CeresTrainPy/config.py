@@ -217,6 +217,28 @@ class Configuration:
     # private) — the suspected structural seat of the value deficit.
     # Reference C=32. Incompatible with vda/gtab modes (asserted).
     self.Opt_ValueHeadChannels = int(config_opt.get('ValueHeadChannels', 0) or 0)
+    # How the private channels reach the value heads:
+    #   'replace' (default, from-scratch): value_head/value2/unc/hlg read the
+    #       private 64*C vector INSTEAD of the shared one. Changes head input
+    #       widths, so a checkpoint that predates the flag cannot be loaded —
+    #       correct for from-scratch, useless for fine-tuning an existing net.
+    #   'inject' (fine-tune): head input widths are UNCHANGED. The private
+    #       vector goes through its own zero-initialized projection that is
+    #       ADDED to the value head's hidden pre-activation. Algebraically this
+    #       is exactly concatenating the private features onto the head's input
+    #       (fc([shared, priv]) == fc_shared(shared) + W_priv @ priv), but as a
+    #       separate module it needs no weight surgery: every pre-existing key
+    #       loads unchanged and the net is BIT-IDENTICAL to the base at step 0
+    #       (zero-init), which is what a LoRA/fine-tune resume requires.
+    #       Applies to value1 + value2 only (the heads the hypothesis is about);
+    #       unc/hlg keep the shared input so a served net's aux-head calibration
+    #       is not disturbed. The injectors are full-rank and NOT LoRA-wrapped —
+    #       they start at exactly zero contribution, so they cannot damage the
+    #       base net no matter how hard they train, and rank-limiting them would
+    #       throttle the very pathway under test.
+    self.Opt_ValueHeadChannelsMode = str(config_opt.get('ValueHeadChannelsMode', 'replace') or 'replace').lower()
+    if self.Opt_ValueHeadChannelsMode not in ('replace', 'inject'):
+      raise ValueError(f"Unsupported ValueHeadChannelsMode: {self.Opt_ValueHeadChannelsMode!r} (use 'replace' or 'inject')")
     # Uncertainty head SELF-ERROR mode (audit finding #2; 0 = legacy): train
     # unc toward the STUDENT's own realized squared value error
     # (q_pred - q_target)^2, detached — lc0 semantics — instead of the

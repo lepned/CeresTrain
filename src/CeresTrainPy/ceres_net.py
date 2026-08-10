@@ -53,8 +53,13 @@ class Head(nn.Module):
     if lora_rank_divisor > 0:
       self.fcFinal = LoRALinear(self.fcFinal, lora_rank_divisor, True)
 
-  def forward(self, flow):
+  def forward(self, flow, inject=None):
     flow = self.fc(flow)
+    if inject is not None:
+      # Additive pre-activation injection (ValueHeadChannelsMode='inject'):
+      # equivalent to widening fc's input with extra columns, without changing
+      # fc's shape. Callers pass None everywhere else.
+      flow = flow + inject
     flow = self.fcActivation(flow)
     flow = self.fcFinal(flow)
     return flow
@@ -132,14 +137,24 @@ class CeresNet(nn.Module):
     # value family gets its own per-square projection D -> C, flattened to
     # 64*C, bypassing the policy-shared bottleneck entirely (lc0-style).
     self.value_head_channels = int(getattr(config, 'Opt_ValueHeadChannels', 0) or 0)
+    self.value_head_channels_mode = str(getattr(config, 'Opt_ValueHeadChannelsMode', 'replace') or 'replace').lower()
+    # 'replace' rewires the value family's INPUT (from-scratch only — head widths
+    # change, so pre-flag checkpoints can't load). 'inject' keeps every head width
+    # intact and adds a zero-init private projection into the value head's hidden
+    # pre-activation instead: same function, but loadable from an existing net and
+    # bit-identical to it at step 0. See config.py for the full rationale.
+    self.value_priv_replace = self.value_head_channels > 0 and self.value_head_channels_mode == 'replace'
+    self.value_priv_inject_mode = self.value_head_channels > 0 and self.value_head_channels_mode == 'inject'
     if self.value_head_channels > 0:
       # LoRA head-front adapters wrap only headPremap/headSharedLinear, which
       # the value family BYPASSES in private mode — a head-front fine-tune
       # would silently become policy-only. Fail loudly instead.
       assert int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0) == 0,         'CERES_LORA_HEADFRONT_RANK_DIV is incompatible with ValueHeadChannels (value_premap has no adapter)'
       self.value_premap = nn.Linear(self.EMBEDDING_DIM, self.value_head_channels)
-      self.VALUE_IN_SIZE = 64 * self.value_head_channels
-      print(f'[ceres_net] PRIVATE VALUE FRONT-END enabled: {self.value_head_channels} ch/square '
+      self.VALUE_PRIV_SIZE = 64 * self.value_head_channels
+    if self.value_priv_replace:
+      self.VALUE_IN_SIZE = self.VALUE_PRIV_SIZE
+      print(f'[ceres_net] PRIVATE VALUE FRONT-END (replace) enabled: {self.value_head_channels} ch/square '
             f'-> {self.VALUE_IN_SIZE}-dim private value input (shared front-end bypassed for value family)')
     else:
       self.VALUE_IN_SIZE = self.HEAD_IN_SIZE
@@ -191,6 +206,23 @@ class CeresNet(nn.Module):
 
     if self.value2_loss_weight > 0:
       self.value2_head = Head(self.Activation, 2 + self.VALUE_IN_SIZE, 64 * HEAD_MULT, 3, _other_rd)
+
+    if self.value_priv_inject_mode:
+      # Zero-init private injectors (ValueHeadChannelsMode='inject'). Bias-free and
+      # zero-weight => exactly no contribution at step 0, so the net reproduces the
+      # base checkpoint bit-for-bit and the fine-tune starts where it should. Not
+      # LoRA-wrapped: full rank, since they cannot damage anything from zero.
+      self.value_priv_inject = nn.Linear(self.VALUE_PRIV_SIZE, 64 * HEAD_MULT, bias=False)
+      nn.init.zeros_(self.value_priv_inject.weight)
+      if self.value2_loss_weight > 0:
+        self.value2_priv_inject = nn.Linear(self.VALUE_PRIV_SIZE, 64 * HEAD_MULT, bias=False)
+        nn.init.zeros_(self.value2_priv_inject.weight)
+      _n_inj = self.VALUE_PRIV_SIZE * 64 * HEAD_MULT * (2 if self.value2_loss_weight > 0 else 1)
+      _n_inj += self.EMBEDDING_DIM * self.value_head_channels + self.value_head_channels
+      print(f'[ceres_net] PRIVATE VALUE FRONT-END (inject) enabled: {self.value_head_channels} ch/square '
+            f'-> {self.VALUE_PRIV_SIZE}-dim private vector added into value1'
+            f'{"/value2" if self.value2_loss_weight > 0 else ""} hidden pre-activation '
+            f'({_n_inj:,} new params, zero-init => base recovered exactly at step 0)')
 
     if self.uncertainty_policy_weight > 0:
       self.unc_policy = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
@@ -870,11 +902,21 @@ class CeresNet(nn.Module):
       fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
       fS_value  = fS_others
 
-    # PRIVATE VALUE FRONT-END (see __init__): the value family reads its own
+    # PRIVATE VALUE FRONT-END (see __init__): the value family gets its own
     # per-square projection, bypassing the policy-shared bottleneck. gtab/vda
     # are asserted off in this mode, so `flow` is the correct source tensor.
+    # 'replace' swaps the head input outright; 'inject' keeps the shared input
+    # and adds the private features inside the head instead (see below).
+    _v_inject = None
+    _v2_inject = None
     if self.value_head_channels > 0:
-      fS_value = self.value_premap(flow).reshape(-1, self.VALUE_IN_SIZE)
+      _priv_value = self.value_premap(flow).reshape(-1, self.VALUE_PRIV_SIZE)
+      if self.value_priv_replace:
+        fS_value = _priv_value
+      else:
+        _v_inject = self.value_priv_inject(_priv_value)
+        if self.value2_loss_weight > 0:
+          _v2_inject = self.value2_priv_inject(_priv_value)
 
     # Depth-attending value context (see __init__). Non-in-place adds create NEW
     # tensors, so fS_others (often the same object as fS_value) is untouched —
@@ -1068,9 +1110,9 @@ class CeresNet(nn.Module):
                             + (_Tm * _r * self.rc_v).sum(-1) \
                             + (_Fm * _d * self.rc_w).sum(-1)
       policy_out = policy_out + _rc_add
-    value_out = self.value_head(fS_value)
-    value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1)) if self.value2_loss_weight > 0 else value_out
-    unc_out = self.unc_head(fS_value if self.value_head_channels > 0 else fS_others)
+    value_out = self.value_head(fS_value, _v_inject)
+    value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
+    unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
     action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if self.action_loss_weight > 0 else unc_out
