@@ -970,9 +970,16 @@ def Train():
   _ema_sd = None
   _ema_n = 0
   _ema_opt_steps = 0
-  if EMA_PERIOD > 0:
-    if WORLD_SIZE > 1:
-      raise NotImplementedError('EMAPeriodSteps > 0 is single-GPU only for now')
+  # DDP: the shadow lives on RANK 0 ONLY. Every rank holds bit-identical weights
+  # (DDP broadcasts params at construction, then all-reduces grads so each rank
+  # applies the same update to the same starting point — the same invariant the
+  # rank-0-only checkpoint save already relies on), so a per-rank shadow would be
+  # WORLD_SIZE identical copies of which only rank 0's is ever exported. Skipping
+  # it elsewhere is safe because the update below and the export swap perform NO
+  # collective operations: rank-divergent code only breaks DDP when it makes one
+  # rank enter a collective the others don't. Non-master ranks leave _ema_sd None,
+  # which no-ops every downstream EMA block.
+  if EMA_PERIOD > 0 and IS_MASTER:
     # Shadow kept in fp32 regardless of model precision: under BFloat16Pure a
     # bf16 shadow's ~8-bit mantissa would swallow the w/(n+1) increments late
     # in training, exactly when averaging matters most. copy_ casts on export.
@@ -980,6 +987,14 @@ def Train():
                if torch.is_floating_point(v)}
     print(f'[train] EMA weight averaging enabled: period={EMA_PERIOD} opt-steps, '
           f'max_n={EMA_MAX_N} ({len(_ema_sd)} tensors; dual export <ckpt>ema.onnx)')
+    if WORLD_SIZE > 1:
+      # The period counts OPTIMIZER STEPS, and each step consumes WORLD_SIZE times
+      # more positions under DDP — so the same value averages over a WORLD_SIZE
+      # times longer stretch of training than it did on one GPU. Divide
+      # EMAPeriodSteps by the GPU count to reproduce a single-GPU-validated recipe.
+      print(f'[train] EMA under DDP: shadow on rank 0 only; period is in optimizer '
+            f'steps, so it now spans {WORLD_SIZE}x more positions than single-GPU '
+            f'(divide EMAPeriodSteps by {WORLD_SIZE} to match a 1-GPU recipe)', flush=True)
 
   # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
   # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
