@@ -1462,7 +1462,43 @@ class CeresNet(nn.Module):
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
-        
+
+    # POLICY/VALUE GRADIENT-CONFLICT PROBE (config GradConflictProbeSteps; the
+    # measurement lives in train.py). When armed for this step, stash the two family
+    # subtotals — WEIGHTED, i.e. as they actually enter total_loss — so the train loop
+    # can differentiate them separately and measure the angle between the two gradients
+    # on the parameters they SHARE. Nothing here alters total_loss; the subtotals are
+    # additional views of terms already summed above.
+    #
+    # Family assignment follows what each head is predicting, not which tensor it reads:
+    #   policy  <- policy, soft-policy, optimistic-policy, policy-uncertainty, action(+unc)
+    #   value   <- value1/value2, unc, q-deviation, value-diff, stvalue, placement,
+    #              vda aux, value-rank, value-contrast, HL-Gauss
+    # Deliberately in NEITHER: moves-left and survival (predict neither W/D/L nor a move
+    # distribution, so they would blur the very angle being measured), the gate/TSB
+    # sparsity regularizers and mirror-consistency (added later, in train.py), and the
+    # depth probes (deep supervision spans both families by construction).
+    if getattr(self, '_gc_probe_now', False):
+      self._gc_policy_loss = (self.policy_loss_weight * p_loss
+          + self.uncertainty_policy_weight * uncertainty_policy_loss
+          + self.action_loss_weight * action_loss
+          + self.action_uncertainty_loss_weight * action_uncertainty_loss
+          + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
+          + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
+      self._gc_value_loss = (self.value_loss_weight * v_loss
+          + self.value2_loss_weight * v2_loss
+          + self.unc_loss_weight * u_loss
+          + self.q_deviation_loss_weight * q_deviation_lower_loss
+          + self.q_deviation_loss_weight * q_deviation_upper_loss
+          + self.value_diff_loss_weight * value_diff_loss
+          + self.value2_diff_loss_weight * value2_diff_loss
+          + self.stvalue_weight * stvalue_loss
+          + self.placement_value_weight * placement_loss
+          + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0)
+          + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
+          + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
+          + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0))
+
     if (log_stats):
       if not gradient_norm_logging_mode:
         stat_suffix = ""

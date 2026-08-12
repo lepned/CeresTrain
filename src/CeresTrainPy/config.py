@@ -300,6 +300,34 @@ class Configuration:
     # training is stable. 0/null/absent = off. Typical tau ~ SoftCapCutoff
     # territory (e.g. 100); ineffective (and skipped) under UseQKNorm.
     self.Opt_QKClipTau = float(config_opt.get('QKClipTau', 0) or 0)
+    # POLICY/VALUE GRADIENT-CONFLICT PROBE (0/absent = off): every N optimizer steps,
+    # differentiate the policy-family and value-family loss subtotals SEPARATELY and
+    # report the cosine between the two gradients on the parameters they share, plus
+    # the value/policy gradient-norm ratio. Measures the late-phase see-saw directly
+    # instead of inferring it from gate tables, and — because the trunk, the shared
+    # head front-end and the embedding are reported separately — says WHERE the two
+    # objectives compete: a negative cosine confined to headPremap/headSharedLinear
+    # is the shared-front-end bottleneck, a negative cosine in the trunk is not
+    # fixable by any head-side change.
+    #
+    # Costs two extra backward passes on probe steps only (~2/N overhead; N=500 is
+    # well under 1%), measured on the first micro-batch of the accumulation group.
+    # Purely diagnostic: it uses torch.autograd.grad, which returns gradients instead of
+    # accumulating into .grad — verified by snapshotting every parameter's .grad across
+    # the probe block and finding it unchanged on every probe step. (A run-level A/B
+    # cannot show this: two byte-identical runs of this trainer already diverge on their
+    # own, so a probe-on/probe-off weight comparison measures only that noise.)
+    #
+    # READ IT BINNED. The per-step cosine is genuinely noisy — a 5-probe toy run spanned
+    # -0.44 to +0.53 on the trunk — because each probe is one micro-batch. The signal
+    # being hunted (does the angle go negative as the anneal proceeds?) is a trend over
+    # tens of probes, so average over bins exactly as with the TRAIN-log diagnostics.
+    #
+    # Requires single GPU and PyTorchCompileMode off (same constraints as the older
+    # per-head gradient-norm logging: extra backwards desync DDP's reducer, and
+    # compiled autograd rejects the retained graph). To read a production run's LATE
+    # phase, resume its checkpoint uncompiled for a few million positions with this on.
+    self.Opt_GradConflictProbeSteps = int(config_opt.get('GradConflictProbeSteps', 0) or 0)
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)

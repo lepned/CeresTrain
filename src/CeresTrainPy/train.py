@@ -988,6 +988,46 @@ def Train():
     print(f'[train] HARD-REPLAY buffer enabled: size={HARD_REPLAY_SIZE}, '
           f'fraction={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}')
 
+  # Policy/value gradient-conflict probe (config: GradConflictProbeSteps — see config.py).
+  # Differentiates the two loss families separately every N optimizer steps and reports
+  # the angle between their gradients on the parameters they SHARE. Head-private params
+  # are excluded by construction: the value head receives no policy gradient and vice
+  # versa, so a cosine over them would be undefined noise. The three groups that ARE
+  # shared are reported separately because they answer different questions —
+  # headfront is the shared bottleneck the private-value-head work is about, trunk is
+  # the one no head-side change can fix.
+  GC_PROBE_STEPS = int(getattr(config, 'Opt_GradConflictProbeSteps', 0) or 0)
+  _gc_groups = {}
+  _gc_opt_steps = 0
+  if GC_PROBE_STEPS > 0:
+    if WORLD_SIZE > 1:
+      raise NotImplementedError('GradConflictProbeSteps > 0 is single-GPU only: the extra '
+                                'per-family backward passes desync DDP\'s gradient reducer')
+    if config.Opt_PyTorchCompileMode is not None:
+      raise ValueError('GradConflictProbeSteps > 0 requires PyTorchCompileMode null: compiled '
+                       'autograd rejects the retained graph the probe needs. To measure a '
+                       'compiled production run, resume its checkpoint uncompiled for a few '
+                       'million positions with the probe on.')
+    for _n, _p in model_nocompile.named_parameters():
+      if not _p.requires_grad:
+        continue
+      if 'transformer_layer' in _n:
+        _gc_groups.setdefault('trunk', []).append((_n, _p))
+      elif 'headPremap' in _n or 'headSharedLinear' in _n:
+        _gc_groups.setdefault('headfront', []).append((_n, _p))
+      elif 'embedding' in _n:
+        _gc_groups.setdefault('emb', []).append((_n, _p))
+    _gc_order = [g for g in ('trunk', 'headfront', 'emb') if g in _gc_groups]
+    _gc_params = [p for g in _gc_order for (_, p) in _gc_groups[g]]
+    _gc_slices = []
+    _gc_at = 0
+    for g in _gc_order:
+      _gc_slices.append((g, _gc_at, _gc_at + len(_gc_groups[g])))
+      _gc_at += len(_gc_groups[g])
+    print(f'[train] GRAD-CONFLICT probe enabled: every {GC_PROBE_STEPS} optimizer steps, '
+          f'groups ' + ', '.join(f'{g}={len(_gc_groups[g])}' for g in _gc_order)
+          + ' (2 extra backwards per probe step; diagnostic only, training unaffected)', flush=True)
+
   # EMA / SWA shadow weights (config: EMAPeriodSteps/EMAMaxN — see config.py).
   # Shadow copies of all floating-point state tensors live on the model's
   # device; updated every EMAPeriodSteps optimizer steps with the lc0 capped
@@ -1513,6 +1553,17 @@ def Train():
     show_losses = (num_pos % (1024 * 64) == 0)
 
     is_accumulating = ((batch_accumulation_counter + 1) % num_batches_gradient_accumulate) != 0
+
+    # Arm the gradient-conflict probe for this micro-batch (see setup block). Measured
+    # on the FIRST micro-batch of an accumulation group: one micro-batch is a fair
+    # sample of the angle, and probing the last one would mean differentiating a graph
+    # that the accumulated backward is about to consume. Must be set before the forward,
+    # since compute_loss builds the per-family subtotals only when armed.
+    if GC_PROBE_STEPS > 0:
+      core._gc_probe_now = (batch_accumulation_counter % num_batches_gradient_accumulate == 0) \
+                           and (_gc_opt_steps % GC_PROBE_STEPS == 0)
+      core._gc_policy_loss = None
+      core._gc_value_loss = None
     # DDP gradient-accumulation: suppress the cross-rank all-reduce on every micro-
     # step EXCEPT the last one of an accumulation window (this is exactly what
     # model.no_sync() toggles; setting the flag avoids re-indenting the forward
@@ -1880,6 +1931,40 @@ def Train():
           print(f"KL_ANCHOR pol={_kl_pol_val if _kl_pol_val is not None else 'off'} "
                 f"val={_kl_val_val if _kl_val_val is not None else 'off'}")
 
+    # GRADIENT-CONFLICT PROBE (see setup block). Runs BEFORE the real backward and uses
+    # torch.autograd.grad, which returns gradients instead of accumulating into .grad —
+    # so the optimizer sees exactly what it would have seen with the probe off. Both
+    # calls retain the graph; loss.backward() below then consumes it as usual.
+    # allow_unused because a family may not reach every shared parameter (missing ->
+    # contributes zero to both the dot product and the norms, which is correct).
+    if GC_PROBE_STEPS > 0 and getattr(core, '_gc_probe_now', False):
+      core._gc_probe_now = False
+      _gc_pl, _gc_vl = core._gc_policy_loss, core._gc_value_loss
+      if torch.is_tensor(_gc_pl) and torch.is_tensor(_gc_vl) and _gc_pl.requires_grad and _gc_vl.requires_grad:
+        _gp = torch.autograd.grad(_gc_pl, _gc_params, retain_graph=True, allow_unused=True)
+        _gv = torch.autograd.grad(_gc_vl, _gc_params, retain_graph=True, allow_unused=True)
+        _gc_msg = []
+        for _gname, _lo, _hi in _gc_slices:
+          _dot = _np = _nv = 0.0
+          for _a, _b in zip(_gp[_lo:_hi], _gv[_lo:_hi]):
+            if _a is None or _b is None:
+              continue
+            _af, _bf = _a.float(), _b.float()
+            _dot += float((_af * _bf).sum())
+            _np += float((_af * _af).sum())
+            _nv += float((_bf * _bf).sum())
+          _np, _nv = _np ** 0.5, _nv ** 0.5
+          _cos = _dot / (_np * _nv) if _np > 0 and _nv > 0 else float('nan')
+          _ratio = _nv / _np if _np > 0 else float('nan')
+          _gc_msg.append(f'{_gname} cos {_cos:+.4f} |gv|/|gp| {_ratio:.4f}')
+          if writer is not None:
+            writer.add_scalar(f'gradconflict/cos_{_gname}', _cos, num_pos)
+            writer.add_scalar(f'gradconflict/ratio_{_gname}', _ratio, num_pos)
+        print(f'GRADCONFLICT: {num_pos} , ' + ' , '.join(_gc_msg), flush=True)
+        del _gp, _gv
+      core._gc_policy_loss = None
+      core._gc_value_loss = None
+
     # Backward outside the autocast context (standard practice; bf16-mixed needs no
     # gradient scaling unlike fp16, so plain loss.backward() is correct).
     loss.backward()
@@ -1898,6 +1983,9 @@ def Train():
 
       optimizer.step()
       optimizer.zero_grad()
+
+      if GC_PROBE_STEPS > 0:
+        _gc_opt_steps += 1   # counts optimizer steps, so the probe cadence is in the config's units
 
       # Per-head QK-clip: rescale Q/K rows of any head whose max logit exceeded
       # tau this step (weight-level; no-op once training is stable). Throttled
