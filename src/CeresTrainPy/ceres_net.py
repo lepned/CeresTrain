@@ -146,10 +146,15 @@ class CeresNet(nn.Module):
     self.value_priv_replace = self.value_head_channels > 0 and self.value_head_channels_mode == 'replace'
     self.value_priv_inject_mode = self.value_head_channels > 0 and self.value_head_channels_mode == 'inject'
     if self.value_head_channels > 0:
-      # LoRA head-front adapters wrap only headPremap/headSharedLinear, which
-      # the value family BYPASSES in private mode — a head-front fine-tune
-      # would silently become policy-only. Fail loudly instead.
-      assert int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0) == 0,         'CERES_LORA_HEADFRONT_RANK_DIV is incompatible with ValueHeadChannels (value_premap has no adapter)'
+      # LoRA head-front adapters wrap only headPremap/headSharedLinear, which the
+      # value family BYPASSES in 'replace' mode — a head-front fine-tune would
+      # silently become policy-only. Fail loudly there. NOT a conflict in 'inject'
+      # mode: the value heads keep reading the shared vector (fS_value IS
+      # fS_others), so the adapters reach them exactly as they reach every other
+      # head, and value_premap trains full-rank alongside. Since 'inject' exists
+      # precisely to fine-tune an existing net, blocking it here would forbid the
+      # combination the mode was built for.
+      assert not self.value_priv_replace or int(os.environ.get('CERES_LORA_HEADFRONT_RANK_DIV', '0') or 0) == 0,         "CERES_LORA_HEADFRONT_RANK_DIV is incompatible with ValueHeadChannelsMode='replace' (value_premap has no adapter)"
       self.value_premap = nn.Linear(self.EMBEDDING_DIM, self.value_head_channels)
       self.VALUE_PRIV_SIZE = 64 * self.value_head_channels
     if self.value_priv_replace:

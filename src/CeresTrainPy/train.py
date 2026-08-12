@@ -470,13 +470,8 @@ def Train():
   QK_CLIP_TAU = float(getattr(config, 'Opt_QKClipTau', 0) or 0)
   _qk_clip_mods = []
   _qk_clip_last_report = [-10**18]  # mutable so the train loop can throttle QKCLIP prints
+  _qk_clip_sync = None              # cross-rank stash reduction (DDP only); None = single-GPU
   if QK_CLIP_TAU > 0:
-    if IS_DISTRIBUTED:
-      # Each rank sees different data -> different per-head maxima -> different
-      # weight rescales -> silent replica divergence. Needs an all-reduce(max)
-      # on the stashes before this is DDP-safe; loud error until then.
-      raise ValueError('QKClipTau is single-GPU only for now (per-rank clipping would '
-                       'silently diverge DDP replicas)')
     from dot_product_attention import DotProductAttention
     for _mod in model.modules():
       if isinstance(_mod, DotProductAttention):
@@ -484,8 +479,41 @@ def Train():
         _qk_clip_mods.append(_mod)
     if not _qk_clip_mods:
       raise ValueError('QKClipTau set but no DotProductAttention modules found')
+    if IS_DISTRIBUTED:
+      # Each rank observes the per-head max logit over ITS OWN microbatch. Clipping on
+      # those independently would rescale different heads by different factors on each
+      # rank and silently diverge the replicas — which is why this combination used to
+      # be refused outright. Reducing the stashes with MAX before the clip removes the
+      # problem and is also the semantically correct statistic: the max over the global
+      # batch is exactly what a single-GPU run of the same batch would have seen.
+      #
+      # Deadlock-safety: the buffer is sized from the module list (identical on every
+      # rank, fixed for the whole run), so all ranks always enter the collective with
+      # the same shape regardless of which stashes happen to be populated. Missing
+      # stashes contribute 0, which yields gamma=1 => no clip. The reduced values are
+      # written back UNCONDITIONALLY, so every rank clips from byte-identical input
+      # even in the edge case where a stash exists on some ranks but not others.
+      _qk_clip_sizes = [int(_m.num_heads) for _m in _qk_clip_mods]
+      _qk_clip_dev = torch.device('cpu') if dist.get_backend() == 'gloo' else device
+      _qk_clip_buf = torch.zeros(sum(_qk_clip_sizes), dtype=torch.float32, device=_qk_clip_dev)
+
+      def _qk_clip_sync():
+        _qk_clip_buf.zero_()
+        _off = 0
+        for _m, _n in zip(_qk_clip_mods, _qk_clip_sizes):
+          _v = getattr(_m, '_last_max_logit', None)
+          if _v is not None:
+            _qk_clip_buf[_off:_off + _n] = _v.detach().float().to(_qk_clip_dev)
+          _off += _n
+        dist.all_reduce(_qk_clip_buf, op=dist.ReduceOp.MAX)
+        _off = 0
+        for _m, _n in zip(_qk_clip_mods, _qk_clip_sizes):
+          _m._last_max_logit = _qk_clip_buf[_off:_off + _n].to(next(_m.parameters()).device)
+          _off += _n
     print(f'[train] QK-CLIP armed: tau={QK_CLIP_TAU}, {len(_qk_clip_mods)} attention modules '
-          f'(per-head weight rescale after optimizer step)', flush=True)
+          f'(per-head weight rescale after optimizer step)'
+          + (f'; DDP: stashes MAX-reduced across {WORLD_SIZE} ranks so every replica clips identically'
+             if IS_DISTRIBUTED else ''), flush=True)
 
   # Possibly compile model (as recommended by Lightning docs, comile should appear before fabric.setup).
   # N.B. when debugging, may be helpful to disable this line (otherwise breakpoints relating to graph evaluation will not be hit).
@@ -1161,15 +1189,25 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.',
-                            # Private value front-end: new modules that can legitimately exist
-                            # on one side of a resume ('inject' mode is bit-identical to the
-                            # base at step 0, so fresh-initializing them is correct). These
-                            # prefixes also match under 'replace', but that mode ADDITIONALLY
-                            # resizes value_head/value2/unc/hlg, and load_state_dict raises on
-                            # a size mismatch even with strict=False — so a replace-mode
-                            # resume across the toggle still fails loudly, as intended.
-                            'value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.')
+      # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
+      # exist on one side of a resume — they are zero-init, so the net is bit-identical
+      # to the base at step 0 and fresh-initializing them is exactly right.
+      #
+      # Deliberately NOT extended to 'replace'. That mode rewires the value family's
+      # INPUT, so a fresh-initialized value_premap would feed the trained value head a
+      # random private vector. It is tempting to rely on 'replace' also resizing
+      # value_head/value2/unc/hlg (load_state_dict rejects a size mismatch even with
+      # strict=False), but the widths COINCIDE whenever 64*ValueHeadChannels ==
+      # HEAD_IN_SIZE — and since HEAD_IN_SIZE = 64 * (HEAD_PREMAP_PER_SQUARE // 4),
+      # at EMBEDDING_DIM 256 that collapses to simply ValueHeadChannels ==
+      # HeadWidthMultiplier (at 384/mult 2 it is ValueHeadChannels == 3). Exactly the
+      # small channel counts a C-ablation would sweep. With every shape matching, the
+      # load would succeed and the corruption would be announced by nothing louder than
+      # an INFO line. Leaving the prefixes out here routes that case into the strict
+      # load / _missing_other check instead, which raises.
+      if getattr(model_nocompile, 'value_priv_inject_mode', False):
+        _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
@@ -1865,6 +1903,11 @@ def Train():
       # tau this step (weight-level; no-op once training is stable). Throttled
       # QKCLIP log line + TB scalar so clip activity is visible/greppable.
       if QK_CLIP_TAU > 0:
+        if _qk_clip_sync is not None:
+          # DDP: fold every rank's per-head maxima into one MAX before clipping, so
+          # all replicas apply the identical rescale (see the setup block). Runs on
+          # every rank — it is a collective.
+          _qk_clip_sync()
         _clip_total = 0
         for _m in _qk_clip_mods:
           _clip_total += _m.apply_qk_clip(QK_CLIP_TAU)
