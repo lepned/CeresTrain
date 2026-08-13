@@ -47,6 +47,7 @@ class EncoderLayer(torch.nn.Module):
                 use_diff_attention : bool = False,
                 tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
                 tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
+                vis_gate_channels : int = 0, vis_gate_mode : str = 'qk',
                 pre_norm : bool = False):
     super().__init__()
 
@@ -74,7 +75,8 @@ class EncoderLayer(torch.nn.Module):
                                          smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
                                          smolgen_delta_rank,
                                          use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum,
-                                         use_diff_attention=use_diff_attention)
+                                         use_diff_attention=use_diff_attention,
+                                         vis_gate_channels=vis_gate_channels, vis_gate_mode=vis_gate_mode)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
@@ -129,15 +131,16 @@ class EncoderLayer(torch.nn.Module):
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None,
               film: Tuple[torch.Tensor, torch.Tensor] = None,
               rpe_src: torch.Tensor = None,
-              rpe_precomputed: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+              rpe_precomputed: bool = False,
+              vis_edge: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
     # Pre-norm vs post-norm differ ONLY in WHERE the norm sits relative to the
     # residual. NormType (LayerNorm/RMSNorm/Derf) is orthogonal — applies the
     # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
     if self.pre_norm:
       attn_input = self.ln1(x)
-      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed)
+      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge)
     else:
-      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed)
+      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge)
 
     if (self.dropout_rate > 0):
       attn_output = self.dropout_attn(attn_output)

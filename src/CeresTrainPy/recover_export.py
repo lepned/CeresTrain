@@ -60,6 +60,22 @@ if _ckpt_emb_w is not None:
       f"features/square ({_ckpt_aux} aux) but the rebuilt model has {_model_in}. "
       f"Set CERES_AUX_FEATURES_PER_SQUARE={_ckpt_aux} and re-run. (checkpoint: {CKPT})")
 
+# VIS-EDGE GUARD: same silent-skip class as the aux-width guard above. If the
+# checkpoint carries trained vis edge-bias weights but the rebuilt model has
+# none, strict=False would discard them with only a WARN and export a net
+# missing an attention bias the trunk co-adapted to. The knobs are config-only
+# (NetDef UseVisEdgeBias/VisEdgeGates), so this firing means the _ceres_net.json
+# no longer matches what the checkpoint was trained with.
+_ckpt_vis = [k for k in loaded['model']
+             if k.startswith('vis_edge_proj.') or '.attack_gate_' in k]
+_model_vis = [k for k in model.state_dict()
+              if k.startswith('vis_edge_proj.') or '.attack_gate_' in k]
+if _ckpt_vis and not _model_vis:
+  raise ValueError(
+    f'Checkpoint contains {len(_ckpt_vis)} vis edge-bias tensors but the rebuilt model has none. '
+    f'Set "UseVisEdgeBias": true (and matching VisEdgeFamilies/VisEdgeGates) in the '
+    f'_ceres_net.json config before re-exporting. (checkpoint: {CKPT})')
+
 missing, unexpected = model.load_state_dict(loaded['model'], strict=False)
 if missing:    print('WARN: missing keys (count={}): {}'.format(len(missing), missing[:5]))
 if unexpected: print('WARN: unexpected keys (count={}): {}'.format(len(unexpected), unexpected[:5]))

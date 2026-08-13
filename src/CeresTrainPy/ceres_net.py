@@ -33,7 +33,7 @@ from rms_norm import RMSNorm, make_norm
 from lora import LoRALinear
 from utils import DWA
 from tactical_adapter import TacticalAdapter, PositionGate, gtab_enabled
-from chess_geometry import PieceRelationBias, RayAttentionBias
+from chess_geometry import PieceRelationBias, RayAttentionBias, VisibilityChannels
 
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
 
@@ -574,9 +574,47 @@ class CeresNet(nn.Module):
     else:
       self.rpe_factor_shared = None
 
+    # Visibility edge bias v2 — parsed HERE (before the transformer stack)
+    # because the optional B/C content gates live inside each layer's attention
+    # (they read that layer's per-head Q/K) and need the channel count at
+    # EncoderLayer construction time. Module creation happens later, next to
+    # the other bias modules. CONFIG-ONLY (NetDef fields, see config.py): these
+    # knobs change the parameter tree, so they must be reconstructable from the
+    # net config alone (resume, recover_export, serving).
+    #   NetDef UseVisEdgeBias           enable channels + form-A per-layer bias
+    #   NetDef VisEdgeFamilies          subset of vis,xray,pinray (default all)
+    #   NetDef VisEdgeGates = q|k|qk    add content-gated forms B / C / B+C
+    #   NetDef VisEdgeSharedProjection  one shared form-A projection (ablation)
+    for _ev in ('CERES_VIS_EDGE_BIAS', 'CERES_VIS_EDGE_FAMILIES',
+                'CERES_VIS_EDGE_GATES', 'CERES_VIS_EDGE_SHARED'):
+      assert not os.environ.get(_ev), \
+          f'{_ev} is retired — set the NetDef VisEdge* fields in the _ceres_net.json config instead'
+    self.use_vis_edge_bias = bool(getattr(config, 'NetDef_UseVisEdgeBias', False))
+    # Canonicalize families (lowercase, dedupe, canonical order) HERE so the
+    # gate channel count below always agrees with VisibilityChannels'
+    # num_channels (which applies the same canonicalization internally).
+    _fams_raw = [f.strip().lower() for f in
+                 str(getattr(config, 'NetDef_VisEdgeFamilies', 'vis,xray,pinray') or '').split(',') if f.strip()]
+    for _f in _fams_raw:
+      assert _f in VisibilityChannels.FAMILY_ORDER, \
+          f'VisEdgeFamilies: unknown family {_f!r} (know: {VisibilityChannels.FAMILY_ORDER})'
+    self._vis_edge_families = tuple(f for f in VisibilityChannels.FAMILY_ORDER if f in _fams_raw)
+    if self.use_vis_edge_bias:
+      assert self._vis_edge_families, 'VisEdgeFamilies resolved to an empty family list'
+    self.vis_edge_shared = bool(getattr(config, 'NetDef_VisEdgeSharedProjection', False))
+    # Accept the codebase-standard disable spellings for the gate field.
+    _gm = str(getattr(config, 'NetDef_VisEdgeGates', '') or '').strip().lower()
+    self.vis_edge_gate_mode = '' if _gm in ('', '0', 'off', 'none', 'false') else _gm
+    if self.vis_edge_gate_mode:
+      assert self.use_vis_edge_bias, 'VisEdgeGates requires UseVisEdgeBias=true'
+      assert self.vis_edge_gate_mode in ('q', 'k', 'qk'), \
+          f'VisEdgeGates must be q, k or qk (or empty/0/off to disable), got: {self.vis_edge_gate_mode}'
+    _vis_gate_channels = (4 * len(self._vis_edge_families)
+                          if (self.use_vis_edge_bias and self.vis_edge_gate_mode) else 0)
+
     num_tokens_q = NUM_TOKENS_NET
     num_tokens_kv = NUM_TOKENS_NET
-    
+
     self.transformer_layer = torch.nn.Sequential(
        *[EncoderLayer('T', num_tokens_q, num_tokens_kv,
                       self.NUM_LAYERS, self.EMBEDDING_DIM,
@@ -612,6 +650,8 @@ class CeresNet(nn.Module):
                       tsb_ffn_multiplier = getattr(config, 'NetDef_TSB_FFNMultiplier', 1),
                       tsb_gate_bias_init = getattr(config, 'NetDef_TSB_GateBiasInit', -4.0),
                       tsb_gate_mlp_hidden_divisor = getattr(config, 'NetDef_TSB_GateMLPHiddenDivisor', 8),
+                      vis_gate_channels = _vis_gate_channels,
+                      vis_gate_mode = self.vis_edge_gate_mode,
                       pre_norm = config.NetDef_PreNorm)
         for i in range(self.NUM_DISTINCT_LAYERS)])
 
@@ -685,6 +725,37 @@ class CeresNet(nn.Module):
       self.ray_bias_module = RayAttentionBias(num_heads=self.NUM_HEADS)
       print(f'[ceres_net] RAY ATTENTION BIAS enabled: 6 blocker-aware slider/x-ray '
             f'channels -> per-head additive bias ({6 * self.NUM_HEADS} params)')
+
+    # Visibility edge bias v2 (CERES_VIS_EDGE_BIAS=1): channel builder + form-A
+    # content-free injection per the Kovax visibility program
+    # (C:\Dev\Chess\Temp\VISIBILITY_PROGRAM.md). Pairwise {0,1} edge channels
+    # (families vis/xray/pinray, each stm/opp x out/in) built ONCE per forward
+    # by chess_geometry.VisibilityChannels and shared by all layers; each layer
+    # projects them with its own zero-init Linear(C -> num_heads) (per-block
+    # attack_w in the source program; zero-init => exact step-0 no-op).
+    # CERES_VIS_EDGE_FAMILIES selects families (default all three);
+    # CERES_VIS_EDGE_SHARED=1 collapses to one shared projection (ablation arm).
+    # Composes additively with PRB / ray-bias / RPE via the piece_relation_bias
+    # path. Env parsing happened before the transformer stack (see there); the
+    # optional B/C content-gate parameters live inside each layer's attention.
+    if self.use_vis_edge_bias:
+      # Mutually exclusive with the ray bias: VisibilityChannels' slider-vis and
+      # xray families re-express RayAttentionBias's channels exactly, so running
+      # both double-parameterizes identical indicators and makes the
+      # "ray-bias vs vis-bias" ablation uninterpretable.
+      assert not self.use_ray_bias, \
+          'UseVisEdgeBias and CERES_RAY_ATTENTION_BIAS are mutually exclusive ablation arms'
+      self.vis_channels_module = VisibilityChannels(families=self._vis_edge_families)
+      _n_proj = 1 if self.vis_edge_shared else self.NUM_DISTINCT_LAYERS
+      _C = self.vis_channels_module.num_channels
+      self.vis_edge_proj = torch.nn.ModuleList(
+          [torch.nn.Linear(_C, self.NUM_HEADS, bias=False) for _ in range(_n_proj)])
+      for _lin in self.vis_edge_proj:
+        torch.nn.init.zeros_(_lin.weight)
+      print(f'[ceres_net] VISIBILITY EDGE BIAS enabled: families={self.vis_channels_module.families} '
+            f'({_C} channels), {"shared" if self.vis_edge_shared else "per-layer"} '
+            f'zero-init projection ({_C * self.NUM_HEADS * _n_proj} params), '
+            f'content gates: {self.vis_edge_gate_mode or "off"}')
 
     # Phase-FiLM (CERES_PHASE_FILM=1): phase-conditioned per-layer FFN modulation.
     # Rationale: a small net averages one circuit over opening/middlegame/endgame;
@@ -796,6 +867,21 @@ class CeresNet(nn.Module):
       piece_relation_bias_tensor = _ray_bias if piece_relation_bias_tensor is None \
           else piece_relation_bias_tensor + _ray_bias
 
+    # Visibility edge channels (see __init__): built once per forward, shared
+    # by all layers. Form-A biases are precomputed per distinct layer HERE
+    # (the rpe_gen_biases pattern) rather than inside the layer loop, so
+    # shared mode computes one tensor and LoopCount>1 never recomputes.
+    vis_edge_E = None
+    vis_edge_biases = None
+    if self.use_vis_edge_bias:
+      vis_edge_E = self.vis_channels_module(squares[:, :, 0:13])  # [B, 64, 64, C]
+      if self.vis_edge_shared:
+        _vb0 = self.vis_edge_proj[0](vis_edge_E).permute(0, 3, 1, 2)
+        vis_edge_biases = [_vb0] * self.NUM_DISTINCT_LAYERS
+      else:
+        vis_edge_biases = [self.vis_edge_proj[i](vis_edge_E).permute(0, 3, 1, 2)
+                           for i in range(self.NUM_DISTINCT_LAYERS)]
+
     # Phase-FiLM conditioning (see __init__): piece census + material scalar from
     # the same one-hot planes PRB reads, computed ONCE per forward. Normalization:
     # counts x0.1 (piece counts 0..8 -> ~O(1)), material x0.025 (0..78 -> ~O(1)).
@@ -862,12 +948,16 @@ class CeresNet(nn.Module):
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
           _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]
+        if vis_edge_biases is not None:
+          _vb = vis_edge_biases[i]  # [B, H, 64, 64], precomputed above
+          _prb_l = _vb if _prb_l is None else _prb_l + _vb
         flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l,
                                          film=None if phase_film_tensor is None else
                                               (phase_film_tensor[:, i, 0].unsqueeze(1),
                                                phase_film_tensor[:, i, 1].unsqueeze(1)),
                                          rpe_src=rpe_src_tensor,
-                                         rpe_precomputed=rpe_gen_biases is not None)
+                                         rpe_precomputed=rpe_gen_biases is not None,
+                                         vis_edge=vis_edge_E if self.vis_edge_gate_mode else None)
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
@@ -1539,6 +1629,26 @@ class CeresNet(nn.Module):
         self._log("pos_mm", num_pos // 1000000., step=num_pos)
         self._log("LR", last_lr, step=num_pos)
         self._log("total_loss", total_loss, step=num_pos)
+
+        # Visibility edge bias: per-family projection-weight RMS. The source
+        # program's structure-first readout — channel-weight RMS reproduces
+        # 10-300x better across runs than short-horizon losses, so this is the
+        # earliest reliable signal that a family is being used.
+        if self.use_vis_edge_bias:
+          with torch.no_grad():
+            for _fam, _sl in self.vis_channels_module.family_slices.items():
+              _w = torch.stack([_lin.weight[:, _sl] for _lin in self.vis_edge_proj])
+              self._log("vis_w_rms_" + _fam, _w.pow(2).mean().sqrt(), step=num_pos)
+            if self.vis_edge_gate_mode:
+              # B/C gate energy per family (gate params live in each layer's
+              # attention; channel dim is index 1 of [H, C, d]).
+              for _gname, _tag in (('attack_gate_q', 'gateq'), ('attack_gate_k', 'gatek')):
+                _gs = [getattr(_l.attention, _gname) for _l in self.transformer_layer]
+                if _gs[0] is None:
+                  continue
+                for _fam, _sl in self.vis_channels_module.family_slices.items():
+                  _w = torch.stack([_g[:, _sl, :] for _g in _gs])
+                  self._log(f"vis_{_tag}_rms_{_fam}", _w.pow(2).mean().sqrt(), step=num_pos)
 
         # Log GPU (CUDA) statistics
         if torch.cuda.is_available():

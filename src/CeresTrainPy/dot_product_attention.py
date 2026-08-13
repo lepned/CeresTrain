@@ -158,7 +158,9 @@ class DotProductAttention(torch.nn.Module):
                use_rope : bool = False,
                test : bool = False,
                layer_num : int = None,
-               use_diff_attention : bool = False) -> None:
+               use_diff_attention : bool = False,
+               vis_gate_channels : int = 0,
+               vis_gate_mode : str = 'qk') -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -257,6 +259,33 @@ class DotProductAttention(torch.nn.Module):
               f'gate [{self.d_model} -> {self.d_model * self.attention_multiplier}] per layer, '
               f'zero-init weight / bias 4.0 (gate~0.982 at step 0)')
 
+    # Visibility edge-bias B/C content gates (Kovax visibility program,
+    # VISIBILITY_PROGRAM.md sec. 4/16): per-layer, per-head LINEAR readout of
+    # this layer's own Q (form B, query-gated) and/or K (form C, key-gated)
+    # per-head content, contracted against the shared pairwise edge channels
+    # E[b, q, k, c] and ADDED to the attention logits alongside the
+    # content-free per-layer projection (form A) that lives in ceres_net:
+    #   B: logits[h,q,k] += sum_c (Q[h,q,:] . gate_q[h,c,:]) * E[q,k,c]
+    #   C: logits[h,q,k] += sum_c (K[h,k,:] . gate_k[h,c,:]) * E[q,k,c]
+    # Zero-init => exact step-0 no-op; the terms are LINEAR in the gate params
+    # so gradient flows from step 1 (no zero-times-zero trap — that only
+    # afflicts the refuted multiplicative B*C form, which is deliberately not
+    # implemented; B+C reached the same ceiling at half the complexity).
+    # Gates read Q/K after qk_norm but BEFORE RoPE rotation (content, not
+    # position, is what the gate is meant to condition on).
+    self.vis_gate_channels = vis_gate_channels
+    self.attack_gate_q = None
+    self.attack_gate_k = None
+    if vis_gate_channels > 0:
+      assert self.use_qkv, 'vis edge gates require use_qkv'
+      assert not use_diff_attention, 'vis edge gates unsupported with DiffAttention (Q is a tuple)'
+      assert vis_gate_mode in ('q', 'k', 'qk'), f'bad vis_gate_mode: {vis_gate_mode}'
+      _dkm = self.d_k * self.attention_multiplier
+      if 'q' in vis_gate_mode:
+        self.attack_gate_q = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
+      if 'k' in vis_gate_mode:
+        self.attack_gate_k = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
+
     if self.use_nonlinear_attention:
       self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
       self.q2 = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_model * self.attention_multiplier, bias=USE_BIAS), self.layer_num)
@@ -340,6 +369,14 @@ class DotProductAttention(torch.nn.Module):
   # Known partial coverage: RPE/smolgen/rel-bias additive logit terms are not
   # rescaled (Q/K scaling shrinks the RPE cross terms by sqrt(gamma) only);
   # the monitored max is the FULL pre-softcap logit, so clipping is conservative.
+  # The same applies to piece_relation_bias and everything folded into it (PRB,
+  # ray bias, vis edge bias + B/C gates). ⚠ With QK-clip ARMED this is a real
+  # feedback risk, not just waste: once a head's bias-driven max exceeds tau,
+  # gamma < 1 every step and the clip multiplicatively shrinks that head's Q/K
+  # rows while the additive bias does not shrink at all — progressive decay of
+  # content attention toward the bias-only solution. If QKClipTau is combined
+  # with large learnable logit biases, the monitor should stash the max BEFORE
+  # the bias add (or those runs should not arm QK-clip).
   @torch.no_grad()
   def apply_qk_clip(self, tau):
     """Returns number of heads clipped this call (0 if none / not applicable)."""
@@ -531,7 +568,7 @@ class DotProductAttention(torch.nn.Module):
 
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
-              rpe_precomputed: bool = False) -> torch.Tensor:
+              rpe_precomputed: bool = False, vis_edge: torch.Tensor = None) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -605,6 +642,31 @@ class DotProductAttention(torch.nn.Module):
       if self.use_qk_norm:
         Q_rpe = self.qLN(Q_rpe)
         K_rpe = self.kLN(K_rpe)
+
+    # Visibility edge-bias B/C content gates (see __init__): contract this
+    # layer's per-head Q/K content against the shared edge channels and fold
+    # the result into piece_relation_bias (added to scores post-1/sqrt(d_k),
+    # the same injection point as the source program). Matmul-only
+    # formulations (no einsum) for export friendliness:
+    #   gq[b,h,q,c] = Q[b,h,q,:] @ gate_q[h,c,:]^T
+    #   B-term[b,h,q,k] = sum_c gq[b,h,q,c] * E[b,q,k,c]   (batch dims b,q)
+    #   C-term[b,h,q,k] = sum_c gk[b,h,k,c] * E[b,q,k,c]   (batch dims b,k)
+    if self.vis_gate_channels > 0 and vis_edge is not None:
+      E = vis_edge.to(Q.dtype)                                    # [B, 64q, 64k, C]
+      vis_gate_bias = None
+      if self.attack_gate_q is not None:
+        gq = torch.matmul(Q, self.attack_gate_q.transpose(-1, -2).unsqueeze(0).to(Q.dtype))  # [B,H,64,C]
+        term = torch.matmul(gq.permute(0, 2, 1, 3),               # [B, 64q, H, C]
+                            E.permute(0, 1, 3, 2))                # [B, 64q, C, 64k]
+        vis_gate_bias = term.permute(0, 2, 1, 3)                  # [B, H, 64q, 64k]
+      if self.attack_gate_k is not None:
+        gk = torch.matmul(K, self.attack_gate_k.transpose(-1, -2).unsqueeze(0).to(K.dtype))  # [B,H,64,C]
+        term = torch.matmul(E.permute(0, 2, 1, 3),                # [B, 64k, 64q, C]
+                            gk.permute(0, 2, 3, 1))               # [B, 64k, C, H]
+        term = term.permute(0, 3, 2, 1)                           # [B, H, 64q, 64k]
+        vis_gate_bias = term if vis_gate_bias is None else vis_gate_bias + term
+      piece_relation_bias = vis_gate_bias if piece_relation_bias is None \
+          else piece_relation_bias + vis_gate_bias
 
     if self.use_rope:
       # Apply rotation to Q and K (not V). Position info is intrinsic to

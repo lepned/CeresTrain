@@ -460,7 +460,13 @@ def Train():
       keep_trainable = ("lora_A" in name or "lora_B" in name or "lora_alpha" in name
                         or "tactical_adapter" in name or "tactical_gate" in name
                         or "tactical_ffn" in name or ".tsb." in name
-                        or "value_premap" in name or "_priv_inject" in name)
+                        or "value_premap" in name or "_priv_inject" in name
+                        # Vis edge-bias modules (NetDef UseVisEdgeBias/VisEdgeGates):
+                        # NEW zero-init modules with no base weights to protect —
+                        # same full-rank rationale as the 'inject' front-end above.
+                        # Without this they freeze at zero and the feature is a
+                        # silent no-op in every LoRA/GTAB/TSB run.
+                        or "vis_edge_proj" in name or "attack_gate_" in name)
       if not keep_trainable:
         param.requires_grad = False
    
@@ -619,8 +625,11 @@ def Train():
         return True
     elif _muon_scope == 'all-non-trunk':
       # Legacy partition: Muon only for 2-D trunk params; everything else AdamW.
+      # ndim == 2 (not >= 2): Muon's ctor asserts exactly-2-D, so any >=3-D
+      # trunk param (e.g. the [H, C, d_k] vis edge-bias gate tensors) must go
+      # to the internal AdamW group — same rule the 'final-only' scope applies.
       def _use_muon(n, p):
-        return p.ndim >= 2 and 'embedding' not in n and 'transformer_layer' in n
+        return p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
     else:
       raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk' or 'final-only')")
     muon_params  = [p for n, p in model.named_parameters() if p.requires_grad and _use_muon(n, p)]
@@ -1248,10 +1257,19 @@ def Train():
       # load / _missing_other check instead, which raises.
       if getattr(model_nocompile, 'value_priv_inject_mode', False):
         _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
+      # Vis edge-bias params (CERES_VIS_EDGE_BIAS/_GATES): the form-A projections
+      # are top-level ('vis_edge_proj.') but the B/C gate params live NESTED in
+      # each layer's attention (transformer_layer.N.attention.attack_gate_*), so
+      # prefix matching can't express them — use a predicate. All are zero-init,
+      # so fresh-initializing on resume reproduces the base net exactly (same
+      # rationale as the 'inject' private-value front-end above).
+      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('vis_edge_proj.',)
+      def _is_aux_key(k):
+        return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k
       _ckpt_model_sd = loaded["model"]
-      _model_has_placement = any(k.startswith(_AUX_HEAD_PREFIXES) for k in model_nocompile.state_dict())
-      _ckpt_placement_keys = [k for k in _ckpt_model_sd if k.startswith(_AUX_HEAD_PREFIXES)]
-      _model_aux_keys = {k for k in model_nocompile.state_dict() if k.startswith(_AUX_HEAD_PREFIXES)}
+      _model_has_placement = any(_is_aux_key(k) for k in model_nocompile.state_dict())
+      _ckpt_placement_keys = [k for k in _ckpt_model_sd if _is_aux_key(k)]
+      _model_aux_keys = {k for k in model_nocompile.state_dict() if _is_aux_key(k)}
       _dropped = [k for k in _ckpt_placement_keys if k not in _model_aux_keys]
       if _dropped:
         print(f"INFO: AUX_HEAD checkpoint keys dropped (env var not set this run): {_dropped}")
@@ -1260,7 +1278,7 @@ def Train():
       if _fresh:
         print(f"INFO: AUX_HEAD newly enabled on resume; params start fresh-initialized: {sorted(_fresh)}")
         _pl_res = model_nocompile.load_state_dict(_ckpt_model_sd, strict=False)
-        _missing_other = [k for k in _pl_res.missing_keys if not k.startswith(_AUX_HEAD_PREFIXES)]
+        _missing_other = [k for k in _pl_res.missing_keys if not _is_aux_key(k)]
         if _missing_other or _pl_res.unexpected_keys:
           raise RuntimeError(f"Resume mismatch beyond aux heads: missing={_missing_other} unexpected={_pl_res.unexpected_keys}")
         # vda mode-3 -> mode-4 warm start: the aux value head sees exactly the
@@ -1293,6 +1311,10 @@ def Train():
           pass # private value front-end ('inject' mode) is new — not in orig ckpt.
                # Injectors are zero-init, so keeping their init values is exactly
                # what reproduces the base net at step 0.
+        elif "vis_edge_proj" in name or "attack_gate_" in name:
+          pass # vis edge-bias modules (CERES_VIS_EDGE_BIAS/_GATES) are new — not
+               # in orig ckpt; zero-init, so keeping init values reproduces the
+               # base net at step 0.
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name

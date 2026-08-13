@@ -379,6 +379,167 @@ class RayAttentionBias(nn.Module):
         return bias
 
 
+def _build_pawn_visibility_tables():
+    """Pawn VISIBILITY tables [64, 64] per side: the two capture diagonals PLUS
+    the single push square directly ahead. Visibility deliberately includes the
+    non-attacking push square (Kovax program: escape-square coverage needs
+    edges onto empty squares; the pawn's reach includes the square it can move
+    to). Double-push is excluded — it is blocker-conditional and rare enough
+    that the (unconditional-indicator) channel would be wrong more often than
+    informative. Channels 1..6 advance toward +rank, 7..12 toward -rank,
+    matching PIECE_PSEUDO_ATTACK.
+
+    ⚠ Any FUTURE channel needing true ATTACK semantics (e.g. king-ring
+    coverage) must use PIECE_PSEUDO_ATTACK's pawn diagonals, NOT these tables:
+    a pawn's visibility includes the push square it does not attack.
+    """
+    w = PIECE_PSEUDO_ATTACK[1].clone()
+    b = PIECE_PSEUDO_ATTACK[7].clone()
+    for i in range(64):
+        f, r = i % 8, i // 8
+        if r + 1 < 8:
+            w[i, (r + 1) * 8 + f] = 1.0
+        if r - 1 >= 0:
+            b[i, (r - 1) * 8 + f] = 1.0
+    return w, b
+
+
+class VisibilityChannels(nn.Module):
+    """Channel builder v2 for the visibility / attack-graph edge-bias program.
+
+    Builds pairwise {0,1} edge indicator channels E[b, q, k, c] ONCE per
+    forward from the 13-channel piece one-hot; the parent net projects them to
+    per-head attention-logit biases (content-free form A) or content-gated
+    variants. Spec follows the Kovax visibility program (VISIBILITY_PROGRAM.md):
+
+    Families (each emitted as stm/opp x outgoing/incoming = 4 channels):
+      vis    — VISIBILITY, not attacks: a piece's reach with NO target-side
+               mask (edge onto empty / friendly / enemy square alike). All
+               piece types: sliders blocker-exact (stop at first blocker,
+               inclusive), knight/king leaper reach, pawn diagonals + push
+               square. No-target-mask is deliberate: king-escape coverage
+               needs edges onto empty squares.
+      xray   — slider ray continued through EXACTLY ONE blocker (the
+               pin/skewer/discovery geometry). Target may be any square on
+               the ray with strictly-between occupancy == 1.
+      pinray — edge FROM THE BLOCKER to the x-ray target: the pinned piece
+               reads what it is pinned against in one hop. Strongest channel
+               per edge in the source program despite 0.08% density.
+
+    Families found NOISE / refuted there and deliberately absent: `defends`
+    (derivable in ~1 hop), raw mobility row-sums. Selection rule: only add a
+    channel the net cannot derive in ~1 layer.
+
+    Channel order: for each family in `families`: [stm_out, opp_out, stm_in,
+    opp_in], where *_in = transpose of *_out (incoming edges carry more weight
+    than outgoing in the ungated form, per the source program's K-side
+    asymmetry finding). "stm" = one-hot channels 1..6, "opp" = 7..12.
+
+    All ops are matmul / elementwise over constant buffers (TRT-friendly, no
+    einsum). Integer blocker counting via BETWEEN_T as in RayAttentionBias.
+    """
+
+    FAMILY_ORDER = ('vis', 'xray', 'pinray')
+
+    def __init__(self, families=('vis', 'xray', 'pinray')):
+        super().__init__()
+        for f in families:
+            assert f in self.FAMILY_ORDER, f'unknown visibility family: {f}'
+        # Keep canonical order regardless of the order given.
+        self.families = tuple(f for f in self.FAMILY_ORDER if f in families)
+        assert self.families, 'VisibilityChannels needs at least one family'
+        self.num_channels = 4 * len(self.families)
+        # Per-family channel-index slices (for structure logging: per-family
+        # weight RMS is the program's structure-first readout).
+        self.family_slices = {f: slice(4 * i, 4 * i + 4)
+                              for i, f in enumerate(self.families)}
+
+        rook, bish, between_t = _build_ray_tables()
+        self.register_buffer('vc_rook_line', rook, persistent=False)
+        self.register_buffer('vc_bish_line', bish, persistent=False)
+        self.register_buffer('vc_between_t', between_t, persistent=False)
+        if 'pinray' in self.families:
+            # [t, s, blocker] layout: constant right-operand of a broadcast
+            # batched matmul with batch dims (B, t) — keeps the DYNAMIC batch
+            # dim leading throughout (export/TRT-friendly; batch-last matmuls
+            # force materialized transposes of the dynamic axis).
+            bt3 = between_t.reshape(64, 64, 64).permute(2, 1, 0).contiguous()
+            self.register_buffer('vc_between_stb', bt3, persistent=False)
+        knight = PIECE_PSEUDO_ATTACK[2].clone()
+        king = PIECE_PSEUDO_ATTACK[6].clone()
+        pawn_w, pawn_b = _build_pawn_visibility_tables()
+        self.register_buffer('vc_knight', knight, persistent=False)
+        self.register_buffer('vc_king', king, persistent=False)
+        self.register_buffer('vc_pawn_stm', pawn_w, persistent=False)
+        self.register_buffer('vc_pawn_opp', pawn_b, persistent=False)
+
+    def _side_channels(self, pt, base, clear, one_bl, pawn_vis, dtype):
+        """Channels for one side. pt: [B, 64, 13]; base: 1 for stm (one-hot
+        channels 1..6) or 7 for opp. Returns dict family -> [B, 64, 64]."""
+        rook_line = self.vc_rook_line.to(dtype)
+        bish_line = self.vc_bish_line.to(dtype)
+        # Piece presence at source square i: [B, 64, 1].
+        p_pawn = pt[:, :, base + 0].unsqueeze(2)
+        p_knight = pt[:, :, base + 1].unsqueeze(2)
+        p_bish = pt[:, :, base + 2].unsqueeze(2)
+        p_rook = pt[:, :, base + 3].unsqueeze(2)
+        p_queen = pt[:, :, base + 4].unsqueeze(2)
+        p_king = pt[:, :, base + 5].unsqueeze(2)
+
+        rq = p_rook + p_queen
+        bq = p_bish + p_queen
+
+        out = {}
+        if 'vis' in self.families:
+            # Sliders: line clear (target itself unmasked — first blocker IS a
+            # visible square). Leapers + pawn: constant reach tables. Terms are
+            # disjoint per source square (one piece per square; rook/bishop
+            # lines are disjoint square-pair sets), so the sum stays {0,1}.
+            out['vis'] = (rq * rook_line * clear
+                          + bq * bish_line * clear
+                          + p_knight * self.vc_knight.to(dtype)
+                          + p_king * self.vc_king.to(dtype)
+                          + p_pawn * pawn_vis.to(dtype))
+        xray = None
+        if 'xray' in self.families or 'pinray' in self.families:
+            xray = (rq * rook_line + bq * bish_line) * one_bl
+        if 'xray' in self.families:
+            out['xray'] = xray
+        if 'pinray' in self.families:
+            # pinray[b, t] = occ[b] * OR_s( between(s, t)[b] AND xray[s, t] ):
+            # b is THE single blocker of some x-ray onto t. Broadcast batched
+            # matmul, batch dims (B, t), dynamic batch dim kept leading:
+            # [B, t, 1, s] @ [t, s, blocker] -> [B, t, 1, blocker].
+            occ = 1.0 - pt[:, :, 0]                                    # [B, 64]
+            xr_t = xray.permute(0, 2, 1).unsqueeze(2)                  # [B, t, 1, s]
+            pin = torch.matmul(xr_t, self.vc_between_stb.to(dtype))    # [B, t, 1, blocker]
+            pin = pin.squeeze(2).permute(0, 2, 1)                      # [B, blocker, t]
+            # clamp: two sliders x-raying the same target through the same
+            # blocker square would sum to 2; keep {0,1} indicator semantics.
+            out['pinray'] = occ.unsqueeze(2) * pin.clamp(max=1.0)
+        return out
+
+    def forward(self, piece_type_onehot: torch.Tensor) -> torch.Tensor:
+        """piece_type_onehot: [B, 64, 13] -> E [B, 64, 64, num_channels]."""
+        pt = piece_type_onehot
+        dtype = pt.dtype
+        occ = 1.0 - pt[:, :, 0]                                       # [B, 64]
+        blocked = torch.matmul(occ, self.vc_between_t.to(dtype))      # [B, 4096]
+        clear = torch.relu(1.0 - blocked).reshape(-1, 64, 64)
+        one_bl = torch.relu(1.0 - torch.abs(blocked - 1.0)).reshape(-1, 64, 64)
+
+        stm = self._side_channels(pt, 1, clear, one_bl, self.vc_pawn_stm, dtype)
+        opp = self._side_channels(pt, 7, clear, one_bl, self.vc_pawn_opp, dtype)
+
+        chans = []
+        for fam in self.families:
+            chans.append(stm[fam])
+            chans.append(opp[fam])
+            chans.append(stm[fam].transpose(1, 2))
+            chans.append(opp[fam].transpose(1, 2))
+        return torch.stack(chans, dim=3)                # [B, 64, 64, C]
+
+
 def build_ray_context_tables(from_idx, to_idx):
   """Constant per-move square-pooling operators for the ray-context policy term.
 

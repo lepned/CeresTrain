@@ -370,6 +370,15 @@ class Configuration:
     # module is constructed and its output is added to attention logits in
     # every encoder layer. Default False reduces to baseline behaviour.
     self.NetDef_UsePieceRelationBias = config_net_def.get('UsePieceRelationBias', False)
+    # Visibility edge bias v2 (Kovax visibility program): pairwise edge channels
+    # + per-layer form-A attention-logit bias, optional B/C content gates.
+    # CONFIG-ONLY by design (no env override): these change the parameter tree,
+    # so they must live in the net config for checkpoints to be reloadable and
+    # re-exportable from config alone (same rationale as LearningRateBaseHeads).
+    self.NetDef_UseVisEdgeBias = config_net_def.get('UseVisEdgeBias', False)
+    self.NetDef_VisEdgeFamilies = config_net_def.get('VisEdgeFamilies', 'vis,xray,pinray')
+    self.NetDef_VisEdgeGates = config_net_def.get('VisEdgeGates', '')
+    self.NetDef_VisEdgeSharedProjection = config_net_def.get('VisEdgeSharedProjection', False)
     # Looped transformer: NumLayers represents the EFFECTIVE depth (number of
     # encoder layer applications). LoopCount controls weight tying — when >1,
     # NumLayers/LoopCount distinct EncoderLayer modules are constructed and each
