@@ -375,6 +375,12 @@ class Configuration:
     # CONFIG-ONLY by design (no env override): these change the parameter tree,
     # so they must live in the net config for checkpoints to be reloadable and
     # re-exportable from config alone (same rationale as LearningRateBaseHeads).
+    # Ray attention bias (the pre-VisEdge slider-only edge bias). Config field
+    # added 2026-08-14 per the config-over-env rule; the legacy
+    # CERES_RAY_ATTENTION_BIAS env var is still honored (DEPRECATED, prints a
+    # warning) only because a prod 200M run launched on it mid-migration —
+    # it becomes a hard error once that run completes.
+    self.NetDef_UseRayAttentionBias = config_net_def.get('UseRayAttentionBias', False)
     self.NetDef_UseVisEdgeBias = config_net_def.get('UseVisEdgeBias', False)
     self.NetDef_VisEdgeFamilies = config_net_def.get('VisEdgeFamilies', 'vis,xray,pinray')
     self.NetDef_VisEdgeGates = config_net_def.get('VisEdgeGates', '')

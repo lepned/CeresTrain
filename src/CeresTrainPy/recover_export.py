@@ -75,6 +75,16 @@ if _ckpt_vis and not _model_vis:
     f'Checkpoint contains {len(_ckpt_vis)} vis edge-bias tensors but the rebuilt model has none. '
     f'Set "UseVisEdgeBias": true (and matching VisEdgeFamilies/VisEdgeGates) in the '
     f'_ceres_net.json config before re-exporting. (checkpoint: {CKPT})')
+# Same guard for the ray attention bias (trained under CERES_RAY_ATTENTION_BIAS
+# or "UseRayAttentionBias": a ray-trained checkpoint re-exported without the
+# flag would silently drop ray_proj and export a net missing its bias.
+_ckpt_ray = [k for k in loaded['model'] if k.startswith('ray_bias_')]
+_model_ray = [k for k in model.state_dict() if k.startswith('ray_bias_')]
+if _ckpt_ray and not _model_ray:
+  raise ValueError(
+    f'Checkpoint contains {len(_ckpt_ray)} ray-bias tensors but the rebuilt model has none. '
+    f'Set "UseRayAttentionBias": true in the _ceres_net.json config before re-exporting. '
+    f'(checkpoint: {CKPT})')
 
 missing, unexpected = model.load_state_dict(loaded['model'], strict=False)
 if missing:    print('WARN: missing keys (count={}): {}'.format(len(missing), missing[:5]))
