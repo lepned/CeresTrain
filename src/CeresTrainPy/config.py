@@ -406,6 +406,23 @@ class Configuration:
     # baseline at training step 0.
     self.NetDef_SmolgenDeltaRank = config_net_def.get('SmolgenDeltaRank', 0)
     self.NetDef_HeadWidthMultiplier = config_net_def.get('HeadWidthMultiplier', 4)
+    # Width of the SHARED head front-end: HEAD_IN_SIZE = 64 * (HEAD_PREMAP_PER_SQUARE //
+    # HeadSharedLinearDiv). 4 = the long-standing hardcoded value, so absent/4 reproduces
+    # every existing net exactly; 2 doubles the vector every head reads, 1 quadruples it.
+    #
+    # Why it is a knob now: the gradient-conflict probe showed the value family sends ~11x
+    # MORE gradient magnitude through headPremap/headSharedLinear than the policy family
+    # does, with a cosine of ~0 between them — so the shared front-end is not a site where
+    # policy crowds value out, and the private-value-head hypothesis reduces to a claim
+    # about WIDTH (256 dims at D=256/mult 4, vs lc0's 2048-dim private per-square vector).
+    # Width is testable directly and symmetrically: if value gains as much from a wider
+    # SHARED front-end as from a private one, "private" was never the operative word.
+    # Note this widens the input of every head, so any gain must be read against the
+    # parameters added (policy is the internal control: a front-end-specific effect should
+    # move value more than policy).
+    self.NetDef_HeadSharedLinearDiv = int(config_net_def.get('HeadSharedLinearDiv', 4) or 4)
+    if self.NetDef_HeadSharedLinearDiv < 1:
+      raise ValueError(f"HeadSharedLinearDiv must be >= 1, got {self.NetDef_HeadSharedLinearDiv}")
     self.NetDef_UseRPE = config_net_def.get('UseRPE', False)
     self.NetDef_UseRPE_V = config_net_def.get('UseRPE_V', True)
     self.NetDef_UseRelBias = config_net_def.get('UseRelBias', False)

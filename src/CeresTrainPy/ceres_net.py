@@ -129,8 +129,20 @@ class CeresNet(nn.Module):
     self.HEAD_PREMAP_PER_SQUARE = (HEAD_MULT * self.EMBEDDING_DIM) // HEAD_PREMAP_DIVISOR
     self.headPremap = nn.Linear(self.EMBEDDING_DIM, self.HEAD_PREMAP_PER_SQUARE)
 
-    HEAD_SHARED_LINEAR_DIV = 4
+    # Shared head front-end width (config HeadSharedLinearDiv; 4 = the historical
+    # hardcoded value, so every pre-existing net is unchanged). See config.py for why
+    # this is adjustable: the private-value-head hypothesis, once the gradient probe
+    # removed its crowding-out premise, is a claim about the width of THIS vector.
+    HEAD_SHARED_LINEAR_DIV = int(getattr(config, 'NetDef_HeadSharedLinearDiv', 4) or 4)
+    assert self.HEAD_PREMAP_PER_SQUARE % HEAD_SHARED_LINEAR_DIV == 0, \
+        (f'HeadSharedLinearDiv={HEAD_SHARED_LINEAR_DIV} must divide HEAD_PREMAP_PER_SQUARE='
+         f'{self.HEAD_PREMAP_PER_SQUARE} (= HeadWidthMultiplier*ModelDim/64) exactly — '
+         f'otherwise the head input width silently truncates')
     self.HEAD_IN_SIZE = 64 * (self.HEAD_PREMAP_PER_SQUARE // HEAD_SHARED_LINEAR_DIV)
+    if HEAD_SHARED_LINEAR_DIV != 4:
+      print(f'[ceres_net] SHARED HEAD FRONT-END widened: div={HEAD_SHARED_LINEAR_DIV} '
+            f'-> HEAD_IN_SIZE {self.HEAD_IN_SIZE} (default div 4 would give '
+            f'{64 * (self.HEAD_PREMAP_PER_SQUARE // 4)})')
     self.headSharedLinear = nn.Linear(64 * self.HEAD_PREMAP_PER_SQUARE, self.HEAD_IN_SIZE)
 
     # PRIVATE VALUE FRONT-END (config ValueHeadChannels; see config.py): the
