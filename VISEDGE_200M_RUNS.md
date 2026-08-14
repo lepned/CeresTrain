@@ -1,19 +1,25 @@
-# VISEDGE 200M pair — overnight run spec for the training computer
+# VISEDGE 200M pair — run spec for the training computer (rev 2, 2026-08-14)
 
-**Goal:** adjudicate the visibility edge-bias mechanism (commit `1aa4f12`) at the
-horizon where value becomes readable. The 20M smoke ladder (2026-08-14, dev box)
-showed structure fully consistent with the Kovax visibility program (all channel
-families in active use, pinray > xray weight ranking, gates absorbing the
-content-free bias) but value deltas inside single-run noise — exactly as the
-source program's calibration predicts: its readable value results needed ~200M
-samples. This pair is that test.
+**Goal:** adjudicate the visibility edge-bias mechanism at the horizon where
+value becomes readable (the source program's readable value results needed
+~200M samples; the 20M ladder's value deltas sit inside single-run noise).
+
+**Rev 2 changes the test arm.** The 5-arm 20M ladder (dev box, 2026-08-14) now
+includes `visqk20M` = **vis-only channels + shared projection + qk content
+gates** — the source program's exact champion configuration (its 2333 value
+arm). On the ladder it is (a) the best OOD-value arm (rg2340/2500/2700 sum +53
+over control, vs +20 for the full-12ch gates arm), (b) the ONLY arm value-led
+at all four bands (the production-like operating point), and (c) nearly free to
+serve: 1.28x engine time, ~−5% search NPS (vs 1.92x / −33% for full-12ch).
+The full-12ch `visgates200M` arm from rev 1 is DEFERRED — it is an
+xray/pinray-attribution experiment, not the value-per-NPS candidate.
 
 Two runs, sequential, single GPU:
 
 | run | what | config delta vs the 20M smokes |
 |---|---|---|
 | `raybase200M` | control | `NumTrainingPositions` 200M |
-| `visgates200M` | vis edge bias + B+C content gates (the source program's best value arm) | 200M + `UseVisEdgeBias`/`VisEdgeGates` in net json |
+| `visqk200M` | vis-only + shared projection + qk gates | 200M + the four `VisEdge*` fields in net json |
 
 **Everything else identical between the two arms and to the 20M smokes**
 (256x10 post-norm RMSNorm + RPE, no smolgen, Muon 2e-3 decay@0.6, batch
@@ -23,9 +29,10 @@ experiment.
 
 ## Prerequisites
 
-1. `git pull` to **at least `1aa4f12`** (visibility edge-bias v2). Older code
-   lacks the `NetDef VisEdge*` config fields AND the Muon fix — the gates arm
-   will either silently ignore the fields or crash Muon with `assert p.ndim == 2`.
+1. `git pull` to **at least `45cb87e`** (vis edge-bias serving-graph
+   optimizations). That commit also guarantees `1aa4f12` (the VisEdge config
+   fields + the Muon ndim fix). Older code either lacks the fields (arm
+   silently becomes the control) or exports the slow serving graph.
 2. Corpus `t91_skip1_v2_surv` (191.5M pos, V2 137 B/sq, survival K=8 sidecars)
    and the puzzle-aug secondary `c1_640_34_2350up_aug_v2_surv/tpg` present on
    local NVMe. Adjust `TrainingFilesDirectory`/`2` in the data configs to the
@@ -38,8 +45,9 @@ experiment.
 ## Configs
 
 Create the quartet `<ID>_ceres_{exec,net,opt,data}.json` in `configs/` for each
-ID. Clone from the in-repo 20M smoke quartet if present (`raybase20M_*`), else
-use these exact contents:
+ID. The dev box's `visqk20M_*` quartet is the exact template for the test arm
+(only `NumTrainingPositions` and data paths change); `raybase20M_*` for the
+control. If cloning is not possible, use these contents:
 
 ### `<ID>_ceres_exec.json` (both arms)
 ```json
@@ -76,16 +84,21 @@ Both arms share this base:
   "TestValue": 0, "LoopCount": 1, "UsePieceRelationBias": false
 }
 ```
-**`visgates200M` net json additionally sets** (these fields ARE the second arm —
-config-only, the old `CERES_VIS_EDGE_*` env vars are retired and assert):
+**`visqk200M` net json additionally sets** (these four fields ARE the test arm —
+config-only; the old `CERES_VIS_EDGE_*` env vars are retired and assert):
 ```json
   "UseVisEdgeBias": true,
-  "VisEdgeFamilies": "vis,xray,pinray",
+  "VisEdgeFamilies": "vis",
   "VisEdgeGates": "qk",
-  "VisEdgeSharedProjection": false
+  "VisEdgeSharedProjection": true
 ```
 `raybase200M` net json must NOT contain the VisEdge fields (or set
 `UseVisEdgeBias: false`).
+
+⚠ Write the json files WITHOUT a UTF-8 BOM (PowerShell 5.1 `Out-File -Encoding
+utf8` adds one and train.py's json load dies on it; use
+`[System.IO.File]::WriteAllText(path, text, [System.Text.UTF8Encoding]::new($false))`
+or write from bash).
 
 ### `<ID>_ceres_opt.json` (both arms)
 ```json
@@ -113,8 +126,8 @@ config-only, the old `CERES_VIS_EDGE_*` env vars are retired and assert):
 ```
 `CheckpointFrequencyNumPositions: 50000000` is a deliberate deviation from the
 final-only default: ckpts at 50/100/150/200M give the value-vs-exposure curve
-(the source program benches exactly such curve nets to separate "value gain" from
-"value overfit-then-collapse"). Keep it.
+(the source program benches exactly such curve nets to separate "value gain"
+from "value overfit-then-collapse"). Keep it.
 
 ### `<ID>_ceres_data.json` (both arms — adjust paths to local disk)
 ```json
@@ -133,7 +146,7 @@ final-only default: ckpts at 50/100/150/200M give the value-vs-exposure curve
 ## Launch
 
 Per-run script (survival/loader knobs are runtime env, still env-based;
-only the VisEdge arch knobs moved to config):
+only the VisEdge arch knobs are config):
 
 ```bash
 #!/usr/bin/env bash
@@ -151,37 +164,46 @@ cd <repo>/src/CeresTrainPy
 exec <python> -u train.py <ID> <OUTPUTS_DIR> > <OUTPUTS_DIR>/<ID>.log 2>&1
 ```
 
-Run `raybase200M` first, `visgates200M` after it exits (sequential wrapper or a
+Run `raybase200M` first, `visqk200M` after it exits (sequential wrapper or a
 `while pgrep -f 'train.py raybase200M'; do sleep 60; done` queue script). Both
 fresh — `CheckpointResumeFromFileName: null`; do NOT resume from the 20M smokes.
 
 ## Launch verification (check within the first minutes, in the log)
 
-1. `visgates200M` only: `[ceres_net] VISIBILITY EDGE BIAS enabled: families=('vis', 'xray', 'pinray') (12 channels), per-layer zero-init projection (960 params), content gates: qk`
-   — if this line is missing, the config fields didn't take (old code or wrong json): **abort**.
-2. `visgates200M` only: `[train] Muon partition scope=all-non-trunk: 70 muon / 117 adamw params`
-   (baseline: 70/97). If Muon crashes with `assert p.ndim == 2` the code is pre-`1aa4f12`: **pull and restart**.
-3. Both: first TRAIN line magnitudes sane (value_loss ~0.6, policy ~1.6 at pos 512;
-   field order: pos, total, value, policy, ... — value BEFORE policy).
+1. `visqk200M` only — this exact line (verified on the dev 20M run):
+   `[ceres_net] VISIBILITY EDGE BIAS enabled: families=('vis',) (4 channels), shared zero-init projection (32 params), content gates: qk`
+   — if missing, the config fields didn't take (old code or wrong json): **abort**.
+   If it says 12 channels or per-layer, the wrong net json was cloned: **abort**.
+2. `visqk200M` only: `[train] Muon partition scope=all-non-trunk: 70 muon / 108 adamw params`
+   (control: 70/97). A Muon crash `assert p.ndim == 2` means pre-`1aa4f12` code:
+   **pull and restart**.
+3. Both: first TRAIN line magnitudes sane (value_loss ~0.6, policy ~1.6 at pos
+   512; field order: pos, total, value, policy, ... — value BEFORE policy).
 4. Both: `... shards carry survival sidecars (mode=required)` for the main corpus.
 
 ## After both finish (`INFO: EXIT_STATUS SUCCESS`)
 
-1. Confirm both exported `.onnx` per checkpoint (auto-export; ~88–89 MB each).
+1. Confirm both exported `.onnx` per checkpoint (auto-export; ~88 MB each).
 2. Report back / sync the nets; the dev box runs the EB 4-band suite
    (mate + rg2340/2500/2700, policy + value, served blend) on the final nets and
    the 50/100/150M curve ckpts of both arms.
-3. Decision rule (pre-registered): visgates value bands +X over raybase across
-   ≥3 of 4 bands with policy flat → mechanism confirmed at horizon → next step
-   is the 384x12 smolgen+SwiGLU production recipe (pre-derisked: the source
-   program's +188-value-at-500k held WITH RPE and smolgen present) + the
-   serving-graph efficiency work (visgates currently −34% NPS on TRT;
-   known fixes documented in the review findings). Value flat at 200M →
-   mechanism is refuted for our stack at this scale; close the arc.
+3. Decision rule (pre-registered): visqk value bands up vs raybase across ≥3 of
+   4 bands with policy flat → mechanism confirmed at horizon → next step is the
+   384x12 smolgen+SwiGLU production recipe with the same four VisEdge fields
+   (pre-derisked: the source program's +188-value-at-500k held WITH RPE and
+   smolgen present), plus one replace-smolgen arm (source program measured its
+   graph 14.9% FASTER than smolgen — the mechanism may be a net-free smolgen
+   substitute). Value flat at 200M → mechanism refuted for our stack at this
+   scale; close the arc.
 
 ## Known non-issues
 
-- visgates trains ~identically fast to baseline (the −34% is TRT serving only).
+- Serving cost of this arm is small and already measured on dev: 1.28x engine
+  time vs control (trtexec B=512), ~−5% search NPS. The −34%/1.92x numbers
+  belong to the deferred full-12ch arm only.
+- Speed probes on throwaway short-trained nets UNDERSTATE search NPS (bad
+  policy → worse tree/batch shapes): judge serving cost by trtexec engine
+  ratio, or by search cmp on properly trained nets only.
 - `WARN`-free resume/re-export requires the VisEdge fields to stay in the
   net json — they are the architecture record; never strip them.
 - Sign-flipping small value deltas on TB during the run are expected; judge on
