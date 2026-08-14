@@ -720,13 +720,12 @@ class CeresNet(nn.Module):
       print('[ceres_net] RPE GENERATOR-PHASE serving graph enabled: per-layer QK-rpe '
             'biases precomputed from static embedding; in-attention einsums + rpe_v skipped')
 
-    _ray_env = int(os.environ.get('CERES_RAY_ATTENTION_BIAS', '0') or 0) > 0
-    self.use_ray_bias = bool(getattr(config, 'NetDef_UseRayAttentionBias', False)) or _ray_env
-    if _ray_env:
-      print('[ceres_net] DEPRECATED: CERES_RAY_ATTENTION_BIAS env var — set '
-            '"UseRayAttentionBias": true in the _ceres_net.json config instead. '
-            'The env fallback exists only for the in-flight prod 200M run and '
-            'will become a hard error.')
+    # Config-only per the config-over-env rule; the transitional env fallback
+    # (kept only for the 2026-08 prod ray6 200M run, now concluded) is retired.
+    assert not os.environ.get('CERES_RAY_ATTENTION_BIAS'), \
+        'CERES_RAY_ATTENTION_BIAS is retired — set "UseRayAttentionBias": true ' \
+        'in the _ceres_net.json config instead'
+    self.use_ray_bias = bool(getattr(config, 'NetDef_UseRayAttentionBias', False))
     if self.use_ray_bias:
       self.ray_bias_module = RayAttentionBias(num_heads=self.NUM_HEADS)
       print(f'[ceres_net] RAY ATTENTION BIAS enabled: 6 blocker-aware slider/x-ray '
