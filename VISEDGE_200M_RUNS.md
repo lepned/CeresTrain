@@ -42,14 +42,15 @@ experiment.
 4. ~7 h per arm at ~8K pos/s (dev-box rate; scale to local NPS). Disk: each
    ckpt ~120 MB, 4 ckpts/arm + exports.
 
-## Configs
+## Configs — the exact 8 files
 
-Create the quartet `<ID>_ceres_{exec,net,opt,data}.json` in `configs/` for each
-ID. The dev box's `visqk20M_*` quartet is the exact template for the test arm
-(only `NumTrainingPositions` and data paths change); `raybase20M_*` for the
-control. If cloning is not possible, use these contents:
+train.py identifies a run by the config **filename prefix** given on the
+command line (`train.py visqk200M ...` reads `configs/visqk200M_ceres_*.json`);
+the `"ID"` field inside exec json is a legacy label and not load-bearing.
+Create these 8 files in `<OUTPUTS_DIR>/configs/` (contents complete — no
+assembly needed). Only the two net jsons differ between the arms.
 
-### `<ID>_ceres_exec.json` (both arms)
+### `raybase200M_ceres_exec.json` AND `visqk200M_ceres_exec.json` (identical contents)
 ```json
 {
   "ID": "visedge200M_pair", "DeviceType": "cuda", "DeviceIDs": [0],
@@ -63,8 +64,7 @@ control. If cloning is not possible, use these contents:
 }
 ```
 
-### `<ID>_ceres_net.json`
-Both arms share this base:
+### `raybase200M_ceres_net.json` (control — note: NO VisEdge fields)
 ```json
 {
   "TrainOn4BoardSequences": false, "ModelDim": 256, "NumLayers": 10,
@@ -84,23 +84,40 @@ Both arms share this base:
   "TestValue": 0, "LoopCount": 1, "UsePieceRelationBias": false
 }
 ```
-**`visqk200M` net json additionally sets** (these four fields ARE the test arm —
-config-only; the old `CERES_VIS_EDGE_*` env vars are retired and assert):
+
+### `visqk200M_ceres_net.json` (test arm — identical plus the last four fields,
+which ARE the experiment; config-only, the old `CERES_VIS_EDGE_*` env vars are
+retired and assert)
 ```json
+{
+  "TrainOn4BoardSequences": false, "ModelDim": 256, "NumLayers": 10,
+  "NumHeads": 8, "LoRARankDivisor": 0, "UseQKV": true,
+  "DualAttentionMode": "None", "PreNorm": false, "NormType": "RMSNorm",
+  "AttentionMultiplier": 1, "FFNMultiplier": 6, "FFNActivationType": "Mish",
+  "FFNUseGlobalEveryNLayers": 0, "HeadsActivationType": "Mish",
+  "PriorStateDim": 0, "NonLinearAttention": false, "SoftCapCutoff": 0,
+  "UseQKNorm": false, "DeepNorm": false, "DenseFormer": false,
+  "SmolgenDimPerSquare": 0, "SmolgenDim": 0, "SmolgenToHeadDivisor": 1,
+  "SmolgenActivationType": "Swish",
+  "UseRPE": true, "UseRPE_V": true, "UseRelBias": false, "UseRoPE": false,
+  "HeadWidthMultiplier": 4,
+  "SoftMoEConfig": { "MoEMode": "None", "OnlyForAlternatingLayers": false,
+    "NumExperts": 0, "NumSlotsPerExpert": 0, "UseNormalization": false,
+    "UseBias": false },
+  "TestValue": 0, "LoopCount": 1, "UsePieceRelationBias": false,
   "UseVisEdgeBias": true,
   "VisEdgeFamilies": "vis",
   "VisEdgeGates": "qk",
   "VisEdgeSharedProjection": true
+}
 ```
-`raybase200M` net json must NOT contain the VisEdge fields (or set
-`UseVisEdgeBias: false`).
 
 ⚠ Write the json files WITHOUT a UTF-8 BOM (PowerShell 5.1 `Out-File -Encoding
 utf8` adds one and train.py's json load dies on it; use
 `[System.IO.File]::WriteAllText(path, text, [System.Text.UTF8Encoding]::new($false))`
 or write from bash).
 
-### `<ID>_ceres_opt.json` (both arms)
+### `raybase200M_ceres_opt.json` AND `visqk200M_ceres_opt.json` (identical contents)
 ```json
 {
   "LoRARankDivisor": 0, "LoRARestrictPolicyValueOnly": false,
@@ -129,7 +146,7 @@ final-only default: ckpts at 50/100/150/200M give the value-vs-exposure curve
 (the source program benches exactly such curve nets to separate "value gain"
 from "value overfit-then-collapse"). Keep it.
 
-### `<ID>_ceres_data.json` (both arms — adjust paths to local disk)
+### `raybase200M_ceres_data.json` AND `visqk200M_ceres_data.json` (identical contents — adjust the two directory paths to the local corpus locations)
 ```json
 {
   "SourceType": "DirectFromTPG",
@@ -163,6 +180,10 @@ export CERES_SECONDARY_LOSS_AUX_MULT=0
 cd <repo>/src/CeresTrainPy
 exec <python> -u train.py <ID> <OUTPUTS_DIR> > <OUTPUTS_DIR>/<ID>.log 2>&1
 ```
+
+`<ID>` is literally `raybase200M` resp. `visqk200M` (must match the config
+filename prefixes above); `<OUTPUTS_DIR>` is the directory CONTAINING
+`configs/` — logs, ckpts (`nets/`) and TB logs land under it.
 
 Run `raybase200M` first, `visqk200M` after it exits (sequential wrapper or a
 `while pgrep -f 'train.py raybase200M'; do sleep 60; done` queue script). Both
