@@ -884,15 +884,27 @@ class CeresNet(nn.Module):
       if self.vis_edge_shared:
         _vb0 = self.vis_edge_proj[0](vis_edge_E).permute(0, 3, 1, 2)
         vis_edge_biases = [_vb0] * self.NUM_DISTINCT_LAYERS
-      else:
-        # All per-layer projections in ONE matmul (weights concatenated along
-        # the output dim — constant-folded at export) + one permute, instead of
-        # NUM_DISTINCT_LAYERS separate matmul+permute materializations.
+      elif (not self.training
+            and all(type(_l) is torch.nn.Linear and _l.bias is None
+                    for _l in self.vis_edge_proj)):
+        # Export/eval serving graph: all per-layer projections in ONE matmul
+        # (weights concatenated along the output dim — constant-folded at
+        # export) + one permute, instead of NUM_DISTINCT_LAYERS separate
+        # matmul+permute materializations. Guarded to plain bias-less Linear —
+        # reading .weight directly bypasses module forwards, so any wrapper
+        # (QAT FakeQuantLinear, LoRA, hooks, a future bias) must take the loop
+        # below. Training also takes the loop: unbind would keep all L grads
+        # buffered through trunk backward, and the loop's per-layer tensors
+        # are independently mutable (the unbound views below all alias one
+        # storage — never write them in place).
         _W = torch.cat([_lin.weight for _lin in self.vis_edge_proj], dim=0)  # [L*H, C]
         _vb = torch.matmul(vis_edge_E, _W.transpose(0, 1))                   # [B,64,64,L*H]
-        _vb = _vb.reshape(_vb.shape[0], 64, 64, self.NUM_DISTINCT_LAYERS,
-                          self.NUM_HEADS).permute(0, 3, 4, 1, 2)             # [B,L,H,64,64]
+        _vb = _vb.unflatten(-1, (self.NUM_DISTINCT_LAYERS,
+                                 self.NUM_HEADS)).permute(0, 3, 4, 1, 2)     # [B,L,H,64,64]
         vis_edge_biases = list(_vb.unbind(1))
+      else:
+        vis_edge_biases = [self.vis_edge_proj[i](vis_edge_E).permute(0, 3, 1, 2)
+                           for i in range(self.NUM_DISTINCT_LAYERS)]
 
     # Phase-FiLM conditioning (see __init__): piece census + material scalar from
     # the same one-hot planes PRB reads, computed ONCE per forward. Normalization:

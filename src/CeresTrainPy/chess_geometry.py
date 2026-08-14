@@ -441,6 +441,19 @@ class VisibilityChannels(nn.Module):
 
     FAMILY_ORDER = ('vis', 'xray', 'pinray')
 
+    @staticmethod
+    def out_in_swap_index(num_channels: int) -> torch.Tensor:
+        """Channel permutation mapping out<->in within each 4-channel family
+        block ([stm_out, opp_out, stm_in, opp_in] -> [stm_in, opp_in, stm_out,
+        opp_out]). Because *_in = *_out^T by construction (see forward),
+        E.permute(0, 2, 1, 3) == E[..., swap] — consumers (the C-side vis gate)
+        contract against raw E with this permutation folded into their weights
+        instead of materializing the transposed tensor. This class OWNS the
+        emission order; the identity is verified at construction below."""
+        assert num_channels % 4 == 0, 'visibility channels come 4 per family'
+        return torch.tensor([b + o for b in range(0, num_channels, 4)
+                             for o in (2, 3, 0, 1)], dtype=torch.long)
+
     def __init__(self, families=('vis', 'xray', 'pinray')):
         super().__init__()
         for f in families:
@@ -472,6 +485,17 @@ class VisibilityChannels(nn.Module):
         self.register_buffer('vc_king', king, persistent=False)
         self.register_buffer('vc_pawn_stm', pawn_w, persistent=False)
         self.register_buffer('vc_pawn_opp', pawn_b, persistent=False)
+
+        # Pin the out/in transpose-pairing + emission-order invariant that
+        # out_in_swap_index encodes: a reorder of the stack in forward, or a
+        # future family that is not transpose-paired, must fail HERE at
+        # construction — not silently miscontract gate_k downstream.
+        with torch.no_grad():
+            probe = (torch.rand(2, 64, 13) < 0.15).float()
+            E = self.forward(probe)
+            swap = self.out_in_swap_index(self.num_channels)
+            assert torch.equal(E.permute(0, 2, 1, 3), E[..., swap]), \
+                'VisibilityChannels emission order violates the out/in swap identity'
 
     def _side_channels(self, pt, base, clear, one_bl, pawn_vis, dtype):
         """Channels for one side. pt: [B, 64, 13]; base: 1 for stm (one-hot

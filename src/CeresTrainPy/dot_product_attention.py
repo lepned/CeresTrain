@@ -23,6 +23,13 @@ from rms_norm import RMSNorm, make_norm
 from activation_functions import Swish, ReLUSquared
 from lora import LoRALinear
 
+# Vis edge-bias B/C gate fusion crossover (see forward): fusing both gate terms
+# into one E contraction was measured −11% TRT engine time at C=12 per-layer
+# but +6% at C=4 (cat/split overhead exceeds the saved E-read); measured on
+# RTX 5090 / TRT 10.16, B=512. Only C=12 and C=4 were measured — C=8 takes the
+# fused path by extrapolation. Re-measure if TRT/GPU generation changes.
+VIS_GATE_FUSE_MIN_CHANNELS = 8
+
 # Attention-LoRA gate. Reads CERES_LORA_ATTN_RANK_DIV first (specific knob),
 # falls back to CERES_LORA_TRANSFORMER_RANK_DIV (legacy unified knob) for
 # backward compatibility. Allows attention-only transformer-LoRA experiments
@@ -280,19 +287,22 @@ class DotProductAttention(torch.nn.Module):
       assert self.use_qkv, 'vis edge gates require use_qkv'
       assert not use_diff_attention, 'vis edge gates unsupported with DiffAttention (Q is a tuple)'
       assert vis_gate_mode in ('q', 'k', 'qk'), f'bad vis_gate_mode: {vis_gate_mode}'
+      # The raw-E gate formulations in forward contract with matmul batch dims
+      # (B, Nq) resp. (B, Nk) against the SAME square E — self-attention only.
+      assert num_tokens_q == num_tokens_kv, \
+          'vis edge gates require num_tokens_q == num_tokens_kv (square E)'
       _dkm = self.d_k * self.attention_multiplier
       if 'q' in vis_gate_mode:
         self.attack_gate_q = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
       if 'k' in vis_gate_mode:
         self.attack_gate_k = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
-        # out<->in channel swap within each 4-channel family block
-        # ([stm_out, opp_out, stm_in, opp_in] -> [stm_in, opp_in, stm_out,
-        # opp_out]); lets the C-term contract gate_k against the raw shared E
-        # (see forward). Relies on VisibilityChannels' canonical channel order.
-        assert vis_gate_channels % 4 == 0, 'vis gate channels must be 4 per family'
+        # out<->in channel swap: lets the C-term contract gate_k against the
+        # raw shared E (see forward). The permutation and the emission-order
+        # invariant it depends on are owned and construction-verified by
+        # VisibilityChannels.
+        from chess_geometry import VisibilityChannels
         self.register_buffer('vis_gate_swap_idx',
-                             torch.tensor([b + o for b in range(0, vis_gate_channels, 4)
-                                           for o in (2, 3, 0, 1)], dtype=torch.long),
+                             VisibilityChannels.out_in_swap_index(vis_gate_channels),
                              persistent=False)
 
     if self.use_nonlinear_attention:
@@ -677,24 +687,22 @@ class DotProductAttention(torch.nn.Module):
         gk_w = self.attack_gate_k.index_select(1, self.vis_gate_swap_idx)  # [H, C, d], channels swapped
         gk = torch.matmul(K, gk_w.transpose(-1, -2).unsqueeze(0).to(K.dtype))  # [B,H,64,C]
         gkP = gk.permute(0, 2, 3, 1)                              # [B, 64k, C, H]
-      if gqP is not None and gkP is not None and self.vis_gate_channels >= 8:
+      if gqP is not None and gkP is not None and self.vis_gate_channels >= VIS_GATE_FUSE_MIN_CHANNELS:
         # qk mode, wide E: ONE E contraction for both terms — the [B,64,64,C]
         # re-read per matmul dominates the gate's serving cost when C is large,
-        # so halving the number of E-reading matmuls halves it (measured −11%
-        # TRT engine time at C=12 per-layer; at C=4 the cat/split overhead
-        # exceeds the saved E-read and the unfused path below wins by ~6%).
-        # First H outputs read with batch dim = q (B-term), last H with batch
-        # dim = k (C-term).
+        # so halving the number of E-reading matmuls halves it. First H outputs
+        # read with batch dim = q (B-term), last H with batch dim = k (C-term).
         term = torch.matmul(E, torch.cat([gqP, gkP], dim=-1))     # [B, s1, s2, 2H]
         vis_gate_bias = (term[..., :self.num_heads].permute(0, 3, 1, 2)
                          + term[..., self.num_heads:].permute(0, 3, 2, 1))
-      elif gqP is not None and gkP is not None:
-        vis_gate_bias = (torch.matmul(E, gqP).permute(0, 3, 1, 2)
-                         + torch.matmul(E, gkP).permute(0, 3, 2, 1))
-      elif gqP is not None:
-        vis_gate_bias = torch.matmul(E, gqP).permute(0, 3, 1, 2)  # [B, H, 64q, 64k]
-      elif gkP is not None:
-        vis_gate_bias = torch.matmul(E, gkP).permute(0, 3, 2, 1)  # [B, H, 64q, 64k]
+      else:
+        # B-term: batch dim = q. C-term: batch dim = k (channel-swapped gate).
+        terms = []
+        if gqP is not None:
+          terms.append(torch.matmul(E, gqP).permute(0, 3, 1, 2))  # [B, H, 64q, 64k]
+        if gkP is not None:
+          terms.append(torch.matmul(E, gkP).permute(0, 3, 2, 1))  # [B, H, 64q, 64k]
+        vis_gate_bias = terms[0] if len(terms) == 1 else terms[0] + terms[1]
       piece_relation_bias = vis_gate_bias if piece_relation_bias is None \
           else piece_relation_bias + vis_gate_bias
 
