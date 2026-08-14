@@ -885,8 +885,14 @@ class CeresNet(nn.Module):
         _vb0 = self.vis_edge_proj[0](vis_edge_E).permute(0, 3, 1, 2)
         vis_edge_biases = [_vb0] * self.NUM_DISTINCT_LAYERS
       else:
-        vis_edge_biases = [self.vis_edge_proj[i](vis_edge_E).permute(0, 3, 1, 2)
-                           for i in range(self.NUM_DISTINCT_LAYERS)]
+        # All per-layer projections in ONE matmul (weights concatenated along
+        # the output dim — constant-folded at export) + one permute, instead of
+        # NUM_DISTINCT_LAYERS separate matmul+permute materializations.
+        _W = torch.cat([_lin.weight for _lin in self.vis_edge_proj], dim=0)  # [L*H, C]
+        _vb = torch.matmul(vis_edge_E, _W.transpose(0, 1))                   # [B,64,64,L*H]
+        _vb = _vb.reshape(_vb.shape[0], 64, 64, self.NUM_DISTINCT_LAYERS,
+                          self.NUM_HEADS).permute(0, 3, 4, 1, 2)             # [B,L,H,64,64]
+        vis_edge_biases = list(_vb.unbind(1))
 
     # Phase-FiLM conditioning (see __init__): piece census + material scalar from
     # the same one-hot planes PRB reads, computed ONCE per forward. Normalization:

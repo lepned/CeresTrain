@@ -285,6 +285,15 @@ class DotProductAttention(torch.nn.Module):
         self.attack_gate_q = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
       if 'k' in vis_gate_mode:
         self.attack_gate_k = torch.nn.Parameter(torch.zeros(self.num_heads, vis_gate_channels, _dkm))
+        # out<->in channel swap within each 4-channel family block
+        # ([stm_out, opp_out, stm_in, opp_in] -> [stm_in, opp_in, stm_out,
+        # opp_out]); lets the C-term contract gate_k against the raw shared E
+        # (see forward). Relies on VisibilityChannels' canonical channel order.
+        assert vis_gate_channels % 4 == 0, 'vis gate channels must be 4 per family'
+        self.register_buffer('vis_gate_swap_idx',
+                             torch.tensor([b + o for b in range(0, vis_gate_channels, 4)
+                                           for o in (2, 3, 0, 1)], dtype=torch.long),
+                             persistent=False)
 
     if self.use_nonlinear_attention:
       self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
@@ -651,20 +660,41 @@ class DotProductAttention(torch.nn.Module):
     #   gq[b,h,q,c] = Q[b,h,q,:] @ gate_q[h,c,:]^T
     #   B-term[b,h,q,k] = sum_c gq[b,h,q,c] * E[b,q,k,c]   (batch dims b,q)
     #   C-term[b,h,q,k] = sum_c gk[b,h,k,c] * E[b,q,k,c]   (batch dims b,k)
+    # Both terms contract against the RAW shared E — no per-layer E permutes.
+    # B-term: batch dim q is already E's leading square axis. C-term: the
+    # transposed operand E.permute(0,2,1,3) equals E with out<->in channels
+    # swapped (VisibilityChannels emits *_in = *_out^T), so the swap is folded
+    # into gate_k via vis_gate_swap_idx (a constant gather on a parameter,
+    # constant-folded at export) instead of materializing [B,64,64,C] per layer.
     if self.vis_gate_channels > 0 and vis_edge is not None:
       E = vis_edge.to(Q.dtype)                                    # [B, 64q, 64k, C]
       vis_gate_bias = None
+      gqP = gkP = None
       if self.attack_gate_q is not None:
         gq = torch.matmul(Q, self.attack_gate_q.transpose(-1, -2).unsqueeze(0).to(Q.dtype))  # [B,H,64,C]
-        term = torch.matmul(gq.permute(0, 2, 1, 3),               # [B, 64q, H, C]
-                            E.permute(0, 1, 3, 2))                # [B, 64q, C, 64k]
-        vis_gate_bias = term.permute(0, 2, 1, 3)                  # [B, H, 64q, 64k]
+        gqP = gq.permute(0, 2, 3, 1)                              # [B, 64q, C, H]
       if self.attack_gate_k is not None:
-        gk = torch.matmul(K, self.attack_gate_k.transpose(-1, -2).unsqueeze(0).to(K.dtype))  # [B,H,64,C]
-        term = torch.matmul(E.permute(0, 2, 1, 3),                # [B, 64k, 64q, C]
-                            gk.permute(0, 2, 3, 1))               # [B, 64k, C, H]
-        term = term.permute(0, 3, 2, 1)                           # [B, H, 64q, 64k]
-        vis_gate_bias = term if vis_gate_bias is None else vis_gate_bias + term
+        gk_w = self.attack_gate_k.index_select(1, self.vis_gate_swap_idx)  # [H, C, d], channels swapped
+        gk = torch.matmul(K, gk_w.transpose(-1, -2).unsqueeze(0).to(K.dtype))  # [B,H,64,C]
+        gkP = gk.permute(0, 2, 3, 1)                              # [B, 64k, C, H]
+      if gqP is not None and gkP is not None and self.vis_gate_channels >= 8:
+        # qk mode, wide E: ONE E contraction for both terms — the [B,64,64,C]
+        # re-read per matmul dominates the gate's serving cost when C is large,
+        # so halving the number of E-reading matmuls halves it (measured −11%
+        # TRT engine time at C=12 per-layer; at C=4 the cat/split overhead
+        # exceeds the saved E-read and the unfused path below wins by ~6%).
+        # First H outputs read with batch dim = q (B-term), last H with batch
+        # dim = k (C-term).
+        term = torch.matmul(E, torch.cat([gqP, gkP], dim=-1))     # [B, s1, s2, 2H]
+        vis_gate_bias = (term[..., :self.num_heads].permute(0, 3, 1, 2)
+                         + term[..., self.num_heads:].permute(0, 3, 2, 1))
+      elif gqP is not None and gkP is not None:
+        vis_gate_bias = (torch.matmul(E, gqP).permute(0, 3, 1, 2)
+                         + torch.matmul(E, gkP).permute(0, 3, 2, 1))
+      elif gqP is not None:
+        vis_gate_bias = torch.matmul(E, gqP).permute(0, 3, 1, 2)  # [B, H, 64q, 64k]
+      elif gkP is not None:
+        vis_gate_bias = torch.matmul(E, gkP).permute(0, 3, 2, 1)  # [B, H, 64q, 64k]
       piece_relation_bias = vis_gate_bias if piece_relation_bias is None \
           else piece_relation_bias + vis_gate_bias
 
