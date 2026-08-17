@@ -354,8 +354,15 @@ class TPGDataset(Dataset):
     # Cross-rank ordering check: the rank slice below is only a PARTITION if
     # every rank shuffled into the same order (see _default_shuffle_seed). A
     # disagreement means silent duplicate/skipped shards, so verify rather than
-    # trust — one tiny all_reduce per re-enumeration, DDP only.
-    if self.world_size > 1:
+    # trust — one tiny all_reduce, DDP only.
+    #
+    # `initial` ONLY, i.e. the __init__ call in the main process. The
+    # re-enumeration calls come from item_generator, which runs inside FORKED
+    # DataLoader workers; a collective there touches CUDA under nccl and dies
+    # with "Cannot re-initialize CUDA in forked subprocess". (The ordering is
+    # deterministic for the whole run anyway — same seed, same stable sort —
+    # so checking once at construction covers every later pass.)
+    if initial and self.world_size > 1:
       try:
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
