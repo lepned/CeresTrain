@@ -9,10 +9,30 @@ data, without needing the full EngineBattle→Ceres→TRT inference pipeline.
 Usage:
   python tpg_eval.py <ckpt_path> <config_dir> <tag> <tpg_shard.zst> [--n 5000] [--aug 0|3]
 
-The --aug flag controls whether the eval computes augmented features per-record
-before forward pass. Must match how the model was trained (use --aug 3 for
-augfeat-trained nets, --aug 0 for baseline).
+Aux width comes from the run config (AuxFeaturesPerSquare, bridged by
+config_bootstrap) and drives both the model size and whether aux channels are
+computed per record; --aux overrides it for configs predating that key.
 """
+
+# ⚠⚠ RESULTS ARE NOT TRUSTWORTHY — DO NOT USE FOR DECISIONS ⚠⚠
+#
+# Measured 2026-08-17 on three checkpoints whose EngineBattle puzzle gates are
+# known (rg2700 policy 2367 / 2381 / 2437). This script ranked them in the
+# EXACT REVERSE order (top-1 5.9% / 5.2% / 4.2%) and reported ~5% top-1 for
+# every one, with avg solver log-prob identical to three decimals across nets
+# of clearly different strength. That is the signature of a misaligned target
+# or square extraction, not of weak networks.
+#
+# The likely cause is the hand-rolled record parsing below: BYTES_PER_POS,
+# SQUARES_OFFSET and POLICIES_INDICES_OFFSET are hardcoded and were derived by
+# hand from a running byte count in a comment, with no cross-check against
+# tpg_dataset.py (the validated reader). A single wrong offset produces exactly
+# this picture.
+#
+# Until it is rewritten to decode shards through TPGDataset instead of its own
+# offsets, use the EngineBattle puzzle gates (run_v5_gate.ps1) for any
+# comparison that informs a decision.
+
 import argparse, os, sys, time
 import numpy as np
 import torch
