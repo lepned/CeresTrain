@@ -52,12 +52,25 @@ from config_bootstrap import bootstrap_env_from_config
 _rc = os.environ.get('CERES_QDQ_RUN_CONFIG')
 _ri = os.environ.get('CERES_QDQ_RUN_ID')
 for _i, _a in enumerate(sys.argv):
-    if _a == '--run_config' and _i + 1 < len(sys.argv):
-        _rc = sys.argv[_i + 1]
-    elif _a == '--run_id' and _i + 1 < len(sys.argv):
-        _ri = sys.argv[_i + 1]
+    # argparse accepts BOTH '--flag value' and '--flag=value'; this pre-import
+    # scan must too, or the bridge is silently skipped for the '=' spelling.
+    for _name, _set in (('--run_config', 'rc'), ('--run_id', 'ri')):
+        _v = None
+        if _a == _name and _i + 1 < len(sys.argv):
+            _v = sys.argv[_i + 1]
+        elif _a.startswith(_name + '='):
+            _v = _a.split('=', 1)[1]
+        if _v is not None:
+            if _set == 'rc':
+                _rc = _v
+            else:
+                _ri = _v
 if _rc and _ri:
     bootstrap_env_from_config(None, _ri, configs_dir=_rc)
+elif _rc or _ri:
+    print('[qdq_export] WARNING: --run_config and --run_id must BOTH be given to bridge the '
+          'run data-format settings; continuing with the ambient CERES_* environment, which '
+          'may parse calibration shards with the wrong record layout.', file=sys.stderr)
 
 from tpg_dataset import TPGDataset
 from onnxruntime.quantization import (quantize_static, QuantType, QuantFormat,

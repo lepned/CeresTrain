@@ -207,7 +207,19 @@ def main():
     E11 = _E(pt11)[:, :, CHECK]
     assert E11[e4, e5v, 0] == 0.0, "mid-board pawn arrival wrongly checks like a queen"
 
-    print("OK: king-shadow flight + promotion-check fixes pass.")
+    # own-occupied arrival squares are not legal check destinations
+    # (review 2026-08-17: vis includes the first blocker, which is right for
+    # visibility but wrong for a MOVE channel).
+    pt12 = _board((a1, WR), (a4v, WP), (a8v, BK))
+    E12 = _E(pt12)[:, :, CHECK]
+    assert E12[a1, a4v, 0] == 0.0, "check edge onto own-occupied square"
+    # enemy-occupied arrival stays legal — Rxa4+ is a real check (the rook
+    # lands on a4 and the a-file above it is clear), so only OWN pieces mask.
+    pt13 = _board((a1, WR), (a4v, BP), (a8v, BK))
+    E13 = _E(pt13)[:, :, CHECK]
+    assert E13[a1, a4v, 0] == 1.0, "capture-arrival check wrongly masked"
+
+    print("OK: king-shadow flight + promotion-check + own-occupancy fixes pass.")
     print("ALL CHECKS PASSED.")
 
 

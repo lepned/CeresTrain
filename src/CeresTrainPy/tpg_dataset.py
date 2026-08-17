@@ -38,8 +38,28 @@ def stable_str_hash(s: str) -> int:
 # of train.py picks a fresh seed (from time_ns), so the file-iteration order shifts
 # between runs. Set CERES_SHUFFLE_SEED to override (e.g. for reproducibility tests).
 import time as _time
-_RUN_SHUFFLE_SEED = int(os.environ.get('CERES_SHUFFLE_SEED', str(_time.time_ns() & 0xFFFFFFFF)))
-print(f'[try_shuffle] run-level shuffle seed = {_RUN_SHUFFLE_SEED} (override with CERES_SHUFFLE_SEED)')
+# ⚠ MUST be identical across DDP ranks. _discover_files partitions the shuffled
+# file list by rank (all_files[rank*fpw : (rank+1)*fpw]), which is only a
+# partition if every rank shuffles into the SAME order. Under torchrun each
+# rank is a separate process that re-imports this module, so a time-based seed
+# gives each rank its own permutation: shards get read by two ranks in the same
+# pass while others are never read at all — silently, with no error and no
+# throughput symptom. torchrun exports TORCHELASTIC_RUN_ID identically to every
+# rank of a run, so derive the default from it when present (still varying
+# between launches, which is the point of randomizing it); fall back to
+# time_ns only for genuinely single-process runs. CERES_SHUFFLE_SEED overrides.
+def _default_shuffle_seed():
+  _run_id = os.environ.get('TORCHELASTIC_RUN_ID') or os.environ.get('TORCH_ELASTIC_RUN_ID')
+  if _run_id:
+    import hashlib as _hl
+    return int(_hl.sha256(_run_id.encode()).hexdigest()[:8], 16)
+  return _time.time_ns() & 0xFFFFFFFF
+_RUN_SHUFFLE_SEED = int(os.environ.get('CERES_SHUFFLE_SEED') or _default_shuffle_seed())
+print(f'[try_shuffle] run-level shuffle seed = {_RUN_SHUFFLE_SEED} (override with CERES_SHUFFLE_SEED)'
+      + ('' if os.environ.get('CERES_SHUFFLE_SEED')
+         else ' [derived from TORCHELASTIC_RUN_ID — rank-consistent]'
+              if (os.environ.get('TORCHELASTIC_RUN_ID') or os.environ.get('TORCH_ELASTIC_RUN_ID'))
+              else ' [time-based; single-process only]'))
 
 def try_shuffle(file_list):
     import random
@@ -331,22 +351,47 @@ class TPGDataset(Dataset):
       assert len(all_files) >= self.num_files_to_skip + self.num_workers, f"Trying to skip more files than available: {len(all_files)} available, {self.num_files_to_skip} to skip, {self.num_workers} workers"
     all_files = all_files[self.num_files_to_skip:]
     all_files = try_shuffle(all_files)
+    # Cross-rank ordering check: the rank slice below is only a PARTITION if
+    # every rank shuffled into the same order (see _default_shuffle_seed). A
+    # disagreement means silent duplicate/skipped shards, so verify rather than
+    # trust — one tiny all_reduce per re-enumeration, DDP only.
+    if self.world_size > 1:
+      try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+          import hashlib as _hl, torch as _torch
+          _sig = int(_hl.sha256('|'.join(all_files).encode()).hexdigest()[:8], 16)
+          _dev = 'cpu' if _dist.get_backend() == 'gloo' else 'cuda'
+          _t = _torch.tensor([_sig, -_sig], dtype=_torch.int64, device=_dev)
+          _dist.all_reduce(_t, op=_dist.ReduceOp.MAX)
+          if int(_t[0]) != -int(_t[1]):
+            raise ValueError(
+              f'{self.root_dir}: ranks disagree on shard ordering, so the per-rank slices '
+              f'overlap (duplicate training data) and miss shards. Set CERES_SHUFFLE_SEED '
+              f'to the same value on every rank, or check _default_shuffle_seed.')
+      except ImportError:
+        pass
     files_per_worker = len(all_files) // self.world_size
     # DDP shard-starvation guard: integer division silently yields ZERO files
     # per rank when a corpus has fewer shards than ranks (e.g. a 3-shard V2
-    # secondary on a 4-GPU box). Every rank would then own an empty file list
-    # and the run stalls with no error — the failure mode is a hang, which is
-    # the worst way to discover this on a rented multi-GPU server.
-    if files_per_worker == 0:
+    # secondary on a 4-GPU box). The rank slice is then split AGAIN by
+    # DataLoader worker (item_generator: index % num_workers == worker_id), so
+    # the real precondition is shards-per-rank >= workers — a rank with 2 files
+    # and 4 workers starves 2 of them. Either way the failure mode is a stall
+    # with no error, the worst way to discover it on a rented multi-GPU box.
+    _min_needed = max(1, self.num_workers)
+    if files_per_worker < _min_needed:
       raise ValueError(
-        f'{self.root_dir}: {len(all_files)} shard(s) available but world_size={self.world_size} '
-        f'— each rank needs at least one shard (files are partitioned, not shared). '
-        f'Use fewer ranks, or split/add shards for this corpus.')
+        f'{self.root_dir}: {len(all_files)} shard(s) give {files_per_worker} per rank at '
+        f'world_size={self.world_size}, but each rank needs at least {_min_needed} '
+        f'(one per DataLoader worker; files are partitioned, not shared). '
+        f'Use fewer ranks/workers, or split/add shards for this corpus.')
     if initial and len(all_files) % self.world_size:
       print(f'[tpg_dataset] {self.root_dir}: {len(all_files) % self.world_size} of '
-            f'{len(all_files)} shards are unused this pass (not divisible by '
-            f'world_size={self.world_size}); the remainder rotates as files are '
-            f're-shuffled on later passes.', flush=True)
+            f'{len(all_files)} shards are NEVER read this run — the ordering is fixed for '
+            f'the whole run (stable-hash sort + a run-level shuffle seed), so the remainder '
+            f'does not rotate on later passes. Use a shard count divisible by '
+            f'world_size={self.world_size} to train on all of them.', flush=True)
     start_index = self.rank * files_per_worker
     end_index = start_index + files_per_worker
     return all_files[start_index:end_index]

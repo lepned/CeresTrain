@@ -43,7 +43,7 @@ class TacticalRefiner(nn.Module):
     super().__init__()
     assert iters >= 1, 'RefinerIters must be >= 1 when the refiner is enabled'
     assert inner_dim % num_heads == 0, \
-        f'refiner inner_dim {inner_dim} must divide num_heads {num_heads}'
+        f'refiner num_heads {num_heads} must divide inner_dim {inner_dim}'
     self.iters = iters
     self.inner_dim = inner_dim
     self.num_heads = num_heads

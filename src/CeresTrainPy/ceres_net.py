@@ -1609,6 +1609,7 @@ class CeresNet(nn.Module):
     # masked inside loss_calc.survival_loss). Same consume-and-clear/value_out gating
     # as the placement head.
     survival_loss = 0
+    _survival_participation_only = False
     _sv_out = getattr(self, '_last_survival_out', None)
     if self.survival_target_weight > 0 and _sv_out is not None and value_out is not None:
       if not gradient_norm_logging_mode:
@@ -1624,9 +1625,12 @@ class CeresNet(nn.Module):
         # DDP static_graph participation term (see the aux-head block in train.py):
         # a zero-weighted read of the stashed output keeps survival_head in the
         # backward's used-parameter set on target-less batches, so the set stays
-        # constant across iterations. Mathematically a no-op (exact zero gradient),
-        # and single-GPU behaviour is unchanged apart from one extra zero add.
+        # constant across iterations. Mathematically a no-op (exact zero gradient).
+        # Flagged so the logging block below can still tell "no target this batch"
+        # from a real 0.0 — otherwise every sidecar-less batch would emit a hard
+        # zero sample and dilute the survival curve the gates are read from.
         survival_loss = 0.0 * _sv_out.float().sum()
+        _survival_participation_only = True
 
     # Short-term value aux head: CE against the WDL built from censored q_st/d_st
     # (V7-extras sidecar; STM-relative, matching TPG conventions), optionally weighted
@@ -1634,6 +1638,7 @@ class CeresNet(nn.Module):
     # (CERES_TPG_V7X_SIDECAR=auto mixed-corpus mode): skip, as with survival.
     # Same consume-and-clear/value_out gating as the other aux heads.
     stvalue_loss = 0
+    _stvalue_participation_only = False
     _st_out = getattr(self, '_last_stvalue_out', None)
     if self.stvalue_weight > 0 and _st_out is not None and value_out is not None:
       if not gradient_norm_logging_mode:
@@ -1645,6 +1650,7 @@ class CeresNet(nn.Module):
       else:
         # DDP static_graph participation term — see the survival branch above.
         stvalue_loss = 0.0 * _st_out.float().sum()
+        _stvalue_participation_only = True
 
     total_loss = (self.policy_loss_weight * p_loss
         + self.value_loss_weight * v_loss
@@ -1791,9 +1797,9 @@ class CeresNet(nn.Module):
       self._log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
       if self.placement_value_weight > 0 and not isinstance(placement_loss, int):
         self._log("placement_value_loss" + stat_suffix, placement_loss, step=num_pos)
-      if self.survival_target_weight > 0 and not isinstance(survival_loss, int):
+      if self.survival_target_weight > 0 and not isinstance(survival_loss, int)           and not _survival_participation_only:
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
-      if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int):
+      if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int)           and not _stvalue_participation_only:
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
       if self.vda_mode == 4 and not isinstance(vda_aux_loss, int):
         self._log("vda_aux_value_loss" + stat_suffix, vda_aux_loss, step=num_pos)

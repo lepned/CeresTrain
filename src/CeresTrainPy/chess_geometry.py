@@ -624,7 +624,16 @@ class VisibilityChannels(nn.Module):
             # checks remain missed (documented in the class docstring).
             _pm = promo_mask.to(dtype)
             d_pawn_arr = _pm * d_queen + (1.0 - _pm) * d_pawn              # [B, 64]
-            out['check'] = ((p_rook * rook_line * clear) * d_rook.unsqueeze(1)
+            # Arrival squares occupied by this side's OWN pieces are not legal
+            # destinations. vis semantics deliberately include the first blocker
+            # (a piece "sees" its own defender), which is right for visibility
+            # but wrong for a MOVE channel: without this mask a rook on a1 with
+            # its own pawn on a4 and the enemy king on a8 emits a check edge
+            # a1->a4, a move that cannot be played.
+            _own = pt[:, :, base:base + 6].sum(dim=2).clamp(max=1.0)       # [B, 64]
+            _free_arr = (1.0 - _own).unsqueeze(1)                          # [B, 1, 64k]
+            out['check'] = _free_arr * (
+                            (p_rook * rook_line * clear) * d_rook.unsqueeze(1)
                             + (p_bish * bish_line * clear) * d_bish.unsqueeze(1)
                             + (p_queen * (rook_line + bish_line) * clear) * d_queen.unsqueeze(1)
                             + (p_knight * self.vc_knight.to(dtype)) * d_knight.unsqueeze(1)
