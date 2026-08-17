@@ -332,6 +332,21 @@ class TPGDataset(Dataset):
     all_files = all_files[self.num_files_to_skip:]
     all_files = try_shuffle(all_files)
     files_per_worker = len(all_files) // self.world_size
+    # DDP shard-starvation guard: integer division silently yields ZERO files
+    # per rank when a corpus has fewer shards than ranks (e.g. a 3-shard V2
+    # secondary on a 4-GPU box). Every rank would then own an empty file list
+    # and the run stalls with no error — the failure mode is a hang, which is
+    # the worst way to discover this on a rented multi-GPU server.
+    if files_per_worker == 0:
+      raise ValueError(
+        f'{self.root_dir}: {len(all_files)} shard(s) available but world_size={self.world_size} '
+        f'— each rank needs at least one shard (files are partitioned, not shared). '
+        f'Use fewer ranks, or split/add shards for this corpus.')
+    if initial and len(all_files) % self.world_size:
+      print(f'[tpg_dataset] {self.root_dir}: {len(all_files) % self.world_size} of '
+            f'{len(all_files)} shards are unused this pass (not divisible by '
+            f'world_size={self.world_size}); the remainder rotates as files are '
+            f're-shuffled on later passes.', flush=True)
     start_index = self.rank * files_per_worker
     end_index = start_index + files_per_worker
     return all_files[start_index:end_index]
