@@ -172,6 +172,12 @@ class TSBSwiGLU(torch.nn.Module):
     # at step 0, regardless of linear1/linear2 init. Combined with the additive
     # residual in the encoder, this guarantees bit-identical forward at init.
     torch.nn.init.zeros_(self.tactical_ffn_linear3.weight)
+    # ... and linear2's BIAS must also be zero: with h == 0 the output is
+    # linear2(0) = bias, so a default-init bias silently injects a constant
+    # into every block at step 0, violating the invariant above (caught by
+    # tools/tsb_smoke.py once its config drift was repaired, 2026-08-17).
+    if self.tactical_ffn_linear2.bias is not None:
+      torch.nn.init.zeros_(self.tactical_ffn_linear2.bias)
 
     # Per-block scalar gate: model_dim -> hidden -> 1, sigmoid.
     gate_hidden = max(1, model_dim // gate_hidden_divisor)

@@ -167,7 +167,8 @@ class DotProductAttention(torch.nn.Module):
                layer_num : int = None,
                use_diff_attention : bool = False,
                vis_gate_channels : int = 0,
-               vis_gate_mode : str = 'qk') -> None:
+               vis_gate_mode : str = 'qk',
+               graph_route_channels : int = 0) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -304,6 +305,38 @@ class DotProductAttention(torch.nn.Module):
         self.register_buffer('vis_gate_swap_idx',
                              VisibilityChannels.out_in_swap_index(vis_gate_channels),
                              persistent=False)
+
+    # Graph-route heads (2026-08 tactical program): per-head gated blend of the
+    # softmax attention map with an EXACT row-stochastic routing matrix built
+    # from the shared visibility edge channels E:
+    #   A_hard[h] = rownorm( sum_c relu(w[h,c]) * E[:, :, c]  +  eps * I )
+    #   A[h]      = A_soft[h] + tanh(g[h]) * (A_hard[h] - A_soft[h])
+    # This upgrades the edge channels from a logit BIAS (which must out-shout
+    # content scores inside softmax) to GUARANTEED routing: with the gate
+    # open, information provably flows along attack/vis edges each layer, and
+    # stacking layers gives exact multi-hop propagation over the attack graph
+    # (exchange chains, coverage nets). Gate is tanh of a ZERO-INIT raw scalar
+    # per head: exact step-0 no-op (the TSB/GTAB/vis convention) with full
+    # gradient at init; the blend coefficient is sign-free during training
+    # (negative = route AWAY from edges, the DiffAttention precedent for
+    # signed attention). For gate in [0, 1] the blend stays row-stochastic.
+    # relu on the mixture keeps A_hard nonnegative; the eps self-loop keeps
+    # rows of empty squares well-defined. Post-softmax => no interaction with
+    # QK-clip (which monitors pre-softmax logits) and composes with smolgen/
+    # RPE/vis biases unchanged. Export: matmul/relu/tanh/div only.
+    # NB LoRA-style two-phase start: dL/dw is ~0 while the gate is ~0, so the
+    # gate moves first and w follows — the SmolgenPerLayerDelta pattern, not
+    # a dead unit (the gate's own gradient is nonzero from step 1).
+    self.graph_route_channels = graph_route_channels
+    if graph_route_channels > 0:
+      assert not use_diff_attention, 'graph-route heads unsupported with DiffAttention'
+      self.graph_route_w = torch.nn.Parameter(
+          torch.full((self.num_heads, graph_route_channels), 1.0 / graph_route_channels))
+      self.graph_route_gate = torch.nn.Parameter(torch.zeros(self.num_heads))
+      self.register_buffer('graph_route_eye', torch.eye(num_tokens_q), persistent=False)
+      if not self.layer_num:
+        print(f'[dot_product_attention] GRAPH-ROUTE HEADS enabled: {self.num_heads} gated '
+              f'heads/layer over {graph_route_channels} edge channels, tanh gate zero-init (exact step-0 no-op)')
 
     if self.use_nonlinear_attention:
       self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
@@ -478,7 +511,8 @@ class DotProductAttention(torch.nn.Module):
 
   def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None,
                           Q_rpe:torch.Tensor = None, K_rpe:torch.Tensor = None,
-                          rpe_precomputed:bool = False): # -> torch.Tensor, torch.Tensor:
+                          rpe_precomputed:bool = False,
+                          graph_route = None): # -> torch.Tensor, torch.Tensor:
     # Note that scaling could be done separately on Q and K to possibly improve stability. See:
     #   https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/118
     #scaleDivisor = 1 # math.pow(self.d_k, 0.25) # apply sqrt twice since we are dividing twice
@@ -543,6 +577,14 @@ class DotProductAttention(torch.nn.Module):
       scores = self.soft_cap(scores, self.softcap_cutoff)
 
     A = self.softmax(scores)
+
+    # Graph-route heads (see __init__): row-stochastic blend toward the exact
+    # attack-graph routing matrix. Applied POST-softmax; the downstream V
+    # aggregation and the rpe_v term read the blended A (intended — routed
+    # heads route everything they carry).
+    if graph_route is not None:
+      _A_hard, _lam = graph_route          # [B, H, T, T], [1, H, 1, 1]
+      A = A + _lam.to(A.dtype) * (_A_hard.to(A.dtype) - A)
 
     # Get the weighted average of the values
     H = torch.matmul(A, V)
@@ -713,13 +755,26 @@ class DotProductAttention(torch.nn.Module):
       Q = apply_rope(Q, self.rope_cos, self.rope_sin)
       K = apply_rope(K, self.rope_cos, self.rope_sin)
 
+    # Graph-route heads (see __init__): build the row-stochastic routing matrix
+    # from the raw shared E once per layer. relu(w) mixture keeps entries
+    # nonnegative; eps self-loop guarantees a nonzero row for squares with no
+    # edges (empty board regions) so the normalization is well-defined.
+    _graph_route = None
+    if self.graph_route_channels > 0 and vis_edge is not None:
+      _E_gr = vis_edge.to(self.graph_route_w.dtype)                         # [B, T, T, C]
+      _M = torch.matmul(_E_gr, torch.relu(self.graph_route_w).transpose(0, 1))  # [B, T, T, H]
+      _M = _M.permute(0, 3, 1, 2) + 1e-3 * self.graph_route_eye.to(_M.dtype)   # [B, H, T, T]
+      _A_hard = _M / _M.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+      _lam = torch.tanh(self.graph_route_gate).reshape(1, self.num_heads, 1, 1)
+      _graph_route = (_A_hard, _lam)
+
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
       if self.use_diff_attention:
         Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed)
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
     else:
       # Always route through the explicit Q·Kᵀ → softmax → ·V form. The previous
       # branch called torch.nn.functional.scaled_dot_product_attention, which
@@ -734,7 +789,7 @@ class DotProductAttention(torch.nn.Module):
         Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, None, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
-        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed)
+        H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)

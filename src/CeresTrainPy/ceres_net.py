@@ -612,6 +612,16 @@ class CeresNet(nn.Module):
     _vis_gate_channels = (4 * len(self._vis_edge_families)
                           if (self.use_vis_edge_bias and self.vis_edge_gate_mode) else 0)
 
+    # Graph-route heads (2026-08 tactical program, see dot_product_attention):
+    # per-head gated blend of softmax attention with exact row-stochastic
+    # routing over the visibility edge channels. Consumes the SAME shared E
+    # as the form-A projection and B/C gates, so it requires UseVisEdgeBias.
+    self.use_graph_route = bool(getattr(config, 'NetDef_UseGraphRouteHeads', False))
+    if self.use_graph_route:
+      assert self.use_vis_edge_bias, 'UseGraphRouteHeads requires UseVisEdgeBias=true'
+    _graph_route_channels = (4 * len(self._vis_edge_families)
+                             if (self.use_vis_edge_bias and self.use_graph_route) else 0)
+
     num_tokens_q = NUM_TOKENS_NET
     num_tokens_kv = NUM_TOKENS_NET
 
@@ -652,6 +662,7 @@ class CeresNet(nn.Module):
                       tsb_gate_mlp_hidden_divisor = getattr(config, 'NetDef_TSB_GateMLPHiddenDivisor', 8),
                       vis_gate_channels = _vis_gate_channels,
                       vis_gate_mode = self.vis_edge_gate_mode,
+                      graph_route_channels = _graph_route_channels,
                       pre_norm = config.NetDef_PreNorm)
         for i in range(self.NUM_DISTINCT_LAYERS)])
 
@@ -664,6 +675,34 @@ class CeresNet(nn.Module):
       self.trunk_end_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
     else:
       self.trunk_end_norm = None
+
+    # Iterated tactic refiner (2026-08 tactical program, see tactical_refiner.py):
+    # one small weight-shared block applied RefinerIters times to the trunk
+    # output — serial calculation depth for forcing lines at a fraction of a
+    # full layer per iteration. Zero-init output => exact no-op at step 0.
+    # Part of the SERVING graph (all heads read the refined flow).
+    # RefinerDeepSupWeight > 0 additionally supervises the intermediate
+    # iterations with the policy target during training (vda deep-supervision
+    # precedent); the aux logits go through the PLAIN shared head front-end +
+    # base policy head (no ray-context/pda augmentation — gradient shaping
+    # only, never served).
+    self.refiner_iters = int(getattr(config, 'NetDef_RefinerIters', 0) or 0)
+    self.refiner_deep_sup_weight = 0.0
+    if self.refiner_iters > 0:
+      from tactical_refiner import TacticalRefiner
+      _rf_dim = int(getattr(config, 'NetDef_RefinerDim', 128) or 128)
+      _rf_heads = int(getattr(config, 'NetDef_RefinerHeads', 4) or 4)
+      _rf_ffn = int(getattr(config, 'NetDef_RefinerFFNMult', 2) or 2)
+      self.refiner_deep_sup_weight = float(getattr(config, 'NetDef_RefinerDeepSupWeight', 0) or 0)
+      self.tactical_refiner = TacticalRefiner(in_dim=self.EMBEDDING_DIM,
+                                              inner_dim=_rf_dim, num_heads=_rf_heads,
+                                              ffn_mult=_rf_ffn, iters=self.refiner_iters,
+                                              norm_type=config.NetDef_NormType,
+                                              softcap_cutoff=config.NetDef_SoftCapCutoff)
+      _rf_params = sum(p.numel() for p in self.tactical_refiner.parameters())
+      print(f'[ceres_net] TACTIC REFINER enabled: dim {_rf_dim} x {_rf_heads} heads, '
+            f'ffn_mult {_rf_ffn}, {self.refiner_iters} weight-shared iterations '
+            f'({_rf_params} params, zero-init no-op), deep-sup weight {self.refiner_deep_sup_weight}')
 
     self.policy_loss_weight = policy_loss_weight
     self.value_loss_weight = value_loss_weight
@@ -980,7 +1019,7 @@ class CeresNet(nn.Module):
                                                phase_film_tensor[:, i, 1].unsqueeze(1)),
                                          rpe_src=rpe_src_tensor,
                                          rpe_precomputed=rpe_gen_biases is not None,
-                                         vis_edge=vis_edge_E if self.vis_edge_gate_mode else None)
+                                         vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None)
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
@@ -991,6 +1030,24 @@ class CeresNet(nn.Module):
     # Pre-norm: final norm before the heads (see __init__ comment).
     if self.trunk_end_norm is not None:
       flow = self.trunk_end_norm(flow)
+
+    # Iterated tactic refiner (see __init__): residual add of the weight-shared
+    # iterated block. Runs BEFORE GTAB/vda/heads so every consumer reads the
+    # refined square states. Deep supervision: intermediate iterations' policy
+    # logits through the plain shared front-end + base policy head, stashed
+    # for compute_loss (training-only attribute mutation — the established
+    # export-safe stash pattern).
+    if self.refiner_iters > 0:
+      _rf_collect = self.training and self.refiner_deep_sup_weight > 0 and self.refiner_iters > 1
+      _rf_final, _rf_inter = self.tactical_refiner(flow, collect_intermediate=_rf_collect)
+      if _rf_collect and _rf_inter:
+        _rf_aux = []
+        for _rf_d in _rf_inter:
+          _rf_fS = self.headSharedLinear(self.headPremap(flow + _rf_d)
+                                         .reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+          _rf_aux.append(self.policy_head(_rf_fS))
+        self._last_refiner_policy = torch.stack(_rf_aux, dim=1)   # [B, T-1, 1858]
+      flow = flow + _rf_final
 
     # TSB: collect per-block gate values across all layers for the gate-sparsity
     # regularizer in train.py. Each layer caches its last gate in _last_tsb_gate.
@@ -1522,6 +1579,23 @@ class CeresNet(nn.Module):
       soft_policy_loss = loss_calc.ce_loss.forward(_sp_m.float(), _sp_t) \
           - (loss_calc.entropy(_sp_t) if SUBTRACT_ENTROPY else 0.0)
 
+    # Refiner deep-supervision policy CE (see __init__/forward): mean CE over
+    # the intermediate refiner iterations against the SAME policy target, with
+    # the standard legality masking. Same consume-and-clear + skip-on-gradnorm
+    # conventions as the other stashed aux losses (depth-probe pattern).
+    refiner_ploss = 0
+    _rfp = getattr(self, '_last_refiner_policy', None)
+    if _rfp is not None and policy_out is not None and not gradient_norm_logging_mode:
+      self._last_refiner_policy = None
+      _rf_T = _rfp.shape[1]
+      _rf_legal = policy_target.greater(0)
+      _rf_ent = loss_calc.entropy(policy_target) if SUBTRACT_ENTROPY else 0.0
+      _rfp_m = torch.where(_rf_legal.unsqueeze(1), _rfp,
+                           torch.full_like(_rfp, loss_calc.MASK_POLICY_VALUE))
+      _rf_pt = policy_target.unsqueeze(1).expand(-1, _rf_T, -1).reshape(-1, policy_target.shape[-1])
+      refiner_ploss = loss_calc.ce_loss.forward(
+          _rfp_m.reshape(-1, _rfp.shape[-1]).float(), _rf_pt) - _rf_ent
+
     _pv_out = getattr(self, '_last_placement_value_out', None)
     if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
       # Consume-and-clear only on the REAL pass: the grad-norm diagnostic pass
@@ -1546,6 +1620,13 @@ class CeresNet(nn.Module):
       # full-run no-op misconfiguration.
       if survival_target is not None:
         survival_loss = loss_calc.survival_loss(survival_target, _sv_out, gradient_norm_logging_mode, self.survival_target_weight)
+      else:
+        # DDP static_graph participation term (see the aux-head block in train.py):
+        # a zero-weighted read of the stashed output keeps survival_head in the
+        # backward's used-parameter set on target-less batches, so the set stays
+        # constant across iterations. Mathematically a no-op (exact zero gradient),
+        # and single-GPU behaviour is unchanged apart from one extra zero add.
+        survival_loss = 0.0 * _sv_out.float().sum()
 
     # Short-term value aux head: CE against the WDL built from censored q_st/d_st
     # (V7-extras sidecar; STM-relative, matching TPG conventions), optionally weighted
@@ -1561,6 +1642,9 @@ class CeresNet(nn.Module):
       if _cens_q is not None:
         stvalue_loss = loss_calc.stvalue_loss(_cens_q, batch['censored_d_st'], batch.get('z_provenance', None),
                                               _st_out.float(), SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.stvalue_weight)
+      else:
+        # DDP static_graph participation term — see the survival branch above.
+        stvalue_loss = 0.0 * _st_out.float().sum()
 
     total_loss = (self.policy_loss_weight * p_loss
         + self.value_loss_weight * v_loss
@@ -1586,7 +1670,8 @@ class CeresNet(nn.Module):
         + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
-        + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
+        + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
+        + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
 
     # POLICY/VALUE GRADIENT-CONFLICT PROBE (config GradConflictProbeSteps; the
     # measurement lives in train.py). When armed for this step, stash the two family
@@ -1609,7 +1694,10 @@ class CeresNet(nn.Module):
           + self.action_loss_weight * action_loss
           + self.action_uncertainty_loss_weight * action_uncertainty_loss
           + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
-          + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0))
+          + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
+          # Refiner deep-sup is pure policy-target CE, so it belongs to the
+          # policy family (unlike the depth probes, which span both).
+          + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
       self._gc_value_loss = (self.value_loss_weight * v_loss
           + self.value2_loss_weight * v2_loss
           + self.unc_loss_weight * u_loss
@@ -1724,6 +1812,8 @@ class CeresNet(nn.Module):
         self._log("optimistic_policy_loss" + stat_suffix, opt_loss, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
+      if not isinstance(refiner_ploss, int):
+        self._log("refiner_deepsup_policy_loss" + stat_suffix, refiner_ploss, step=num_pos)
       if not gradient_norm_logging_mode:
         # Depth-attending value head diagnostics (see forward): WHICH depths does the
         # value head read? Logs batch-mean attention weight per depth state
