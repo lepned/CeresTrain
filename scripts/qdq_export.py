@@ -42,6 +42,23 @@ from onnx import numpy_helper, TensorProto
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CERES_PY = '/mnt/c/Users/lepne/source/repos/CeresTrain/src/CeresTrainPy'
 sys.path.insert(0, os.environ.get('CERES_PY_DIR', DEFAULT_CERES_PY))
+# Calibration reads real TPG shards, so the shard format (V2 137 vs V3 141
+# bytes/square, aux channels) must be right BEFORE tpg_dataset is imported —
+# it resolves those at import time. --run_config/--run_id bridge them from the
+# net's own training config using the same mapping train.py uses; without it
+# the caller must remember to export the CERES_* vars by hand, and a mismatch
+# calibrates INT8 scales on misparsed records.
+from config_bootstrap import bootstrap_env_from_config
+_rc = os.environ.get('CERES_QDQ_RUN_CONFIG')
+_ri = os.environ.get('CERES_QDQ_RUN_ID')
+for _i, _a in enumerate(sys.argv):
+    if _a == '--run_config' and _i + 1 < len(sys.argv):
+        _rc = sys.argv[_i + 1]
+    elif _a == '--run_id' and _i + 1 < len(sys.argv):
+        _ri = sys.argv[_i + 1]
+if _rc and _ri:
+    bootstrap_env_from_config(None, _ri, configs_dir=_rc)
+
 from tpg_dataset import TPGDataset
 from onnxruntime.quantization import (quantize_static, QuantType, QuantFormat,
                                       CalibrationDataReader, CalibrationMethod)
@@ -244,6 +261,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('onnx', help='FP16-converted CeresNet ONNX (decomposed norm, opset 18)')
     ap.add_argument('tpg_dir')
+    ap.add_argument('--run_config', default=None,
+                    help="configs dir of the run that produced this net (with --run_id, "
+                         "bridges its data-format settings; parsed pre-import, see top of file)")
+    ap.add_argument('--run_id', default=None,
+                    help='training id whose <id>_ceres_opt.json describes the shard format')
     ap.add_argument('--calib_batches', type=int, default=8)
     ap.add_argument('--num_batches', type=int, default=30)
     ap.add_argument('--batch', type=int, default=64)

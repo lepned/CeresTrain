@@ -7,6 +7,10 @@
 
 import os, sys, socket, torch
 
+# See recover_export.py: config->env bridge must run before these imports.
+from config_bootstrap import bootstrap_env_from_config
+bootstrap_env_from_config(sys.argv[2], sys.argv[1])
+
 from config import Configuration
 from ceres_net import CeresNet
 from save_model import save_model

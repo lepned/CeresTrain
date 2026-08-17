@@ -83,12 +83,34 @@ def main():
   ap.add_argument('tag')
   ap.add_argument('shard')
   ap.add_argument('--n', type=int, default=5000)
-  ap.add_argument('--aug', type=int, default=0, help='0 or 3 — must match training setup')
+  ap.add_argument('--aux', type=int, default=None,
+                  help='aux features/square override (0 or 4); default = the value in the '
+                       'run config, bridged automatically')
   ap.add_argument('--batch', type=int, default=512)
   args = ap.parse_args()
 
-  # Set env var BEFORE importing config so TOTAL_INPUT_FEATURES_PER_SQUARE is correct
-  os.environ['CERES_AUG_FEATURES_PER_SQUARE'] = str(args.aug)
+  # Data-format settings must be in os.environ BEFORE importing config, which
+  # reads them at import time to size TOTAL_INPUT_FEATURES_PER_SQUARE. Bridge
+  # them from the run's own config (shared mapping with train.py) so an eval
+  # automatically matches the checkpoint's training setup instead of relying on
+  # the caller's shell.
+  #
+  # NB this replaces an env write that never worked: it set
+  # CERES_AUG_FEATURES_PER_SQUARE (AUG, not AUX), a name nothing reads — so
+  # --aug was a silent no-op and the width came from the ambient environment.
+  # --aux is still honoured as an explicit override for configs that predate
+  # the AuxFeaturesPerSquare key.
+  from config_bootstrap import bootstrap_env_from_config
+  bootstrap_env_from_config(None, args.tag, configs_dir=args.config_dir)
+  if args.aux is not None:
+    os.environ['CERES_AUX_FEATURES_PER_SQUARE'] = str(args.aux)
+    print(f'[tpg_eval] aux width override: CERES_AUX_FEATURES_PER_SQUARE={args.aux}')
+
+  # One source of truth for the aux width: whatever the env now holds drives
+  # BOTH the model's input size (read at import, next line) and whether this
+  # script computes+concatenates the 4 aux channels onto the 137-byte records
+  # below. They must agree or the forward gets a wrong-width tensor.
+  _aux_n = int(os.environ.get('CERES_AUX_FEATURES_PER_SQUARE', '4') or 0)
 
   from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE
   print(f'[tpg_eval] TOTAL_INPUT_FEATURES_PER_SQUARE = {TOTAL_INPUT_FEATURES_PER_SQUARE}')
@@ -128,8 +150,8 @@ def main():
   n = squares.shape[0]
   print(f'[tpg_eval] evaluating {n:,} records (batch={args.batch})...')
 
-  # if aug=3, prep feature computer
-  if args.aug > 0:
+  # aux enabled: prep the on-the-fly feature computer (records are 137-byte V2)
+  if _aux_n > 0:
     from aug_features import compute_aug_features_batch
 
   top1 = 0
@@ -142,7 +164,7 @@ def main():
       sq_batch = squares[off:off + args.batch]              # (B, 64, 137)
       solver_batch = solver_target[off:off + args.batch]    # (B,) — solver move-index
 
-      if args.aug > 0:
+      if _aux_n > 0:
         aug = compute_aug_features_batch(sq_batch)
         sq_batch_full = np.concatenate([sq_batch, aug], axis=-1)
       else:
