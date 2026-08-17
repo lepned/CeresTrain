@@ -265,7 +265,7 @@ class Configuration:
     # exist and be trained).
     self.Opt_OptimisticPolicyServeBlend = _cfg_num('OptimisticPolicyServeBlend', 0.0)
     # Data-format / survival-sidecar settings (TPGV3, AuxFeaturesPerSquare,
-    # SquareBytes, SquareBytes2, AuxChannelIndices,
+    # SquareBytes, SquareBytes2, AuxChannelIndices, ShuffleSeed,
     # TargetSidecar, V7XSidecar, SurvivalHorizon, SurvivalTargetWeight,
     # SurvivalLossBuckets, SurvivalCaptureWeight), the stream-routing keys
     # (SecondaryLoss*Mult, MixProloguePositions, FileMirrorAug, KeepDrawProb)
@@ -288,6 +288,11 @@ class Configuration:
     self.Opt_MirrorConsAutoLow = _cfg_num('MirrorConsAutoLow', 0.0015)
     self.Opt_MirrorConsAutoHigh = _cfg_num('MirrorConsAutoHigh', 0.003)
     self.Opt_ValueFocalGamma = float(config_opt.get('ValueFocalGamma', 0) or 0)
+    # Run seed for weight init / dropout / sampling (see train.py). None = the
+    # historical behaviour of no seeding at all. Pair with the ShuffleSeed key
+    # (bridged to CERES_SHUFFLE_SEED, governs data order) when two arms must
+    # differ only by the mechanism under test.
+    self.Opt_TorchSeed = config_opt.get('TorchSeed', None)
     # Per-head Muon (Muon only, Kimi K3-style): orthogonalize each attention head's
     # projection block independently (qkv per-head x per-projection on the linear
     # path / per-projection on the nonlinear path; q2/k2/v2/q2b per-head rows;

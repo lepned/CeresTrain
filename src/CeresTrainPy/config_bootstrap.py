@@ -42,6 +42,13 @@ BOOTSTRAP_ENV_MAP = {
     'SquareBytes': 'CERES_TPG_SQUARE_BYTES',
     'SquareBytes2': 'CERES_TPG_SQUARE_BYTES2',
     'AuxChannelIndices': 'CERES_AUX_CHANNEL_INDICES',
+    # Shard-order seed. Two reasons it belongs in the config rather than the
+    # shell: it decides WHICH shards each DDP rank reads (so it is part of what
+    # the run actually trained on, not a preference), and pinning it is how a
+    # run is made reproducible or how two arms are given identical data order.
+    # Omit it to keep the default — derived from TORCHELASTIC_RUN_ID under
+    # torchrun, time-based otherwise (see tpg_dataset._default_shuffle_seed).
+    'ShuffleSeed': 'CERES_SHUFFLE_SEED',
     'TargetSidecar': 'CERES_TPG_TARGET_SIDECAR',
     'V7XSidecar': 'CERES_TPG_V7X_SIDECAR',
     'SurvivalHorizon': 'CERES_SURVIVAL_HORIZON',

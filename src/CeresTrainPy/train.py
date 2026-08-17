@@ -313,7 +313,39 @@ def Train():
   global fraction_complete
 
   print("**** STARTING ", NAME)
-  
+
+  # Optional run seed (config Opt 'TorchSeed'; env CERES_TORCH_SEED as fallback).
+  # Unset = previous behaviour: no seeding at all, so weight init, dropout
+  # masks, hard-replay/mirror row sampling and the file-mirror coin flips all
+  # differ between runs — the ±2-3 Elo "seed noise" measured on same-config
+  # arms. Setting it makes two arms start from IDENTICAL weights and take the
+  # same stochastic decisions, so a gate delta is attributable to the change
+  # under test rather than to init luck. Pair with ShuffleSeed (data order) for
+  # a fully controlled A/B.
+  #
+  # Scope note: this is reproducibility BETWEEN RUNS, not bit-exact
+  # determinism — that additionally needs torch.use_deterministic_algorithms
+  # and disabling cuDNN autotuning, which costs throughput and is deliberately
+  # not done here.
+  #
+  # DDP: every rank seeds IDENTICALLY. Weight init must match across ranks
+  # (DDP broadcasts parameters at construction anyway, so this only makes the
+  # pre-broadcast state agree), and data divergence is already handled by the
+  # rank-partitioned file slices, not by RNG.
+  _torch_seed = getattr(config, 'Opt_TorchSeed', None)
+  if _torch_seed in (None, ''):
+    _torch_seed = os.environ.get('CERES_TORCH_SEED')
+  if _torch_seed not in (None, ''):
+    _torch_seed = int(_torch_seed)
+    import random as _py_random
+    torch.manual_seed(_torch_seed)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed_all(_torch_seed)
+    np.random.seed(_torch_seed & 0xFFFFFFFF)
+    _py_random.seed(_torch_seed)
+    print(f'[train] TORCH SEED set to {_torch_seed} (weight init + dropout + sampling; '
+          f'identical on every rank). Data order is governed separately by ShuffleSeed.',
+          flush=True)
 
   if config.Exec_UseFP8:
     raise NotImplementedError(
