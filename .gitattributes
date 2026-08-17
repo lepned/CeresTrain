@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings: a CRLF checkout makes Linux fail with
+# "bad interpreter: /usr/bin/env bash^M", which is a confusing way to lose an
+# hour on a remote box. This does not depend on anyone's core.autocrlf.
+*.sh text eol=lf
