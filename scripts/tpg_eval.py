@@ -83,15 +83,38 @@ def main():
   ap.add_argument('tag')
   ap.add_argument('shard')
   ap.add_argument('--n', type=int, default=5000)
-  ap.add_argument('--aug', type=int, default=0, help='0 or 3 — must match training setup')
+  ap.add_argument('--aux', type=int, default=None,
+                  help='aux features/square override (0 or 4); default = the value in the '
+                       'run config, bridged automatically')
   ap.add_argument('--batch', type=int, default=512)
   args = ap.parse_args()
 
-  # Set env var BEFORE importing config so TOTAL_INPUT_FEATURES_PER_SQUARE is correct
-  os.environ['CERES_AUG_FEATURES_PER_SQUARE'] = str(args.aug)
+  # Data-format settings must be in os.environ BEFORE importing config, which
+  # reads them at import time to size TOTAL_INPUT_FEATURES_PER_SQUARE. Bridge
+  # them from the run's own config (shared mapping with train.py) so an eval
+  # automatically matches the checkpoint's training setup instead of relying on
+  # the caller's shell.
+  #
+  # The old code wrote CERES_AUG_FEATURES_PER_SQUARE here. That name is NOT
+  # dead — config.py reads it as a fallback for CERES_AUX_FEATURES_PER_SQUARE —
+  # so --aug did control the width whenever the AUX name was unset. It is
+  # replaced (not just renamed) because the width belongs to the run, not to
+  # the caller's shell; --aux remains as an explicit override for configs that
+  # predate the AuxFeaturesPerSquare key.
+  from config_bootstrap import bootstrap_env_from_config
+  bootstrap_env_from_config(None, args.tag, configs_dir=args.config_dir)
+  if args.aux is not None:
+    os.environ['CERES_AUX_FEATURES_PER_SQUARE'] = str(args.aux)
+    print(f'[tpg_eval] aux width override: CERES_AUX_FEATURES_PER_SQUARE={args.aux}')
 
-  from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE
-  print(f'[tpg_eval] TOTAL_INPUT_FEATURES_PER_SQUARE = {TOTAL_INPUT_FEATURES_PER_SQUARE}')
+  from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE, NUM_INPUT_BYTES_PER_SQUARE
+  # Single source of truth, taken from config's OWN resolution rather than
+  # re-parsing the env: config applies an AUG->AUX fallback and its own default,
+  # so a second independent read can disagree with the model that was just
+  # sized (either direction produces a wrong-width forward).
+  _aux_n = TOTAL_INPUT_FEATURES_PER_SQUARE - NUM_INPUT_BYTES_PER_SQUARE
+  print(f'[tpg_eval] TOTAL_INPUT_FEATURES_PER_SQUARE = {TOTAL_INPUT_FEATURES_PER_SQUARE} '
+        f'(aux={_aux_n})')
   from ceres_net import CeresNet
 
   cfg = Configuration(args.config_dir, args.tag)
@@ -128,9 +151,12 @@ def main():
   n = squares.shape[0]
   print(f'[tpg_eval] evaluating {n:,} records (batch={args.batch})...')
 
-  # if aug=3, prep feature computer
-  if args.aug > 0:
-    from aug_features import compute_aug_features_batch
+  # aux enabled: prep the on-the-fly feature computer (records are 137-byte V2).
+  # The module is aux_features (an earlier 'aug_features' import here named a
+  # module that does not exist — unreachable while --aug defaulted to 0, and an
+  # immediate ImportError once the width came from a config with aux=4).
+  if _aux_n > 0:
+    from aux_features import compute_aux_features_batch
 
   top1 = 0
   top3 = 0
@@ -142,8 +168,8 @@ def main():
       sq_batch = squares[off:off + args.batch]              # (B, 64, 137)
       solver_batch = solver_target[off:off + args.batch]    # (B,) — solver move-index
 
-      if args.aug > 0:
-        aug = compute_aug_features_batch(sq_batch)
+      if _aux_n > 0:
+        aug = compute_aux_features_batch(sq_batch)
         sq_batch_full = np.concatenate([sq_batch, aug], axis=-1)
       else:
         sq_batch_full = sq_batch

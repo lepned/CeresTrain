@@ -265,6 +265,7 @@ class Configuration:
     # exist and be trained).
     self.Opt_OptimisticPolicyServeBlend = _cfg_num('OptimisticPolicyServeBlend', 0.0)
     # Data-format / survival-sidecar settings (TPGV3, AuxFeaturesPerSquare,
+    # SquareBytes, SquareBytes2, AuxChannelIndices,
     # TargetSidecar, V7XSidecar, SurvivalHorizon, SurvivalTargetWeight,
     # SurvivalLossBuckets, SurvivalCaptureWeight), the stream-routing keys
     # (SecondaryLoss*Mult, MixProloguePositions, FileMirrorAug, KeepDrawProb)
@@ -384,6 +385,15 @@ class Configuration:
     self.NetDef_VisEdgeFamilies = config_net_def.get('VisEdgeFamilies', 'vis,xray,pinray')
     self.NetDef_VisEdgeGates = config_net_def.get('VisEdgeGates', '')
     self.NetDef_VisEdgeSharedProjection = config_net_def.get('VisEdgeSharedProjection', False)
+    # Graph-route heads (2026-08 tactical program): gated exact routing over the
+    # visibility edge channels; requires UseVisEdgeBias (see ceres_net).
+    self.NetDef_UseGraphRouteHeads = config_net_def.get('UseGraphRouteHeads', False)
+    # Iterated tactic refiner (see tactical_refiner.py): 0 = off.
+    self.NetDef_RefinerIters = config_net_def.get('RefinerIters', 0)
+    self.NetDef_RefinerDim = config_net_def.get('RefinerDim', 128)
+    self.NetDef_RefinerHeads = config_net_def.get('RefinerHeads', 4)
+    self.NetDef_RefinerFFNMult = config_net_def.get('RefinerFFNMult', 2)
+    self.NetDef_RefinerDeepSupWeight = config_net_def.get('RefinerDeepSupWeight', 0.0)
     # Looped transformer: NumLayers represents the EFFECTIVE depth (number of
     # encoder layer applications). LoopCount controls weight tying — when >1,
     # NumLayers/LoopCount distinct EncoderLayer modules are constructed and each

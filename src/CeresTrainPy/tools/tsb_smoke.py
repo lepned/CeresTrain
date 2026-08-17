@@ -17,7 +17,7 @@ import torch
 # Ensure imports resolve from the parent CeresTrainPy directory.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from config import Configuration, NUM_TOKENS_INPUT, NUM_INPUT_BYTES_PER_SQUARE
+from config import Configuration, NUM_TOKENS_INPUT, TOTAL_INPUT_FEATURES_PER_SQUARE
 from ceres_net import CeresNet
 
 
@@ -121,6 +121,13 @@ def _make_config(tsb_enabled: bool):
     cfg.NetDef_SmolgenToHeadDivisor = 0
     cfg.NetDef_SmolgenActivationType = 'None'
     cfg.NetDef_HeadWidthMultiplier = 2
+    # Post-dates this script: with ModelDim 64 the premap width is 2 per
+    # square, not divisible by the default HeadSharedLinearDiv=4.
+    cfg.NetDef_HeadSharedLinearDiv = 1
+    cfg.NetDef_SoftMoE_ExpertInputDim = 0
+    cfg.NetDef_UseDiffAttention = False
+    cfg.NetDef_UseRoPE = False
+    cfg.NetDef_SmolgenDeltaRank = 0
     cfg.NetDef_UseRPE = False
     cfg.NetDef_UseRPE_V = True
     cfg.NetDef_UseRelBias = False
@@ -191,7 +198,7 @@ def main():
     # Forward both nets on identical input.
     torch.manual_seed(0)
     B = 2
-    squares = torch.randn(B, NUM_TOKENS_INPUT, NUM_INPUT_BYTES_PER_SQUARE)
+    squares = torch.randn(B, NUM_TOKENS_INPUT, TOTAL_INPUT_FEATURES_PER_SQUARE)
 
     with torch.no_grad():
         out_off = net_off(squares, None)

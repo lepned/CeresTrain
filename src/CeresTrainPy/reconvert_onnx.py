@@ -15,16 +15,21 @@ import sys
 import socket
 import torch
 
-from config import Configuration
-from ceres_net import CeresNet
-from save_model import save_model
-
 if len(sys.argv) != 4:
     print(__doc__)
     sys.exit(1)
 
 CONFIG_ID = sys.argv[1]
 OUTPUTS_DIR = sys.argv[2]
+
+# See recover_export.py: the config->env bridge must run BEFORE importing
+# config/ceres_net (they read data-format settings at import time).
+from config_bootstrap import bootstrap_env_from_config
+bootstrap_env_from_config(OUTPUTS_DIR, CONFIG_ID)
+
+from config import Configuration
+from ceres_net import CeresNet
+from save_model import save_model
 CKPT_NAME = sys.argv[3]
 
 config = Configuration('.', os.path.join(OUTPUTS_DIR, "configs", CONFIG_ID))

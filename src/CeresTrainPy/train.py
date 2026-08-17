@@ -22,90 +22,16 @@ import contextlib
 import json as _bootstrap_json
 
 # ---- Config -> env bootstrap (BEFORE the heavy imports) -------------------
-# The data-format and survival-sidecar settings below are consumed at IMPORT
-# time by module-level reads (config.py, tpg_dataset.py, losses.py), so plain
-# Configuration fields would arrive too late. Bridging them from the run's
-# _ceres_opt.json into os.environ here makes them travel WITH the run/
-# checkpoint across resume and ExportOnly (the 2026-08-07 export incident:
-# an export shell without CERES_AUX_FEATURES_PER_SQUARE=0 crashed on width
-# mismatch). Precedence: a key PRESENT in the config overrides the env
-# (config authoritative); absent keys leave the env untouched (fallback).
-_BOOTSTRAP_ENV_MAP = {
-    # data format / sidecars
-    'TPGV3': 'CERES_TPG_V3',
-    'AuxFeaturesPerSquare': 'CERES_AUX_FEATURES_PER_SQUARE',
-    'TargetSidecar': 'CERES_TPG_TARGET_SIDECAR',
-    'V7XSidecar': 'CERES_TPG_V7X_SIDECAR',
-    'SurvivalHorizon': 'CERES_SURVIVAL_HORIZON',
-    'SurvivalTargetWeight': 'CERES_SURVIVAL_TARGET_WEIGHT',
-    'SurvivalLossBuckets': 'CERES_SURVIVAL_LOSS_BUCKETS',
-    'SurvivalCaptureWeight': 'CERES_SURVIVAL_CAPTURE_WEIGHT',
-    # stream routing / data augmentation
-    'SecondaryLossPolicyMult': 'CERES_SECONDARY_LOSS_POLICY_MULT',
-    'SecondaryLossValueMult': 'CERES_SECONDARY_LOSS_VALUE_MULT',
-    'SecondaryLossValue2Mult': 'CERES_SECONDARY_LOSS_VALUE2_MULT',
-    'SecondaryLossAuxMult': 'CERES_SECONDARY_LOSS_AUX_MULT',
-    'SecondaryLossPlacementMult': 'CERES_SECONDARY_LOSS_PLACEMENT_MULT',
-    'SecondaryLossSurvivalMult': 'CERES_SECONDARY_LOSS_SURVIVAL_MULT',
-    'SecondaryLossStvalueMult': 'CERES_SECONDARY_LOSS_STVALUE_MULT',
-    'MixProloguePositions': 'CERES_MIX_PROLOGUE_POSITIONS',
-    'FileMirrorAug': 'CERES_FILE_MIRROR_AUG',
-    'KeepDrawProb': 'CERES_KEEP_DRAW_PROB',
-}
-def _bs_norm(_v):
-  # Normalize JSON literals to the string forms the env consumers actually
-  # parse (2026-08-07 review): booleans -> '1'/'0' (consumers compare == '0'
-  # or int(); str(True) would silently select the WRONG branch), integral
-  # floats -> int string (int('4.0') raises), lists -> comma-join (the
-  # natural JSON spelling of e.g. SurvivalLossBuckets [2,4] -> '2,4').
-  if isinstance(_v, bool):
-    return '1' if _v else '0'
-  if isinstance(_v, float) and _v.is_integer():
-    return str(int(_v))
-  if isinstance(_v, (list, tuple)):
-    return ','.join(_bs_norm(_x) for _x in _v)
-  return str(_v)
-
-try:
-  if len(sys.argv) > 2:
-    _bs_path = os.path.join(sys.argv[2], 'configs', sys.argv[1] + '_ceres_opt.json')
-    if os.path.isfile(_bs_path):
-      with open(_bs_path, encoding='utf-8') as _bs_f:
-        _bs_cfg = _bootstrap_json.load(_bs_f)
-      # Collect EVERYTHING first, apply atomically afterwards — a malformed
-      # "Env" section must not leave a half-bridged environment behind.
-      _bs_pending = {}
-      for _bs_key, _bs_env in _BOOTSTRAP_ENV_MAP.items():
-        if _bs_key in _bs_cfg and _bs_cfg[_bs_key] is not None:
-          if _bs_cfg[_bs_key] == '':
-            print(f'[bootstrap] WARNING: {_bs_key} is an empty string; skipped (use null/omit to fall back to env)')
-            continue
-          _bs_pending[_bs_env] = _bs_norm(_bs_cfg[_bs_key])
-      # Generic escape hatch: an "Env" dict in the config is bridged with the
-      # same normalization (applied AFTER the friendly names, so Env wins on
-      # collision). Lets ANY env-gated knob — arch flags, probes, one-off
-      # switches — live in the run's config without mapping maintenance.
-      _bs_envsec = _bs_cfg.get('Env')
-      if _bs_envsec is not None:
-        if not isinstance(_bs_envsec, dict):
-          # Hard failure by design: the config EXISTS and is wrong — running
-          # on with silently dropped settings is worse than stopping.
-          print(f'[bootstrap] ERROR: "Env" must be a JSON object of VAR: value, got {type(_bs_envsec).__name__}')
-          sys.exit(1)
-        for _bs_k, _bs_v in _bs_envsec.items():
-          if _bs_v is None or _bs_v == '':
-            print(f'[bootstrap] WARNING: Env.{_bs_k} is null/empty; skipped')
-            continue
-          _bs_pending[str(_bs_k)] = _bs_norm(_bs_v)
-      for _bs_k, _bs_v in _bs_pending.items():
-        os.environ[_bs_k] = _bs_v
-        print(f'[bootstrap] {_bs_k}={_bs_v} (from config)')
-    else:
-      print(f'[bootstrap] no opt-config at {_bs_path}; env-only run')
-except SystemExit:
-  raise
-except Exception as _bs_e:  # never let the bootstrap kill a legacy env-driven run
-  print(f'[bootstrap] WARNING: config->env bridge failed ({_bs_e}); using env as-is')
+# The data-format and survival-sidecar settings are consumed at IMPORT time by
+# module-level reads (config.py, tpg_dataset.py, losses.py), so plain
+# Configuration fields would arrive too late. The bridge lives in
+# config_bootstrap so the standalone checkpoint tools (recover_export.py,
+# reconvert_onnx.py) apply the IDENTICAL mapping — they rebuild nets from
+# checkpoints these same settings shape, and a tool that disagrees with the
+# training run re-exports a differently-shaped net (the 2026-08-07 incident).
+from config_bootstrap import bootstrap_env_from_config
+if len(sys.argv) > 2:
+  bootstrap_env_from_config(sys.argv[2], sys.argv[1])
 # ---------------------------------------------------------------------------
 
 import numpy as np
@@ -466,7 +392,10 @@ def Train():
                         # same full-rank rationale as the 'inject' front-end above.
                         # Without this they freeze at zero and the feature is a
                         # silent no-op in every LoRA/GTAB/TSB run.
-                        or "vis_edge_proj" in name or "attack_gate_" in name)
+                        or "vis_edge_proj" in name or "attack_gate_" in name
+                        # Graph-route heads + tactic refiner (2026-08 tactical
+                        # program): same NEW-zero-init-module rationale.
+                        or "graph_route" in name or "tactical_refiner" in name)
       if not keep_trainable:
         param.requires_grad = False
    
@@ -764,6 +693,7 @@ def Train():
   model = model.to(device)
   if config.Exec_DataType == 'BFloat16Pure':
     model = model.to(torch.bfloat16)
+  DDP_STATIC_GRAPH = False   # set below when DDP is active; read by the train loop
   if IS_DISTRIBUTED:
     # Two DDP modes, chosen by the data layout:
     #
@@ -782,6 +712,7 @@ def Train():
     #    find_unused_parameters are mutually exclusive, so static_graph wins.
     _static_graph = int(os.environ.get('CERES_DDP_STATIC_GRAPH',
                                        '1' if BOARDS_PER_BATCH > 1 else '0') or 0) > 0
+    DDP_STATIC_GRAPH = _static_graph
     _find_unused = (int(os.environ.get('CERES_DDP_FIND_UNUSED', '1') or 1) > 0
                     and not _static_graph)
     model = DDP(model, device_ids=[DDP_LOCAL_GPU], output_device=DDP_LOCAL_GPU,
@@ -971,8 +902,22 @@ def Train():
     if BOARDS_PER_BATCH != 1:
       raise NotImplementedError('CERES_VALUE_MIRROR_CONS_WEIGHT is only implemented for BOARDS_PER_BATCH==1')
     if WORLD_SIZE > 1:
-      raise NotImplementedError('CERES_VALUE_MIRROR_CONS_WEIGHT is single-GPU only: the second forward '
-                                'through the DDP-wrapped model would break reducer bookkeeping')
+      # Three separate blockers, all measured/analysed 2026-08-17 — a future
+      # multi-GPU port has to clear every one, not just the first:
+      #  1. The second forward through the DDP-wrapped model needs
+      #     static_graph=True (the default reducer dies with "marked ready
+      #     twice" on two forwards per backward).
+      #  2. Whether the term runs at all is DATA-dependent per rank
+      #     (_elig.numel() > 0 below), so ranks can disagree and desync into a
+      #     hang; the decision would need an all-reduce (MIN) first.
+      #  3. static_graph also requires a constant per-iteration graph, which
+      #     the probe/hysteresis mode (MirrorConsProbeSteps, running the term
+      #     only every Nth step) violates — under DDP the term must run every
+      #     step or never, i.e. the thermostat that makes it cheap has to go.
+      raise NotImplementedError(
+        'CERES_VALUE_MIRROR_CONS_WEIGHT is single-GPU only: the second forward through the '
+        'DDP-wrapped model needs static_graph, the run/skip decision is rank-divergent, and '
+        'probe mode breaks static_graph\'s constant-graph requirement (see comment above)')
     import tpg_dataset as _tpgds
     _tpgds._ensure_mirror_tables()
     _mirror_perm64_t = torch.tensor(_tpgds._MIRROR_PERM64, dtype=torch.long)
@@ -1073,12 +1018,34 @@ def Train():
             f'steps, so it now spans {WORLD_SIZE}x more positions than single-GPU '
             f'(divide EMAPeriodSteps by {WORLD_SIZE} to match a 1-GPU recipe)', flush=True)
 
-  # Aux heads (placement/survival): the stash-based aux loss is not DDP-safe (params are
-  # unreachable from the forward return outputs, breaking DDP's reducer bookkeeping).
+  # Aux heads (placement/survival/stvalue/depth-probes) under DDP.
+  #
+  # Their losses are built from tensors STASHED on the module, not from the
+  # forward() return value. DDP's default reducer discovers used parameters by
+  # walking the autograd graph backwards from the returned outputs, so those
+  # heads' params look "unused" — the reducer marks them ready immediately, then
+  # the real backward produces gradients for them and it dies with
+  # "Expected to mark a variable ready only once".
+  #
+  # static_graph=True is the supported path: it derives the used-parameter set
+  # from the FIRST backward instead of from an output traversal, so stash-only
+  # params are included and reduced correctly. Its precondition is that the set
+  # is IDENTICAL every iteration — which is why compute_loss now emits
+  # zero-weighted participation terms for the aux heads on batches whose targets
+  # are absent (mixed-corpus sidecar 'auto' mode, e.g. a puzzle secondary stream
+  # alongside a survival-labelled primary). Without those terms the set would
+  # shrink on target-less batches and static_graph would fire
+  # "Your training graph has changed in this iteration".
   if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
       or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)) and WORLD_SIZE > 1:
-    raise NotImplementedError('placement/survival/stvalue aux heads are single-GPU only for now: '
-                              'the stashed aux output is invisible to DDP\'s reducer')
+    if not _static_graph:
+      raise NotImplementedError(
+        'placement/survival/stvalue/depth-probe aux heads under DDP require static_graph: '
+        'the stashed aux output is invisible to DDP\'s default reducer. '
+        'Re-launch with CERES_DDP_STATIC_GRAPH=1.')
+    print(f'[ddp] aux heads (placement/survival/stvalue/depth-probes) enabled under DDP via '
+          f'static_graph; compute_loss emits zero-weighted participation terms so the '
+          f'used-parameter set stays constant on target-less batches', flush=True)
 
   # Survival head requires sidecar targets in (at least some of) the batches.
   if getattr(core, 'survival_target_weight', 0) > 0:
@@ -1264,8 +1231,14 @@ def Train():
       # so fresh-initializing on resume reproduces the base net exactly (same
       # rationale as the 'inject' private-value front-end above).
       _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('vis_edge_proj.',)
+      # Graph-route heads + tactic refiner (2026-08 tactical program): the
+      # refiner is top-level ('tactical_refiner.'), the route params live
+      # nested per attention layer (transformer_layer.N.attention.graph_route_*).
+      # Both are exact step-0 no-ops (zero-init proj_out / tanh-zero gate), so
+      # fresh-initializing on warm-start reproduces the base net exactly.
+      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('tactical_refiner.',)
       def _is_aux_key(k):
-        return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k
+        return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(_is_aux_key(k) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if _is_aux_key(k)]
@@ -1315,6 +1288,11 @@ def Train():
           pass # vis edge-bias modules (CERES_VIS_EDGE_BIAS/_GATES) are new — not
                # in orig ckpt; zero-init, so keeping init values reproduces the
                # base net at step 0.
+        elif "graph_route" in name or "tactical_refiner" in name:
+          pass # graph-route heads + tactic refiner (2026-08 tactical program)
+               # are new — not in orig ckpt; exact step-0 no-ops (zero-init
+               # proj_out / tanh-zero gate), so keeping init values reproduces
+               # the base net at step 0.
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name
@@ -1591,7 +1569,18 @@ def Train():
     # model.no_sync() toggles; setting the flag avoids re-indenting the forward
     # block). On the final, non-accumulating micro-step the flag is True, so the
     # backward all-reduces the summed gradients once. No-op in single-GPU mode.
-    if IS_DISTRIBUTED:
+    #
+    # ⚠ NOT under static_graph: the no_sync path is explicitly unsupported there
+    # (PyTorch docs), and the combination dies inside the reducer with
+    # "expect_autograd_hooks_ INTERNAL ASSERT FAILED" on the first accumulating
+    # backward — which every production config hits, since they accumulate
+    # (512 forward / 4096 backward = 8 micro-steps). Leaving sync ON every
+    # micro-step is mathematically IDENTICAL: each micro-step all-reduces (i.e.
+    # averages across ranks) its own gradients and accumulates them into .grad,
+    # and sum-over-microsteps of mean-over-ranks == mean-over-ranks of
+    # sum-over-microsteps. The only cost is one all-reduce per micro-step
+    # instead of one per optimizer step — bandwidth, not correctness.
+    if IS_DISTRIBUTED and not DDP_STATIC_GRAPH:
       model.require_backward_grad_sync = (not is_accumulating)
     # Autocast handles bf16-mixed precision (Fabric did this implicitly via
     # precision='bf16-mixed').

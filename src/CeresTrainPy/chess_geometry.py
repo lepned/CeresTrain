@@ -425,6 +425,36 @@ class VisibilityChannels(nn.Module):
       pinray — edge FROM THE BLOCKER to the x-ray target: the pinned piece
                reads what it is pinned against in one hop. Strongest channel
                per edge in the source program despite 0.08% density.
+      check  — FORCING-MOVE edges (2026-08 tactical program): E[i, j] = 1 iff
+               the piece on i can move to j (its vis reach) AND a piece of
+               that type standing on j would attack the enemy king (blocker-
+               aware for sliders, current occupancy). "Which moves give
+               check" — the forcing skeleton of tactics, material-agnostic
+               (a queen sac surfaces because it is a check, not because it
+               wins material). 2-hop composition (reach ∘ king-attack) the
+               net otherwise spends 2+ layers deriving. Approximations,
+               documented: post-move occupancy is NOT simulated (mover still
+               on i, so a discovered self-block/unblock along j->king is
+               missed); pawn arrival uses the vis reach (push square
+               unconditionally, diagonals without requiring a capturable
+               target); pawn arrivals on the LAST RANK check as the QUEEN
+               they promote to (auto-queen — underpromotion-to-knight checks
+               are missed). King moves never generate check edges.
+      flight — MATING-NET closure (same program): E[i, j] = 1 for ALL i iff
+               j is a currently FREE flight square of the enemy king: in the
+               king's ring, not occupied by the king's own side, and not
+               covered by the attacker side (ATTACK semantics: pawn capture
+               diagonals only — per the pawn-visibility warning above, the
+               push square does not deny the king a square). Slider coverage
+               is KING-SHADOW-aware: the defending king is removed from the
+               blocker set, so squares behind it along a checking ray read
+               as covered — a king cannot escape backwards along the ray
+               (no phantom back-rank escape holes). The thresholded
+               AND ("this square is still open") is exactly what softmax
+               attention is bad at deriving; broadcast over i so every query
+               reads where the escape holes are. stm channel = free squares
+               of the OPP king (stm's mating target); opp channel = free
+               squares of the STM king (defensive view).
 
     Families found NOISE / refuted there and deliberately absent: `defends`
     (derivable in ~1 hop), raw mobility row-sums. Selection rule: only add a
@@ -439,7 +469,7 @@ class VisibilityChannels(nn.Module):
     einsum). Integer blocker counting via BETWEEN_T as in RayAttentionBias.
     """
 
-    FAMILY_ORDER = ('vis', 'xray', 'pinray')
+    FAMILY_ORDER = ('vis', 'xray', 'pinray', 'check', 'flight')
 
     @staticmethod
     def out_in_swap_index(num_channels: int) -> torch.Tensor:
@@ -485,6 +515,20 @@ class VisibilityChannels(nn.Module):
         self.register_buffer('vc_king', king, persistent=False)
         self.register_buffer('vc_pawn_stm', pawn_w, persistent=False)
         self.register_buffer('vc_pawn_opp', pawn_b, persistent=False)
+        if 'check' in self.families or 'flight' in self.families:
+            # TRUE-ATTACK pawn tables (capture diagonals ONLY — see the pawn
+            # visibility warning above): used for check delivery from the
+            # arrival square and for flight-square coverage denial. The push
+            # square neither checks nor covers.
+            self.register_buffer('vc_pawn_att_stm', PIECE_PSEUDO_ATTACK[1].clone(), persistent=False)
+            self.register_buffer('vc_pawn_att_opp', PIECE_PSEUDO_ATTACK[7].clone(), persistent=False)
+        if 'check' in self.families:
+            # Last-rank arrival masks for promotion checks (auto-queen): stm
+            # promotes on rank 7 (squares 56..63), opp on rank 0 (0..7).
+            _lr_stm = torch.zeros(64); _lr_stm[56:] = 1.0
+            _lr_opp = torch.zeros(64); _lr_opp[:8] = 1.0
+            self.register_buffer('vc_lastrank_stm', _lr_stm, persistent=False)
+            self.register_buffer('vc_lastrank_opp', _lr_opp, persistent=False)
 
         # Pin the out/in transpose-pairing + emission-order invariant that
         # out_in_swap_index encodes: a reorder of the stack in forward, or a
@@ -497,9 +541,22 @@ class VisibilityChannels(nn.Module):
             assert torch.equal(E.permute(0, 2, 1, 3), E[..., swap]), \
                 'VisibilityChannels emission order violates the out/in swap identity'
 
-    def _side_channels(self, pt, base, clear, one_bl, pawn_vis, dtype):
+    def _side_channels(self, pt, base, clear, one_bl, pawn_vis, dtype,
+                       pawn_att=None, enemy_king=None, promo_mask=None,
+                       clear_att=None):
         """Channels for one side. pt: [B, 64, 13]; base: 1 for stm (one-hot
-        channels 1..6) or 7 for opp. Returns dict family -> [B, 64, 64]."""
+        channels 1..6) or 7 for opp. pawn_att: this side's TRUE-ATTACK pawn
+        table (diagonals only); enemy_king: [B, 64] one-hot of the OTHER
+        side's king (both only needed for the check/flight families).
+        promo_mask: [64] {0,1} last-rank arrival mask for this side (check
+        family's auto-queen promotion term). clear_att: king-shadow-aware
+        clear used ONLY for the flight-coverage attackvis (the enemy king
+        removed from the blocker set, so slider rays extend THROUGH the
+        checked king — a king cannot escape backwards along the ray).
+        Returns (dict family -> [B, 64, 64], attackvis or None) where
+        attackvis [B, 64, 64] is this side's blocker-aware ATTACK reach
+        (vis minus the pawn push square) — the flight family's coverage
+        source, computed here because the per-type presence terms live here."""
         rook_line = self.vc_rook_line.to(dtype)
         bish_line = self.vc_bish_line.to(dtype)
         # Piece presence at source square i: [B, 64, 1].
@@ -541,7 +598,61 @@ class VisibilityChannels(nn.Module):
             # clamp: two sliders x-raying the same target through the same
             # blocker square would sum to 2; keep {0,1} indicator semantics.
             out['pinray'] = occ.unsqueeze(2) * pin.clamp(max=1.0)
-        return out
+        if 'check' in self.families:
+            # D_t[b, j]: a type-t piece of THIS side standing on j attacks the
+            # enemy king. Sliders blocker-aware via `clear` FROM j (current
+            # occupancy — mover-still-on-i approximation, see class docstring);
+            # leaper/pawn via constant tables. King never checks. Clamps keep
+            # {0,1} under the random multi-hot construction probe (a real
+            # position has one king, so they are no-ops there).
+            ek = enemy_king.to(dtype).unsqueeze(2)                          # [B, 64, 1]
+            d_rook = torch.matmul(rook_line * clear, ek).squeeze(2).clamp(max=1.0)   # [B, 64]
+            d_bish = torch.matmul(bish_line * clear, ek).squeeze(2).clamp(max=1.0)
+            d_queen = (d_rook + d_bish).clamp(max=1.0)
+            # Symmetric table: attack-from-j-to-king == attack-from-king-to-j.
+            d_knight = torch.matmul(enemy_king.to(dtype), self.vc_knight.to(dtype)).clamp(max=1.0)
+            # Pawn table is NOT symmetric — transpose to get "pawn ON j attacks
+            # king square k", i.e. contract over the table's target axis.
+            d_pawn = torch.matmul(enemy_king.to(dtype),
+                                  pawn_att.to(dtype).transpose(0, 1)).clamp(max=1.0)
+            # Arrival reach per mover type (move semantics = vis reach; pawn
+            # includes the push square, see class docstring). Per-square piece
+            # presence is disjoint over types, so the sum stays {0,1}.
+            # Pawn arrivals on the LAST RANK check as the QUEEN they promote
+            # to (auto-queen; d_pawn is identically 0 there — the pawn attack
+            # table has no attacks from rank 8). Underpromotion-to-knight
+            # checks remain missed (documented in the class docstring).
+            _pm = promo_mask.to(dtype)
+            d_pawn_arr = _pm * d_queen + (1.0 - _pm) * d_pawn              # [B, 64]
+            # Arrival squares occupied by this side's OWN pieces are not legal
+            # destinations. vis semantics deliberately include the first blocker
+            # (a piece "sees" its own defender), which is right for visibility
+            # but wrong for a MOVE channel: without this mask a rook on a1 with
+            # its own pawn on a4 and the enemy king on a8 emits a check edge
+            # a1->a4, a move that cannot be played.
+            _own = pt[:, :, base:base + 6].sum(dim=2).clamp(max=1.0)       # [B, 64]
+            _free_arr = (1.0 - _own).unsqueeze(1)                          # [B, 1, 64k]
+            out['check'] = _free_arr * (
+                            (p_rook * rook_line * clear) * d_rook.unsqueeze(1)
+                            + (p_bish * bish_line * clear) * d_bish.unsqueeze(1)
+                            + (p_queen * (rook_line + bish_line) * clear) * d_queen.unsqueeze(1)
+                            + (p_knight * self.vc_knight.to(dtype)) * d_knight.unsqueeze(1)
+                            + (p_pawn * pawn_vis.to(dtype)) * d_pawn_arr.unsqueeze(1))
+        attackvis = None
+        if 'flight' in self.families:
+            # TRUE-ATTACK reach (vis with the pawn PUSH square removed): the
+            # coverage source for flight-square denial. King included — the
+            # enemy king cannot step adjacent to ours. Sliders use clear_att,
+            # the KING-SHADOW-aware clear (enemy king removed from blockers):
+            # a checked king cannot step backwards along the checking ray, so
+            # the squares behind it must read as covered, not as escape holes.
+            _ca = clear if clear_att is None else clear_att
+            attackvis = (rq * rook_line * _ca
+                         + bq * bish_line * _ca
+                         + p_knight * self.vc_knight.to(dtype)
+                         + p_king * self.vc_king.to(dtype)
+                         + p_pawn * pawn_att.to(dtype))
+        return out, attackvis
 
     def forward(self, piece_type_onehot: torch.Tensor) -> torch.Tensor:
         """piece_type_onehot: [B, 64, 13] -> E [B, 64, 64, num_channels]."""
@@ -552,8 +663,50 @@ class VisibilityChannels(nn.Module):
         clear = torch.relu(1.0 - blocked).reshape(-1, 64, 64)
         one_bl = torch.relu(1.0 - torch.abs(blocked - 1.0)).reshape(-1, 64, 64)
 
-        stm = self._side_channels(pt, 1, clear, one_bl, self.vc_pawn_stm, dtype)
-        opp = self._side_channels(pt, 7, clear, one_bl, self.vc_pawn_opp, dtype)
+        _need_att = 'check' in self.families or 'flight' in self.families
+        _has_check = 'check' in self.families
+        # King-shadow-aware clears for flight coverage (see _side_channels):
+        # the ENEMY king is removed from the blocker counts — linear in the
+        # occupancy, so it is one subtraction on the already-computed counts.
+        # clamp guards the multi-hot construction probe (king channel set on a
+        # square the empty channel also claims would make the count negative).
+        clear_xopp = clear_xstm = None
+        if 'flight' in self.families:
+            kb_stm = torch.matmul(pt[:, :, 6], self.vc_between_t.to(dtype))    # [B, 4096]
+            kb_opp = torch.matmul(pt[:, :, 12], self.vc_between_t.to(dtype))
+            clear_xopp = torch.relu(1.0 - (blocked - kb_opp)).clamp(max=1.0).reshape(-1, 64, 64)
+            clear_xstm = torch.relu(1.0 - (blocked - kb_stm)).clamp(max=1.0).reshape(-1, 64, 64)
+        stm, stm_att = self._side_channels(
+            pt, 1, clear, one_bl, self.vc_pawn_stm, dtype,
+            pawn_att=self.vc_pawn_att_stm if _need_att else None,
+            enemy_king=pt[:, :, 12] if _has_check else None,
+            promo_mask=self.vc_lastrank_stm if _has_check else None,
+            clear_att=clear_xopp)
+        opp, opp_att = self._side_channels(
+            pt, 7, clear, one_bl, self.vc_pawn_opp, dtype,
+            pawn_att=self.vc_pawn_att_opp if _need_att else None,
+            enemy_king=pt[:, :, 6] if _has_check else None,
+            promo_mask=self.vc_lastrank_opp if _has_check else None,
+            clear_att=clear_xstm)
+
+        if 'flight' in self.families:
+            # free flight square of side X's king: in X's king ring, not
+            # occupied by X's own piece, not attacked by the other side.
+            # (An enemy-occupied ring square counts as free when uncovered —
+            # the king just captures it; the coverage term handles defense.)
+            # Clamps keep {0,1} under the multi-hot construction probe.
+            occ_stm = pt[:, :, 1:7].sum(dim=2).clamp(max=1.0)              # [B, 64]
+            occ_opp = pt[:, :, 7:13].sum(dim=2).clamp(max=1.0)
+            cov_stm = stm_att.sum(dim=1).clamp(max=1.0)                    # attacked by stm
+            cov_opp = opp_att.sum(dim=1).clamp(max=1.0)
+            king_tab = self.vc_king.to(dtype)                              # symmetric
+            ring_opp = torch.matmul(pt[:, :, 12], king_tab).clamp(max=1.0)
+            ring_stm = torch.matmul(pt[:, :, 6], king_tab).clamp(max=1.0)
+            free_opp = ring_opp * (1.0 - occ_opp) * (1.0 - cov_stm)        # [B, 64]
+            free_stm = ring_stm * (1.0 - occ_stm) * (1.0 - cov_opp)
+            # Broadcast over the query axis: every square reads the holes.
+            stm['flight'] = free_opp.unsqueeze(1).expand(-1, 64, -1)
+            opp['flight'] = free_stm.unsqueeze(1).expand(-1, 64, -1)
 
         chans = []
         for fam in self.families:

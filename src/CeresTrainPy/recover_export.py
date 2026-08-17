@@ -12,6 +12,13 @@
 
 import os, sys, torch
 
+# Bridge the run config into os.environ BEFORE importing config/ceres_net:
+# those modules read data-format settings (aux width, shard format) at IMPORT
+# time, and rebuilding a net from a checkpoint under different values silently
+# produces a differently-shaped net. Same mapping train.py uses.
+from config_bootstrap import bootstrap_env_from_config
+bootstrap_env_from_config(sys.argv[2], sys.argv[1])
+
 from config import Configuration, NUM_INPUT_BYTES_PER_SQUARE
 from ceres_net import CeresNet
 from save_model import save_model
@@ -85,6 +92,25 @@ if _ckpt_ray and not _model_ray:
     f'Checkpoint contains {len(_ckpt_ray)} ray-bias tensors but the rebuilt model has none. '
     f'Set "UseRayAttentionBias": true in the _ceres_net.json config before re-exporting. '
     f'(checkpoint: {CKPT})')
+# Same guard for the graph-route heads and the tactic refiner (2026-08 tactical
+# program; config NetDef UseGraphRouteHeads / RefinerIters). These are WORSE to
+# silently drop than the bias-only cases above: the refiner residual feeds
+# EVERY head (flow = flow + refiner delta), so exporting without it serves a
+# functionally corrupted net, not just one missing an attention bias.
+_ckpt_gr = [k for k in loaded['model'] if '.graph_route_' in k]
+_model_gr = [k for k in model.state_dict() if '.graph_route_' in k]
+if _ckpt_gr and not _model_gr:
+  raise ValueError(
+    f'Checkpoint contains {len(_ckpt_gr)} graph-route tensors but the rebuilt model has none. '
+    f'Set "UseGraphRouteHeads": true (and UseVisEdgeBias + matching VisEdgeFamilies) in the '
+    f'_ceres_net.json config before re-exporting. (checkpoint: {CKPT})')
+_ckpt_rf = [k for k in loaded['model'] if k.startswith('tactical_refiner.')]
+_model_rf = [k for k in model.state_dict() if k.startswith('tactical_refiner.')]
+if _ckpt_rf and not _model_rf:
+  raise ValueError(
+    f'Checkpoint contains {len(_ckpt_rf)} tactic-refiner tensors but the rebuilt model has none. '
+    f'Set "RefinerIters" (and matching RefinerDim/Heads/FFNMult) in the _ceres_net.json '
+    f'config before re-exporting. (checkpoint: {CKPT})')
 
 missing, unexpected = model.load_state_dict(loaded['model'], strict=False)
 if missing:    print('WARN: missing keys (count={}): {}'.format(len(missing), missing[:5]))
