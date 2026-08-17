@@ -1,0 +1,13 @@
+{
+    "SourceType": "DirectFromPositionGenerator",
+    "TPGFixedSet1": null,
+    "TPGFixedSet2": null,
+    "NumTPGFixedSet1BatchesReturnedForSet2": 0,
+    "TrainingFilesDirectory": "/EDIT/ME/PATH/TO/GAME_CORPUS_TPG",
+    "TrainingFilesDirectory2": "/EDIT/ME/PATH/TO/PUZZLE_CORPUS_TPG",
+    "RatioSet1ToSet2": 999,
+    "NumTPGFilesToSkip": 0,
+    "TARPositionSkipCount": 30,
+    "FractionQ": 1,
+    "WDLLabelSmoothing": 0
+}
