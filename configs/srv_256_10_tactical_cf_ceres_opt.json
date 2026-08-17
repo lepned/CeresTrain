@@ -44,7 +44,7 @@
     "MirrorConsistencyWeight": 0,
     "ValueHeadChannels": 0,
     "UncSelfError": 0,
-    "TPGV3": 0,
+    "TPGV3": 1,
     "AuxFeaturesPerSquare": 0,
     "TargetSidecar": "auto",
     "SurvivalHorizon": 4,

@@ -155,15 +155,60 @@ Before launching, edit in **both** `_ceres_data.json` files:
 "TrainingFilesDirectory2": "/EDIT/ME/PATH/TO/PUZZLE_CORPUS_TPG"
 ```
 
-Then run the arms concurrently, two GPUs each:
+Then launch both arms with one command — it copies the repo configs into the
+outputs dir (without overwriting), validates them, and starts each arm on its
+own GPU pair with distinct rendezvous ports:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2     --master_port=29500 train.py srv_256_10_tactical_ctrl /path/to/OUTPUTS &
-CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2     --master_port=29501 train.py srv_256_10_tactical_cf   /path/to/OUTPUTS &
+scripts/server/launch_tactical_ab.sh /path/to/OUTPUTS 2
 ```
 
-Distinct `--master_port` per job is required, otherwise the second rendezvous
-attaches to the first job's process group.
+Individual runs, and the validator on its own:
+
+```bash
+scripts/server/launch_ddp.sh <CONFIG_ID> /path/to/OUTPUTS 4          # all 4 GPUs
+scripts/server/launch_ddp.sh <CONFIG_ID> /path/to/OUTPUTS 2 2,3 29501
+scripts/server/preflight.sh  <CONFIG_ID> /path/to/OUTPUTS 4          # check only
+```
+
+`preflight.sh` refuses to launch on: unedited `/EDIT/ME` paths, a corpus with
+fewer shards than `ranks × workers`, a V2 corpus with `AuxFeaturesPerSquare != 0`,
+`BatchSizeForwardPass` not divisible by the rank count, and mirror-consistency
+under DDP. It warns about never-read remainder shards and about `EMAPeriodSteps`
+needing division by the rank count. Distinct `--master_port` per concurrent job
+is mandatory — a shared port makes the second job join the first's process group.
+
+### Corpus format: start on V3, add V2 later without changing the net
+
+The A/B configs ship as `TPGV3: 1` (V3 primary) with `AuxFeaturesPerSquare: 0`.
+That combination is deliberate: the V3 reader slices the aux tail, so the model
+is **137 channels wide whether the shards are V2 or V3**. Adding a V2 corpus
+later is then a one-line change with no architectural consequence and no loss of
+comparability against the runs that came before:
+
+```jsonc
+"SquareBytes2": 137     // secondary corpus is V2; everything else unchanged
+```
+
+Had aux been left at 4, introducing any V2 data would have forced it to 0 and
+silently changed the input width — i.e. a different network, not comparable with
+earlier gates. (Project measurement is that aux buys nothing anyway.)
+
+### Environment variables: none required
+
+Everything the run needs now lives in its config and travels with it through
+resume, ExportOnly and the checkpoint tools. `CERES_*` variables remain only as
+fallbacks for configs that predate a key. Optional, if you want them:
+
+| Var | When |
+|---|---|
+| `CERES_NUM_DATASET_WORKERS` | raise if the dataloader caps throughput (remember the shard requirement scales with it) |
+| `CERES_DDP_BACKEND=gloo` | single-GPU simulation only |
+| `CERES_DDP_STATIC_GRAPH=1` | required if you enable placement/survival/stvalue/depth-probe aux heads |
+
+In particular `CERES_AUX_FEATURES_PER_SQUARE` no longer needs exporting — it
+comes from `AuxFeaturesPerSquare` in the config, which is authoritative over the
+environment.
 
 **Pre-registered decision rule:** check/flight proceeds to production if the
 value delta at the 200M gate (rg2700, raw weights) is **>= +30 Elo**. Below
