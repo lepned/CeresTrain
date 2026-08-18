@@ -19,10 +19,10 @@ A_GPUS=$(seq -s, 0 $((PER - 1)))
 B_GPUS=$(seq -s, "$PER" $((PER * 2 - 1)))
 
 echo "=== arm A (ctrl, no check/flight) on GPUs $A_GPUS ==="
-"$REPO/scripts/server/launch_ddp.sh" srv_256_10_tactical_ctrl "$OUT" "$PER" "$A_GPUS" 29500
+bash "$REPO/scripts/server/launch_ddp.sh" srv_256_10_tactical_ctrl "$OUT" "$PER" "$A_GPUS" 29500
 echo
 echo "=== arm B (cf, with check/flight) on GPUs $B_GPUS ==="
-"$REPO/scripts/server/launch_ddp.sh" srv_256_10_tactical_cf   "$OUT" "$PER" "$B_GPUS" 29501
+bash "$REPO/scripts/server/launch_ddp.sh" srv_256_10_tactical_cf   "$OUT" "$PER" "$B_GPUS" 29501
 echo
 echo "Both arms launched. Watch:  tail -f $OUT/logs/srv_256_10_tactical_{ctrl,cf}_launch.log"
 echo "Gate at 200M, compare VALUE at rg2700 raw. Ship check/flight if delta >= +30 Elo."
