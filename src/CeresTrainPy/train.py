@@ -990,10 +990,26 @@ def Train():
   if HARD_REPLAY_SIZE > 0:
     if BOARDS_PER_BATCH != 1:
       raise NotImplementedError('HardReplayBufferSize > 0 is only implemented for BOARDS_PER_BATCH==1')
-    if WORLD_SIZE > 1:
-      raise NotImplementedError('HardReplayBufferSize > 0 is single-GPU only for now')
     print(f'[train] HARD-REPLAY buffer enabled: size={HARD_REPLAY_SIZE}, '
           f'fraction={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}')
+    if WORLD_SIZE > 1:
+      # DDP: the buffer is deliberately PER RANK, and that is the correct
+      # semantics rather than a compromise — each rank owns a disjoint slice of
+      # the corpus (see tpg_dataset partitioning), so its hard positions are its
+      # own. Nothing here is collective: harvesting reads that rank's own loss
+      # tensors, injection replaces rows in the batch BEFORE the forward, and
+      # the batch shape the reducer sees is unchanged. Ranks may inject
+      # different row counts without desyncing, because no rank enters a
+      # collective the others skip.
+      #
+      # Two consequences for a config ported from a single-GPU recipe:
+      #   * size is per rank, so N ranks hold N x HardReplayBufferSize in total
+      #   * the fraction applies to the per-rank batch, so each rank churns its
+      #     buffer faster while seeing fewer positions
+      print(f'[train] HARD-REPLAY under DDP: buffer is per-rank ({WORLD_SIZE} x '
+            f'{HARD_REPLAY_SIZE} total), fed from each rank own shard slice; ' 
+            f'no collectives involved. Divide the size by {WORLD_SIZE} to match a '
+            f'single-GPU recipe.', flush=True)
 
   # Policy/value gradient-conflict probe (config: GradConflictProbeSteps — see config.py).
   # Differentiates the two loss families separately every N optimizer steps and reports
