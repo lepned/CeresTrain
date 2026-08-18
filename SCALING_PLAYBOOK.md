@@ -134,8 +134,13 @@ single-GPU on an earlier run).
 | 2 | Faster storage | corpus on local NVMe | all ranks read the same disk |
 | 3 | Larger forward batch | `BatchSizeForwardPass` 1024/2048/4096 | fewer, larger kernels; does not reduce the bytes to parse, so it cannot fix a data bound |
 
-More workers is **not** monotonic — measured best at 2 on a 4×A100 host, worse
-above that (CPU cores and disk contend). Measure, do not assume.
+**Measured and exhausted on the 4×A100 host (2026-08-18): worker counts 1, 2, 4
+and 8 all landed within noise of each other, with 2 marginally best.** A flat
+response to worker count means the loader is *not* the binding constraint — a
+real supply limit improves when you add parsers. Combined with 6.6k pos/s on a
+single card and 40+ idle cores, single-GPU throughput here is compute-bound, and
+worker tuning is a dead end on this machine. Do not re-derive this; measure
+utilization (section 1) before touching section 3 at all.
 
 ## 4. Compute-bound: compile mode
 
@@ -160,4 +165,10 @@ the gradient-conflict probe.
 | 2026-08-18 | cfT80_300M | 1 (4090) | 1 | 512/4096 | baseline | 5 046 | desktop reference |
 | 2026-08-18 | — | 1 (A100) | 2 | 4096/4096 | baseline | 6 600 | |
 | 2026-08-18 | — | 2 (A100, NVLink pair) | 2 | 4096/4096 | baseline | ~12 000 | 1.82× |
-| 2026-08-18 | — | 4 (A100, both pairs) | 2 | 4096/4096 | baseline | 2 800 | comm-bound |
+| 2026-08-18 | — | 4 (A100, both pairs) | 2 | 4096/4096 | baseline | 2 800 | comm/placement-bound |
+| 2026-08-18 | — | 4 | 1 / 2 / 4 / 8 | 4096/4096 | worker count | ~2 800 | flat — loader is not the constraint |
+| 2026-08-18 | — | 4 | 2 | 4096/4096 | FIND_UNUSED=0 | no change | |
+| 2026-08-18 | — | 4 | 2 | 4096/4096 | NCCL_ALGO=Tree | no change | |
+| 2026-08-18 | — | 4 | 2 | 4096/4096 | bf16 compress + buckets | no change | |
+| — | — | 4 | 2 | 4096/4096 | **NUMA binding** | *pending* | the one lever not yet tried |
+| reference | lc0 (kovax) | 4 | C++ loader | 1024/GPU | — | ~12 000 | same per-GPU batch |
