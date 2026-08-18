@@ -293,6 +293,13 @@ class Configuration:
     # (bridged to CERES_SHUFFLE_SEED, governs data order) when two arms must
     # differ only by the mechanism under test.
     self.Opt_TorchSeed = config_opt.get('TorchSeed', None)
+    # DDP communication tuning — only matters when the run is comm-bound, which
+    # in practice means ranks spanning more than one NVLink island (see
+    # DDP_MULTI_GPU.md). Both default to the previous behaviour.
+    #   DDPBucketCapMB   gradient bucket size in MB (0/absent = PyTorch's 25)
+    #   DDPBF16Compress  send gradients as bf16 (halves the payload)
+    self.Opt_DDPBucketCapMB = config_opt.get('DDPBucketCapMB', 0)
+    self.Opt_DDPBF16Compress = bool(config_opt.get('DDPBF16Compress', False))
     # Per-head Muon (Muon only, Kimi K3-style): orthogonalize each attention head's
     # projection block independently (qkv per-head x per-projection on the linear
     # path / per-projection on the nonlinear path; q2/k2/v2/q2b per-head rows;

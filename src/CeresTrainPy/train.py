@@ -747,11 +747,32 @@ def Train():
     DDP_STATIC_GRAPH = _static_graph
     _find_unused = (int(os.environ.get('CERES_DDP_FIND_UNUSED', '1') or 1) > 0
                     and not _static_graph)
+    # Gradient bucket size. DDP coalesces gradients into buckets and fires one
+    # all-reduce per bucket as it fills; PyTorch's 25 MB default is tuned for
+    # fast homogeneous interconnects. On a box whose ranks are NOT all on one
+    # NVLink island (e.g. two NVLink pairs bridged by PCIe), cross-island
+    # traffic is latency-dominated and fewer/larger transfers win. Raise it
+    # there; there is no benefit on a single fast fabric, so the default is
+    # unchanged.
+    _bucket_mb = float(getattr(config, 'Opt_DDPBucketCapMB', 0) or 0)
+    _ddp_kwargs = {'bucket_cap_mb': _bucket_mb} if _bucket_mb > 0 else {}
     model = DDP(model, device_ids=[DDP_LOCAL_GPU], output_device=DDP_LOCAL_GPU,
                 find_unused_parameters=_find_unused, gradient_as_bucket_view=True,
-                static_graph=_static_graph)
+                static_graph=_static_graph, **_ddp_kwargs)
+    # bf16 gradient compression (config Opt_DDPBF16Compress). Halves the bytes
+    # on the wire by casting each bucket to bf16 for the all-reduce and back to
+    # fp32 afterwards — close to a 2x win when the run is communication-bound,
+    # and near-free in quality here because the gradients were produced under
+    # bf16 autocast in the first place (the fp32 .grad buffers hold values that
+    # already passed through bf16 matmuls). Off by default: on a fast fabric it
+    # buys nothing and the cast is pure overhead.
+    if bool(getattr(config, 'Opt_DDPBF16Compress', False)):
+      from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as _ddp_hooks
+      model.register_comm_hook(state=None, hook=_ddp_hooks.bf16_compress_hook)
+      print('[ddp] bf16 gradient compression ENABLED (all-reduce payload halved)', flush=True)
     print(f"[ddp] model wrapped in DistributedDataParallel "
-          f"(static_graph={_static_graph}, find_unused_parameters={_find_unused})", flush=True)
+          f"(static_graph={_static_graph}, find_unused_parameters={_find_unused}, "
+          f"bucket_cap_mb={_bucket_mb if _bucket_mb > 0 else 'default'})", flush=True)
   # Custom CeresNet methods/attributes (compute_loss, use_gtab, _last_gate_value,
   # _last_tsb_gates) are NOT exposed through the DDP wrapper — DDP only forwards
   # forward(). Route those calls through the raw module (model_nocompile shares the
