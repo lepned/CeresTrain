@@ -79,35 +79,41 @@ into more micro-steps leaves communication per position unchanged. (It does
 matter under `static_graph`, where `no_sync` is disabled — see
 `DDP_MULTI_GPU.md`.)
 
-### If none of items 1–4 change anything: check NUMA
+### If none of items 1–4 change anything
 
-Measured on the 4×A100 host, items 1–4 were tried and none moved the number.
-That rules out the collective's *execution* and points at process placement.
+Measured on the 4×A100 host: items 1–4 were each tried and none moved the
+number. That rules out the collective's *execution* (algorithm choice, overlap,
+payload size, bucket granularity).
 
-On a dual-socket box the GPUs are split across sockets — typically 0,1 on
-socket 0 and 2,3 on socket 1. An unbound rank can be scheduled on the socket
-that does **not** own its GPU, so its dataloader parses into remote memory and
-NCCL stages host buffers on the wrong side. Every batch then crosses the
-inter-socket link twice. Two ranks on one socket never expose it; four ranks
-spanning both do — exactly the "2 GPUs fine, 4 GPUs collapse" signature. It also
-explains more workers making things *worse*: unbound workers scatter across both
-sockets and add cross-socket traffic rather than parallelism.
+Process placement was the next hypothesis and it **did not apply there** — that
+host is single-socket, so there is no cross-socket misplacement to fix.
+`scripts/server/numa_wrap.sh` still runs by default and is a harmless no-op on a
+single-node machine (every GPU reports node 0); on a genuinely dual-socket box,
+where GPUs are split across sockets, it is worth having, because no NCCL
+variable can fix allocation-time misplacement of dataloader buffers and NCCL
+host staging. Disable with `CERES_NUMA_BIND=0`.
 
-No NCCL variable can fix this, because the misplacement happens at allocation
-time in both the dataloader and the collective's host buffers.
+What that leaves, on a single-socket host with two NVLink islands:
 
 ```bash
-nvidia-smi topo -m                     # CPU Affinity / NUMA Affinity columns
-lscpu | grep -E "Socket|NUMA"
+nvidia-smi topo -m     # the path between GPU0/1 and GPU2/3: PIX, PXB, PHB or SYS
+NCCL_DEBUG=INFO ...    # what NCCL actually built, and over which transport
 ```
 
-Different NUMA nodes for 0,1 versus 2,3 confirms it. `launch_ddp.sh` then binds
-each rank to its own GPU's node automatically via `scripts/server/numa_wrap.sh`;
-`CERES_NUMA_BIND=0` disables it so the effect can be measured both ways. Look
-for the `[numa] rank N -> gpu N -> NUMA node M` lines at startup.
+The arithmetic says the link alone should not explain it. This model is ~22.7M
+parameters, so one all-reduce moves roughly 90 MB; at PCIe gen4 x16 speeds that
+is a few milliseconds against ~3 optimizer steps per second — low single-digit
+percent overhead, not a 4× collapse. So if 4 ranks collapse anyway, suspect the
+transport rather than the topology:
 
-Note this is placement, not core count: the same host had 40+ cores idle, so
-CPU starvation was never the issue.
+- **P2P disabled between the islands** (ACS/IOMMU on the PCIe switch is the
+  usual cause) forces traffic through host memory with extra copies, which can
+  cost an order of magnitude. `nvidia-smi topo -m` showing `PHB`/`SYS` rather
+  than `PIX`/`PXB` between the pairs is the tell, and `NCCL_DEBUG=INFO` names
+  the transport it fell back to.
+- Small-model latency effects: at 22.7M parameters the collectives are small
+  enough that per-call latency, not bandwidth, can dominate once the fast path
+  is gone.
 
 ### Stopping rule
 
@@ -170,5 +176,5 @@ the gradient-conflict probe.
 | 2026-08-18 | — | 4 | 2 | 4096/4096 | FIND_UNUSED=0 | no change | |
 | 2026-08-18 | — | 4 | 2 | 4096/4096 | NCCL_ALGO=Tree | no change | |
 | 2026-08-18 | — | 4 | 2 | 4096/4096 | bf16 compress + buckets | no change | |
-| — | — | 4 | 2 | 4096/4096 | **NUMA binding** | *pending* | the one lever not yet tried |
+| 2026-08-18 | — | 4 | 2 | 4096/4096 | NUMA binding | n/a | host is single-socket — no-op there |
 | reference | lc0 (kovax) | 4 | C++ loader | 1024/GPU | — | ~12 000 | same per-GPU batch |
