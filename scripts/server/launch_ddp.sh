@@ -55,14 +55,26 @@ cd "$PYDIR"
 echo "launching $ID: nproc=$NPROC gpus=${GPUS:-all} port=$PORT"
 echo "  torchrun: $TORCHRUN"
 echo "  log: $LOG"
-setsid nohup "$TORCHRUN" --standalone --nproc_per_node="$NPROC" --master_port="$PORT" \
-    train.py "$ID" "$OUT" > "$LOG" 2>&1 < /dev/null &
+# NUMA binding: on a dual-socket box the GPUs are split across sockets, and an
+# unbound rank can land on the socket that does not own its GPU — dataloader
+# parsing into remote memory and NCCL staging buffers on the wrong side. That is
+# invisible with 2 ranks on one socket and severe with 4 spanning both. The
+# wrapper pins each rank to its own GPU's node; CERES_NUMA_BIND=0 disables it
+# for an A/B. Falls back to a plain launch if the wrapper is missing.
+NUMA_WRAP="$REPO/scripts/server/numa_wrap.sh"
+if [ -x "$NUMA_WRAP" ] && [ "${CERES_NUMA_BIND:-1}" != "0" ]; then
+  ENTRY=("$NUMA_WRAP" train.py)
+else
+  ENTRY=(train.py)
+fi
+
+setsid nohup $TORCHRUN --standalone --nproc_per_node="$NPROC" --master_port="$PORT"     "${ENTRY[@]}" "$ID" "$OUT" > "$LOG" 2>&1 < /dev/null &
 
 sleep 45
 if pgrep -f "train.py $ID" > /dev/null; then
   echo "$ID RUNNING"
   echo "--- startup checklist (all ranks must agree on the seed) ---"
-  grep -E '\[try_shuffle\]|TORCH SEED|\[ddp\]|VISIBILITY EDGE|shards are NEVER' "$LOG" | head -12 || true
+  grep -E '\[numa\]|\[try_shuffle\]|TORCH SEED|\[ddp\]|VISIBILITY EDGE|shards are NEVER' "$LOG" | head -16 || true
 else
   echo "$ID FAILED TO START — log tail:"; tail -n 25 "$LOG"; exit 1
 fi

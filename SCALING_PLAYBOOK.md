@@ -79,6 +79,36 @@ into more micro-steps leaves communication per position unchanged. (It does
 matter under `static_graph`, where `no_sync` is disabled — see
 `DDP_MULTI_GPU.md`.)
 
+### If none of items 1–4 change anything: check NUMA
+
+Measured on the 4×A100 host, items 1–4 were tried and none moved the number.
+That rules out the collective's *execution* and points at process placement.
+
+On a dual-socket box the GPUs are split across sockets — typically 0,1 on
+socket 0 and 2,3 on socket 1. An unbound rank can be scheduled on the socket
+that does **not** own its GPU, so its dataloader parses into remote memory and
+NCCL stages host buffers on the wrong side. Every batch then crosses the
+inter-socket link twice. Two ranks on one socket never expose it; four ranks
+spanning both do — exactly the "2 GPUs fine, 4 GPUs collapse" signature. It also
+explains more workers making things *worse*: unbound workers scatter across both
+sockets and add cross-socket traffic rather than parallelism.
+
+No NCCL variable can fix this, because the misplacement happens at allocation
+time in both the dataloader and the collective's host buffers.
+
+```bash
+nvidia-smi topo -m                     # CPU Affinity / NUMA Affinity columns
+lscpu | grep -E "Socket|NUMA"
+```
+
+Different NUMA nodes for 0,1 versus 2,3 confirms it. `launch_ddp.sh` then binds
+each rank to its own GPU's node automatically via `scripts/server/numa_wrap.sh`;
+`CERES_NUMA_BIND=0` disables it so the effect can be measured both ways. Look
+for the `[numa] rank N -> gpu N -> NUMA node M` lines at startup.
+
+Note this is placement, not core count: the same host had 40+ cores idle, so
+CPU starvation was never the issue.
+
 ### Stopping rule
 
 If items 1–4 do not lift a 4-rank job above roughly 10k pos/s, stop optimizing.
