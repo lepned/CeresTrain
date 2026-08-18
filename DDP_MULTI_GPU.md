@@ -76,6 +76,10 @@ count advance at the same rate.
 | `CERES_DDP_STATIC_GRAPH` | `1` if 4-board else `0` | `static_graph=True` DDP. Auto-on for `TrainOn4BoardSequences` (the action head calls the model 3–4× before one backward, which the default reducer mishandles). |
 | `CERES_DDP_FIND_UNUSED` | `1` | `find_unused_parameters`. Needed when a head/output never reaches the loss. Ignored when static_graph is on. Set `0` once a config is verified to use every parameter (slightly faster). |
 
+> **Throughput and scaling** live in `SCALING_PLAYBOOK.md`: how to measure it
+> without compile time poisoning the result, how to tell a communication
+> bound from a data bound, and a prioritized fix list for each.
+
 ## Reproducible A/B runs (seeds)
 
 Two config keys make an ablation attributable. Both live in `_ceres_opt.json`
