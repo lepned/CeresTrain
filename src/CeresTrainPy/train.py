@@ -997,6 +997,16 @@ def Train():
   HARD_REPLAY_MIN_KL = float(getattr(config, 'Opt_HardReplayMinKL', 0.0) or 0.0)
   HARD_REPLAY_REUSE_TARGET = float(getattr(config, 'Opt_HardReplayReuseTarget', 0.0) or 0.0)
   HARD_REPLAY_START_FRAC = float(getattr(config, 'Opt_HardReplayStartFraction', 0.0) or 0.0)
+  # NO `or default` on any of these: it maps an EXPLICIT 0 (and '' / false on
+  # the selector) back to the default before the validators can reject it —
+  # the silent-arm-switch the validators exist to prevent. config.py already
+  # guarantees the attributes exist with None-checked defaults.
+  HARD_REPLAY_SELECTOR = str(getattr(config, 'Opt_HardReplaySelector', 'valuekl'))
+  HARD_REPLAY_TOPN = int(getattr(config, 'Opt_HardReplayTopN', 3))
+  HARD_REPLAY_TN_PBEST = float(getattr(config, 'Opt_HardReplayTopNPBest', 0.5))
+  HARD_REPLAY_TN_MINABSQ = float(getattr(config, 'Opt_HardReplayTopNMinAbsQ', 0.4))
+  HARD_REPLAY_TN_EXIT = float(getattr(config, 'Opt_HardReplayTopNExitMargin', 0.5))
+  HARD_REPLAY_TN_KEYS = bool(getattr(config, 'Opt_HardReplayTopNKeysPresent', False))
   # EMAs of rows actually ADMITTED / INJECTED per micro-step. Injection is sized
   # from the intake EMA so reuse tends to the target; both are also the only
   # honest basis for the realised-reuse metric (a smoothed numerator over a raw
@@ -1007,7 +1017,9 @@ def Train():
   _hr_displaced_total = 0   # cumulative injected rows this rank (reporting only)
   _hard_replay_buf = []   # {'rows':…, 'uses': int, 'kl': float, 'miss': int, 'sig':…}
   if HARD_REPLAY_SIZE == 0 and (HARD_REPLAY_MIN_KL > 0 or HARD_REPLAY_REUSE_TARGET > 0
-                                or HARD_REPLAY_START_FRAC > 0):
+                                or HARD_REPLAY_START_FRAC > 0
+                                or HARD_REPLAY_SELECTOR != 'valuekl'
+                                or HARD_REPLAY_TN_KEYS):
     # Every validator and the banner live inside the SIZE>0 block, so without
     # this a control-shaped config carrying treatment knobs would run silently
     # as a plain control while presenting as a treatment arm.
@@ -1029,11 +1041,30 @@ def Train():
     if HARD_REPLAY_MIN_KL < 0 or not (0.0 <= HARD_REPLAY_START_FRAC < 1.0):
       raise ValueError(f'HardReplayMinKL must be >=0 (got {HARD_REPLAY_MIN_KL}) and '
                        f'HardReplayStartFraction in [0,1) (got {HARD_REPLAY_START_FRAC}).')
-    if HARD_REPLAY_REUSE_TARGET > 0 and HARD_REPLAY_MIN_KL <= 0:
+    if HARD_REPLAY_SELECTOR not in ('valuekl', 'topn'):
+      raise ValueError(f'HardReplaySelector must be "valuekl" or "topn", got '
+                       f'{HARD_REPLAY_SELECTOR!r} (typo/empty value would silently change the arm).')
+    if HARD_REPLAY_SELECTOR == 'topn':
+      if not (1 <= HARD_REPLAY_TOPN <= 10 and 0.0 < HARD_REPLAY_TN_PBEST < 1.0
+              and 0.0 <= HARD_REPLAY_TN_MINABSQ < 1.0 and HARD_REPLAY_TN_EXIT >= 0.0):
+        raise ValueError(f'topn selector knobs out of range: N={HARD_REPLAY_TOPN}, '
+                         f'PBest={HARD_REPLAY_TN_PBEST}, MinAbsQ={HARD_REPLAY_TN_MINABSQ}, '
+                         f'ExitMargin={HARD_REPLAY_TN_EXIT}')
+      if HARD_REPLAY_MIN_KL > 0:
+        raise ValueError('HardReplayMinKL is INERT under the topn selector (admission floor is '
+                         'the margin at 0, exit at -ExitMargin). Remove it so the run log '
+                         'cannot mislabel the arm.')
+    if HARD_REPLAY_SELECTOR == 'valuekl' and HARD_REPLAY_TN_KEYS:
+      raise ValueError('HardReplayTopN* knobs are set but HardReplaySelector is "valuekl" — '
+                       'they would be silently inert and the A/B result would be attributed '
+                       'to a topn treatment that never ran. Set the selector or remove them.')
+    if (HARD_REPLAY_REUSE_TARGET > 0 and HARD_REPLAY_MIN_KL <= 0
+        and HARD_REPLAY_SELECTOR == 'valuekl'):
       raise ValueError(
-        'HardReplayReuseTarget > 0 requires HardReplayMinKL > 0: with the legacy relative '
-        'top-k intake, admissions always equal the injection quota, so realised reuse is '
-        'pinned at ~1 and the configured target is a silent no-op.')
+        'HardReplayReuseTarget > 0 requires HardReplayMinKL > 0 under the valuekl selector: '
+        'with the legacy relative top-k intake, admissions always equal the injection quota, '
+        'so realised reuse is pinned at ~1 and the configured target is a silent no-op. '
+        '(The topn selector has an intrinsic absolute criterion and is exempt.)')
     if HARD_REPLAY_REUSE_TARGET > 0 and HARD_REPLAY_MAX_REUSE <= HARD_REPLAY_REUSE_TARGET:
       raise ValueError(
         f'HardReplayMaxReuse ({HARD_REPLAY_MAX_REUSE}) must be STRICTLY GREATER than '
@@ -1041,8 +1072,12 @@ def Train():
         f'a neutral random walk; below it the buffer starves and injection silently falls '
         f'under HardReplayFraction. Use e.g. MaxReuse = 3x the target.')
     print(f'[train] HARD-REPLAY enabled: size={HARD_REPLAY_SIZE}, '
-          f'inject_cap={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}, '
-          f'min_kl={HARD_REPLAY_MIN_KL or "off (relative top-k)"}, '
+          f'selector={HARD_REPLAY_SELECTOR}'
+          + (f' (N={HARD_REPLAY_TOPN}, pbest>{HARD_REPLAY_TN_PBEST}, '
+             f'|W-L|>{HARD_REPLAY_TN_MINABSQ}, exit_margin={HARD_REPLAY_TN_EXIT})'
+             if HARD_REPLAY_SELECTOR == 'topn' else
+             f', min_kl={HARD_REPLAY_MIN_KL or "off (relative top-k)"}') +
+          f', inject_cap={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}, '
           f'reuse_target={HARD_REPLAY_REUSE_TARGET or "off (fixed injection)"}, '
           f'start_fraction={HARD_REPLAY_START_FRAC}')
     if WORLD_SIZE > 1:
@@ -1823,6 +1858,8 @@ def Train():
           _dead = {_bi for _bi in _picks0
                    if _hard_replay_buf[_bi]['uses'] >= HARD_REPLAY_MAX_REUSE
                    or _hard_replay_buf[_bi]['miss'] >= HARD_REPLAY_MISS_LIMIT}
+          for _bi in _dead:
+            _hard_replay_buf[_bi]['gone'] = True
           for _bi in sorted(_dead, reverse=True):
             _hard_replay_buf[_bi] = _hard_replay_buf[-1]
             _hard_replay_buf.pop()
@@ -1905,8 +1942,10 @@ def Train():
                 core._log("value_mirror_cons_level", _mirror_level, step=num_pos)
                 core._log("value_mirror_cons_active", 1.0 if _mirror_active else 0.0, step=num_pos)
 
-        # Hard-replay INTAKE: measure per-sample value1-KL on the fresh
-        # (non-replayed) rows and buffer the hardest ones. CPU copies, ~40KB/row.
+        # Hard-replay INTAKE: score the fresh (non-replayed) rows with the
+        # configured selector (valuekl: per-sample value1-KL; topn: top-N margin
+        # with eligibility gates) and buffer the ones above the mode's floor.
+        # CPU copies, ~40KB/row.
         # Gate INTAKE on the start delay too, not just injection: filling the
         # buffer from step 0 would stock it with rows an immature net found
         # hard, and 54.3% of those fall below the floor on their own by the
@@ -1919,6 +1958,43 @@ def Train():
             _hce = torch.nn.functional.cross_entropy(value_out.float(), _vt, reduction='none')
             _htt = torch.clamp(_vt + 1e-6, min=1e-6)
             _hkl = _hce + (_htt * torch.log(_htt)).sum(dim=-1)
+            if HARD_REPLAY_SELECTOR == 'topn':
+              # Score = top-3 MARGIN in logit space: logit(3rd best legal move)
+              # minus logit(target's best move). >0 = the clear best move is NOT
+              # in the net's top-3 (admit); more negative = contained by a wider
+              # margin (exit on re-score below -ExitMargin). Rows failing the
+              # eligibility gates (no clear solution, or drawish so the target
+              # argmax is search noise) are forced to -1e9: never admitted, and
+              # replayed rows always pass the gates since their (buffered)
+              # targets were eligible at admission. NOTE: _hkl above is still
+              # computed first because the fresh/replay VALUE diagnostics below
+              # remain KL-based in both modes; only selection switches scale.
+              _tn_tgt = batch['policies'].float()
+              # "Ranked moves" = search-VISITED moves (target > 0), a legality
+              # proxy — same convention as losses.py and the offline calibration
+              # (top3_crit.py); strictly conservative vs true legality. Changing
+              # this to a real legal mask would silently invalidate the measured
+              # pbest/absq calibration.
+              _tn_pol = policy_out.float()
+              _tn_pol.masked_fill_(_tn_tgt <= 0, -1e9)
+              _tn_pmax, _tn_best = _tn_tgt.max(dim=-1)
+              _tn_nth = _tn_pol.topk(HARD_REPLAY_TOPN, dim=-1).values[:, HARD_REPLAY_TOPN - 1]
+              _tn_bestlogit = _tn_pol.gather(1, _tn_best.unsqueeze(1)).squeeze(1)
+              # Clamp: an +inf margin (saturated logits on exactly the rows this
+              # selector admits) would pass admission, pass the NaN guard, and
+              # fail every floor comparison forever — an immortal entry pinning
+              # the score metric at inf. Logit margins beyond +-100 carry no
+              # information anyway.
+              _tn_margin = torch.clamp(torch.nan_to_num(_tn_nth - _tn_bestlogit,
+                                                        nan=-1e9, posinf=100.0, neginf=-1e9),
+                                       min=-1e9, max=100.0)
+              _wq = batch['wdl_q'].float()
+              _tn_elig = ((_tn_pmax > HARD_REPLAY_TN_PBEST)
+                          & ((_wq[:, 0] - _wq[:, 2]).abs() > HARD_REPLAY_TN_MINABSQ))
+              _hsel = torch.where(_tn_elig, _tn_margin,
+                                  torch.full_like(_tn_margin, -1e9))
+            else:
+              _hsel = _hkl
 
             # Separate fresh-vs-replayed diagnostics: batch metrics are
             # composition-shifted by the injected hard rows, so log each subset
@@ -1941,44 +2017,61 @@ def Train():
               # RE-SCORE the injected rows: 'kl' is otherwise an admission-time
               # snapshot, so at a reuse target of N most of the budget would go to
               # rows the net has since learned. Their current KL is already here.
-              _rsl = _replay_slots.to(_hkl.device)
-              _cur = _hkl[_rsl].detach().float().cpu().tolist()
+              _rsl = _replay_slots.to(_hsel.device)
+              _cur = _hsel[_rsl].detach().float().cpu().tolist()
               for _n, _e in enumerate(_replay_entries):
                 # NaN fails every comparison, so a NaN kl would make the entry
                 # immortal (never floor-dropped) and poison buffer_kl_mean for
                 # the rest of the run. Force NaN to below the drop floor.
-                _e['kl'] = _cur[_n] if _cur[_n] == _cur[_n] else -1.0
-              if HARD_REPLAY_MIN_KL > 0:
+                _e['kl'] = _cur[_n] if _cur[_n] == _cur[_n] else -1e9
+              if HARD_REPLAY_MIN_KL > 0 or HARD_REPLAY_SELECTOR == 'topn':
                 # HYSTERESIS: drop well BELOW the admission floor, not at it.
                 # Dropping at the same threshold churns entries out after ~1 use
                 # (simulated realised reuse 5.2/3.1/2.0 against a target of 8 at
                 # 30/50/80% re-score-below-floor rates) and starves the buffer.
-                _dfloor = 0.5 * HARD_REPLAY_MIN_KL
+                _dfloor = (-HARD_REPLAY_TN_EXIT if HARD_REPLAY_SELECTOR == 'topn'
+                           else 0.5 * HARD_REPLAY_MIN_KL)
                 # Only re-scored entries can have moved below the drop floor
                 # (everything else was admitted at >= MinKL > 0.5*MinKL and its
                 # stored kl has not changed since), so gate the O(buffer) scan
                 # behind an O(_rk) test — it fires rarely, not every step.
-                if any(_e['kl'] <= _dfloor for _e in _replay_entries):
+                # 'gone' skips entries MaxReuse-evicted at injection this step:
+                # their (collapsed) re-score would otherwise trip this gate and
+                # walk the O(buffer) scan on steps where nothing can drop.
+                if any(_e['kl'] <= _dfloor and not _e.get('gone')
+                       for _e in _replay_entries):
                   _drop = sorted((_bi for _bi, _e in enumerate(_hard_replay_buf)
                                   if _e['kl'] <= _dfloor and _e['uses'] > 0), reverse=True)
                   for _bi in _drop:
                     _hard_replay_buf[_bi] = _hard_replay_buf[-1]
                     _hard_replay_buf.pop()
-              _hkl[_rsl] = -1.0                             # replayed rows never re-enter
+              _hsel[_rsl] = -1e9                            # replayed rows never re-enter
             # Intake quota stays at HardReplayFraction so the ABSOLUTE FLOOR does
             # the selecting. Sizing it as FRAC/ReuseTarget instead would cap
             # admissions at 1.56% while only ~1-3% of rows clear the floor, so the
             # rank quota would bind first and the floor would never remove a single
             # row — the arm would silently run legacy top-k at a smaller quota.
-            _hnk = max(1, int(_hkl.shape[0] * HARD_REPLAY_FRAC))
-            _hv, _hi = torch.topk(_hkl, min(_hnk, _hkl.shape[0]))
-            _hfloor = HARD_REPLAY_MIN_KL if HARD_REPLAY_MIN_KL > 0 else 0.0
+            _hnk = max(1, int(_hsel.shape[0] * HARD_REPLAY_FRAC))
+            _hv, _hi = torch.topk(_hsel, min(_hnk, _hsel.shape[0]))
+            _hfloor = (0.0 if HARD_REPLAY_SELECTOR == 'topn'
+                       else (HARD_REPLAY_MIN_KL if HARD_REPLAY_MIN_KL > 0 else 0.0))
             _hkeep = _hv > _hfloor
             _hvk = _hv[_hkeep].cpu()
             _hi = _hi[_hkeep]
             # Updated on EVERY intake including empty ones, so the estimate decays
             # when the net stops failing instead of freezing at its last value.
             _adm = int(_hi.numel())
+            # One-shot saturation warning (finding: if admissions fill the rank
+            # quota persistently, ReuseTarget degenerates toward reuse ~1 — the
+            # regime the quota-vs-floor design assumes is transient).
+            global _hr_quota_warned
+            if (_adm >= _hnk and HARD_REPLAY_REUSE_TARGET > 0
+                and not globals().get('_hr_quota_warned')):
+              _hr_quota_warned = True
+              print(f'[train] HARD-REPLAY NOTE: admissions saturate the intake quota '
+                    f'({_adm}/{_hnk}); while this persists, realised reuse sits near '
+                    f'inject/admit rather than the ReuseTarget. Expected transiently '
+                    f'after switch-on; investigate if hard_replay_reuse_realised stays low.')
             _hr_intake_ema = float(_adm) if _hr_intake_ema is None                              else 0.99 * _hr_intake_ema + 0.01 * _adm
             if _hi.numel() > 0:
               # One indexed gather + one D2H transfer per key; per-row entries
@@ -2021,7 +2114,8 @@ def Train():
               if _hard_replay_buf:
                 # Buffer population stats (logging cadence only): how hard the
                 # current population is, and typical reuse progress.
-                core._log("hard_replay_buffer_kl_mean",
+                core._log("hard_replay_buffer_score_mean" if HARD_REPLAY_SELECTOR == 'topn'
+                          else "hard_replay_buffer_kl_mean",
                           sum(_e['kl'] for _e in _hard_replay_buf) / len(_hard_replay_buf), step=num_pos)
                 core._log("hard_replay_buffer_uses_mean",
                           sum(_e['uses'] for _e in _hard_replay_buf) / len(_hard_replay_buf), step=num_pos)

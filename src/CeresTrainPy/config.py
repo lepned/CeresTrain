@@ -211,6 +211,43 @@ class Configuration:
     # 76.4% @700M — the jump is between 300M and 500M, which is why 0.5 is the
     # natural cut rather than an arbitrary one.
     self.Opt_HardReplayStartFraction = _cfg_num('HardReplayStartFraction', 0.0)
+    # HardReplaySelector: what makes a row "hard".
+    #   'valuekl' (default): per-row value-KL vs the search target, admitted above
+    #       HardReplayMinKL. Measured result (2026-08-19, two arms): this diet
+    #       damages value calibration — the selected rows are value-extreme and
+    #       8x oversampling shifts the value head's gradient composition.
+    #   'topn': the position has a CLEAR solution the net misranks. Admission:
+    #       target's best move prob > HardReplayTopNPBest (unambiguous answer)
+    #       AND |W-L| > HardReplayTopNMinAbsQ (not a drawish position where many
+    #       moves tie and the target argmax is search noise)
+    #       AND the best move is NOT among the net's HardReplayTopN highest-
+    #       ranked moves. "Ranked moves" means moves with SEARCH VISITS
+    #       (target > 0) — a visited-moves proxy for legality, the same
+    #       convention as losses.py and the offline calibration, and strictly
+    #       conservative (can only under-admit) vs a true legal mask. Changing
+    #       it to true legality would silently invalidate the calibration below.
+    #       Measured on ctrl@600M (N=3, pbest 0.5, absq 0.4): 1.45% of the
+    #       stream (dose 8 feasible), value-EASY (median value-KL 0.0023 vs
+    #       0.0102 corpus — no value-diet damage), and ~70% of the population
+    #       is STILL misranked at 1B under ordinary training: real headroom,
+    #       unlike the value-hard set where 54% self-resolved.
+    #   Internal score = top-N margin: logit(Nth best ranked move) minus
+    #   logit(target best move). >0 = fails containment (admit); exit on
+    #   re-score when contained by more than HardReplayTopNExitMargin
+    #   (hysteresis, same role as the 0.5x floor drop in 'valuekl' mode).
+    #   NOTE parse rule: None-checked (a user zero must reach the validator and
+    #   fail loudly there, not be silently replaced by the default).
+    _sel_raw = config_opt.get('HardReplaySelector')
+    self.Opt_HardReplaySelector = 'valuekl' if _sel_raw is None else str(_sel_raw)
+    self.Opt_HardReplayTopN = _cfg_num('HardReplayTopN', 3, int)
+    self.Opt_HardReplayTopNPBest = _cfg_num('HardReplayTopNPBest', 0.5)
+    self.Opt_HardReplayTopNMinAbsQ = _cfg_num('HardReplayTopNMinAbsQ', 0.4)
+    self.Opt_HardReplayTopNExitMargin = _cfg_num('HardReplayTopNExitMargin', 0.5)
+    # For the selector-mismatch guard in train.py: were any topn knobs
+    # EXPLICITLY present in the json (as opposed to defaulted)?
+    self.Opt_HardReplayTopNKeysPresent = any(
+      k in config_opt for k in ('HardReplayTopN', 'HardReplayTopNPBest',
+                                'HardReplayTopNMinAbsQ', 'HardReplayTopNExitMargin'))
     # EMA / SWA weight averaging (lc0-style capped running average; 0 = off).
     # Every EMAPeriodSteps optimizer steps: ema = ema*(n/(n+1)) + w*(1/(n+1)),
     # n = min(n+1, EMAMaxN) — i.e. an EMA whose momentum saturates at
