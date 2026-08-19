@@ -175,6 +175,42 @@ class Configuration:
     self.Opt_HardReplayBufferSize = int(config_opt.get('HardReplayBufferSize', 0) or 0)
     self.Opt_HardReplayFraction = _cfg_num('HardReplayFraction', 0.125)
     self.Opt_HardReplayMaxReuse = _cfg_num('HardReplayMaxReuse', 8, int)
+    # ---- Selection / dosing (see train.py replay block) -------------------
+    # HardReplayMinKL: ABSOLUTE admission floor on per-row value KL (0 = off,
+    # legacy relative top-k). The legacy selector is a pure RANK: it always fills
+    # its quota, so as the net improves "the hardest 12.5%" becomes progressively
+    # less hard and the buffer fills with almost-understood rows. Measured
+    # 2026-08-19 on T91: at a 12.5% quota the LOWEST admitted row had KL 0.124
+    # against a corpus median of 0.012. Learnability rises monotonically with
+    # ABSOLUTE KL and has no upper cutoff (improvement vs corpus baseline, top
+    # band = most learnable):
+    #     KL 0.00-0.05 (74.2% of rows) 0.6x | 0.05-0.15 1.8x | 0.15-0.40 2.1x
+    #     KL 0.40-1.00 ( 2.8% of rows) 2.8x | 1.00-2.50 5.2x
+    # 0.4 excludes everything at or below 2.1x and admits ~3.4% of the stream.
+    # An absolute floor also makes the treatment SELF-LIMITING: admissions fall
+    # as the net improves, instead of permanently displacing 12.5% of every batch
+    # (the fixed displacement is the surviving explanation for why the 2026-08-18
+    # arm generalised worse while fitting its own distribution fine).
+    self.Opt_HardReplayMinKL = _cfg_num('HardReplayMinKL', 0.0)
+    # HardReplayReuseTarget: desired mean reuse (0 = off, legacy fixed injection
+    # at HardReplayFraction). Mean reuse is EXACTLY injected/admitted by flow
+    # conservation, so injection is sized as target x realised admissions rather
+    # than as a fixed batch share -- which both pins the dose and lets replay
+    # VOLUME taper with the floor above. HardReplayFraction remains a hard cap on
+    # injection. NOTE: buffer size does NOT affect reuse (it cancels); it only
+    # sets residency/diversity. HardReplayMaxReuse must stay comfortably ABOVE
+    # this target -- at MaxReuse == target occupancy is a neutral random walk and
+    # below it the buffer starves and injection silently falls under the cap.
+    self.Opt_HardReplayReuseTarget = _cfg_num('HardReplayReuseTarget', 0.0)
+    # HardReplayStartFraction: hold replay OFF until this fraction of training is
+    # done (0 = from step 0). Measured 2026-08-19 on the 1B ctrl checkpoints: the
+    # hard set TURNS OVER early, so focusing on it early wastes the budget on rows
+    # ordinary training resolves by itself. Of the rows hardest at 100M, 54.3% had
+    # fallen below KL 0.4 by 900M (median 0.890 -> 0.354). Stability of the top-3%
+    # set, measured against the 900M net: 45.7% @100M, 46.7% @300M, 64.9% @500M,
+    # 76.4% @700M — the jump is between 300M and 500M, which is why 0.5 is the
+    # natural cut rather than an arbitrary one.
+    self.Opt_HardReplayStartFraction = _cfg_num('HardReplayStartFraction', 0.0)
     # EMA / SWA weight averaging (lc0-style capped running average; 0 = off).
     # Every EMAPeriodSteps optimizer steps: ema = ema*(n/(n+1)) + w*(1/(n+1)),
     # n = min(n+1, EMAMaxN) — i.e. an EMA whose momentum saturates at

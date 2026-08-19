@@ -977,7 +977,8 @@ def Train():
     print(f'[train] VALUE MIRROR-CONSISTENCY enabled: w={MIRROR_CONS_WEIGHT}, frac={MIRROR_CONS_FRAC} '
           f'(castling-rights records exempt; value1 sym-KL)')
 
-  # Hard-position replay buffer (config: HardReplayBufferSize/Fraction/MaxReuse —
+  # Hard-position replay buffer (config: HardReplayBufferSize/Fraction/MaxReuse/
+  # MinKL/ReuseTarget/StartFraction —
   # see config.py). Flow per primary batch: (1) BEFORE forward, replace a fixed
   # number of rows with sampled buffer entries; (2) after the loss, measure
   # per-sample value1-KL on the NON-replayed rows and push the hardest ones
@@ -986,12 +987,64 @@ def Train():
   HARD_REPLAY_SIZE = int(getattr(config, 'Opt_HardReplayBufferSize', 0) or 0)
   HARD_REPLAY_FRAC = float(getattr(config, 'Opt_HardReplayFraction', 0.125))
   HARD_REPLAY_MAX_REUSE = int(getattr(config, 'Opt_HardReplayMaxReuse', 8))
-  _hard_replay_buf = []   # list of {'rows': {key: cpu tensor}, 'uses': int}
+  # Consecutive signature-mismatched draws before an entry is dropped. Named
+  # rather than inline so it is not read as tied to MaxReuse (whose default
+  # is also 8). Without it, entries whose signature never matches are
+  # unreachable by BOTH eviction paths and accumulate until injection decays.
+  HARD_REPLAY_MISS_LIMIT = 8
+  # Absolute admission floor / reuse CAP / start delay (all see config.py).
+  # All default to 0 = legacy relative top-k with fixed injection from step 0.
+  HARD_REPLAY_MIN_KL = float(getattr(config, 'Opt_HardReplayMinKL', 0.0) or 0.0)
+  HARD_REPLAY_REUSE_TARGET = float(getattr(config, 'Opt_HardReplayReuseTarget', 0.0) or 0.0)
+  HARD_REPLAY_START_FRAC = float(getattr(config, 'Opt_HardReplayStartFraction', 0.0) or 0.0)
+  # EMAs of rows actually ADMITTED / INJECTED per micro-step. Injection is sized
+  # from the intake EMA so reuse tends to the target; both are also the only
+  # honest basis for the realised-reuse metric (a smoothed numerator over a raw
+  # per-step denominator reads 64x high on a low-admission step). Per-rank and
+  # local: no collectives, exactly like the buffer itself.
+  _hr_intake_ema = None
+  _hr_inject_ema = 0.0
+  _hr_displaced_total = 0   # cumulative injected rows this rank (reporting only)
+  _hard_replay_buf = []   # {'rows':…, 'uses': int, 'kl': float, 'miss': int, 'sig':…}
+  if HARD_REPLAY_SIZE == 0 and (HARD_REPLAY_MIN_KL > 0 or HARD_REPLAY_REUSE_TARGET > 0
+                                or HARD_REPLAY_START_FRAC > 0):
+    # Every validator and the banner live inside the SIZE>0 block, so without
+    # this a control-shaped config carrying treatment knobs would run silently
+    # as a plain control while presenting as a treatment arm.
+    raise ValueError('HardReplayMinKL/ReuseTarget/StartFraction are set but '
+                     'HardReplayBufferSize is 0 — replay is OFF. Remove the knobs '
+                     'or set a buffer size.')
   if HARD_REPLAY_SIZE > 0:
     if BOARDS_PER_BATCH != 1:
       raise NotImplementedError('HardReplayBufferSize > 0 is only implemented for BOARDS_PER_BATCH==1')
-    print(f'[train] HARD-REPLAY buffer enabled: size={HARD_REPLAY_SIZE}, '
-          f'fraction={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}')
+    # Mean reuse is EXACTLY injected/admitted by flow conservation (every
+    # injection increments one entry's 'uses'); MaxReuse does not reduce it and
+    # buffer size cancels. ReuseTarget is therefore a CAP that binds only while
+    # admissions are scarce — early on, when many rows clear the floor, realised
+    # reuse is lower and variety is higher, which is the behaviour we want.
+    if not (0.0 < HARD_REPLAY_FRAC <= 1.0):
+      raise ValueError(f'HardReplayFraction must be in (0,1]; got {HARD_REPLAY_FRAC}. '
+                       f'0 fills the buffer and never injects; >1 raises a shape error at the '
+                       f'first injection.')
+    if HARD_REPLAY_MIN_KL < 0 or not (0.0 <= HARD_REPLAY_START_FRAC < 1.0):
+      raise ValueError(f'HardReplayMinKL must be >=0 (got {HARD_REPLAY_MIN_KL}) and '
+                       f'HardReplayStartFraction in [0,1) (got {HARD_REPLAY_START_FRAC}).')
+    if HARD_REPLAY_REUSE_TARGET > 0 and HARD_REPLAY_MIN_KL <= 0:
+      raise ValueError(
+        'HardReplayReuseTarget > 0 requires HardReplayMinKL > 0: with the legacy relative '
+        'top-k intake, admissions always equal the injection quota, so realised reuse is '
+        'pinned at ~1 and the configured target is a silent no-op.')
+    if HARD_REPLAY_REUSE_TARGET > 0 and HARD_REPLAY_MAX_REUSE <= HARD_REPLAY_REUSE_TARGET:
+      raise ValueError(
+        f'HardReplayMaxReuse ({HARD_REPLAY_MAX_REUSE}) must be STRICTLY GREATER than '
+        f'HardReplayReuseTarget ({HARD_REPLAY_REUSE_TARGET}): at equality buffer occupancy is '
+        f'a neutral random walk; below it the buffer starves and injection silently falls '
+        f'under HardReplayFraction. Use e.g. MaxReuse = 3x the target.')
+    print(f'[train] HARD-REPLAY enabled: size={HARD_REPLAY_SIZE}, '
+          f'inject_cap={HARD_REPLAY_FRAC}, max_reuse={HARD_REPLAY_MAX_REUSE}, '
+          f'min_kl={HARD_REPLAY_MIN_KL or "off (relative top-k)"}, '
+          f'reuse_target={HARD_REPLAY_REUSE_TARGET or "off (fixed injection)"}, '
+          f'start_fraction={HARD_REPLAY_START_FRAC}')
     if WORLD_SIZE > 1:
       # DDP: the buffer is deliberately PER RANK, and that is the correct
       # semantics rather than a compromise — each rank owns a disjoint slice of
@@ -1601,6 +1654,7 @@ def Train():
   wdl_reverse = torch.tensor([2, 1, 0]) # for reversing perspective on WDL
   
 
+  _last_show_losses_pos = 0
   # Train Network
   for batch_idx, (batch) in enumerate(dataloader):
     if (num_pos >= MAX_POSITIONS and not config.Exec_ExportOnly):
@@ -1618,8 +1672,14 @@ def Train():
     if QAT_ENABLED:
       fake_quant.freeze_if_ready(model_nocompile, num_pos, QAT_FREEZE_AT)
 
-    # Periodically log statistics
-    show_losses = (num_pos % (1024 * 64) == 0)
+    # Periodically log statistics. Interval-passed, NOT modulo: since replayed
+    # rows no longer count toward num_pos, the counter advances in uneven steps
+    # once injection starts, and `num_pos % 65536 == 0` then simply never fires
+    # again — every TB stat silently stopped for the rest of the run (observed
+    # in smoke_rep5: zero hard_replay metrics after the 50% switch-on).
+    show_losses = (num_pos - _last_show_losses_pos) >= (1024 * 64)
+    if show_losses:
+      _last_show_losses_pos = num_pos
 
     is_accumulating = ((batch_accumulation_counter + 1) % num_batches_gradient_accumulate) != 0
 
@@ -1675,47 +1735,97 @@ def Train():
         FLOPS_CALCULATED = True
 
         
+      # Reset per ITERATION at loop level, not inside the BOARDS_PER_BATCH==1
+      # branch: Python does not scope by block, so a branch-local init would
+      # leave the PREVIOUS step's value visible to the position count below,
+      # and would be undefined entirely on the BOARDS_PER_BATCH>1 path where
+      # hard replay is not implemented at all.
+      _replay_entries = []
       if BOARDS_PER_BATCH == 1:
         batch = batch[0]
         is_secondary_batch = bool(batch.pop('is_secondary', False))
         num_processing_now = batch['squares'].shape[0]
 
-        # Hard-replay INJECTION (see setup block): swap a fixed share of this
-        # primary batch for buffered hard rows before the forward pass.
-        # Batched per KEY (one stack + one H2D transfer per tensor key) instead
-        # of per row x key — the naive loop cost ~1000 small dispatches/step.
+        # Hard-replay INJECTION (see setup block): swap buffered hard rows into
+        # this primary batch before the forward pass. Batched per KEY (one stack
+        # + one H2D transfer per tensor key) instead of per row x key — the naive
+        # loop cost ~1000 small dispatches/step.
         _replay_slots = None
-        if HARD_REPLAY_SIZE > 0 and not is_secondary_batch and _hard_replay_buf:
+        # Start delay: the hard set turns over early, so focusing before the net
+        # has matured spends the budget on rows ordinary training resolves anyway
+        # (see config.py for the measured turnover).
+        _hr_on = (HARD_REPLAY_SIZE > 0 and fraction_complete >= HARD_REPLAY_START_FRAC)
+        # Inject-EMA oppdateres FØR buffer-guarden: ellers fryser den på sin
+        # siste verdi når bufferet tømmes, og de to diagnosene som skal avsløre
+        # sult rapporterer helse nøyaktig ved sult.
+        if _hr_on and not is_secondary_batch:
+          _hr_inject_ema = 0.99 * _hr_inject_ema  # decays; re-added below on injection
+        if _hr_on and not is_secondary_batch and _hard_replay_buf:
           _rb = batch['squares'].shape[0]
-          _rk = min(int(_rb * HARD_REPLAY_FRAC), len(_hard_replay_buf))
-          if _rk > 0:
-            # Key-signature matching: under sidecar 'auto' modes, batches from
-            # different shards can carry different target-key sets — an entry
-            # may only be injected into a batch with the SAME tensor keys
-            # (otherwise the victim row's survival/censored/provenance targets
-            # would silently label the replayed position).
-            _bsig = frozenset(_k for _k, _v in batch.items() if torch.is_tensor(_v))
-            _picks0 = torch.randint(len(_hard_replay_buf), (_rk,)).tolist()
-            _sel = [(_bi, _hard_replay_buf[_bi]) for _bi in _picks0
-                    if _hard_replay_buf[_bi]['sig'] == _bsig]
-            if _sel:
-              _picks = [_bi for _bi, _ in _sel]
-              _entries = [_e for _, _e in _sel]
-              _replay_slots = torch.randperm(_rb)[:len(_entries)]
-              _slots_dev = _replay_slots.to(batch['squares'].device)
-              for _k in _entries[0]['rows']:
-                _stk = torch.stack([_e['rows'][_k] for _e in _entries])
-                batch[_k][_slots_dev] = _stk.to(batch[_k].device, non_blocking=True)
-              for _e in _entries:
-                _e['uses'] += 1
-            else:
-              _picks = []
-            # O(1) swap-remove of spent entries (unique indices, descending so
-            # tail moves never disturb an index still to be processed).
-            for _bi in sorted(set(_picks), reverse=True):
-              if _hard_replay_buf[_bi]['uses'] >= HARD_REPLAY_MAX_REUSE:
-                _hard_replay_buf[_bi] = _hard_replay_buf[-1]
-                _hard_replay_buf.pop()
+          _rcap = int(_rb * HARD_REPLAY_FRAC)
+          if HARD_REPLAY_REUSE_TARGET > 0 and _hr_intake_ema is not None:
+            # Target x realised admissions, CAPPED by HardReplayFraction. The cap
+            # binds while admissions are plentiful (early: lower reuse, more
+            # variety); the target binds once the floor makes them scarce.
+            _rk = min(int(round(HARD_REPLAY_REUSE_TARGET * _hr_intake_ema)), _rcap)
+          else:
+            _rk = _rcap
+          # Floor at 1 whenever the buffer is non-empty: at 0 the eviction paths
+          # below never run and the buffer would freeze full of stale entries
+          # while `hard_replay_buffer_fill` still looked healthy.
+          _rk = min(max(_rk, 1), len(_hard_replay_buf))
+          # Min-population gate: right after switch-on the buffer holds a
+          # handful of entries, and _rk clamped to len(buf) would inject EVERY
+          # entry into EVERY micro-batch of the accumulation window — one row
+          # contributing 8x to a single optimizer step at full LR, while its
+          # 'uses' burns toward MaxReuse in one window. Wait until the buffer
+          # can cover a full injection quota (fills in a few steps).
+          if len(_hard_replay_buf) < _rcap:
+            _rk = 0
+          # Key-signature matching: under sidecar 'auto' modes, batches from
+          # different shards can carry different target-key sets — an entry may
+          # only be injected into a batch with the SAME tensor keys (otherwise the
+          # victim row's survival/censored/provenance targets would silently
+          # label the replayed position).
+          _bsig = frozenset(_k for _k, _v in batch.items() if torch.is_tensor(_v))
+          # randperm, NOT randint: with-replacement sampling injects one entry
+          # into several slots of the SAME micro-batch. randperm fixes only that
+          # granularity — the same entry can still recur across the micro-batches
+          # of one accumulation window (~5-6% of injected rows at steady state),
+          # which the min-population gate above keeps bounded; a per-window draw
+          # would remove it entirely if it ever proves to matter.
+          _picks0 = torch.randperm(len(_hard_replay_buf))[:_rk].tolist()
+          _sel = [(_bi, _hard_replay_buf[_bi]) for _bi in _picks0
+                  if _hard_replay_buf[_bi]['sig'] == _bsig]
+          if _sel:
+            _picks = [_bi for _bi, _ in _sel]
+            _entries = [_e for _, _e in _sel]
+            _replay_slots = torch.randperm(_rb)[:len(_entries)]
+            _replay_entries = _entries
+            _slots_dev = _replay_slots.to(batch['squares'].device)
+            for _k in _entries[0]['rows']:
+              _stk = torch.stack([_e['rows'][_k] for _e in _entries])
+              batch[_k][_slots_dev] = _stk.to(batch[_k].device, non_blocking=True)
+            for _e in _entries:
+              _e['uses'] += 1
+              _e['miss'] = 0
+            _hr_inject_ema += 0.01 * len(_entries)
+            _hr_displaced_total += len(_entries)
+          else:
+            _picks = []
+          # ONE combined descending eviction pass over every index touched this
+          # step. Two separate passes would leave the second dereferencing indices
+          # the first had already swap-removed (IndexError, and under DDP a hang
+          # rather than a clean crash, since the other ranks stay in all-reduce).
+          _missed = set(_picks0) - set(_picks)
+          for _bi in _missed:
+            _hard_replay_buf[_bi]['miss'] += 1
+          _dead = {_bi for _bi in _picks0
+                   if _hard_replay_buf[_bi]['uses'] >= HARD_REPLAY_MAX_REUSE
+                   or _hard_replay_buf[_bi]['miss'] >= HARD_REPLAY_MISS_LIMIT}
+          for _bi in sorted(_dead, reverse=True):
+            _hard_replay_buf[_bi] = _hard_replay_buf[-1]
+            _hard_replay_buf.pop()
 
         policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower, q_deviation_upper, uncertainty_policy_out, _, _, _ = model(batch['squares'], None)
 
@@ -1797,7 +1907,12 @@ def Train():
 
         # Hard-replay INTAKE: measure per-sample value1-KL on the fresh
         # (non-replayed) rows and buffer the hardest ones. CPU copies, ~40KB/row.
-        if HARD_REPLAY_SIZE > 0 and not is_secondary_batch:
+        # Gate INTAKE on the start delay too, not just injection: filling the
+        # buffer from step 0 would stock it with rows an immature net found
+        # hard, and 54.3% of those fall below the floor on their own by the
+        # end (measured). Replay would then switch on against a stale set —
+        # exactly what the delay exists to avoid. Fill costs ~40 steps.
+        if _hr_on and not is_secondary_batch:
           with torch.no_grad():
             _vt = (batch['wdl_q'].float() * core.q_ratio
                    + batch['wdl_deblundered'].float() * (1.0 - core.q_ratio))
@@ -1823,20 +1938,61 @@ def Train():
                 core._log("value_acc_fresh", _vmatch.mean(), step=num_pos)
 
             if _replay_slots is not None:
-              _hkl[_replay_slots.to(_hkl.device)] = -1.0      # replayed rows never re-enter
+              # RE-SCORE the injected rows: 'kl' is otherwise an admission-time
+              # snapshot, so at a reuse target of N most of the budget would go to
+              # rows the net has since learned. Their current KL is already here.
+              _rsl = _replay_slots.to(_hkl.device)
+              _cur = _hkl[_rsl].detach().float().cpu().tolist()
+              for _n, _e in enumerate(_replay_entries):
+                # NaN fails every comparison, so a NaN kl would make the entry
+                # immortal (never floor-dropped) and poison buffer_kl_mean for
+                # the rest of the run. Force NaN to below the drop floor.
+                _e['kl'] = _cur[_n] if _cur[_n] == _cur[_n] else -1.0
+              if HARD_REPLAY_MIN_KL > 0:
+                # HYSTERESIS: drop well BELOW the admission floor, not at it.
+                # Dropping at the same threshold churns entries out after ~1 use
+                # (simulated realised reuse 5.2/3.1/2.0 against a target of 8 at
+                # 30/50/80% re-score-below-floor rates) and starves the buffer.
+                _dfloor = 0.5 * HARD_REPLAY_MIN_KL
+                # Only re-scored entries can have moved below the drop floor
+                # (everything else was admitted at >= MinKL > 0.5*MinKL and its
+                # stored kl has not changed since), so gate the O(buffer) scan
+                # behind an O(_rk) test — it fires rarely, not every step.
+                if any(_e['kl'] <= _dfloor for _e in _replay_entries):
+                  _drop = sorted((_bi for _bi, _e in enumerate(_hard_replay_buf)
+                                  if _e['kl'] <= _dfloor and _e['uses'] > 0), reverse=True)
+                  for _bi in _drop:
+                    _hard_replay_buf[_bi] = _hard_replay_buf[-1]
+                    _hard_replay_buf.pop()
+              _hkl[_rsl] = -1.0                             # replayed rows never re-enter
+            # Intake quota stays at HardReplayFraction so the ABSOLUTE FLOOR does
+            # the selecting. Sizing it as FRAC/ReuseTarget instead would cap
+            # admissions at 1.56% while only ~1-3% of rows clear the floor, so the
+            # rank quota would bind first and the floor would never remove a single
+            # row — the arm would silently run legacy top-k at a smaller quota.
             _hnk = max(1, int(_hkl.shape[0] * HARD_REPLAY_FRAC))
             _hv, _hi = torch.topk(_hkl, min(_hnk, _hkl.shape[0]))
-            _hvk = _hv[_hv > 0].cpu()
-            _hi = _hi[_hv > 0]
+            _hfloor = HARD_REPLAY_MIN_KL if HARD_REPLAY_MIN_KL > 0 else 0.0
+            _hkeep = _hv > _hfloor
+            _hvk = _hv[_hkeep].cpu()
+            _hi = _hi[_hkeep]
+            # Updated on EVERY intake including empty ones, so the estimate decays
+            # when the net stops failing instead of freezing at its last value.
+            _adm = int(_hi.numel())
+            _hr_intake_ema = float(_adm) if _hr_intake_ema is None                              else 0.99 * _hr_intake_ema + 0.01 * _adm
             if _hi.numel() > 0:
               # One indexed gather + one D2H transfer per key; per-row entries
               # hold zero-copy CPU views into the shared intake tensors.
+              # .clone() below: _v[_j] is a storage-sharing VIEW into this block,
+              # so one surviving entry pins the entire block's host memory
+              # (measured 128x amplification). The selective floor-drop is the
+              # worst case for that, since it retires an arbitrary subset.
               _rows_cpu = {_k: _t[_hi].detach().to('cpu', copy=True)
                            for _k, _t in batch.items() if torch.is_tensor(_t)}
               _rsig = frozenset(_rows_cpu)
               for _j in range(_hi.numel()):
-                _entry = {'uses': 0, 'kl': float(_hvk[_j]), 'sig': _rsig,
-                          'rows': {_k: _v[_j] for _k, _v in _rows_cpu.items()}}
+                _entry = {'uses': 0, 'kl': float(_hvk[_j]), 'sig': _rsig, 'miss': 0,
+                          'rows': {_k: _v[_j].clone() for _k, _v in _rows_cpu.items()}}
                 if len(_hard_replay_buf) >= HARD_REPLAY_SIZE:
                   # random replacement at cap (buffer churns; strict FIFO not needed)
                   _hard_replay_buf[int(torch.randint(len(_hard_replay_buf), (1,)))] = _entry
@@ -1844,6 +2000,24 @@ def Train():
                   _hard_replay_buf.append(_entry)
             if show_losses:
               core._log("hard_replay_buffer_fill", float(len(_hard_replay_buf)), step=num_pos)
+              # Realised volumes. Without these the design is blind: a floor that
+              # admits nothing and a starved buffer look identical to a healthy run.
+              # Reuse is EMA/EMA — a smoothed numerator over a raw per-step
+              # denominator reads 8x/64x high on low-admission steps, which become
+              # common exactly as the treatment self-limits.
+              core._log("hard_replay_intake_rows", float(_adm), step=num_pos)
+              core._log("hard_replay_intake_ema", float(_hr_intake_ema or 0.0), step=num_pos)
+              core._log("hard_replay_inject_ema", float(_hr_inject_ema), step=num_pos)
+              core._log("hard_replay_inject_frac_realised",
+                        float(_hr_inject_ema) / max(_hkl.shape[0], 1), step=num_pos)
+              # Unique-data displacement, reported instead of being subtracted
+              # from num_pos (see the num_pos comment for why subtracting is
+              # rank-divergent under DDP). x WORLD_SIZE approximates the global
+              # figure since ranks draw comparable volumes.
+              core._log("hard_replay_displaced_pos",
+                        float(_hr_displaced_total * WORLD_SIZE), step=num_pos)
+              core._log("hard_replay_reuse_realised",
+                        float(_hr_inject_ema) / max(float(_hr_intake_ema or 0.0), 1e-6), step=num_pos)
               if _hard_replay_buf:
                 # Buffer population stats (logging cadence only): how hard the
                 # current population is, and typical reuse progress.
@@ -2108,6 +2282,16 @@ def Train():
     # this is unchanged there. Counting globally keeps MAX_POSITIONS, checkpoint
     # cadence and the LR-decay schedule (fraction_complete) on the same footing as
     # a single-GPU run rather than running world_size× too long.
+    # num_pos counts GROSS positions, replayed rows included — deliberately.
+    # Subtracting injected rows was tried (2026-08-19) and reverted the same
+    # day: the subtraction is rank-LOCAL (each rank's buffer draws differ), so
+    # under DDP the counters diverge, every rank derives a DIFFERENT LR from
+    # its own num_pos, and ranks cross MAX_POSITIONS on different iterations —
+    # an NCCL hang with no final checkpoint. It also does not buy a clean A/B:
+    # matching on unique positions un-matches on optimizer steps, compute and
+    # the EMA window. The unique-data displacement is intrinsic to replay and
+    # is REPORTED instead (hard_replay_displaced_pos) rather than hidden in
+    # the schedule counter.
     num_pos = num_pos + num_processing_now * WORLD_SIZE
     num_batches = num_pos // BATCH_SIZE
 
