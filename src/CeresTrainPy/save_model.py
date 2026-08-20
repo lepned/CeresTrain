@@ -299,6 +299,32 @@ def save_model(NAME : str,
             onnx_model_16 = convert_float_to_float16(
                 onnx_model, keep_io_types=False,
                 min_positive_val=1e-10, max_finite_val=1e4)
+            # RECONCILE Cast attributes with the converted graph. The converter
+            # rewrites tensor types wholesale but leaves pre-existing Cast nodes'
+            # `to` attribute untouched, so a graph-internal Cast(to=FLOAT) whose
+            # output value_info it just converted to FLOAT16 now contradicts
+            # itself — onnxruntime refuses to LOAD the file ("Type Error: Type
+            # (tensor(float16)) of output arg ... does not match expected type
+            # (tensor(float))"). First hit: dual_plane's internal .float()
+            # upcasts (dynamo emits chained _to_copy Casts). Fix is systemic
+            # here rather than per-module: any future .float()/.half() inside a
+            # submodule would trip the same converter gap. FLOAT<->FLOAT16 only;
+            # Casts to other dtypes (bool/int) are left alone.
+            _F32, _F16 = 1, 10   # onnx.TensorProto.FLOAT / FLOAT16
+            _vtypes = {vi.name: vi.type.tensor_type.elem_type
+                       for vi in list(onnx_model_16.graph.value_info)
+                       + list(onnx_model_16.graph.output)}
+            _fixed = 0
+            for _n in onnx_model_16.graph.node:
+              if _n.op_type != 'Cast' or not _n.output:
+                continue
+              _declared = _vtypes.get(_n.output[0])
+              for _a in _n.attribute:
+                if _a.name == 'to' and _a.i in (_F32, _F16)                    and _declared in (_F32, _F16) and _a.i != _declared:
+                  _a.i = _declared
+                  _fixed += 1
+            if _fixed:
+              print(f'INFO: ONNX_FP16_CAST_RECONCILED {_fixed} Cast node(s)')
             # Embed weights inline in the .onnx file (same as production Ceres nets
             # like C3-768-30-pre3-I8.onnx). Our nets are well under the 2 GB protobuf
             # limit so no external data file is needed.
