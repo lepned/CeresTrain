@@ -16,12 +16,32 @@ speil-matrisen @5M (F:\cout\puzzle_tacs_*_gate.log) og EB-cmp-målinger
 | P-planet er ~gratis ved 512-skala | EB cmp begge ordrer: ingen målbar EPS-kost (512-15) |
 | deg3 tåler anneal bedre (mindre OOD-tap) | deg310 vs dp210-kontroll @10M: +71/+59 in-dist, +19/+8 OOD |
 
-## Net-config (ceres_net.json) — delta mot server-baseline
+## Net-config (ceres_net.json) — KOMPLETT chassis, ikke bare delta
+
+VIKTIG (laert 2026-08-20 kveld): forste versjon av denne filen listet bare
+dual-plane-deltaet — da arvet serveren sine egne defaults for resten
+(bl.a. RPE av). Under er HELE chassiset evidensen ble malt pa (lokal
+dp2/tacs-familie), tilpasset 512-16:
 
 ```json
 {
     "ModelDim": 512,
     "NumLayers": 16,
+    "NumHeads": 8,
+    "PreNorm": false,
+    "NormType": "RMSNorm",
+    "FFNMultiplier": 6,
+    "FFNActivationType": "Mish",
+    "HeadsActivationType": "Mish",
+    "NonLinearAttention": true,
+    "SoftCapCutoff": 100,
+    "SmolgenDimPerSquare": 32,
+    "SmolgenDim": 256,
+    "SmolgenToHeadDivisor": 4,
+    "SmolgenActivationType": "Swish",
+    "UseRPE": true,
+    "UseRPE_V": false,
+    "UseRoPE": false,
 
     "UseVisEdgeBias": false,
     "VisEdgeFamilies": "vis,xray,pinray,check,flight",
@@ -34,6 +54,20 @@ speil-matrisen @5M (F:\cout\puzzle_tacs_*_gate.log) og EB-cmp-målinger
     "DualPlaneSoftMinHeads": 2
 }
 ```
+
+### Komponent-viktighet (malt @5M, dp2-chassis, ablasjoner dp2ns/dp2nr)
+
+| Komponent | Kost ved fjerning | Dom |
+|---|---|---|
+| Smolgen | P −71, pT3 −59 in-dist; KLD 1.05→1.43 | **PAKREVD** |
+| RPE | P −3 in-dist, men OOD −35/−36 | Anbefalt, ikke kritisk |
+
+Kjorer serveren uten RPE (som runen startet 2026-08-20): akseptabelt —
+v4r-presedens (2.5B, smolgen + ingen pos-enc = policy-paritet), P-planet
+baerer egen geometri (fil/rank-embed + relasjonsbiaser), og OOD-kosten er
+malt i puzzle-regimet der den trolig overdriver. Men merk at deg4-deltaene
+(+49 OOD osv.) ble malt MED RPE — forste RPE-pa-arm pa server er verdt a
+prove nar baseline-deltaet er kjent.
 
 Merknader:
 - `UseVisEdgeBias: false` = bar chassis. `VisEdgeFamilies` MÅ likevel stå:
