@@ -215,14 +215,33 @@ class CeresNet(nn.Module):
     if action_uncertainty_loss_weight > 0:
       self.action_uncertainty_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _other_rd)
 
-    self.value_head = Head(self.Activation, self.VALUE_IN_SIZE, 64 * HEAD_MULT, 3, _val_rd)
+    # VALUE POOL CHANNELS (toolbox T1.2 "channels" variant, NetDef
+    # ValueHeadPoolChannels): min/max extreme-square summaries of the trunk
+    # concatenated as FIRST-CLASS INPUT COLUMNS to the value family's first
+    # linear — default init, carrying signal from step 0 — instead of the
+    # zero-init additive offer of ValueHeadMinMaxPool (which died on the cf3g
+    # chassis, where the AND-heads already supply extreme info and the
+    # optimizer must additionally DISCOVER a zero-init path). ARCH key: widens
+    # value_head.fc/value2_head.fc, so warm starts across a toggle fail loudly
+    # on the shape mismatch (no silent-drop guard needed).
+    self.value_pool_channels = bool(getattr(config, 'NetDef_ValueHeadPoolChannels', False))
+    assert not (self.value_pool_channels and getattr(config, 'NetDef_ValueHeadMinMaxPool', False)), \
+        'ValueHeadPoolChannels and ValueHeadMinMaxPool are redundant together — pick one'
+    _v_extra = 2 * self.EMBEDDING_DIM if self.value_pool_channels else 0
+    if self.value_pool_channels:
+      print(f'[ceres_net] VALUE POOL CHANNELS enabled: trunk min/max over squares '
+            f'[B,{_v_extra}] concatenated into value1'
+            f'{"/value2" if self.value2_loss_weight > 0 else ""} head input '
+            f'(first linear widened by {_v_extra} columns, default init — active from step 0)')
+
+    self.value_head = Head(self.Activation, self.VALUE_IN_SIZE + _v_extra, 64 * HEAD_MULT, 3, _val_rd)
     # unc follows the value family: on the private path it reads the private
     # value features (audit finding #4 — error-family heads should enrich the
     # value representation, not the shared bottleneck).
     self.unc_head = Head(self.Activation, self.VALUE_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
 
     if self.value2_loss_weight > 0:
-      self.value2_head = Head(self.Activation, 2 + self.VALUE_IN_SIZE, 64 * HEAD_MULT, 3, _other_rd)
+      self.value2_head = Head(self.Activation, 2 + self.VALUE_IN_SIZE + _v_extra, 64 * HEAD_MULT, 3, _other_rd)
 
     if self.value_priv_inject_mode:
       # Zero-init private injectors (ValueHeadChannelsMode='inject'). Bias-free and
@@ -240,6 +259,30 @@ class CeresNet(nn.Module):
             f'-> {self.VALUE_PRIV_SIZE}-dim private vector added into value1'
             f'{"/value2" if self.value2_loss_weight > 0 else ""} hidden pre-activation '
             f'({_n_inj:,} new params, zero-init => base recovered exactly at step 0)')
+
+    # VALUE MIN/MAX POOL SIDE-CHANNELS (2026-08 tactics toolbox T1.2, NetDef
+    # ValueHeadMinMaxPool): worst-square/best-square summaries of the trunk
+    # for the value family only. The value input is a 64:1 compressed
+    # projection; extreme per-square facts (the one uncovered flight square,
+    # the one hanging piece) die in that compression — the same AND/OR
+    # quantifier gap the soft-min heads target, but at the head instead of in
+    # attention. min/max over squares of the trunk flow [B,64,D] -> [B,2D],
+    # fed through zero-init bias-free Linears into the value1/value2 hidden
+    # pre-activation (the ValueHeadChannelsMode='inject' pattern): exact
+    # step-0 no-op, composes additively with the private front-end inject.
+    self.value_minmax_pool = bool(getattr(config, 'NetDef_ValueHeadMinMaxPool', False))
+    if self.value_minmax_pool:
+      self.value_pool_inject = nn.Linear(2 * self.EMBEDDING_DIM, 64 * HEAD_MULT, bias=False)
+      nn.init.zeros_(self.value_pool_inject.weight)
+      _n_vp = 2 * self.EMBEDDING_DIM * 64 * HEAD_MULT
+      if self.value2_loss_weight > 0:
+        self.value2_pool_inject = nn.Linear(2 * self.EMBEDDING_DIM, 64 * HEAD_MULT, bias=False)
+        nn.init.zeros_(self.value2_pool_inject.weight)
+        _n_vp *= 2
+      print(f'[ceres_net] VALUE MIN/MAX POOL enabled: trunk amin/amax over squares '
+            f'[B,{2 * self.EMBEDDING_DIM}] -> value1'
+            f'{"/value2" if self.value2_loss_weight > 0 else ""} hidden pre-activation '
+            f'({_n_vp:,} new params, zero-init => exact step-0 no-op)')
 
     if self.uncertainty_policy_weight > 0:
       self.unc_policy = Head(self.Activation, self.HEAD_IN_SIZE, 32 * HEAD_MULT, 1, _other_rd)
@@ -622,6 +665,231 @@ class CeresNet(nn.Module):
     _graph_route_channels = (4 * len(self._vis_edge_families)
                              if (self.use_vis_edge_bias and self.use_graph_route) else 0)
 
+    # Soft-min ("AND-logic") value-aggregation heads (2026-08 tactical program,
+    # see dot_product_attention). ARCH key, not a zero-init add-on: with
+    # SoftMinHeads > 0 the first k heads of every layer aggregate V by an
+    # attention-weighted soft minimum from step 0. Independent of the vis-edge
+    # machinery (no E consumption, no extra channels).
+    self.softmin_heads = int(getattr(config, 'NetDef_SoftMinHeads', 0) or 0)
+    # Signed-tau dual (T1.1): SoftMaxAggHeads = m gives the NEXT m heads a
+    # soft-MAX aggregation (same formula, tau = -exp(log_tau) init -1) for
+    # existential/threat facts. Same ARCH-key semantics.
+    self.softmax_agg_heads = int(getattr(config, 'NetDef_SoftMaxAggHeads', 0) or 0)
+    # Per-head logit temperature (T4.1): learnable per-head sharpness on the
+    # pre-softmax logits, init 1.0 = exact step-0 no-op. See dot_product_attention.
+    self.use_head_logit_temp = bool(getattr(config, 'NetDef_UseHeadLogitTemp', False))
+
+    # TACTICAL CODEBOOK (toolbox T3.3, NetDef UseTacticalCodebook): 256
+    # learnable motif vectors read by one post-trunk cross-attention block
+    # (64x256 linear attention — no new quadratic term). Explicit pattern
+    # LIBRARY instead of patterns smeared through FFN weights: each square
+    # matches its state against the codebook and reads back the matched
+    # motif's contribution. Zero-init out-projection => exact step-0
+    # bit-identity (headtemp/refiner contract class). Runs after the refiner,
+    # before all heads, so every consumer reads the motif-enriched states.
+    # KING-CENTRIC DISTANCE CHANNELS (toolbox T3.2, NetDef UseKingDistChannels):
+    # all current geometry (RPE, rays, vis) is piece-relative; attack
+    # evaluation is KING-relative (zones, ring distance). Per square: one-hot
+    # Chebyshev-distance bucket (0..7) to own king and to enemy king (16
+    # channels), computed in-graph as king-plane @ constant table (ray-
+    # machinery pattern), then a zero-init Linear 16 -> D added to the
+    # post-embedding flow => exact step-0 bit-identity. Known risk (weak
+    # prior): smolgen already carries king context globally.
+    self.use_king_dist = bool(getattr(config, 'NetDef_UseKingDistChannels', False))
+    if self.use_king_dist:
+      from chess_geometry import build_king_distance_onehot_table
+      self.register_buffer('kdist_table', build_king_distance_onehot_table(), persistent=False)
+      self.kdist_proj = nn.Linear(16, self.EMBEDDING_DIM, bias=False)
+      nn.init.zeros_(self.kdist_proj.weight)
+      print(f'[ceres_net] KING-DIST CHANNELS enabled: 2x8 Chebyshev buckets -> zero-init '
+            f'Linear 16->{self.EMBEDDING_DIM} added post-embedding (exact step-0 no-op)')
+
+    # DUAL-PLANE P-PLANE (dual_plane_concept.md, Stage A1 scope; NetDef
+    # UseDualPlane): 32 occupancy-TopK piece tokens, relation-typed P<->P
+    # attention (double-gathered VisibilityChannels E), optional soft-min
+    # quantifier heads over PIECES, one zero-init cross-read of the final
+    # square flow, masked mean+softmin pools -> zero-init injects into the
+    # value1/value2 hidden pre-activation. S-plane untouched; policy
+    # isolation provable. Requires UseVisEdgeBias (E is the relation source).
+    self.use_dual_plane = bool(getattr(config, 'NetDef_UseDualPlane', False))
+    if self.use_dual_plane:
+      from dual_plane import DualPlane
+      # Same source-tensor rationale as the pool asserts (review finding #9):
+      # the P-plane cross-reads plain `flow` and dpva queries pre-vda fS_value.
+      assert int(os.environ.get('CERES_VALUE_DEPTH_ATTENTION', '0') or 0) == 0, \
+          'UseDualPlane is incompatible with vda modes (P-plane reads plain flow/fS_value)'
+      from tactical_adapter import gtab_enabled as _dp_gtab_enabled
+      assert not _dp_gtab_enabled(), \
+          'UseDualPlane is incompatible with GTAB (P-plane would read the non-adapter stream)'
+      _dp_fams = tuple(f for f in VisibilityChannels.FAMILY_ORDER
+                       if f in str(getattr(config, 'NetDef_VisEdgeFamilies', '')))
+      assert _dp_fams, 'UseDualPlane needs VisEdgeFamilies for its relation channels'
+      _dp_rel_C = 4 * len(_dp_fams)
+      # Relation source: reuse the S-plane's vis_edge_E when UseVisEdgeBias is
+      # on; on a BARE chassis (the A1 one-key-delta design: dp1 = nvc +
+      # UseDualPlane) build a private VisibilityChannels and compute E solely
+      # for the P-plane — the S-plane attention stays untouched either way.
+      self.dp_private_vis = not bool(getattr(config, 'NetDef_UseVisEdgeBias', False))
+      if self.dp_private_vis:
+        self.dp_vis_module = VisibilityChannels(families=_dp_fams)
+      _dp_smh = int(getattr(config, 'NetDef_DualPlaneSoftMinHeads', 2) or 0)
+      _dp_dim = int(getattr(config, 'NetDef_DualPlaneDim', 128) or 128)
+      _dp_layers = int(getattr(config, 'NetDef_DualPlaneLayers', 2) or 2)
+      _dp_il = bool(getattr(config, 'NetDef_DualPlaneInterleave', False))
+      self.dual_plane = DualPlane(s_dim=self.EMBEDDING_DIM, rel_channels=_dp_rel_C,
+                                  norm_type=config.NetDef_NormType,
+                                  dp=_dp_dim, heads=max(4, _dp_dim // 32),
+                                  layers=_dp_layers,
+                                  softmin_heads=_dp_smh,
+                                  interleave_cross=_dp_il,
+                                  rel_degrees=bool(getattr(config, 'NetDef_DualPlaneRelDegrees', False)),
+                                  rel_gains=bool(getattr(config, 'NetDef_DualPlaneRelGains', False)))
+      if getattr(config, 'NetDef_DualPlaneRelDegrees', False):
+        print(f'[ceres_net] DUAL-PLANE REL-DEGREES enabled: 2x{_dp_rel_C} degree channels -> '
+              f'zero-init token features (exact step-0 no-op)')
+      if getattr(config, 'NetDef_DualPlaneRelGains', False):
+        print(f'[ceres_net] DUAL-PLANE REL-GAINS enabled: per-block masked-mean -> '
+              f'per-head/channel gains on relation bias ({_dp_rel_C} ch), '
+              f'zero-init (exact step-0 no-op)')
+      # Stage A3 (NetDef DualPlanePolicyDecode): mover-bilinear policy term at
+      # DECODE — logit[m] += q(S-state at to(m))^T p(piece token standing on
+      # from(m)). Piece-selection composed with destination content, exactly
+      # where the bilinear family won before (ray-context). Zero-init q side
+      # => exact step-0 policy no-op; gathers on constant index tables only.
+      self.dp_policy_decode = bool(getattr(config, 'NetDef_DualPlanePolicyDecode', False))
+      if self.dp_policy_decode:
+        from lc0_moves_1858 import FROM_1858, TO_1858
+        _mv = torch.tensor(TO_1858, dtype=torch.long) * 64 + torch.tensor(FROM_1858, dtype=torch.long)
+        self.register_buffer('dp_move_flat', _mv, persistent=False)   # [1858] to*64+from
+        _DP_DQ = 64
+        self.dp_pol_q = nn.Linear(self.EMBEDDING_DIM, _DP_DQ, bias=False)
+        nn.init.zeros_(self.dp_pol_q.weight)
+        self.dp_pol_p = nn.Linear(self.dual_plane.dp, _DP_DQ, bias=False)
+        print(f'[ceres_net] DUAL-PLANE POLICY DECODE enabled: mover-bilinear dq={_DP_DQ}, '
+              f'zero-init q-side (exact step-0 policy no-op)')
+      # ATTACKER×VICTIM decode (catalogue #2, sac-rule-compliant: LEARNED pair
+      # bilinear over piece TOKENS, no hand-coded value diff — sign-free, the
+      # net decides when Qxh7 is brilliant): logit[m] += p_a(mover) · p_b(piece
+      # on to(m)). Non-captures get exactly 0 (empty to-squares are unselected
+      # slots / occ-masked). Zero-init b-side => step-0 policy no-op.
+      self.dp_victim_decode = bool(getattr(config, 'NetDef_DualPlaneVictimDecode', False))
+      # MOVE-EDGE decode (catalogue #3): the move's OWN relation-edge channels
+      # (is this a check-edge? a pinray? vacates an x-ray?) gathered from the
+      # already-computed E tensor straight into the move score. Zero-init.
+      # Works on ANY dp chassis: with UseVisEdgeBias it reads the shared S-plane
+      # E; on a bare chassis it reads the P-plane's PRIVATE E (computed anyway
+      # for the relation biases — the gather is free either way).
+      self.move_edge_decode = bool(getattr(config, 'NetDef_MoveEdgeDecode', False))
+      if self.dp_victim_decode or self.move_edge_decode:
+        assert self.dp_policy_decode, 'victim/edge decode extend DualPlanePolicyDecode'
+        from lc0_moves_1858 import FROM_1858 as _F2, TO_1858 as _T2
+        _mv_ft = torch.tensor(_F2, dtype=torch.long) * 64 + torch.tensor(_T2, dtype=torch.long)
+        self.register_buffer('dp_move_flat_ft', _mv_ft, persistent=False)  # [1858] from*64+to
+      if self.dp_victim_decode:
+        _DPV_DQ = 64
+        self.dpv_a = nn.Linear(self.dual_plane.dp, _DPV_DQ, bias=False)
+        self.dpv_b = nn.Linear(self.dual_plane.dp, _DPV_DQ, bias=False)
+        nn.init.zeros_(self.dpv_b.weight)
+        print('[ceres_net] ATTACKER×VICTIM DECODE enabled: pair-bilinear dq=64, '
+              'zero-init victim-side (exact step-0 no-op)')
+      if self.move_edge_decode:
+        self.dpe_w = nn.Linear(_dp_rel_C, 1, bias=False)
+        nn.init.zeros_(self.dpe_w.weight)
+        print(f'[ceres_net] MOVE-EDGE DECODE enabled: {_dp_rel_C} edge channels -> '
+              'per-move scalar, zero-init (exact step-0 no-op)')
+      # MOVE-DEGREE decode (catalogue idea B): per-move scalar from the
+      # DESTINATION square's per-channel in-degree ("who hits where I land")
+      # plus the FROM square's out-degree ("what I abandon by leaving").
+      # Descriptive facts with LEARNED sign-free weights — sac-compliant: the
+      # sacrificing queen knows h7 is defended and plays it anyway.
+      self.move_degree_decode = bool(getattr(config, 'NetDef_MoveDegreeDecode', False))
+      if self.move_degree_decode:
+        assert self.dp_policy_decode, 'MoveDegreeDecode extends DualPlanePolicyDecode'
+        from lc0_moves_1858 import FROM_1858 as _F3, TO_1858 as _T3
+        self.register_buffer('dp_move_to', torch.tensor(_T3, dtype=torch.long), persistent=False)
+        self.register_buffer('dp_move_from', torch.tensor(_F3, dtype=torch.long), persistent=False)
+        self.dpd_in = nn.Linear(_dp_rel_C, 1, bias=False)
+        self.dpd_out = nn.Linear(_dp_rel_C, 1, bias=False)
+        nn.init.zeros_(self.dpd_in.weight)
+        nn.init.zeros_(self.dpd_out.weight)
+        print(f'[ceres_net] MOVE-DEGREE DECODE enabled: destination in-degree + origin '
+              f'out-degree ({_dp_rel_C} ch each), zero-init (exact step-0 no-op)')
+      self.dp_value_inject = nn.Linear(2 * self.dual_plane.dp, 64 * HEAD_MULT, bias=False)
+      nn.init.zeros_(self.dp_value_inject.weight)
+      if self.value2_loss_weight > 0:
+        self.dp_value2_inject = nn.Linear(2 * self.dual_plane.dp, 64 * HEAD_MULT, bias=False)
+        nn.init.zeros_(self.dp_value2_inject.weight)
+      # PER-PIECE SURVIVAL AUX (training-only; value-grip hypothesis 2026-08-21):
+      # predict each PIECE TOKEN's fate (captured at ply d / survives) against
+      # the square-indexed survival sidecar targets gathered to piece slots.
+      # Gives value-relevant threat state a DIRECT gradient grip on the piece
+      # tokens (the decode lesson: grips work, offers get ignored). Amputated
+      # at export (training-gated stash, placement/survival pattern).
+      self.dp_surv_weight = float(getattr(config, 'NetDef_DualPlaneSurvivalAux', 0.0) or 0.0)
+      if self.dp_surv_weight > 0:
+        _dp_sk = int(getattr(config, 'NetDef_DualPlaneSurvivalK', 4) or 4)
+        self.dp_surv_head = nn.Linear(self.dual_plane.dp, _dp_sk + 2)
+        print(f'[ceres_net] DUAL-PLANE PER-PIECE SURVIVAL AUX enabled: weight {self.dp_surv_weight}, '
+              f'K={_dp_sk} (fate CE on piece tokens vs sidecar targets gathered to slots)')
+      # VALUE-ATTENTION READ (dpva): instead of only the pooled summary, the
+      # value pathway asks the piece plane QUESTIONS — nq content-conditioned
+      # queries (projected from fS_value) attend over the 32 piece tokens
+      # (empty slots masked), and the attended answer enters value1/value2
+      # via zero-init injects. Richer grip than one pooled offer; exact
+      # step-0 no-op; plain matmul/softmax (serving graph, TRT-safe).
+      self.dp_value_attn = int(getattr(config, 'NetDef_DualPlaneValueAttention', 0) or 0)
+      if self.dp_value_attn > 0:
+        _dpva_dk = 64
+        self.dpva_q = nn.Linear(self.VALUE_IN_SIZE, self.dp_value_attn * _dpva_dk, bias=False)
+        self.dpva_k = nn.Linear(self.dual_plane.dp, _dpva_dk, bias=False)
+        self.dpva_v = nn.Linear(self.dual_plane.dp, _dpva_dk, bias=False)
+        self.dpva_out = nn.Linear(self.dp_value_attn * _dpva_dk, 64 * HEAD_MULT, bias=False)
+        nn.init.zeros_(self.dpva_out.weight)
+        if self.value2_loss_weight > 0:
+          self.dpva_out2 = nn.Linear(self.dp_value_attn * _dpva_dk, 64 * HEAD_MULT, bias=False)
+          nn.init.zeros_(self.dpva_out2.weight)
+        print(f'[ceres_net] DUAL-PLANE VALUE-ATTENTION enabled: {self.dp_value_attn} queries x dk={_dpva_dk} '
+              f'over piece tokens -> zero-init value1/value2 injects (exact step-0 no-op)')
+      _n_dp = sum(p.numel() for p in self.dual_plane.parameters())
+      print(f'[ceres_net] DUAL-PLANE enabled: 32 piece tokens, dp={_dp_dim}, {_dp_layers} P-blocks'
+            f'{" (interleaved cross)" if _dp_il else ""} ({_dp_rel_C} relation channels), '
+            f'value injects{" + policy decode" if self.dp_policy_decode else ""} '
+            f'({_n_dp:,} P-plane params, zero-init injects => exact step-0 no-op)')
+
+    # MOVE-GRAPH SPECTRAL PE (toolbox T4.3, NetDef UseSpectralPE): Laplacian
+    # eigenvector coordinates of the four elementary move graphs (N/K/R/B),
+    # OCCUPANCY-GATED — each type's block contributes only on squares hosting
+    # that type (queen gates both R and B blocks). Knight distance is not
+    # Euclidean; these coordinates are native to how pieces actually travel.
+    # Zero-init Linear 32 -> D post-embedding => exact step-0 bit-identity.
+    self.use_spectral_pe = bool(getattr(config, 'NetDef_UseSpectralPE', False))
+    if self.use_spectral_pe:
+      from chess_geometry import build_spectral_pe_table
+      # persistent=True (review finding #2): the table comes from eigh over
+      # DEGENERATE eigenspaces, so the basis/sign is LAPACK-arbitrary — a
+      # rebuild on another platform (WSL train -> Windows export) would pair
+      # trained spe_proj weights with a rotated eigenbasis. Persisting stores
+      # the training-time basis in the checkpoint.
+      self.register_buffer('spe_table', build_spectral_pe_table(8), persistent=True)
+      self.spe_proj = nn.Linear(32, self.EMBEDDING_DIM, bias=False)
+      nn.init.zeros_(self.spe_proj.weight)
+      print(f'[ceres_net] SPECTRAL PE enabled: 4 move-graphs x 8 eigenvectors, occupancy-gated, '
+            f'zero-init Linear 32->{self.EMBEDDING_DIM} post-embedding (exact step-0 no-op)')
+
+    self.use_tactical_codebook = bool(getattr(config, 'NetDef_UseTacticalCodebook', False))
+    if self.use_tactical_codebook:
+      _CBK_N, _CBK_DK = 256, 64
+      self.cbk_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+      self.cbk_q = nn.Linear(self.EMBEDDING_DIM, _CBK_DK, bias=False)
+      self.cbk_keys = nn.Parameter(torch.randn(_CBK_N, _CBK_DK) * 0.02)
+      self.cbk_vals = nn.Parameter(torch.randn(_CBK_N, self.EMBEDDING_DIM) * 0.02)
+      self.cbk_out = nn.Linear(self.EMBEDDING_DIM, self.EMBEDDING_DIM, bias=False)
+      nn.init.zeros_(self.cbk_out.weight)
+      _n_cbk = (self.EMBEDDING_DIM * _CBK_DK + _CBK_N * _CBK_DK
+                + _CBK_N * self.EMBEDDING_DIM + self.EMBEDDING_DIM ** 2)
+      print(f'[ceres_net] TACTICAL CODEBOOK enabled: {_CBK_N} motif vectors, dk={_CBK_DK}, '
+            f'one post-trunk cross-attn block ({_n_cbk:,} params, zero-init out => exact step-0 no-op)')
+
     num_tokens_q = NUM_TOKENS_NET
     num_tokens_kv = NUM_TOKENS_NET
 
@@ -663,6 +931,9 @@ class CeresNet(nn.Module):
                       vis_gate_channels = _vis_gate_channels,
                       vis_gate_mode = self.vis_edge_gate_mode,
                       graph_route_channels = _graph_route_channels,
+                      softmin_heads = self.softmin_heads,
+                      softmax_agg_heads = self.softmax_agg_heads,
+                      use_head_logit_temp = self.use_head_logit_temp,
                       pre_norm = config.NetDef_PreNorm)
         for i in range(self.NUM_DISTINCT_LAYERS)])
 
@@ -835,6 +1106,13 @@ class CeresNet(nn.Module):
     # at training step 0. See tactical_adapter.py for details.
     self.use_gtab = gtab_enabled()
     assert self.value_head_channels == 0 or (self.vda_mode == 0 and not self.use_gtab),       'ValueHeadChannels (private value front-end) is incompatible with vda/gtab modes'
+    # Same source-tensor rationale: the pool reads plain `flow`; under gtab
+    # value-only the value family reads flow_value instead and the pool would
+    # silently summarize the wrong stream.
+    assert not self.value_minmax_pool or (self.vda_mode == 0 and not self.use_gtab), \
+      'ValueHeadMinMaxPool is incompatible with vda/gtab modes (pool reads plain flow)'
+    assert not self.value_pool_channels or (self.vda_mode == 0 and not self.use_gtab), \
+      'ValueHeadPoolChannels is incompatible with vda/gtab modes (pool reads plain flow)'
     self.gtab_value_only = self.use_gtab and (int(os.environ.get('CERES_GTAB_VALUE_ONLY', '0') or 0) > 0)
     if self.use_gtab:
       self.tactical_adapter = TacticalAdapter(in_dim=self.EMBEDDING_DIM)
@@ -982,6 +1260,30 @@ class CeresNet(nn.Module):
     flow = self.embedding_layer(flow_squares)
     flow = self.embedding_norm(flow)
 
+    # King-centric distance channels (see __init__): king one-hot planes
+    # (6 = STM king, 12 = opponent king, STM-relative encoding) against the
+    # constant bucket table; zero-init projection added post-embedding.
+    if self.use_king_dist:
+      _kt = self.kdist_table.to(flow.dtype)
+      _kd_own = torch.matmul(squares[:, :, 6].to(flow.dtype), _kt).reshape(-1, 64, 8)
+      _kd_opp = torch.matmul(squares[:, :, 12].to(flow.dtype), _kt).reshape(-1, 64, 8)
+      flow = flow + self.kdist_proj(torch.cat([_kd_own, _kd_opp], dim=-1))
+
+    # Spectral PE (see __init__). Type-presence gates from the one-hot planes
+    # (1..6 = P,N,B,R,Q,K white; 7..12 mirror): N block gated by knights,
+    # K by kings, R by rooks+queens, B by bishops+queens.
+    if self.use_spectral_pe:
+      _sq = squares.to(flow.dtype)
+      _g = torch.stack([
+        _sq[:, :, 2] + _sq[:, :, 8],                       # knights
+        _sq[:, :, 6] + _sq[:, :, 12],                      # kings
+        _sq[:, :, 4] + _sq[:, :, 10] + _sq[:, :, 5] + _sq[:, :, 11],  # rooks + queens
+        _sq[:, :, 3] + _sq[:, :, 9] + _sq[:, :, 5] + _sq[:, :, 11],   # bishops + queens
+      ], dim=-1)                                            # [B, 64, 4]
+      _pe = self.spe_table.to(flow.dtype).reshape(64, 4, 8)  # [64, 4, 8]
+      _gated = (_g.unsqueeze(-1) * _pe.unsqueeze(0)).reshape(-1, 64, 32)
+      flow = flow + self.spe_proj(_gated)
+
     # GTAB reads the post-embedding flow (independent of body) so the adapter
     # branch is structurally separate from any body distortion.
     flow_post_embed = flow if self.use_gtab else None
@@ -1049,6 +1351,15 @@ class CeresNet(nn.Module):
         self._last_refiner_policy = torch.stack(_rf_aux, dim=1)   # [B, T-1, 1858]
       flow = flow + _rf_final
 
+    # Tactical codebook (see __init__): one cross-attn read of the motif
+    # library, residual-added so every head sees the enriched states.
+    # Plain matmul+softmax — TRT-safe, fp32 for the small attention math.
+    if self.use_tactical_codebook:
+      _cx = self.cbk_norm(flow).float()
+      _cs = torch.matmul(self.cbk_q(_cx), self.cbk_keys.t()) * (self.cbk_keys.shape[1] ** -0.5)
+      _ca = torch.softmax(_cs, dim=-1)                       # [B, 64, 256]
+      flow = flow + self.cbk_out(torch.matmul(_ca, self.cbk_vals)).to(flow.dtype)
+
     # TSB: collect per-block gate values across all layers for the gate-sparsity
     # regularizer in train.py. Each layer caches its last gate in _last_tsb_gate.
     if self.use_tsb:
@@ -1104,6 +1415,60 @@ class CeresNet(nn.Module):
         _v_inject = self.value_priv_inject(_priv_value)
         if self.value2_loss_weight > 0:
           _v2_inject = self.value2_priv_inject(_priv_value)
+
+    # DUAL-PLANE (see __init__): piece-plane summary into the value family's
+    # hidden pre-activation. Reads the ONE-HOT slice of squares, the shared
+    # vis_edge_E relation tensor (computed once per forward above) and the
+    # FINAL square flow. Composes additively with the other injects.
+    _dp_tokens = None
+    _dp_E_dec = None
+    if self.use_dual_plane:
+      _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
+      _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
+      _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
+      _dpv = self.dp_value_inject(_dp_pool)
+      _v_inject = _dpv if _v_inject is None else _v_inject + _dpv
+      if self.value2_loss_weight > 0:
+        _dpv2 = self.dp_value2_inject(_dp_pool)
+        _v2_inject = _dpv2 if _v2_inject is None else _v2_inject + _dpv2
+      # Per-piece survival aux stash (training-only; consumed in compute_loss).
+      if self.training and getattr(self, 'dp_surv_weight', 0) > 0:
+        self._last_dp_surv = (self.dp_surv_head(_dp_tokens), _dp_sel, _dp_occ)
+      # Value-attention read (see __init__): fS_value-conditioned queries over
+      # the piece tokens; empty slots masked as keys.
+      if getattr(self, 'dp_value_attn', 0) > 0:
+        _vq = self.dpva_q(fS_value).reshape(-1, self.dp_value_attn, 64)
+        _vk = self.dpva_k(_dp_tokens)
+        _vv = self.dpva_v(_dp_tokens)
+        _vsc = torch.matmul(_vq, _vk.transpose(1, 2)) * (64 ** -0.5)
+        _vsc = _vsc + ((_dp_occ.to(_vsc.dtype) - 1.0) * 1e4).unsqueeze(1)
+        _vat = torch.matmul(torch.softmax(_vsc, dim=-1), _vv).reshape(-1, self.dp_value_attn * 64)
+        _vai = self.dpva_out(_vat)
+        _v_inject = _vai if _v_inject is None else _v_inject + _vai
+        if self.value2_loss_weight > 0:
+          _vai2 = self.dpva_out2(_vat)
+          _v2_inject = _vai2 if _v2_inject is None else _v2_inject + _vai2
+
+    # VALUE MIN/MAX POOL (see __init__): extreme-square summaries into the
+    # value family's hidden pre-activation. Composes additively with the
+    # private-front-end inject above; amin/amax export as ReduceMin/ReduceMax.
+    if self.value_minmax_pool:
+      # min/max(dim).values instead of amin/amax: the amin+amax+cat pattern
+      # produced a pathological inductor kernel on CUDA (host-side TDR resets /
+      # in-WSL infinite spin, 2026-08-19 — three vmp launches: two
+      # cudaErrorUnknown crashes at step ~1, one 100%-CPU soft hang in
+      # compile). torch.aminmax was tried first but has no autograd derivative
+      # (torch 2.7). min/max lower to a different (values+indices) codegen
+      # path; forward math is identical, backward routes grad to the arg
+      # element instead of splitting among ties — fine for this purpose.
+      _mn = flow.min(dim=1).values
+      _mx = flow.max(dim=1).values
+      _pool = torch.cat([_mn, _mx], dim=-1)
+      _vp = self.value_pool_inject(_pool)
+      _v_inject = _vp if _v_inject is None else _v_inject + _vp
+      if self.value2_loss_weight > 0:
+        _v2p = self.value2_pool_inject(_pool)
+        _v2_inject = _v2p if _v2_inject is None else _v2_inject + _v2p
 
     # Depth-attending value context (see __init__). Non-in-place adds create NEW
     # tensors, so fS_others (often the same object as fS_value) is untouched —
@@ -1240,6 +1605,50 @@ class CeresNet(nn.Module):
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
 
+    # Dual-plane mover-bilinear decode (Stage A3, see __init__): pair scores
+    # destination-square x piece-slot, mapped to from-squares via the slot
+    # one-hot, then flat-gathered per move on the constant to*64+from table.
+    if self.use_dual_plane and self.dp_policy_decode and _dp_tokens is not None:
+      _q = self.dp_pol_q(flow)                                   # [B, 64, dq] (zero-init => 0)
+      _p = self.dp_pol_p(_dp_tokens) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
+      _pair = torch.matmul(_q, _p.transpose(1, 2))               # [B, 64to, 32slot]
+      _sl1h = torch.nn.functional.one_hot(_dp_sel, 64).to(_pair.dtype)  # [B, 32, 64from]
+      _tofrom = torch.matmul(_pair, _sl1h)                       # [B, 64to, 64from]
+      _corr = _tofrom.reshape(-1, 4096).index_select(1, self.dp_move_flat)  # [B, 1858]
+      policy_out = policy_out + _corr.to(policy_out.dtype)
+
+      # Attacker×victim decode (see __init__): mover-token × to-square-token
+      # bilinear, mapped slots -> (from, to) squares via the slot one-hot.
+      # Empty to-squares contribute exactly 0 (unselected/occ-masked slots).
+      if getattr(self, 'dp_victim_decode', False):
+        _occm = _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)
+        _pa = self.dpv_a(_dp_tokens) * _occm                     # [B, 32, dq]
+        _pb = self.dpv_b(_dp_tokens) * _occm
+        _pp = torch.matmul(_pa, _pb.transpose(1, 2))             # [B, 32m, 32v]
+        _ftsq = torch.matmul(_sl1h.transpose(1, 2),
+                             torch.matmul(_pp.to(_sl1h.dtype), _sl1h))  # [B, 64from, 64to]
+        _corr2 = _ftsq.reshape(-1, 4096).index_select(1, self.dp_move_flat_ft)
+        policy_out = policy_out + _corr2.to(policy_out.dtype)
+
+      # Move-edge decode (see __init__): gather the move's own (from, to)
+      # relation-edge channels from the shared E tensor into the move score.
+      if getattr(self, 'move_edge_decode', False) and _dp_E_dec is not None:
+        _C_e = _dp_E_dec.shape[-1]
+        _em = _dp_E_dec.reshape(-1, 4096, _C_e).index_select(1, self.dp_move_flat_ft)
+        _corr3 = self.dpe_w(_em.float()).squeeze(-1)             # [B, 1858]
+        policy_out = policy_out + _corr3.to(policy_out.dtype)
+
+      # Move-degree decode (see __init__): square-level degree scores gathered
+      # per move at the destination (in-degree) and origin (out-degree).
+      if getattr(self, 'move_degree_decode', False) and _dp_E_dec is not None:
+        _indeg = _dp_E_dec.float().sum(dim=1)                    # [B, 64, C]  edges INTO j
+        _outdeg = _dp_E_dec.float().sum(dim=2)                   # [B, 64, C]  edges FROM i
+        _s_in = self.dpd_in(_indeg).squeeze(-1)                  # [B, 64]
+        _s_out = self.dpd_out(_outdeg).squeeze(-1)               # [B, 64]
+        _corr4 = (_s_in.index_select(1, self.dp_move_to)
+                  + _s_out.index_select(1, self.dp_move_from))   # [B, 1858]
+        policy_out = policy_out + _corr4.to(policy_out.dtype)
+
     # Policy SERVE blend (see __init__): eval/export mode only — three-way
     # logit-space mix of vanilla / optimistic / soft heads, applied BEFORE the
     # ray-context add so rc stays unscaled at any lambda. Training untouched.
@@ -1297,8 +1706,19 @@ class CeresNet(nn.Module):
                             + (_Tm * _r * self.rc_v).sum(-1) \
                             + (_Fm * _d * self.rc_w).sum(-1)
       policy_out = policy_out + _rc_add
-    value_out = self.value_head(fS_value, _v_inject)
-    value2_out = self.value2_head(torch.cat((fS_value, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
+    # VALUE POOL CHANNELS (see __init__): concat the extreme-square summaries
+    # onto the value family's head input. Separate variable — fS_value itself
+    # is shared with unc/other heads and must keep its width. Same
+    # min/max(dim).values formulation as the vmp block (aminmax has no
+    # autograd derivative in torch 2.7; amin/amax+cat hit a pathological
+    # inductor kernel, 2026-08-19).
+    if self.value_pool_channels:
+      _poolc = torch.cat([flow.min(dim=1).values, flow.max(dim=1).values], dim=-1)
+      fS_value_v = torch.cat([fS_value, _poolc], dim=-1)
+    else:
+      fS_value_v = fS_value
+    value_out = self.value_head(fS_value_v, _v_inject)
+    value2_out = self.value2_head(torch.cat((fS_value_v, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
@@ -1632,6 +2052,34 @@ class CeresNet(nn.Module):
         survival_loss = 0.0 * _sv_out.float().sum()
         _survival_participation_only = True
 
+    # Per-piece survival aux (dual-plane): fate CE on piece tokens, targets =
+    # square survival sidecar gathered to the piece slots. Empty slots and
+    # class-0 squares masked. Same consume-and-clear + sidecar-less-batch
+    # zero-read pattern as the square survival head above.
+    dp_surv_loss = 0
+    _dps = getattr(self, '_last_dp_surv', None)
+    if getattr(self, 'dp_surv_weight', 0) > 0 and _dps is not None and value_out is not None:
+      if not gradient_norm_logging_mode:
+        self._last_dp_surv = None
+      _dps_out, _dps_sel, _dps_occ = _dps
+      _dps_tgt_sq = batch.get('survival', None)
+      if _dps_tgt_sq is not None:
+        _tgt_p = torch.gather(_dps_tgt_sq.to(_dps_sel.device).long(), 1, _dps_sel)   # [B, 32]
+        # Sidecar horizon K_gen may exceed the head's DualPlaneSurvivalK (review
+        # finding 2026-08-20 #1: raw class K_gen+1 overflows a K+2-logit CE ->
+        # device assert). Clamp maps "captured at ply > K" and "survives" both
+        # onto the head's own survives-beyond-K class — semantically exact for
+        # fate-within-K classification.
+        _tgt_p = _tgt_p.clamp(max=self.dp_surv_head.out_features - 1)
+        _m = (_tgt_p > 0) & (_dps_occ > 0)
+        if _m.any():
+          dp_surv_loss = torch.nn.functional.cross_entropy(
+              _dps_out[_m].float(), _tgt_p[_m])
+        else:
+          dp_surv_loss = 0.0 * _dps_out.float().sum()
+      else:
+        dp_surv_loss = 0.0 * _dps_out.float().sum()
+
     # Short-term value aux head: CE against the WDL built from censored q_st/d_st
     # (V7-extras sidecar; STM-relative, matching TPG conventions), optionally weighted
     # per record by z-provenance. Missing keys = batch from a v7x-less shard
@@ -1666,6 +2114,7 @@ class CeresNet(nn.Module):
         + self.uncertainty_policy_weight * uncertainty_policy_loss
         + self.placement_value_weight * placement_loss
         + self.survival_target_weight * survival_loss
+        + (self.dp_surv_weight * dp_surv_loss if not isinstance(dp_surv_loss, int) else 0)
         + self.stvalue_weight * stvalue_loss
         + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0)
         + ((self.depth_probe_policy_weight * depth_probe_ploss
@@ -1799,6 +2248,8 @@ class CeresNet(nn.Module):
         self._log("placement_value_loss" + stat_suffix, placement_loss, step=num_pos)
       if self.survival_target_weight > 0 and not isinstance(survival_loss, int)           and not _survival_participation_only:
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
+      if getattr(self, 'dp_surv_weight', 0) > 0 and not isinstance(dp_surv_loss, int):
+        self._log("dp_survival_loss" + stat_suffix, dp_surv_loss, step=num_pos)
       if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int)           and not _stvalue_participation_only:
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
       if self.vda_mode == 4 and not isinstance(vda_aux_loss, int):

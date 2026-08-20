@@ -82,6 +82,35 @@ if VALUE_FOCAL_GAMMA > 0:
     'CERES_VALUE_FOCAL_GAMMA and value1-scope provenance weighting are mutually exclusive'
   print(f'[losses] value1 FOCAL hardness weighting enabled: gamma={VALUE_FOCAL_GAMMA}')
 
+# CERES_POLICY_ONLYMOVE_LAMBDA: only-move criticality weighting of the policy
+# CE (tactics toolbox T1.3, default 0 = off). Tactics are only-move chains,
+# but plain mean CE prices a forced mate-in-3 exactly like a quiet
+# 12-candidate position. Weight each sample by the sharpness of its own
+# POLICY TARGET: w_i = 1 + lambda * gap_i, gap_i = top1 - top2 of the target
+# distribution (in [0,1], detached — it is pure label data). Batch-normalized
+# (sum w*ce / sum w) so the loss SCALE — and thus the effective policy LR —
+# is unchanged: the mechanism only REDISTRIBUTES gradient toward forced
+# positions. Pure loss-side: no params, serving graph untouched.
+POLICY_ONLYMOVE_LAMBDA = float(os.environ.get('CERES_POLICY_ONLYMOVE_LAMBDA', '0') or 0)
+if POLICY_ONLYMOVE_LAMBDA > 0:
+  print(f'[losses] policy ONLY-MOVE sharpness weighting enabled: lambda={POLICY_ONLYMOVE_LAMBDA}')
+
+# CERES_POLICY_SIBLING_MARGIN_WEIGHT (+ CERES_POLICY_SIBLING_MARGIN, nats):
+# sibling-margin policy term (tactics toolbox T1.4, default 0 = off). CE only
+# asks for probability mass on the target; tactics additionally require the
+# forced move to DOMINATE its best-scoring WRONG sibling. Adds a hinge in
+# log-prob space (scale-free): relu(margin + logp_bestwrong - logp_target),
+# weighted per-sample by the target's own sharpness gap (top1-top2, detached)
+# so ambiguous multi-candidate labels contribute ~nothing — the term reprices
+# only genuinely forced positions. Added to the RETURNED loss only; the
+# logged/TRAIN policy loss stays pure CE for cross-run comparability. Watch
+# gate KLD for over-sharpening (pre-registered risk).
+POLICY_SIBLING_MARGIN_WEIGHT = float(os.environ.get('CERES_POLICY_SIBLING_MARGIN_WEIGHT', '0') or 0)
+POLICY_SIBLING_MARGIN = float(os.environ.get('CERES_POLICY_SIBLING_MARGIN', '1.0') or 1.0)
+if POLICY_SIBLING_MARGIN_WEIGHT > 0:
+  print(f'[losses] policy SIBLING-MARGIN enabled: weight={POLICY_SIBLING_MARGIN_WEIGHT}, '
+        f'margin={POLICY_SIBLING_MARGIN} nats, gap-weighted')
+
 
 
 class LossCalculator():
@@ -233,9 +262,36 @@ class LossCalculator():
     output = torch.where(legalMoves, output, illegalMaskValue)
 
     entropy = self.entropy(target) if subtract_entropy else 0.0
-    loss = self.ce_loss.forward(output, target) - entropy
-       
-    self.PENDING_POLICY_LOSS += loss.item() if not calc_grad_norm_mode else 0
+    if POLICY_ONLYMOVE_LAMBDA > 0:
+      # Only-move weighting (see module header). fp32 CE mirrors the value
+      # path; entropy subtraction stays unweighted (informational only — the
+      # target entropy carries no gradient wrt the output).
+      _ce_i = F.cross_entropy(output.float(), target.float(), reduction='none')
+      _t2 = target.float().topk(2, dim=1).values
+      _w_i = 1.0 + POLICY_ONLYMOVE_LAMBDA * (_t2[:, 0] - _t2[:, 1]).detach()
+      loss = (_w_i * _ce_i).sum() / _w_i.sum().clamp_min(1e-6) - entropy
+      # Pure-CE logging invariant (review finding #10, mirroring the
+      # sibling-margin block): the LOGGED number stays the unweighted mean CE
+      # for cross-run comparability; only the RETURNED loss is reweighted.
+      _log_loss = _ce_i.mean() - entropy
+    else:
+      loss = self.ce_loss.forward(output, target) - entropy
+      _log_loss = loss
+
+    self.PENDING_POLICY_LOSS += _log_loss.item() if not calc_grad_norm_mode else 0
+    if POLICY_SIBLING_MARGIN_WEIGHT > 0:
+      # Sibling-margin hinge (see module header). Computed on the MASKED
+      # logits, so illegal moves (at MASK_POLICY_VALUE) can never be the
+      # best-wrong sibling. Added after the PENDING update: logged policy
+      # loss stays pure CE.
+      _logp = F.log_softmax(output.float(), dim=1)
+      _tgt_idx = target.argmax(dim=1, keepdim=True)
+      _lp_t = _logp.gather(1, _tgt_idx).squeeze(1)
+      _lp_w = _logp.scatter(1, _tgt_idx, float('-inf')).max(dim=1).values
+      _t2 = target.float().topk(2, dim=1).values
+      _gap = (_t2[:, 0] - _t2[:, 1]).detach()
+      _hinge = F.relu(POLICY_SIBLING_MARGIN + _lp_w - _lp_t)
+      loss = loss + POLICY_SIBLING_MARGIN_WEIGHT * (_gap * _hinge).mean()
     self.PENDING_POLICY_ACC += self.calc_accuracy(target, output, True) if not calc_grad_norm_mode else 0
     self.PENDING_COUNT += 1 if not calc_grad_norm_mode else 0 # increment only for policy, not other losses
 

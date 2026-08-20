@@ -427,7 +427,18 @@ def Train():
                         or "vis_edge_proj" in name or "attack_gate_" in name
                         # Graph-route heads + tactic refiner (2026-08 tactical
                         # program): same NEW-zero-init-module rationale.
-                        or "graph_route" in name or "tactical_refiner" in name)
+                        or "graph_route" in name or "tactical_refiner" in name
+                        # Value min/max pool injectors (NetDef ValueHeadMinMaxPool):
+                        # same NEW-zero-init-module rationale.
+                        or "_pool_inject" in name
+                        # Dual-plane P-plane + decode/aux/attention couplings and
+                        # the 2026-08-20/21 input/pattern modules (kdist/spectral
+                        # PE/codebook): same NEW-module rationale — review finding
+                        # 2026-08-20 #5 (they froze at zero under LoRA/GTAB/TSB).
+                        or "dual_plane" in name or "dp_value" in name
+                        or "dp_pol_" in name or "dpva_" in name or "dp_surv" in name
+                        or "dpv_" in name or "dpe_w" in name or "dpd_" in name
+                        or "kdist_proj" in name or "spe_proj" in name or "cbk_" in name)
       if not keep_trainable:
         param.requires_grad = False
    
@@ -518,6 +529,23 @@ def Train():
               no_decay.add(fpn)
           elif "rc_W" in fpn: # ray-context projections (plain Linear weights)
               decay.add(fpn)
+          elif fpn.endswith('softmin_log_tau') or fpn.endswith('softmax_log_tau') \
+                or fpn.endswith('head_logit_temp'):
+              # Log-scale mechanism params (trunk soft-agg taus, per-head logit
+              # temps, P-plane taus): bias-like 1-D log params. MUST precede the
+              # 'transformer_layer' catch-all — review finding 2026-08-20 #6:
+              # weight decay was pulling these toward their 1.0 no-op inits,
+              # regularizing away the very mechanisms under test.
+              no_decay.add(fpn)
+          elif "dual_plane" in fpn and "log_tau" in fpn:
+              # P-plane soft-min temperatures: bias-like 1-D log params.
+              no_decay.add(fpn)
+          elif "cbk_keys" in fpn or "cbk_vals" in fpn:
+              # Tactical-codebook motif tables: embedding-like raw matrices
+              # (row = motif), not projection weights — follow the embedding
+              # convention (no decay; also keeps them out of Muon's
+              # orthogonalization, which targets true weight matrices).
+              no_decay.add(fpn)
           elif ".mem_" in fpn:
               decay.add(fpn)
           elif "mlp.linear" in fpn:
@@ -580,8 +608,9 @@ def Train():
       def _use_muon(n, p):
         if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
         if 'embedding' in n: return False         # lookup-table-like: AdamW
+        if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
         if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
-        if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n: return False  # single-Linear aux heads ARE final layers
+        if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
         if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
         return True
     elif _muon_scope == 'all-non-trunk':
@@ -591,8 +620,18 @@ def Train():
       # to the internal AdamW group — same rule the 'final-only' scope applies.
       def _use_muon(n, p):
         return p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
+    elif _muon_scope == 'ffn-only':
+      # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
+      # AdamW substituted for NAdam by design — the load-bearing choice is
+      # taking ATTENTION matrices out of Muon's orthogonalization, which
+      # suits square FFN GEMMs but may fight the spectral sensitivity of
+      # QK^T products): Muon = 2-D FFN linears only; attention qkv/proj and
+      # smolgen go to the internal AdamW group at base lr.
+      def _use_muon(n, p):
+        return (p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
+                and ('mlp.linear' in n or 'tactical_ffn' in n))
     else:
-      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk' or 'final-only')")
+      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only' or 'ffn-only')")
     muon_params  = [p for n, p in model.named_parameters() if p.requires_grad and _use_muon(n, p)]
     adamw_params = [p for n, p in model.named_parameters() if p.requires_grad and not _use_muon(n, p)]
     print(f"[train] Muon partition scope={_muon_scope}: {len(muon_params)} muon / {len(adamw_params)} adamw params", flush=True)
@@ -653,11 +692,43 @@ def Train():
         raise ValueError('MuonPerHeadAttention=true but no eligible attention matrices found '
                          '(LoRA-wrapped model, or attention params not under Muon scope?)')
       print(f'[train] Muon PER-HEAD attention: {len(_phm_specs)} attention matrices head-split', flush=True)
+    # FAMILY LR RATIOS (split-LR program 2026-08-20, Kovax-style): per-param
+    # multiplicative ratios applied on top of the group lr in BOTH Muon and
+    # AdamW branches. Unlike LearningRateBaseHeads (whole-internal-AdamW-group
+    # knob, also hits embeddings/norms/taus), these target NAME FAMILIES
+    # regardless of partition membership:
+    #   LearningRateHeadsRatio     — output-head family (Kovax runs 1/3)
+    #   LearningRateCouplingsRatio — dual-plane zero-init couplings (plan H2)
+    _HEAD_FAMILY = ('policy_head.', 'value_head.', 'value2_head.', 'unc_head.',
+                    'mlh_head.', 'qdev_upper.', 'qdev_lower.', 'headPremap.',
+                    'headSharedLinear.', 'unc_policy.')
+    _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
+                        'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dp_surv_head.')
+    _heads_ratio = getattr(config, 'Opt_LearningRateHeadsRatio', None)
+    _coup_ratio = getattr(config, 'Opt_LearningRateCouplingsRatio', None)
+    assert not (_heads_ratio is not None and _heads_lr is not None), \
+        'LearningRateHeadsRatio and LearningRateBaseHeads are mutually exclusive (different group semantics)'
+    _lr_ratios = {}
+    if _heads_ratio is not None or _coup_ratio is not None:
+      _n_h = _n_c = 0
+      for _pn, _pp in model.named_parameters():
+        if _heads_ratio is not None and any(f in _pn for f in _HEAD_FAMILY):
+          _lr_ratios[_pp] = float(_heads_ratio); _n_h += 1
+        elif _coup_ratio is not None and any(f in _pn for f in _COUPLING_FAMILY):
+          _lr_ratios[_pp] = float(_coup_ratio); _n_c += 1
+      # Membership dump (phase-0 smoke contract): grep-able, one line per family.
+      print(f'[train] FAMILY-LR: heads ratio={_heads_ratio} ({_n_h} params), '
+            f'couplings ratio={_coup_ratio} ({_n_c} params); '
+            f'ratios ride the schedule multiplicatively', flush=True)
+      if _heads_ratio is not None and _n_h == 0:
+        raise ValueError('LearningRateHeadsRatio set but no head-family params matched')
+      if _coup_ratio is not None and _n_c == 0:
+        raise ValueError('LearningRateCouplingsRatio set but no coupling-family params matched (UseDualPlane off?)')
     # MuonMomentum decouples the Muon SGD-momentum from the internal-AdamW
     # beta1 (see config.py) — reference combo is momentum 0.95 / adam beta1 0.9.
     _muon_mom = config.Opt_MuonMomentum if getattr(config, 'Opt_MuonMomentum', None) is not None else config.Opt_Beta1
     _muon_aeps = config.Opt_MuonAdamWEps if getattr(config, 'Opt_MuonAdamWEps', None) is not None else 1e-8
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None)
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None)
     if getattr(config, 'Opt_MuonMomentum', None) is not None or getattr(config, 'Opt_MuonAdamWEps', None) is not None:
       print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':
@@ -1193,7 +1264,8 @@ def Train():
   # alongside a survival-labelled primary). Without those terms the set would
   # shrink on target-less batches and static_graph would fire
   # "Your training graph has changed in this iteration".
-  if (getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
+  if (getattr(core, 'dp_surv_weight', 0) > 0
+      or getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
       or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)) and WORLD_SIZE > 1:
     if not _static_graph:
       raise NotImplementedError(
@@ -1388,12 +1460,22 @@ def Train():
       # so fresh-initializing on resume reproduces the base net exactly (same
       # rationale as the 'inject' private-value front-end above).
       _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('vis_edge_proj.',)
+      # Dual-plane family + 2026-08-20/21 modules (review finding #5): all are
+      # exact step-0 no-ops (zero-init couplings), so fresh-init on warm start
+      # reproduces the base net — same contract as the inject front-end.
+      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + (
+          'dual_plane.', 'dp_value_inject.', 'dp_value2_inject.', 'dp_pol_q.',
+          'dp_pol_p.', 'dpva_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
+          'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_')
       # Graph-route heads + tactic refiner (2026-08 tactical program): the
       # refiner is top-level ('tactical_refiner.'), the route params live
       # nested per attention layer (transformer_layer.N.attention.graph_route_*).
       # Both are exact step-0 no-ops (zero-init proj_out / tanh-zero gate), so
       # fresh-initializing on warm-start reproduces the base net exactly.
       _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('tactical_refiner.',)
+      # Value min/max pool injectors (NetDef ValueHeadMinMaxPool): top-level,
+      # zero-init — fresh-initializing on warm start reproduces the base net.
+      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_pool_inject.', 'value2_pool_inject.')
       def _is_aux_key(k):
         return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k
       _ckpt_model_sd = loaded["model"]
@@ -1450,6 +1532,10 @@ def Train():
                # are new — not in orig ckpt; exact step-0 no-ops (zero-init
                # proj_out / tanh-zero gate), so keeping init values reproduces
                # the base net at step 0.
+        elif "_pool_inject" in name:
+          pass # value min/max pool injectors (NetDef ValueHeadMinMaxPool) are
+               # new — not in orig ckpt; zero-init, so keeping init values
+               # reproduces the base net at step 0.
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name

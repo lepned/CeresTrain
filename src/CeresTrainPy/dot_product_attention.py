@@ -168,7 +168,10 @@ class DotProductAttention(torch.nn.Module):
                use_diff_attention : bool = False,
                vis_gate_channels : int = 0,
                vis_gate_mode : str = 'qk',
-               graph_route_channels : int = 0) -> None:
+               graph_route_channels : int = 0,
+               softmin_heads : int = 0,
+               softmax_agg_heads : int = 0,
+               use_head_logit_temp : bool = False) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -337,6 +340,73 @@ class DotProductAttention(torch.nn.Module):
       if not self.layer_num:
         print(f'[dot_product_attention] GRAPH-ROUTE HEADS enabled: {self.num_heads} gated '
               f'heads/layer over {graph_route_channels} edge channels, tanh gate zero-init (exact step-0 no-op)')
+
+    # Soft-min ("AND-logic") value aggregation (2026-08 tactical program).
+    # Coverage/safety facts are universally quantified — "no defender reaches
+    # h7", "every flight square is covered" — and the softmax aggregation
+    # H = A @ V can only express weighted ORs (means) over the attended set.
+    # The measured check/flight value gain was exactly a HAND-CODED such AND
+    # (flight = coverage closure of the enemy king's neighborhood); soft-min
+    # heads make the AND learnable and motif-general instead. The FIRST
+    # `softmin_heads` heads aggregate V with an attention-weighted soft
+    # minimum in place of the weighted mean:
+    #   H[i,c] = -(1/tau) * log( sum_j A[i,j] * exp(-tau * V[j,c]) )
+    # Same A @ V' matmul as standard aggregation with exp before / log after,
+    # so serving cost is ~0 (unlike the vis qk gates' E contraction). tau is
+    # per-head learnable (log-parameterized, init tau=1): tau->0 recovers the
+    # weighted mean exactly, tau->inf approaches the hard min over the
+    # attention support, so each head interpolates mean<->min as training
+    # asks. LSE max-shift for stability; computed in fp32 (tiny: k x 64 x d_k).
+    # NOT a zero-init no-op: aggregation differs from step 0, so this is an
+    # ARCH key (like NormType) — no resume fresh-init path, and strict load
+    # correctly refuses warm starts across a SoftMinHeads config change.
+    # Signed-tau generalization (T1.1): soft-min detects universally
+    # quantified failures; the dual soft-MAX detects existential threats
+    # ("SOME piece attacks h7" — one attacker suffices, the mean dilutes it).
+    # Identical formula with tau < 0: heads [softmin_heads,
+    # softmin_heads+softmax_agg_heads) use tau = -exp(log_tau), init -1.
+    # Same ARCH-key semantics as SoftMinHeads (not a zero-init no-op).
+    self.softmin_heads = softmin_heads
+    self.softmax_agg_heads = softmax_agg_heads
+    if softmin_heads > 0 or softmax_agg_heads > 0:
+      assert not use_diff_attention, \
+          'soft-agg heads unsupported with DiffAttention (differential A can be negative — log undefined)'
+      assert graph_route_channels == 0, \
+          ('soft-agg heads unsupported with graph-route heads: the route blend '
+           'A + tanh(g)*(A_hard - A) can produce NEGATIVE attention entries for '
+           'tanh(g) < 0, and the soft-agg log of an A-weighted sum silently NaNs on them')
+      assert softmin_heads >= 0 and softmax_agg_heads >= 0 and \
+          0 < softmin_heads + softmax_agg_heads <= self.num_heads, \
+          (f'SoftMinHeads+SoftMaxAggHeads must total 1..{self.num_heads}, '
+           f'got {softmin_heads}+{softmax_agg_heads}')
+      if softmin_heads > 0:
+        self.softmin_log_tau = torch.nn.Parameter(torch.zeros(softmin_heads))
+      if softmax_agg_heads > 0:
+        self.softmax_log_tau = torch.nn.Parameter(torch.zeros(softmax_agg_heads))
+      if not self.layer_num:
+        print(f'[dot_product_attention] SOFT-AGG HEADS enabled: {softmin_heads} soft-min '
+              f'+ {softmax_agg_heads} soft-max of {self.num_heads} heads '
+              f'(learnable per-head tau, init +1.0 / -1.0)')
+
+    # Per-head logit temperature (2026-08 tactics toolbox T4.1): learnable
+    # multiplicative sharpness on the fully-assembled pre-softmax logits.
+    # Tactical attention must COMMIT (near-argmax routing); general attention
+    # must blend — one global 1/sqrt(d_k) cannot serve both. temp =
+    # exp(log_temp), init log 0 => temp 1 => EXACT step-0 bit-identity with
+    # the baseline (unlike the soft-agg heads this IS a zero-effect init).
+    # Applied BEFORE the QK-clip monitor stash, so QKClipTau sees the true
+    # effective logits. ⚠ CAVEAT (review 2026-08-20 #8): the clip answers by
+    # shrinking W_q/W_k only, while temp also scales the ADDITIVE bias terms
+    # (smolgen/RPE/vis) the clip cannot touch — a persistently hot temp can
+    # squeeze content attention toward the bias-only solution while the clip
+    # counter looks healthy. Mechanism is parked (pht verdict); if revived,
+    # consider clipping on the pre-temp content term instead.
+    self.use_head_logit_temp = use_head_logit_temp
+    if use_head_logit_temp:
+      self.head_logit_temp = torch.nn.Parameter(torch.zeros(self.num_heads))
+      if not self.layer_num:
+        print(f'[dot_product_attention] PER-HEAD LOGIT TEMP enabled: {self.num_heads} heads/layer, '
+              f'temp=exp(log_temp) init 1.0 (exact step-0 no-op), clamp exp(±2)')
 
     if self.use_nonlinear_attention:
       self.qkvLN = make_norm(norm_type, self.d_model * self.attention_multiplier)
@@ -565,6 +635,12 @@ class DotProductAttention(torch.nn.Module):
     if piece_relation_bias is not None:
       scores = scores + piece_relation_bias.to(scores.dtype)
 
+    # Per-head logit temperature (see __init__): scale the assembled logits
+    # before the clip monitor and softcap, so both see effective magnitudes.
+    if self.use_head_logit_temp:
+      _temp = torch.exp(self.head_logit_temp.clamp(-2.0, 2.0)).reshape(1, self.num_heads, 1, 1)
+      scores = scores * _temp.to(scores.dtype)
+
     # QK-clip monitor (K2 MuonClip / K3 recipe): stash the per-head max PRE-softcap
     # logit for the weight-level clip applied after the optimizer step (train.py).
     # Training-only attribute stash (placement-head pattern) — contributes NOTHING
@@ -586,14 +662,45 @@ class DotProductAttention(torch.nn.Module):
       _A_hard, _lam = graph_route          # [B, H, T, T], [1, H, 1, 1]
       A = A + _lam.to(A.dtype) * (_A_hard.to(A.dtype) - A)
 
-    # Get the weighted average of the values
-    H = torch.matmul(A, V)
+    # Get the weighted average of the values. Soft-min heads (see __init__)
+    # aggregate with an attention-weighted soft minimum instead: the same
+    # matmul against exp-transformed V, log after, fp32 for the
+    # transcendentals (k heads x 64 x d_k — negligible).
+    if self.softmin_heads > 0 or self.softmax_agg_heads > 0:
+      # Signed tau per soft-agg head: +exp for soft-min heads, -exp for
+      # soft-max heads. The LSE identity below is sign-agnostic (max-shift
+      # keeps exp in range either way): tau<0 turns the soft-min into its
+      # dual soft-max exactly.
+      k_agg = self.softmin_heads + self.softmax_agg_heads
+      taus = []
+      if self.softmin_heads > 0:
+        taus.append(torch.exp(self.softmin_log_tau.clamp(-4.0, 4.0)))
+      if self.softmax_agg_heads > 0:
+        taus.append(-torch.exp(self.softmax_log_tau.clamp(-4.0, 4.0)))
+      tau = torch.cat(taus).reshape(1, k_agg, 1, 1)
+      A_agg = A[:, :k_agg].float()
+      V_agg = V[:, :k_agg].float()
+      negtv = -tau * V_agg
+      m = negtv.amax(dim=2, keepdim=True)              # max over source tokens j
+      s = torch.matmul(A_agg, torch.exp(negtv - m))    # rows of A sum to 1 -> s in (0, 1]
+      H_agg = -(torch.log(s.clamp_min(1e-20)) + m) / tau
+      H = torch.cat([H_agg.to(V.dtype), torch.matmul(A[:, k_agg:], V[:, k_agg:])], dim=1)
+    else:
+      H = torch.matmul(A, V)
 
     if self.use_rpe and self.use_rpe_v and not rpe_precomputed:
       rpe_v = self.rpe_v @ self.rpeFactorShared
       rpe_v = rpe_v.reshape(self.d_k * self.attention_multiplier, self.num_heads, 64, 64)
-      
-      H = H + einsum(A, rpe_v, "b h q k, d h q k->b h q d")
+
+      _k_agg0 = self.softmin_heads + self.softmax_agg_heads
+      if _k_agg0 > 0:
+        # Soft-agg heads (review finding #7): the rpe_v term is a WEIGHTED-MEAN
+        # positional add — splicing it onto an LSE min/max aggregate corrupts
+        # the quantifier semantics. Apply it to the plain-mean heads only.
+        _rpe_add = einsum(A[:, _k_agg0:], rpe_v[:, _k_agg0:], "b h q k, d h q k->b h q d")
+        H = torch.cat([H[:, :_k_agg0], H[:, _k_agg0:] + _rpe_add], dim=1)
+      else:
+        H = H + einsum(A, rpe_v, "b h q k, d h q k->b h q d")
 
     return H, A
   

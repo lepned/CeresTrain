@@ -49,6 +49,9 @@ class EncoderLayer(torch.nn.Module):
                 tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
                 vis_gate_channels : int = 0, vis_gate_mode : str = 'qk',
                 graph_route_channels : int = 0,
+                softmin_heads : int = 0,
+                softmax_agg_heads : int = 0,
+                use_head_logit_temp : bool = False,
                 pre_norm : bool = False):
     super().__init__()
 
@@ -78,7 +81,10 @@ class EncoderLayer(torch.nn.Module):
                                          use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum,
                                          use_diff_attention=use_diff_attention,
                                          vis_gate_channels=vis_gate_channels, vis_gate_mode=vis_gate_mode,
-                                         graph_route_channels=graph_route_channels)
+                                         graph_route_channels=graph_route_channels,
+                                         softmin_heads=softmin_heads,
+                                         softmax_agg_heads=softmax_agg_heads,
+                                         use_head_logit_temp=use_head_logit_temp)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 

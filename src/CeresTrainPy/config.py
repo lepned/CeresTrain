@@ -140,6 +140,11 @@ class Configuration:
     # (heads/embeddings/norms/biases); the Muon trunk keeps LearningRateBase.
     # None/absent = legacy single-rate. CONFIG-ONLY (no env override by design).
     self.Opt_LearningRateBaseHeads = config_opt.get('LearningRateBaseHeads', None)
+    # Family LR ratios (split-LR program 2026-08-20): multiplicative on base LR,
+    # name-family targeted regardless of Muon/AdamW membership (Kovax runs 1/3
+    # on heads). Mutually exclusive with LearningRateBaseHeads.
+    self.Opt_LearningRateHeadsRatio = config_opt.get('LearningRateHeadsRatio', None)
+    self.Opt_LearningRateCouplingsRatio = config_opt.get('LearningRateCouplingsRatio', None)
     # Muon momentum decoupling (Muon only): historically Beta1 fed BOTH the
     # Muon SGD-momentum and the internal-AdamW beta1, so the reference combo
     # (Muon momentum 0.95 + Adam beta1 0.9, Kovax live configs) was
@@ -473,6 +478,34 @@ class Configuration:
     # Graph-route heads (2026-08 tactical program): gated exact routing over the
     # visibility edge channels; requires UseVisEdgeBias (see ceres_net).
     self.NetDef_UseGraphRouteHeads = config_net_def.get('UseGraphRouteHeads', False)
+    # Soft-min ("AND-logic") value-aggregation heads (2026-08 tactical program):
+    # first k heads/layer aggregate V by attention-weighted soft minimum.
+    # ARCH key (changes aggregation from step 0), not a zero-init add-on. 0 = off.
+    self.NetDef_SoftMinHeads = config_net_def.get('SoftMinHeads', 0)
+    self.NetDef_SoftMaxAggHeads = config_net_def.get('SoftMaxAggHeads', 0)
+    self.NetDef_UseHeadLogitTemp = config_net_def.get('UseHeadLogitTemp', False)
+    self.NetDef_UseTacticalCodebook = config_net_def.get('UseTacticalCodebook', False)
+    self.NetDef_UseKingDistChannels = config_net_def.get('UseKingDistChannels', False)
+    self.NetDef_UseSpectralPE = config_net_def.get('UseSpectralPE', False)
+    self.NetDef_UseDualPlane = config_net_def.get('UseDualPlane', False)
+    self.NetDef_DualPlaneSoftMinHeads = config_net_def.get('DualPlaneSoftMinHeads', 2)
+    self.NetDef_DualPlanePolicyDecode = config_net_def.get('DualPlanePolicyDecode', False)
+    self.NetDef_DualPlaneDim = config_net_def.get('DualPlaneDim', 128)
+    self.NetDef_DualPlaneLayers = config_net_def.get('DualPlaneLayers', 2)
+    self.NetDef_DualPlaneInterleave = config_net_def.get('DualPlaneInterleave', False)
+    self.NetDef_DualPlaneSurvivalAux = config_net_def.get('DualPlaneSurvivalAux', 0.0)
+    self.NetDef_DualPlaneSurvivalK = config_net_def.get('DualPlaneSurvivalK', 4)
+    self.NetDef_DualPlaneValueAttention = config_net_def.get('DualPlaneValueAttention', 0)
+    self.NetDef_DualPlaneVictimDecode = config_net_def.get('DualPlaneVictimDecode', False)
+    self.NetDef_MoveEdgeDecode = config_net_def.get('MoveEdgeDecode', False)
+    self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)
+    self.NetDef_MoveDegreeDecode = config_net_def.get('MoveDegreeDecode', False)
+    self.NetDef_DualPlaneRelGains = config_net_def.get('DualPlaneRelGains', False)
+    # Value min/max pool side-channels (2026-08 tactics toolbox T1.2): trunk
+    # amin/amax over squares into the value family's hidden pre-activation.
+    # Zero-init no-op add-on (the 'inject' class).
+    self.NetDef_ValueHeadMinMaxPool = config_net_def.get('ValueHeadMinMaxPool', False)
+    self.NetDef_ValueHeadPoolChannels = config_net_def.get('ValueHeadPoolChannels', False)
     # Iterated tactic refiner (see tactical_refiner.py): 0 = off.
     self.NetDef_RefinerIters = config_net_def.get('RefinerIters', 0)
     self.NetDef_RefinerDim = config_net_def.get('RefinerDim', 128)

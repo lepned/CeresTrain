@@ -1,0 +1,225 @@
+# License Notice
+"""
+This file is part of the CeresTrain project at https://github.com/dje-dev/CeresTrain.
+Copyright (C) 2023- by David Elliott and the CeresTrain Authors.
+GNU GPL v3.0 — see <http://www.gnu.org/licenses/>.
+"""
+# End of License Notice
+
+"""Dual-Plane Attention — the P-plane (piece tokens) of the dual-plane
+concept (F:/cout/Findings/dual_plane_concept.md). Stage A1 scope: a small
+piece-token transformer with relation-typed attention biases, read into the
+VALUE family only via zero-init injects. The S-plane (square trunk) is
+untouched, so policy isolation is provable (vpc smoke pattern).
+
+Mechanism summary:
+  - 32 piece slots selected by occupancy TopK over the 64 squares
+    (deterministic tie-break by square index; chess has <=32 pieces, so all
+    real pieces are always selected; empty slots are attention-masked).
+    TopK + Gather were TRT-validated by the PTV day-zero build.
+  - Piece token init: Linear(13 piece one-hot + 8 file one-hot + 8 rank
+    one-hot -> dp) — identity + location, the classic piece-square pairing.
+  - Relation-typed P<->P bias: the parent computes VisibilityChannels E
+    [B, 64, 64, C] ONCE; we double-gather to piece pairs [B, 32, 32, C] and
+    project per-head with a ZERO-INIT linear (bias starts silent; the
+    magnitude trajectory is the does-the-net-want-this diagnostic, FGH
+    lesson).
+  - num_layers pre-norm P-blocks (MHA + FFN). Optional soft-min heads
+    (quantifiers over PIECES — "is ANY piece hanging") via the same signed
+    LSE formulation as dot_product_attention.
+  - One cross-read P->S: piece tokens attend the FINAL square flow
+    (queries = pieces, keys/values = squares), zero-init out-projection.
+  - Output: [B, 2*dp] (masked mean-pool + masked soft-min pool over piece
+    tokens), consumed by ceres_net through zero-init Linears into the
+    value1/value2 hidden pre-activation (the proven inject pattern).
+
+Everything is matmul/softmax/topk/gather — export/TRT-safe by construction.
+Zero-init injects => exact step-0 bit-identity for ALL heads.
+"""
+
+import torch
+from torch import nn
+from rms_norm import make_norm
+
+
+class DualPlanePBlock(nn.Module):
+  """Pre-norm piece-plane encoder block with additive relation bias."""
+
+  def __init__(self, dp: int, heads: int, rel_channels: int, ffn_mult: int,
+               norm_type: str, softmin_heads: int = 0, rel_gains: bool = False):
+    super().__init__()
+    assert dp % heads == 0
+    self.dp, self.heads, self.dk = dp, heads, dp // heads
+    self.rel_channels = rel_channels
+    self.softmin_heads = softmin_heads
+    self.ln1 = make_norm(norm_type, dp)
+    self.qkv = nn.Linear(dp, 3 * dp, bias=False)
+    self.proj = nn.Linear(dp, dp, bias=False)
+    # Relation-typed bias: per-head zero-init projection of the gathered
+    # edge channels. Zero-init => block starts as PLAIN attention.
+    self.rel_proj = nn.Linear(rel_channels, heads, bias=False)
+    nn.init.zeros_(self.rel_proj.weight)
+    # Relational-type modulation ("P-plane smolgen", catalogue idea, 2026-08-20):
+    # a masked mean of the block's normed piece tokens conditions per-head,
+    # per-channel GAINS on the relation-bias weights — the global position
+    # picks WHICH relation types matter now ("weight check edges up, xray
+    # down"), rather than generating raw slot-pair maps (slot semantics vary
+    # per position, so classic smolgen maps would be uninterpretable here).
+    # W_eff = rel_proj.weight * (1 + delta): zero-init delta => exact no-op,
+    # and the modulator can only scale relations the net has already grown
+    # (gradient reaches gain_mlp only once rel_proj is nonzero).
+    self.rel_gains = rel_gains
+    if rel_gains:
+      self.gain_mlp = nn.Linear(dp, heads * rel_channels, bias=False)
+      nn.init.zeros_(self.gain_mlp.weight)
+    if softmin_heads > 0:
+      self.softmin_log_tau = nn.Parameter(torch.zeros(softmin_heads))
+    self.ln2 = make_norm(norm_type, dp)
+    self.ffn1 = nn.Linear(dp, ffn_mult * dp, bias=False)
+    self.ffn2 = nn.Linear(ffn_mult * dp, dp, bias=False)
+    self.act = nn.Mish()
+
+  def forward(self, x, rel_pair, pad_bias):
+    # x [B, 32, dp]; rel_pair [B, 32, 32, C]; pad_bias [B, 1, 1, 32]
+    B = x.shape[0]
+    h = self.ln1(x)
+    q, k, v = self.qkv(h).chunk(3, dim=-1)
+    q = q.reshape(B, 32, self.heads, self.dk).transpose(1, 2)
+    k = k.reshape(B, 32, self.heads, self.dk).transpose(1, 2)
+    v = v.reshape(B, 32, self.heads, self.dk).transpose(1, 2)
+    scores = torch.matmul(q, k.transpose(2, 3)) * (self.dk ** -0.5)
+    if self.rel_gains:
+      # Masked mean of normed tokens -> per-head/channel gain deltas.
+      _w = (pad_bias.reshape(B, 32, 1) > -5e3).to(h.dtype)   # midpoint: occ>0.5 = real slot
+      _g = (h * _w).sum(dim=1) / _w.sum(dim=1).clamp_min(1.0)          # [B, dp]
+      delta = self.gain_mlp(_g).reshape(B, self.heads, self.rel_channels)
+      W_eff = self.rel_proj.weight.unsqueeze(0) * (1.0 + delta)        # [B, H, C]
+      bias = torch.matmul(rel_pair.reshape(B, 32 * 32, -1).to(scores.dtype),
+                          W_eff.transpose(1, 2).to(scores.dtype))      # [B, 1024, H]
+      scores = scores + bias.permute(0, 2, 1).reshape(B, self.heads, 32, 32)
+    else:
+      scores = scores + self.rel_proj(rel_pair.to(scores.dtype)).permute(0, 3, 1, 2)
+    scores = scores + pad_bias.to(scores.dtype)          # mask empty slots as keys
+    A = torch.softmax(scores, dim=-1)
+    if self.softmin_heads > 0:
+      ks = self.softmin_heads
+      A_s, V_s = A[:, :ks].float(), v[:, :ks].float()
+      tau = torch.exp(self.softmin_log_tau.clamp(-4.0, 4.0)).reshape(1, ks, 1, 1)
+      negtv = -tau * V_s
+      # Max-shift over VALID keys only: empty slots carry never-trained
+      # garbage V; letting them set the shift would underflow every real
+      # term (their A-weight is 0 so they contribute nothing to s, but the
+      # SHIFT is global). pad_bias is [B,1,1,32] keyed on keys — move it to
+      # the key axis of negtv ([B,ks,32keys,dk]).
+      _key_pad = pad_bias.reshape(pad_bias.shape[0], 1, 32, 1).float()
+      m = (negtv + _key_pad).amax(dim=2, keepdim=True)
+      s = torch.matmul(A_s, torch.exp(negtv + _key_pad - m))
+      H_s = -(torch.log(s.clamp_min(1e-20)) + m) / tau
+      out = torch.cat([H_s.to(v.dtype), torch.matmul(A[:, ks:], v[:, ks:])], dim=1)
+    else:
+      out = torch.matmul(A, v)
+    out = out.transpose(1, 2).reshape(B, 32, self.dp)
+    x = x + self.proj(out)
+    x = x + self.ffn2(self.act(self.ffn1(self.ln2(x))))
+    return x
+
+
+class DualPlane(nn.Module):
+  """P-plane stack + S-plane cross-read + pooled outputs (Stage A1 scope)."""
+
+  def __init__(self, s_dim: int, rel_channels: int, norm_type: str,
+               dp: int = 128, heads: int = 4, layers: int = 2,
+               ffn_mult: int = 2, softmin_heads: int = 2,
+               interleave_cross: bool = False,
+               rel_degrees: bool = False,
+               rel_gains: bool = False):
+    super().__init__()
+    self.dp = dp
+    # interleave_cross: apply the (weight-shared, zero-init) S-plane
+    # cross-read after EVERY P-block instead of once at the end — each
+    # P-block then reasons over piece states refreshed with square context.
+    # Weight sharing keeps the param count flat; zero-init x_out keeps the
+    # exact step-0 no-op regardless of how many times it is applied.
+    self.interleave_cross = interleave_cross
+    # Piece identity+location embedding: 13 one-hot + 8 file + 8 rank.
+    self.embed = nn.Linear(13 + 16, dp, bias=False)
+    fr = torch.zeros(64, 16)
+    for sq in range(64):
+      fr[sq, sq % 8] = 1.0
+      fr[sq, 8 + sq // 8] = 1.0
+    self.register_buffer('filerank', fr, persistent=False)
+    # Relation DEGREES as token features (catalogue idea A, 2026-08-20):
+    # each piece token receives its per-channel row/column sums of the
+    # relation tensor — "I attack 2, I am attacked by 3, defended by 1" —
+    # overload/hanging detection is DEGREE COUNTING, which attention
+    # otherwise spends capacity re-deriving. One reduce over an already-
+    # computed tensor; zero-init projection => exact step-0 no-op.
+    # Descriptive facts only (sac-rule compliant).
+    self.rel_degrees = rel_degrees
+    if rel_degrees:
+      self.deg_proj = nn.Linear(2 * rel_channels, dp, bias=False)
+      nn.init.zeros_(self.deg_proj.weight)
+    self.blocks = nn.ModuleList([
+        DualPlanePBlock(dp, heads, rel_channels, ffn_mult, norm_type,
+                        softmin_heads=softmin_heads, rel_gains=rel_gains)
+        for _ in range(layers)])
+    # Cross-read P->S on the FINAL square flow.
+    self.x_ln_p = make_norm(norm_type, dp)
+    self.x_ln_s = make_norm(norm_type, s_dim)
+    self.x_q = nn.Linear(dp, dp, bias=False)
+    self.x_k = nn.Linear(s_dim, dp, bias=False)
+    self.x_v = nn.Linear(s_dim, dp, bias=False)
+    self.x_out = nn.Linear(dp, dp, bias=False)
+    nn.init.zeros_(self.x_out.weight)                    # cross-read starts silent
+    self.out_ln = make_norm(norm_type, dp)
+
+  def forward(self, squares13, vis_E, s_flow):
+    """squares13 [B,64,13] one-hot; vis_E [B,64,64,C]; s_flow [B,64,S].
+    Returns [B, 2*dp] pooled piece summary (masked mean + masked soft-min)."""
+    B = squares13.shape[0]
+    occ = 1.0 - squares13[:, :, 0]                       # [B, 64]
+    # Deterministic slot selection: occupancy + tiny positional tie-break.
+    tie = torch.arange(64, device=squares13.device, dtype=occ.dtype) * 1e-4
+    sel = torch.topk(occ + tie, k=32, dim=1).indices     # [B, 32]
+    slot_occ = torch.gather(occ, 1, sel)                 # [B, 32] 1=piece, 0=empty
+    feats = torch.cat([squares13,
+                       self.filerank.to(squares13.dtype).unsqueeze(0).expand(B, 64, 16)],
+                      dim=-1)                            # [B, 64, 29]
+    x = self.embed(torch.gather(feats, 1, sel.unsqueeze(-1).expand(-1, -1, 29)))
+    # Pair-gather the relation channels: E[b, sel_i, sel_j, :].
+    C = vis_E.shape[-1]
+    e_rows = torch.gather(vis_E, 1, sel.reshape(B, 32, 1, 1).expand(-1, -1, 64, C))
+    rel_pair = torch.gather(e_rows, 2, sel.reshape(B, 1, 32, 1).expand(-1, 32, -1, C))
+    pad_bias = ((slot_occ - 1.0) * 1e4).reshape(B, 1, 1, 32)  # empty slots: -1e4 as keys
+
+    if self.rel_degrees:
+      # out-degree (what I do to others) + in-degree (what others do to me),
+      # per channel; empty slots' garbage degrees are harmless (their tokens
+      # are masked from keys/pools everywhere downstream).
+      _deg = torch.cat([rel_pair.sum(dim=2), rel_pair.sum(dim=1)], dim=-1)   # [B, 32, 2C]
+      x = x + self.deg_proj(_deg.to(x.dtype))
+
+    def _cross_read(xp):
+      qx = self.x_q(self.x_ln_p(xp))
+      s_n = self.x_ln_s(s_flow)
+      kx, vx = self.x_k(s_n), self.x_v(s_n)
+      a = torch.softmax(torch.matmul(qx, kx.transpose(1, 2)) * (self.dp ** -0.5), dim=-1)
+      return xp + self.x_out(torch.matmul(a, vx))
+
+    for blk in self.blocks:
+      x = blk(x, rel_pair, pad_bias)
+      if self.interleave_cross:
+        x = _cross_read(x)
+    if not self.interleave_cross:
+      x = _cross_read(x)
+    x = self.out_ln(x)
+    # Masked pools over REAL pieces only.
+    w = slot_occ.unsqueeze(-1)                           # [B, 32, 1]
+    mean_pool = (x * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+    # Masked soft-min over pieces (tau=1): empty slots pushed to +inf side.
+    xm = x.float() + (1.0 - w.float()) * 1e4
+    smin = -torch.logsumexp(-xm, dim=1) + torch.log(w.float().sum(dim=1).clamp_min(1.0))
+    pooled = torch.cat([mean_pool, smin.to(x.dtype)], dim=-1)  # [B, 2*dp]
+    # Also expose the raw tokens + slot bookkeeping for decode-side consumers
+    # (Stage A3 mover-bilinear reads the mover's token by from-square).
+    return pooled, x, sel, slot_occ

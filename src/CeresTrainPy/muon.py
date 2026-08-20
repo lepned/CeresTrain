@@ -106,6 +106,7 @@ class Muon(torch.optim.Optimizer):
         adamw_eps=1e-8,
         adamw_lr=None,
         head_split_specs=None,
+        lr_ratios=None,
     ):
         # adamw_lr: separate learning rate for the internal-AdamW group (heads, embeddings,
         # norms, biases). The docstring always advertised it but it was never implemented -
@@ -153,6 +154,20 @@ class Muon(torch.optim.Optimizer):
             assert p.ndim == 2 and axis in (0, 1) and p.shape[axis] % nb == 0, \
                 f"bad head_split {spec} for param shape {tuple(p.shape)}"
             self.state[p]["head_split"] = (int(axis), int(nb))
+
+        # Per-PARAM LR ratios (split-LR program 2026-08-20): {param: ratio},
+        # applied multiplicatively on top of the group lr in BOTH branches —
+        # so a "head family" or "couplings family" can run at e.g. base/3
+        # regardless of whether its members landed in the Muon or the AdamW
+        # partition (the old adamw_lr knob could only throttle the whole
+        # internal-AdamW group, which also contains embeddings/norms/taus).
+        # Kept OUT of self.state (head_split_specs precedent) so ratios are
+        # construction-time config, never resurrected from a stale checkpoint.
+        # Ratios are constants => the external LambdaLR scheduler keeps every
+        # family proportional through warmup/decay automatically.
+        self._lr_ratios = dict(lr_ratios) if lr_ratios else {}
+        for p, r in self._lr_ratios.items():
+            assert r > 0, f"lr ratio must be positive, got {r}"
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -206,6 +221,7 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
+                lr_p = lr * self._lr_ratios.get(p, 1.0)
                 head_split = state.get("head_split")
                 if head_split is not None:
                     # Per-head Muon: orthogonalize each head's block independently.
@@ -222,15 +238,16 @@ class Muon(torch.optim.Optimizer):
                     else:
                         u = U3.transpose(0, 1).reshape(rows, cols)
                         block_shape = (rows, cols // nb)
-                    adjusted_lr = self.adjust_lr_for_muon(lr, block_shape)
+                    adjusted_lr = self.adjust_lr_for_muon(lr_p, block_shape)
                 else:
                     u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
                     # scale update
-                    adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
+                    adjusted_lr = self.adjust_lr_for_muon(lr_p, p.shape)
 
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
+                # apply weight decay (family-scaled lr => decay stays
+                # proportional to the actual step size, matching AdamW branch)
+                p.data.mul_(1 - lr_p * wd)
 
                 # apply update
                 p.data.add_(u, alpha=-adjusted_lr)
@@ -268,7 +285,8 @@ class Muon(torch.optim.Optimizer):
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
                 scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                lr_p = lr * self._lr_ratios.get(p, 1.0)
+                p.data.mul_(1 - lr_p * weight_decay)
+                p.data.add_(g, alpha=-lr_p / scale)
 
         return loss

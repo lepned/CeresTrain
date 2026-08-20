@@ -717,6 +717,75 @@ class VisibilityChannels(nn.Module):
         return torch.stack(chans, dim=3)                # [B, 64, 64, C]
 
 
+def build_spectral_pe_table(k: int = 8) -> torch.Tensor:
+    """Move-graph spectral PE table (toolbox T4.3). Returns [64, 4*k]: for
+    each of the four elementary move graphs (N, K, R, B; queen = R∪B gates)
+    the k lowest nontrivial Laplacian eigenvectors of the empty-board move
+    graph. Knight-distance geometry is NOT Euclidean — these coordinates are.
+    Constant table; sign/scale absorbed by the learned projection."""
+    def adj(moves_fn):
+        a = torch.zeros(64, 64)
+        for i in range(64):
+            for j in moves_fn(i):
+                a[i, j] = 1.0
+        return a
+
+    def knight(i):
+        f, r = _file_of(i), _rank_of(i)
+        for df, dr in ((1, 2), (2, 1), (-1, 2), (-2, 1), (1, -2), (2, -1), (-1, -2), (-2, -1)):
+            if 0 <= f + df < 8 and 0 <= r + dr < 8:
+                yield (r + dr) * 8 + (f + df)
+
+    def king(i):
+        f, r = _file_of(i), _rank_of(i)
+        for df in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if (df or dr) and 0 <= f + df < 8 and 0 <= r + dr < 8:
+                    yield (r + dr) * 8 + (f + df)
+
+    def rook(i):
+        f, r = _file_of(i), _rank_of(i)
+        for j in range(64):
+            if j != i and (_file_of(j) == f or _rank_of(j) == r):
+                yield j
+
+    def bishop(i):
+        f, r = _file_of(i), _rank_of(i)
+        for j in range(64):
+            if j != i and (abs(_file_of(j) - f) == abs(_rank_of(j) - r)):
+                yield j
+
+    cols = []
+    for fn in (knight, king, rook, bishop):
+        a = adj(fn)
+        lap = torch.diag(a.sum(dim=1)) - a
+        evals, evecs = torch.linalg.eigh(lap)
+        # Skip ALL kernel modes, not just the first: the bishop graph is
+        # DISCONNECTED (light/dark squares) => two zero eigenvalues, and the
+        # kernel basis is degenerate/arbitrary. (The color-complex bit itself
+        # is already trivially present in the raw geometry features.)
+        nz = int((evals < 1e-6).sum())
+        cols.append(evecs[:, nz:nz + k])
+    return torch.cat(cols, dim=1)        # [64, 4k]
+
+
+def build_king_distance_onehot_table() -> torch.Tensor:
+    """King-distance bucket table for the king-centric channels (toolbox T3.2).
+
+    Returns [64, 64*8] float: row k (king square) holds, for every board
+    square i, the one-hot Chebyshev-distance bucket (0..7) at columns
+    i*8 + bucket. Usage: king_plane [B, 64] @ table -> [B, 64*8] -> reshape
+    [B, 64, 8] = per-square one-hot distance to that king. A single matmul
+    against a constant — TRT-clean, ray-machinery pattern.
+    """
+    t = torch.zeros(64, 64 * 8)
+    for k in range(64):
+        for i in range(64):
+            d = max(abs(_file_of(k) - _file_of(i)), abs(_rank_of(k) - _rank_of(i)))
+            t[k, i * 8 + min(d, 7)] = 1.0
+    return t
+
+
 def build_ray_context_tables(from_idx, to_idx):
   """Constant per-move square-pooling operators for the ray-context policy term.
 

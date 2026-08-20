@@ -104,6 +104,80 @@ if _ckpt_gr and not _model_gr:
     f'Checkpoint contains {len(_ckpt_gr)} graph-route tensors but the rebuilt model has none. '
     f'Set "UseGraphRouteHeads": true (and UseVisEdgeBias + matching VisEdgeFamilies) in the '
     f'_ceres_net.json config before re-exporting. (checkpoint: {CKPT})')
+# Same guard for the value min/max pool injectors (config NetDef
+# ValueHeadMinMaxPool): zero-init at start but TRAINED weights are a real
+# contribution to the value heads — silently dropping them exports a net whose
+# value family lost a co-adapted input.
+_ckpt_vp = [k for k in loaded['model'] if '_pool_inject' in k]
+_model_vp = [k for k in model.state_dict() if '_pool_inject' in k]
+if _ckpt_vp and not _model_vp:
+  raise ValueError(
+    f'Checkpoint contains {len(_ckpt_vp)} value-pool-inject tensors but the rebuilt model '
+    f'has none. Set "ValueHeadMinMaxPool": true in the _ceres_net.json config before '
+    f're-exporting. (checkpoint: {CKPT})')
+# Same guard for soft-min heads (config NetDef SoftMinHeads). ARCH key, worse
+# than the drop cases above in a different way: the params are per-layer tau
+# scalars, but disabling the key also flips the first k heads' aggregation
+# back to weighted mean — the rebuilt net computes a different FUNCTION even
+# where weights match, so a mismatch here means the config is simply wrong.
+_ckpt_sm = [k for k in loaded['model'] if '.softmin_log_tau' in k]
+_model_sm = [k for k in model.state_dict() if '.softmin_log_tau' in k]
+if bool(_ckpt_sm) != bool(_model_sm):
+  raise ValueError(
+    f'SoftMinHeads mismatch: checkpoint has {len(_ckpt_sm)} softmin_log_tau tensors, '
+    f'rebuilt model has {len(_model_sm)}. Set "SoftMinHeads" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Guard for the dual-plane P-plane (config NetDef UseDualPlane).
+_ckpt_dp = [k for k in loaded['model'] if k.startswith('dual_plane.') or 'dp_value' in k or 'dp_pol_' in k or 'dpva_' in k or 'dpv_' in k or 'dpe_w' in k or 'dpd_' in k]
+_model_dp = [k for k in model.state_dict() if k.startswith('dual_plane.') or 'dp_value' in k or 'dp_pol_' in k or 'dpva_' in k or 'dpv_' in k or 'dpe_w' in k or 'dpd_' in k]
+if bool(_ckpt_dp) != bool(_model_dp):
+  raise ValueError(
+    f'UseDualPlane mismatch: checkpoint has {len(_ckpt_dp)} dual-plane tensors, '
+    f'rebuilt model has {len(_model_dp)}. Set "UseDualPlane" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Guard for spectral PE (config NetDef UseSpectralPE).
+_ckpt_sp = [k for k in loaded['model'] if 'spe_proj' in k]
+_model_sp = [k for k in model.state_dict() if 'spe_proj' in k]
+if bool(_ckpt_sp) != bool(_model_sp):
+  raise ValueError(
+    f'UseSpectralPE mismatch: checkpoint has {len(_ckpt_sp)} spe_proj tensors, '
+    f'rebuilt model has {len(_model_sp)}. Set "UseSpectralPE" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Guard for king-distance channels (config NetDef UseKingDistChannels).
+_ckpt_kd = [k for k in loaded['model'] if 'kdist_proj' in k]
+_model_kd = [k for k in model.state_dict() if 'kdist_proj' in k]
+if bool(_ckpt_kd) != bool(_model_kd):
+  raise ValueError(
+    f'UseKingDistChannels mismatch: checkpoint has {len(_ckpt_kd)} kdist_proj tensors, '
+    f'rebuilt model has {len(_model_kd)}. Set "UseKingDistChannels" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Guard for the tactical codebook (config NetDef UseTacticalCodebook):
+# dropping the key amputates a trained residual contributor = corrupt net.
+_ckpt_cb = [k for k in loaded['model'] if k.startswith('cbk_')]
+_model_cb = [k for k in model.state_dict() if k.startswith('cbk_')]
+if bool(_ckpt_cb) != bool(_model_cb):
+  raise ValueError(
+    f'UseTacticalCodebook mismatch: checkpoint has {len(_ckpt_cb)} cbk_* tensors, '
+    f'rebuilt model has {len(_model_cb)}. Set "UseTacticalCodebook" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Guard for per-head logit temperature (config NetDef UseHeadLogitTemp):
+# dropping the key silently rebuilds with temp=1 while the checkpoint trained
+# with learned temps — a different function everywhere.
+_ckpt_ht = [k for k in loaded['model'] if '.head_logit_temp' in k]
+_model_ht = [k for k in model.state_dict() if '.head_logit_temp' in k]
+if bool(_ckpt_ht) != bool(_model_ht):
+  raise ValueError(
+    f'UseHeadLogitTemp mismatch: checkpoint has {len(_ckpt_ht)} head_logit_temp tensors, '
+    f'rebuilt model has {len(_model_ht)}. Set "UseHeadLogitTemp" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
+# Identical guard for the signed-tau dual (config NetDef SoftMaxAggHeads).
+_ckpt_sx = [k for k in loaded['model'] if '.softmax_log_tau' in k]
+_model_sx = [k for k in model.state_dict() if '.softmax_log_tau' in k]
+if bool(_ckpt_sx) != bool(_model_sx):
+  raise ValueError(
+    f'SoftMaxAggHeads mismatch: checkpoint has {len(_ckpt_sx)} softmax_log_tau tensors, '
+    f'rebuilt model has {len(_model_sx)}. Set "SoftMaxAggHeads" in the _ceres_net.json '
+    f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
 _ckpt_rf = [k for k in loaded['model'] if k.startswith('tactical_refiner.')]
 _model_rf = [k for k in model.state_dict() if k.startswith('tactical_refiner.')]
 if _ckpt_rf and not _model_rf:
