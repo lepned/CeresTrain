@@ -126,3 +126,40 @@ Sammenlign mot 512-16-baselinen ved samme posisjonstall; value-regelen
 ≥ +30 @200M rg2700 star. Les OOD (rg2100/2300-klassen) for
 generaliseringsdommer og hits i gulvregimet — og for policy: pT3 +
 KLD-matrisen, ikke bare P.
+
+## ⚠ EKSPORTBUG FUNNET OG FIKSET (b2c6af6, 2026-08-20 kveld) — les foer du EB-tester dp-nett
+
+**Symptom:** deg4@100M fra serverloepet "spilte daarlig" i EB gameplay. Aarsaken var IKKE
+nettet — treningsmetrikkene var friske — men en oedelagt ONNX-eksport:
+
+- `convert_float_to_float16` (save_model) omskriver tensortyper i grafen, men lar
+  eksisterende Cast-noders `to`-attributt staa urort. Dual-planes interne `.float()`-kast
+  (dynamo → kjedede `_to_copy`-noder) ga dermed en selvmotsigende graf.
+- onnxruntime NEKTER aa laste fila ("Type Error: Type (tensor(float16)) of output arg
+  (_to_copy_1) ... does not match expected type (tensor(float))").
+- TensorRT parser den likevel og bygger en SUBTILT FEIL motor → nett som "virker" men
+  spiller svakt. Dette er fella: EB/TRT gir ingen feilmelding.
+
+**Fix (in-tree):** avstemmingspass i `save_model.py` etter fp16-konverteringen — alle
+FLOAT<->FLOAT16-Cast-attributter settes til aa matche konvertert utgangstype. Logger
+`INFO: ONNX_FP16_CAST_RECONCILED N` naar den bidrar. Systemisk: all fremtidig modulkode
+med interne `.float()`/`.half()` er dekket.
+
+**Validering (lokalt, mot server-ckpt deg4@100M):** foer = ORT-load feiler eksakt som over;
+etter = laster rent, 0 NaN, og maaler som treningsmetrikkene tilsier
+(top1 54.9 % / pTop3 82.3 % / valAcc 91.6 % paa T91-skip1 — paritet med 256ctrl@100M).
+⇒ gameplay-dommen over deg4@100M er UGYLDIG; retest med fikset eksport.
+
+**Praktisk:**
+- Kjørende treningsprosesser har gammel save_model i minnet: deres eksporter maa
+  re-eksporteres med `recover_export.py <ID> <outputs_dir> <numpos>` etter pull.
+  Checkpointene er friske; ingen retrening.
+- Lastbarhets-test = perfekt CI: `onnxruntime.InferenceSession(path)` groenn/roed pa sekundet.
+
+**Bifunn (gjelder ogsaa uten dual-plane):** 512-BASELINENS tidlige eksporter (100M/200M,
+LR 1.2e-3) er FP16-SKJOERE: strikt fp16 (ORT) gir soeppel (top1 11 %!), TRT fungerte fordi
+den selv velger fp32 der det trengs. Mekanisme: ekstreme vekter/logiter i den varme fasen
+(QK-klipp-regimet) satureres av fp16-konverteringen; fra ~500M er filene friske. EB-tall
+(TRT) staar seg, men IKKE bruk tidlige 512@1.2e-3-onnx i ORT-baserte maalinger.
+deg4 (LR 0.6e-3) er frisk allerede ved 100M — nok et argument for lavere peak-LR.
+
