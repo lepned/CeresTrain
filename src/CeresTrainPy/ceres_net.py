@@ -209,8 +209,18 @@ class CeresNet(nn.Module):
     if self.prior_state_dim > 0:
       self.state_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 64*self.prior_state_dim, _other_rd)
 
-    if action_loss_weight > 0:
+    # Played-move action training (2026-08-21): the v7 fields supply an exact
+    # per-played-move WDL target (q_after_played == -next.best_q verified to
+    # MAE 0.000; d from the next record) � the 4-board-sequence machinery is
+    # not needed. The head itself is the SAME exported 'action' output the
+    # Ceres TRT evaluator detects by name and MCTS consumes via
+    # ActionWDLForMove; only the training signal differs.
+    self.action_played_weight = float(getattr(config, 'Opt_LossActionPlayedMultiplier', 0) or 0)
+    if action_loss_weight > 0 or self.action_played_weight > 0:
       self.action_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858 * 3, _other_rd)
+      if self.action_played_weight > 0:
+        print(f'[ceres_net] ACTION head (played-move mode) enabled: w={self.action_played_weight} '
+              f'(EXPORTED as output "action"; target = v7 q/d-after-played, invalid masked)')
 
     if action_uncertainty_loss_weight > 0:
       self.action_uncertainty_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _other_rd)
@@ -771,8 +781,15 @@ class CeresNet(nn.Module):
         print(f'[ceres_net] DUAL-PLANE KING-ZONE (kf2) enabled: per-piece coverage of '
               f'both king 3x3 zones ({_dp_rel_C} ch each) from e_rows, '
               f'zero-init (exact step-0 no-op)')
-      self.dp_policy_grad_scale = float(getattr(config, 'NetDef_DualPlanePolicyGradScale', 1.0) or 1.0)
+      # NOTE: no 'or default' here — 0.0 (full detach) is a legitimate setting
+      # and the falsy-swallow would silently turn that arm into the control
+      # (review 2026-08-21 finding 3).
+      _dpgs = getattr(config, 'NetDef_DualPlanePolicyGradScale', 1.0)
+      self.dp_policy_grad_scale = float(1.0 if _dpgs is None else _dpgs)
       if self.dp_policy_grad_scale != 1.0:
+        assert getattr(config, 'NetDef_DualPlanePolicyDecode', False), \
+          'DualPlanePolicyGradScale != 1.0 requires DualPlanePolicyDecode (the scale is ' \
+          'applied inside the policy-decode branch; without decode the knob is a no-op)'
         print(f'[ceres_net] DUAL-PLANE POLICY-GRAD SCALE enabled: policy-decode gradients '
               f'into shared P-tokens x {self.dp_policy_grad_scale} (forward identity; '
               f'value gradients and decode weights unscaled)')
@@ -1657,8 +1674,12 @@ class CeresNet(nn.Module):
       # unchanged (gated on self.training).
       _dpt = _dp_tokens
       if self.dp_policy_grad_scale != 1.0 and self.training:
+        # Bit-exact identity form (review 2026-08-21 finding 12): x - x.detach()
+        # is exactly 0 in any dtype (same bits), so forward == x to the bit;
+        # gradient wrt x is exactly _a. The a*x + (1-a)*x.detach() form differed
+        # by 1-2 ulp under bf16, breaking step-0 parity comparisons.
         _a = self.dp_policy_grad_scale
-        _dpt = _dp_tokens * _a + _dp_tokens.detach() * (1.0 - _a)
+        _dpt = _dp_tokens.detach() + (_dp_tokens - _dp_tokens.detach()) * _a
       _q = self.dp_pol_q(flow)                                   # [B, 64, dq] (zero-init => 0)
       _p = self.dp_pol_p(_dpt) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
       _pair = torch.matmul(_q, _p.transpose(1, 2))               # [B, 64to, 32slot]
@@ -1772,7 +1793,10 @@ class CeresNet(nn.Module):
     unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
-    action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if self.action_loss_weight > 0 else unc_out
+    _want_action = self.action_loss_weight > 0 or getattr(self, 'action_played_weight', 0) > 0
+    action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if _want_action else unc_out
+    if getattr(self, 'action_played_weight', 0) > 0 and self.training:
+      self._last_actionp_out = action_out
     action_uncertainty_out = self.action_uncertainty_head(fS_others) if self.action_uncertainty_loss_weight > 0 else unc_out
     state_out              = self.state_head(fS_others) if self.prior_state_dim > 0 else unc_out
     moves_left_out         = self.mlh_head(fS_others) if self.moves_left_loss_weight > 0 else unc_out
@@ -1923,20 +1947,65 @@ class CeresNet(nn.Module):
     # aux head, weighted toward positions where value1 UNDERESTIMATES the
     # target in units of the unc head's predicted error. Weight-normalized so
     # the logged number stays a per-effective-sample CE.
+    # Played-move action loss (see __init__): soft-CE between the exported
+    # action head's WDL at the PLAYED slot and the v7-derived after-move WDL.
+    # Invalid targets (-1: last ply, NO_MOVE, non-v7 batches) are masked; a
+    # batch with zero valid targets contributes exactly 0.
+    actp_loss = 0
+    _actp_participation_only = False
+    _actp = getattr(self, '_last_actionp_out', None)
+    if _actp is not None and not gradient_norm_logging_mode:
+      self._last_actionp_out = None
+      _apidx = batch.get('action_played_idx', None)
+      if _apidx is not None and not isinstance(_actp, int):
+        _apidx = _apidx.reshape(-1).long()
+        _aq = batch['action_q_after'].reshape(-1).float()
+        _ad = batch['action_d_after'].reshape(-1).float()
+        _avalid = (_apidx >= 0) & (_apidx < 1858)
+        if bool(_avalid.any()):
+          _aw = ((1.0 + _aq - _ad) * 0.5).clamp(0, 1)
+          _al = ((1.0 - _aq - _ad) * 0.5).clamp(0, 1)
+          _add = (1.0 - _aw - _al).clamp(0, 1)
+          _tgt = torch.stack([_aw, _add, _al], dim=1)[_avalid]
+          _rows = torch.arange(_actp.size(0), device=_actp.device)[_avalid]
+          _pred = _actp[_rows, _apidx[_avalid]]
+          actp_loss = torch.nn.functional.cross_entropy(_pred.float(), _tgt)
+        else:
+          # DDP participation term (see the survival template above): keeps
+          # action_head in the backward's used-parameter set on all-invalid
+          # batches; exact-zero gradient, excluded from logging.
+          actp_loss = 0.0 * _actp.float().sum()
+          _actp_participation_only = True
+      else:
+        # Batch without action targets (e.g. TPG secondary in a mixed run).
+        actp_loss = 0.0 * _actp.float().sum()
+        _actp_participation_only = True
+
     # Opponent-policy aux (see __init__): CE against the opponent's reply
     # move; -1 targets (no reply / batches without v7 data) are masked, and
     # a batch with zero valid targets contributes exactly 0.
     oppp_loss = 0
+    _oppp_participation_only = False
     _oppp = getattr(self, '_last_oppp_out', None)
     if _oppp is not None and not gradient_norm_logging_mode:
       self._last_oppp_out = None
-      _ot = batch.get('opp_played_idx', None) if hasattr(batch, 'get') else None
+      _ot = batch.get('opp_played_idx', None)
       if _ot is not None:
         _ot = _ot.reshape(-1).long()
         _ovalid = (_ot >= 0) & (_ot < 1858)
         if bool(_ovalid.any()):
           oppp_loss = torch.nn.functional.cross_entropy(
               _oppp.float()[_ovalid], _ot[_ovalid])
+        else:
+          # DDP participation term (review 2026-08-21 finding 2): all--1 batch.
+          oppp_loss = 0.0 * _oppp.float().sum()
+          _oppp_participation_only = True
+      else:
+        # Batch without the key (TPG sidecar 3-tuple / mixed-run secondary):
+        # zero-weighted read keeps oppp_head in the used-parameter set so
+        # static_graph does not see a shrinking graph (finding 2).
+        oppp_loss = 0.0 * _oppp.float().sum()
+        _oppp_participation_only = True
 
     opt_loss = 0
     _opt = getattr(self, '_last_opt_out', None)
@@ -2191,6 +2260,7 @@ class CeresNet(nn.Module):
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
+        + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
 
@@ -2216,6 +2286,7 @@ class CeresNet(nn.Module):
           + self.action_uncertainty_loss_weight * action_uncertainty_loss
           + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
+        + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
           # policy family (unlike the depth probes, which span both).
@@ -2334,8 +2405,10 @@ class CeresNet(nn.Module):
         self._log("hlgauss_value_loss" + stat_suffix, hlg_loss, step=num_pos)
       if not isinstance(opt_loss, int):
         self._log("optimistic_policy_loss" + stat_suffix, opt_loss, step=num_pos)
-      if not isinstance(oppp_loss, int):
+      if not isinstance(oppp_loss, int) and not _oppp_participation_only:
         self._log("opp_policy_loss" + stat_suffix, oppp_loss, step=num_pos)
+      if not isinstance(actp_loss, int) and not _actp_participation_only:
+        self._log("action_played_loss" + stat_suffix, actp_loss, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not isinstance(refiner_ploss, int):

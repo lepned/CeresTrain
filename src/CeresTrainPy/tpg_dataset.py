@@ -14,6 +14,7 @@ If not, see <http://www.gnu.org/licenses/>.
 # NOTE: this code derived from: https://github.com/Rocketknight1/minimal_lczero.
 
 import os, fnmatch
+from collections import namedtuple
 import numpy as np
 import zstandard
 
@@ -89,6 +90,17 @@ def try_shuffle(file_list):
 
 
 MAX_MOVES = 92 # Maximum number of policy moves in a position that can be stored (TPGRecord.MAX_MOVES)
+
+# NAMED layout contract for the per-batch V7-extras payload (review 2026-08-21
+# finding 15: two producers + positional len() discrimination cannot survive a
+# reordering). Producers construct by keyword; the consumer reads by name and
+# treats None as "field not supplied by this producer".
+#   - TPG .v7x sidecar (this file): cens_q/cens_d/prov only.
+#   - DirectFromV6 v7 records (v6_dataset.py): all seven.
+# Fields are numpy arrays [B, 1] (act/opp indices int32, -1 = masked).
+V7Extras = namedtuple('V7Extras',
+                      ['cens_q', 'cens_d', 'prov', 'opp_idx', 'act_idx', 'act_q', 'act_d'],
+                      defaults=(None, None, None, None))  # last 4 optional
 
 # SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
 # re-reading the env here. This guarantees the data width (how many aux channels
@@ -572,9 +584,9 @@ class TPGDataset(Dataset):
               if v7x_batches is not None:
                 _v7x_rows = v7x_batches[batch_num]
                 # Field extraction copies out of the structured view (contiguous plain arrays).
-                v7x = (_v7x_rows['cens_q'].astype(np.float32).reshape(-1, 1),
-                       _v7x_rows['cens_d'].astype(np.float32).reshape(-1, 1),
-                       _v7x_rows['prov'].copy().reshape(-1, 1))
+                v7x = V7Extras(cens_q=_v7x_rows['cens_q'].astype(np.float32).reshape(-1, 1),
+                               cens_d=_v7x_rows['cens_d'].astype(np.float32).reshape(-1, 1),
+                               prov=_v7x_rows['prov'].copy().reshape(-1, 1))
               else:
                 v7x = None
               
@@ -804,14 +816,19 @@ class TPGDataset(Dataset):
         # V7-extras sidecar values (V7_EXTRAS_SIDECAR_SPEC.md), each [B, 1]:
         # censored q_st/d_st are STM-relative (TPG convention); z-provenance codes
         # 0=orig result, 1=syzygy, 2=deblunder-noise, 3=deblunder-unintended, 4=op1-8man.
-        cens_q, cens_d, prov = v7x[0], v7x[1], v7x[2]
-        filtered_dict['censored_q_st'] = filter_tensor(torch.tensor(cens_q, dtype=torch.float32), mod_value)
-        filtered_dict['censored_d_st'] = filter_tensor(torch.tensor(cens_d, dtype=torch.float32), mod_value)
-        filtered_dict['z_provenance'] = filter_tensor(torch.tensor(prov, dtype=torch.uint8), mod_value)
-        # Optional 4th component (DirectFromV6 v7 records only, not in TPG
-        # .v7x sidecars): opponent's reply move index, -1 = none/masked.
-        if len(v7x) > 3:
-          filtered_dict['opp_played_idx'] = filter_tensor(torch.tensor(v7x[3], dtype=torch.int64), mod_value)
+        filtered_dict['censored_q_st'] = filter_tensor(torch.tensor(v7x.cens_q, dtype=torch.float32), mod_value)
+        filtered_dict['censored_d_st'] = filter_tensor(torch.tensor(v7x.cens_d, dtype=torch.float32), mod_value)
+        filtered_dict['z_provenance'] = filter_tensor(torch.tensor(v7x.prov, dtype=torch.uint8), mod_value)
+        # Optional fields (DirectFromV6 v7 records only, not in TPG .v7x
+        # sidecars) — access BY NAME per the V7Extras contract, None = absent.
+        if v7x.opp_idx is not None:
+          # Opponent's reply move index, -1 = none/masked.
+          filtered_dict['opp_played_idx'] = filter_tensor(torch.tensor(v7x.opp_idx, dtype=torch.int64), mod_value)
+        if v7x.act_idx is not None:
+          # Played-move action target for the exported action head.
+          filtered_dict['action_played_idx'] = filter_tensor(torch.tensor(v7x.act_idx, dtype=torch.int64), mod_value)
+          filtered_dict['action_q_after'] = filter_tensor(torch.tensor(v7x.act_q, dtype=torch.float32), mod_value)
+          filtered_dict['action_d_after'] = filter_tensor(torch.tensor(v7x.act_d, dtype=torch.float32), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

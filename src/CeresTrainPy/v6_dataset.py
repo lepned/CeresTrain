@@ -65,8 +65,8 @@ except ImportError:
   _DECOMP_ERRORS = (OSError, EOFError, zlib.error)
   _GZIP_IMPL = 'gzip'
 
-from config import NUM_AUX_FEATURES_PER_SQUARE
-from tpg_dataset import stable_str_hash, TPGDataset, _RUN_SHUFFLE_SEED
+from config import NUM_AUX_FEATURES_PER_SQUARE, split_roots
+from tpg_dataset import stable_str_hash, TPGDataset, _RUN_SHUFFLE_SEED, V7Extras
 
 MAX_MOVES = 92               # TPGRecord.MAX_MOVES — top-K policy slots
 POLICY_FLOOR = 0.0005        # CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE
@@ -174,16 +174,34 @@ class V6ChunkDataset(TPGDataset):
     # TrainingFilesDirectory accepts MULTIPLE roots separated by ';' (e.g.
     # "/data/t91_v7_op1;/data/cv2" — combine same-version corpora living in
     # different places; mixing is volume-proportional after the flat entry
-    # shuffle). All roots must hold the same record version (pinning applies
-    # across the union).
+    # shuffle). All roots must hold the same record version — ENFORCED in
+    # _startup_diagnosis (finding 5: per-worker first-chunk pinning would
+    # otherwise silently drop a different root per worker/rank).
+    # Overlap guard (finding 6): a duplicated root, or one root nested inside
+    # another, would double-count every affected chunk after the recursive glob
+    # — 'volume-proportional mixing' silently becomes 2x oversampling.
+    roots = split_roots(root_dir)
+    _rp = [os.path.realpath(r) for r in roots]
+    for i, a in enumerate(_rp):
+      for b in _rp[:i]:
+        if a == b:
+          raise ValueError(f'DirectFromV6: duplicate root in TrainingFilesDirectory: {a!r}')
+        if a.startswith(b + os.sep) or b.startswith(a + os.sep):
+          raise ValueError(f'DirectFromV6: nested roots in TrainingFilesDirectory '
+                           f'({a!r} inside {b!r}) — chunks under the overlap would be '
+                           f'enumerated twice (2x sampling weight)')
     entries = []
-    for root in [r.strip() for r in str(root_dir).split(';') if r.strip()]:
-      entries += [('fs', p) for p in
-                  sorted(glob.glob(os.path.join(root, '**', '*.gz'), recursive=True))]
+    for root in roots:
+      root_entries = [('fs', p) for p in
+                      sorted(glob.glob(os.path.join(root, '**', '*.gz'), recursive=True))]
       for tp in sorted(glob.glob(os.path.join(root, '**', '*.tar'), recursive=True)):
-        entries += self._index_tar(tp)
-    if num_files_to_skip:
-      entries = entries[num_files_to_skip:]
+        root_entries += self._index_tar(tp)
+      # Skip applies PER ROOT (finding 10): single-root semantics were 'skip N
+      # of this corpus'; applied to the concatenated list, a large skip would
+      # silently delete the whole first root.
+      if num_files_to_skip:
+        root_entries = root_entries[num_files_to_skip:]
+      entries += root_entries
     if not entries:
       raise FileNotFoundError(f'DirectFromV6: no .gz chunks or .tar archives under {root_dir}')
     # Rank-consistent shuffle (finding 6): all ranks must produce the SAME
@@ -221,6 +239,7 @@ class V6ChunkDataset(TPGDataset):
     folklore about a directory."""
     step = max(1, len(entries) // sample_n)
     versions, provs, rq_nonint, rq_n = set(), set(), 0, 0
+    opp_pop, act_pop, v7_n = 0, 0, 0
     for e in entries[::step][:sample_n]:
       data = self._read_entry(e)
       if data is None or len(data) < 8:
@@ -239,12 +258,30 @@ class V6ChunkDataset(TPGDataset):
       rq_n += len(rq)
       if ver == 7:
         provs.update(np.unique(np.nan_to_num(recs['z_provenance']).astype(np.uint8)).tolist())
+        opp_pop += int((recs['opp_played_idx'] < 1858).sum())
+        act_pop += int(((recs['played_idx'] < 1858)
+                        & (np.nan_to_num(recs['q_after_played']) != 0)).sum())
+        v7_n += len(recs)
     # Close parent-process tar handles so forked workers do not inherit
     # shared file offsets (each worker reopens lazily).
     for fh in self._tar_handles.values():
       fh.close()
     self._tar_handles = {}
     self._diag_versions = versions            # consumed by train.py sidecar preflights
+    # Aux-target population fractions over the v7 sample (finding 7: a corpus
+    # whose writer zero-filled the ExtraV7 tail would otherwise train the
+    # opp/action heads on 100% 'valid' garbage with plausible loss curves).
+    # Consumed by the train.py oppp/action preflights.
+    self._diag_opp_populated = (opp_pop / v7_n) if v7_n else None
+    self._diag_action_populated = (act_pop / v7_n) if v7_n else None
+    # Same-version constraint across the multi-root union (finding 5): version
+    # pinning is first-decoded-chunk-wins PER FORKED WORKER, so a mixed union
+    # would pin differently per worker/rank — rank-divergent batch keys (NCCL
+    # hang under static_graph) and ~half the corpus silently dropped.
+    if len(versions & {6, 7}) > 1:
+      raise ValueError(f'DirectFromV6: mixed record versions {sorted(versions)} across '
+                       f'TrainingFilesDirectory roots — all roots must hold the SAME '
+                       f'version (v6 and v7 cannot be combined in one source)')
     deblundered = (rq_nonint > 0) or bool(provs & {2, 3})
     rescored = bool(provs & {1, 4})
     parts = [f'versions={sorted(versions)}']
@@ -254,6 +291,9 @@ class V6ChunkDataset(TPGDataset):
                  else 'rescored=undetectable (v6)')
     if provs:
       parts.append(f'provenance={sorted(provs)}')
+    if v7_n:
+      parts.append(f'opp_idx populated={self._diag_opp_populated:.1%}')
+      parts.append(f'action(q_after) populated={self._diag_action_populated:.1%}')
     print(f'[v6_dataset] corpus diagnosis ({rq_n:,} pos sampled): ' + ', '.join(parts))
 
   # ---- tar support ------------------------------------------------------
@@ -346,6 +386,17 @@ class V6ChunkDataset(TPGDataset):
       pqs[1:] = np.maximum(bq[:-1] - pq[:-1], 0.0)
     recs = recs.copy()                             # frombuffer view is read-only
     recs['played_m'] = pqs                         # repurposed (see docstring)
+    # Played-move action targets (v7 only): d-after-played = next record's
+    # best_d (game order, side-symmetric so no flip; q comes from the
+    # q_after_played field itself, verified == -next.best_q to MAE 0.000).
+    # Repurpose 'root_m' for the shifted d; the LAST record has no next ->
+    # invalidate by forcing its played_idx out of range.
+    if 'cens_q_st' in recs.dtype.names:
+      d_after = np.zeros(len(recs), dtype=np.float32)
+      if len(recs) > 1:
+        d_after[:-1] = np.nan_to_num(recs['best_d'])[1:]
+      recs['root_m'] = d_after
+      recs['played_idx'][-1] = 0xFFFF
     # z-integrity filter (deblunder-lite; ~neutral on deblundered data).
     if self.max_resultq_delta > 0:
       zok = np.abs(bq - np.nan_to_num(recs['result_q'])) <= self.max_resultq_delta
@@ -470,10 +521,17 @@ class V6ChunkDataset(TPGDataset):
       # both Kovax v7 corpora (measured 2026-08-21).
       _opp = recs['opp_played_idx'].astype(np.int32)
       _opp = np.where(_opp < 1858, _opp, -1).reshape(-1, 1)
-      v7x = (np.nan_to_num(recs['cens_q_st']).astype(np.float32).reshape(-1, 1),
-             np.nan_to_num(recs['cens_d_st']).astype(np.float32).reshape(-1, 1),
-             np.nan_to_num(recs['z_provenance']).astype(np.uint8).reshape(-1, 1),
-             _opp)
+      # Components 5-7: played-move action target (idx, q-after, d-after);
+      # idx -1 = invalid (last ply / NO_MOVE), masked in the loss.
+      _apidx = recs['played_idx'].astype(np.int32)
+      _apidx = np.where(_apidx < 1858, _apidx, -1).reshape(-1, 1)
+      v7x = V7Extras(cens_q=np.nan_to_num(recs['cens_q_st']).astype(np.float32).reshape(-1, 1),
+                     cens_d=np.nan_to_num(recs['cens_d_st']).astype(np.float32).reshape(-1, 1),
+                     prov=np.nan_to_num(recs['z_provenance']).astype(np.uint8).reshape(-1, 1),
+                     opp_idx=_opp,
+                     act_idx=_apidx,
+                     act_q=np.nan_to_num(recs['q_after_played']).astype(np.float32).reshape(-1, 1),
+                     act_d=np.nan_to_num(recs['root_m']).astype(np.float32).reshape(-1, 1))   # repurposed: d_after
 
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
             unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,
@@ -514,10 +572,13 @@ class V6ChunkDataset(TPGDataset):
       for i0 in range(0, len(recs), CONVERT_BLOCK):
         block = recs[i0:i0 + CONVERT_BLOCK]
         out = self._records_to_arrays(block)
-        v7x = out[13]                        # 3- or 4-tuple (len-agnostic below)
+        v7x = out[13]                        # V7Extras or None
         for b0 in range(0, len(block), B):
           sl = slice(b0, b0 + B)
-          v7x_b = tuple(a[sl] for a in v7x) if v7x is not None else None
+          # Slice each field but KEEP the V7Extras type (a plain tuple here
+          # loses the named contract the consumer reads by).
+          v7x_b = (V7Extras(*[a[sl] if a is not None else None for a in v7x])
+                   if v7x is not None else None)
           yield tuple(a[sl] for a in out[:13]) + (None, v7x_b)
       rec_pool = [leftover] if len(leftover) and not final else []
       pool_count = len(leftover) if not final else 0

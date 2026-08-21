@@ -13,7 +13,6 @@ If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import re
-import fnmatch
 import sys
 import socket
 import datetime
@@ -52,7 +51,7 @@ from derf_norm import DerfNorm
 from dyt_norm import DyTNorm
 from losses import LossCalculator
 from tpg_dataset import TPGDataset, TPGMixedDataset, TPG_TARGET_SIDECAR_MODE
-from config import Configuration
+from config import Configuration, split_roots
 import lora
 from config import NUM_TOKENS_INPUT, NUM_TOKENS_NET, NUM_INPUT_BYTES_PER_SQUARE, TOTAL_INPUT_FEATURES_PER_SQUARE
 from utils import calc_flops
@@ -121,13 +120,24 @@ if TPG_TRAIN_DIR is None:
   print('ERROR: TrainingFilesDirectory is null')
   exit(1)
 else:
-  # DirectFromV6 accepts MULTIPLE ';'-separated roots (v6_dataset.py);
-  # validate each part so a typo in any of them still fails loudly here.
-  for _dir_part in [d.strip() for d in str(TPG_TRAIN_DIR).split(';') if d.strip()]:
+  # ONLY DirectFromV6 accepts MULTIPLE ';'-separated roots (v6_dataset.py);
+  # a multi-part value under any other SourceType would pass per-part
+  # validation here and then die deep in dataset init on the raw joined
+  # string (review 2026-08-21 finding 8). Empty/separator-only values are
+  # rejected too (they used to skip the loop and fail late).
+  _dir_parts = split_roots(TPG_TRAIN_DIR)
+  if not _dir_parts:
+    print(f"ERROR: TrainingFilesDirectory ('{TPG_TRAIN_DIR}') names no directories.")
+    exit(1)
+  if len(_dir_parts) > 1 and str(getattr(config, 'Data_SourceType', '') or '') != 'DirectFromV6':
+    print(f"ERROR: multiple ';'-separated TrainingFilesDirectory roots are only "
+          f"supported with SourceType DirectFromV6 (got {config.Data_SourceType!r}).")
+    exit(1)
+  for _dir_part in _dir_parts:
     if not os.path.isdir(_dir_part):
       print('ERROR: TrainingFilesDirectory does not exist:', _dir_part)
       exit(1)
-    if not os.listdir(_dir_part):
+    if next(os.scandir(_dir_part), None) is None:
       print(f"ERROR: The directory TrainingFilesDirectory ('{_dir_part}') is empty.")
       exit(1)
 
@@ -879,9 +889,8 @@ def Train():
   # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work
   # (zstd decompression + TPG parsing) is the bottleneck. Note: V3 aux features are baked
   # into the TPG record and read directly, so CERES_AUX_FEATURES_PER_SQUARE adds no recompute.
-  # (TPG_TRAIN_DIR may be a ';'-separated multi-root list for DirectFromV6.)
-  count_zst_files = sum(len([f for f in fnmatch.filter(os.listdir(_d.strip()), '*.zst') if not f.endswith('.tgt.zst')])
-                        for _d in str(TPG_TRAIN_DIR).split(';') if _d.strip())
+  # (The old count_zst_files here was a write-only dead variable that fully
+  # listed every root at startup — deleted, review 2026-08-21 finding 13.)
   _DEFAULT_NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1
   NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))
   if NUM_DATASET_WORKERS != _DEFAULT_NUM_DATASET_WORKERS:
@@ -1290,15 +1299,22 @@ def Train():
   # alongside a survival-labelled primary). Without those terms the set would
   # shrink on target-less batches and static_graph would fire
   # "Your training graph has changed in this iteration".
+  # (oppp_head and opt_head are stash-only too — omitting them here made the
+  # exact recipe-prescribed 4xA100 run die at step 1 with the raw reducer
+  # error instead of this guard's message, review 2026-08-21 finding 1. The
+  # action head's OUTPUT is returned from forward so its params are visible
+  # to the reducer, but its loss still needs the participation term.)
   if (getattr(core, 'dp_surv_weight', 0) > 0
       or getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
-      or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)) and WORLD_SIZE > 1:
+      or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)
+      or getattr(core, 'opp_policy_weight', 0) > 0
+      or getattr(core, 'opt_policy_weight', 0) > 0) and WORLD_SIZE > 1:
     if not _static_graph:
       raise NotImplementedError(
-        'placement/survival/stvalue/depth-probe aux heads under DDP require static_graph: '
-        'the stashed aux output is invisible to DDP\'s default reducer. '
-        'Re-launch with CERES_DDP_STATIC_GRAPH=1.')
-    print(f'[ddp] aux heads (placement/survival/stvalue/depth-probes) enabled under DDP via '
+        'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy aux heads '
+        'under DDP require static_graph: the stashed aux output is invisible to DDP\'s '
+        'default reducer. Re-launch with CERES_DDP_STATIC_GRAPH=1.')
+    print(f'[ddp] stash-only aux heads enabled under DDP via '
           f'static_graph; compute_loss emits zero-weighted participation terms so the '
           f'used-parameter set stays constant on target-less batches', flush=True)
 
@@ -1362,6 +1378,29 @@ def Train():
       _any_v7x = any(f.endswith('.v7x.zst') for d in _dirs for f in os.listdir(d))
       if not _any_v7x:
         raise ValueError(f'CERES_TPG_V7X_SIDECAR=auto but no .v7x.zst sidecars found in any dataset dir: {_dirs}')
+
+  # Opp-policy / action-played aux heads require v7 targets that only the
+  # DirectFromV6 path supplies in-band (TPG .v7x sidecars carry only the
+  # cens_q/cens_d/prov triple). Without this preflight a misconfigured run
+  # would pay the full head forward every step with zero supervision and no
+  # log line, review 2026-08-21 finding 4. A TPG SECONDARY in a mixed run is
+  # fine (participation terms cover its batches); the PRIMARY must supply
+  # the targets.
+  for _aux_w, _aux_name, _pop_attr in (
+      (getattr(core, 'opp_policy_weight', 0), 'LossOppPolicyMultiplier', '_diag_opp_populated'),
+      (getattr(core, 'action_played_weight', 0), 'LossActionPlayedMultiplier', '_diag_action_populated')):
+    if _aux_w > 0:
+      if not _IS_V6_SOURCE:
+        raise ValueError(f'{_aux_name} > 0 requires SourceType DirectFromV6 with a v7 corpus '
+                         f'(TPG records/sidecars carry no opp/action targets)')
+      if 7 not in getattr(primary_dataset, '_diag_versions', set()):
+        raise ValueError(f'{_aux_name} > 0 but the DirectFromV6 corpus is not v7 '
+                         f'(no OppPlayedIndex/QAfterPlayedMove in v6 records)')
+      _pop = getattr(primary_dataset, _pop_attr, None)
+      if _pop is not None and _pop < 0.01:
+        raise ValueError(f'{_aux_name} > 0 but only {_pop:.1%} of sampled v7 records carry a '
+                         f'populated target — this corpus\'s ExtraV7 tail looks zero-filled; '
+                         f'training would push the head toward garbage (finding 7)')
 
   # Curriculum prologue (CERES_MIX_PROLOGUE_POSITIONS): serve ONLY secondary
   # (e.g. puzzle) batches for the first N positions, then switch to the normal
@@ -1581,7 +1620,18 @@ def Train():
         else:
           # Map to the original name (before it was subsumed within original_layer)
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name
-          new_state_dict[name] = loaded["model"][name_in_checkpoint]
+          if name_in_checkpoint in loaded["model"]:
+            new_state_dict[name] = loaded["model"][name_in_checkpoint]
+          elif name.startswith(('oppp_head.', 'opt_head.', 'hlg_head.', 'sp_head.',
+                                'action_head.', 'stvalue_', 'vc_head.')):
+            # Aux head newer than the base checkpoint (review 2026-08-21
+            # finding 9: the unconditional index raised KeyError at startup
+            # for the standard LoRA-from-orig flow) — keep init values, the
+            # head trains from scratch during the fine-tune.
+            pass
+          else:
+            raise KeyError(f'LoRA base checkpoint is missing required weight {name_in_checkpoint!r} '
+                           f'(model layer {name!r}) and it is not a known-new aux head')
 
       # Load updated state dict
       model_nocompile.load_state_dict(new_state_dict, strict=False)

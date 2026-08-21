@@ -183,9 +183,10 @@ opt-config:  "LossValueMultiplier": 2.0
   den raskeste laereren dempes — gevinsten er stabilitet paa 400M+-skala.
 - Value-masse 2.0: Kovax-adopsjon #1 (hans objektiv er ~50 % value; vaart ~20-25 %) —
   adresserer at trunken flytter seg for policy paa values bekostning.
-- Tillegg hvis korpuset har .tgt.zst-sidecars (t91_skip1_v2_surv-navnet antyder det):
-  survival-aux med liten vekt gir value-familien committende gradienter i P-planet
-  som motvekt (dpsv malte +21/+22 value-grip lokalt).
+- Survival-anker: UTGAAR paa server (besluttet 2026-08-21): labelene finnes kun
+  som TPG-sidecars, og serverens datasti er chunks/tars (v6/v7) som ikke baerer
+  dem — preflighten nekter kombinasjonen by design. Value-familiens reserve er
+  dermed den value-private P-blokken alene.
 
 **Anbefalt design (besluttet 2026-08-21 kveld): FRISKT 1B-loep, ikke forlengelses-arm.**
 Begrunnelse: (1) en resume-hale senker LR samtidig som stabilisatorene slaas paa —
@@ -208,7 +209,12 @@ net-config:  "DualPlanePolicyGradScale": 0.25
 opt-config:  "LossValueMultiplier": 2.0,
              "LossOppPolicyMultiplier": 0.1,
              "AuxFeaturesPerSquare": 0, "LossQDeviationMultiplier": 0
-env:         CERES_SHUFFLE_SEED=<fast tall>, CERES_NUM_DATASET_WORKERS=4 per rank
+env:         CERES_SHUFFLE_SEED=<fast tall>, CERES_NUM_DATASET_WORKERS=4 per rank,
+             CERES_DDP_STATIC_GRAPH=1  (PAAKREVD med LossOppPolicyMultiplier>0
+             under torchrun: oppp-hodet er stash-only og usynlig for DDPs
+             default-reducer; guard i train.py feiler hoylytt uten. Review
+             2026-08-21 funn 1+2 — participation-terms er inne, saa mixed/
+             all--1-batcher er trygge.)
 ```
 - Opponent-policy aux (LossOppPolicyMultiplier 0.1): Monroe-ideen (+5 % hos LC0),
   target = v7 OppPlayedIndex (99 % populert i begge korpus), training-only hode,
@@ -223,8 +229,11 @@ env:         CERES_SHUFFLE_SEED=<fast tall>, CERES_NUM_DATASET_WORKERS=4 per ran
   negativ ved fast tenketid. Arkivert som maalt-og-avvist for serving-nett.
 - value-masse 2.0: Kovax-adopsjon #1
 - Survival-anker: IKKE i dette loepet (brukerbeslutning) — staar som senere kandidat
-- Datasti: TPG som foer (DirectFromV6 tas i loepet ETTER, saa feilsoeking ikke maa
-  skille datasti fra arkitektur)
+- Datasti (revidert 2026-08-21): DirectFromV6 paa v7 DIREKTE (ingen TPG) —
+  brukerbeslutning; de nye v7-feltene (OppPlayedIndex, QAfterPlayedMove) finnes
+  bare der. Multi-rot: cv2 + T91-v7 i ett TrainingFilesDirectory (';'-separert,
+  volumproporsjonal miks). Hele pakken 1M-roeyktestet samlet (run2pkg +
+  actsmk-varianter).
 
 GRATIS DIAGNOSTIKK FOER START: kjoer EB paa 900M- og 1B-checkpointene fra det
 gamle loepet — deres egen cosinus er allerede nede paa ~1e-4 der. Alternerer
@@ -235,7 +244,18 @@ stor informasjonsverdi.
 Suksesskriterium for det friske loepet: EB-value-kurven 400M-1B flat/monoton
 (ingen niva-alternering), TB value/value2/unc uten sagtann. Reserve hvis dempingen
 ikke rekker: value-privat P-blokk (fork etter siste delte blokk, kun value-
-gradienter) — og deretter survival-ankeret.
+gradienter). Action-hodet (q_after_played, ett-stegs lookahead-value) er den
+andre value-forsterkeren i koe — BYGD OG VALIDERT 2026-08-21:
+- `LossActionPlayedMultiplier` (opt-config, anbefalt 0.1): action-hodet
+  ([B,1858,3] WDL per trekk) faar masked soft-CE paa SPILT trekk-slot mot
+  WDL fra v7 q/d-after-played (99 % populert i begge korpus, verifisert
+  q_after == -next.best_q til MAE 0.000). 1M-smoke: action_played_loss
+  0.918 -> 0.834, policy/value upaavirket.
+- Hodet EKSPORTERES som ONNX-output "action" — Ceres-TRT gjenkjenner paa navn
+  og MCTS konsumerer via ActionWDLForMove.
+- TRT-kost MAALT (EB cmp actsmk vs run2pkg, begge ordrer): ~9-12 % EPS.
+  Kosten er VALGFRI ved serving: tren med hodet (value-signal inn i trunken),
+  strippes ev. fra eksporten for full fart — beslutning per nett, ikke per run.
 
 ## Gate-regel (uendret fra Stage C-protokollen)
 

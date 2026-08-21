@@ -52,6 +52,14 @@ def read_config(file_path):
   with open(file_path, 'r') as file:
       return json.load(file)
 
+def split_roots(dirs):
+  """THE definition of how a ';'-separated TrainingFilesDirectory value is
+  parsed into a list of roots. All consumers (train.py validation,
+  v6_dataset enumeration) must use this so startup validation cannot approve
+  a different directory set than the loader enumerates (review 2026-08-21
+  finding 14)."""
+  return [d.strip() for d in str(dirs).split(';') if d.strip()]
+
 class Configuration:
   """
     Initializes the Configuration object by loading various configuration settings from JSON files.
@@ -513,6 +521,8 @@ class Configuration:
     self.NetDef_DualPlanePolicyGradScale = config_net_def.get('DualPlanePolicyGradScale', 1.0)
     # Opponent-policy aux (v7 OppPlayedIndex target; DirectFromV6 sources only)
     self.Opt_LossOppPolicyMultiplier = config_opt.get('LossOppPolicyMultiplier', 0)
+    # Played-move action training (v7 q_after_played target; head is exported)
+    self.Opt_LossActionPlayedMultiplier = config_opt.get('LossActionPlayedMultiplier', 0)
     # Value min/max pool side-channels (2026-08 tactics toolbox T1.2): trunk
     # amin/amax over squares into the value family's hidden pre-activation.
     # Zero-init no-op add-on (the 'inject' class).
