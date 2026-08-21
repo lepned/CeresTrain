@@ -187,13 +187,38 @@ opt-config:  "LossValueMultiplier": 2.0
   survival-aux med liten vekt gir value-familien committende gradienter i P-planet
   som motvekt (dpsv malte +21/+22 value-grip lokalt).
 
-**Anbefalt testdesign naar 1B-loepet er ferdig — forlengelses-arm 1B -> ~1.3B:**
-resume fra 1B-checkpointen med de to noeklene over og forlenget lav-LR-hale
-(value konsoliderer i lav-LR-regimet). Gir ren A/B paa SAMME nett: oscillasjons-
-aeraen 400M-1B vs post-fiks-aeraen, ~6 t ved 14K pos/s. Suksesskriterium:
-EB-value ved 1.1/1.2/1.3B slutter aa alternere (flatt/monotont, ikke niva-hopp),
-og TB value/value2/unc roer seg mot dagens sagtann. Reserve hvis dempingen ikke
-rekker: value-privat P-blokk (fork etter siste delte blokk, kun value-gradienter).
+**Anbefalt design (besluttet 2026-08-21 kveld): FRISKT 1B-loep, ikke forlengelses-arm.**
+Begrunnelse: (1) en resume-hale senker LR samtidig som stabilisatorene slaas paa —
+attribusjonen drukner i s3-loven (value konsoliderer i lav LR uansett); (2) value-
+representasjonen DANNES i 100-400M-vinduet — stabilisatorene maa beskytte
+formasjonsfasen, ikke bare reparere halen; (3) RPE hoerer til fra steg 0 og kan
+ikke varmstartes inn.
+
+Konfig-pakken for det friske loepet (alle punkter med maalt evidens):
+```json
+net-config:  "DualPlanePolicyGradScale": 0.25,
+             "UseRPE": true
+opt-config:  "LossValueMultiplier": 2.0
+```
+- grad-scale 0.25: kirurgisk verifisert (P-plan-grad x0.25, decode-vekter x1.0,
+  value-grad x1.0), null inferenskost
+- UseRPE true: deg4nr-ablasjonen maalte RPE-fjerning til -15/-36 OOD-policy paa
+  spilldata-miks (value upaavirket) — foerste loep kjoerte uten
+- value-masse 2.0: Kovax-adopsjon #1
+- Survival-anker: IKKE i dette loepet (brukerbeslutning) — staar som senere kandidat
+- Datasti: TPG som foer (DirectFromV6 tas i loepet ETTER, saa feilsoeking ikke maa
+  skille datasti fra arkitektur)
+
+GRATIS DIAGNOSTIKK FOER START: kjoer EB paa 900M- og 1B-checkpointene fra det
+gamle loepet — deres egen cosinus er allerede nede paa ~1e-4 der. Alternerer
+value fortsatt, er lav LR alene bevist utilstrekkelig (stabilisatorene noedvendige);
+roer den seg selv, er diagnosen mer LR-koblet enn delt-pool-koblet. En EB-kjoering,
+stor informasjonsverdi.
+
+Suksesskriterium for det friske loepet: EB-value-kurven 400M-1B flat/monoton
+(ingen niva-alternering), TB value/value2/unc uten sagtann. Reserve hvis dempingen
+ikke rekker: value-privat P-blokk (fork etter siste delte blokk, kun value-
+gradienter) — og deretter survival-ankeret.
 
 ## Gate-regel (uendret fra Stage C-protokollen)
 
