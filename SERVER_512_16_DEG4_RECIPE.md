@@ -120,6 +120,41 @@ En variabel om gangen — forst dual-plane-deltaet mot 512-16-baselinen du
 allerede har, sa evt. H1 (heads ratio 1/3) som neste arm nar deltaet er
 kjent.
 
+## DirectFromV6: tren rett fra LC0-tars/chunks — null TPG-lagring (2026-08-21)
+
+For servere uten diskplass til TPG-shards: data-configen
+```json
+{
+    "SourceType": "DirectFromV6",
+    "TrainingFilesDirectory": "/path/til/tars-eller-chunks",
+    "V6SkipCount": 30,
+    "V6ShufflePool": 50000
+}
+```
+leser LC0 v6- OG v7-records direkte — baade loese .gz-chunks og
+UUTPAKKEDE .tar-arkiver (medlemmene leses in-place via seek+read;
+indeks caches som <tar>.chunkindex.npz naar katalogen er skrivbar).
+v7-halen mater trainerens v7x-forbrukere (censored q/d + z-provenance)
+uten sidecar-filer.
+
+Krav/valg:
+- `AuxFeaturesPerSquare: 0` (137-kanals modell; qz-ablasjonen viste aux-noeytralitet)
+- `LossQDeviationMultiplier: 0` (feltet finnes ikke i v6)
+- `pip install isal` (2-3x raskere gunzip; brukes automatisk om installert)
+- CERES_NUM_DATASET_WORKERS etter kjerner: ~2,2M pos/h/worker (loese filer,
+  native fs) og opptil ~19M pos/h/worker DIREKTE FRA TAR (een filhaandtak,
+  ingen per-fil-aapningskost — raskeste sti, maalt 2026-08-21)
+- V6ShufflePool: RAM = pool x workers x 8,4 KB (200k x 8 = 13 GB OOM-et
+  lokalt; 50k er trygg default)
+- Ingen rescore/deblunder i loypa: bruk pre-rescorede tars
+- Skip er TILFELDIG per pass (hele korpuset naas over epoker, ulikt
+  gen-tpgs permanente utvalg)
+
+Validert ende-til-ende lokalt 2026-08-21: startpos-anker + felt-sanity
+(v6 og v7), 5M-trening fra raa chunks pa deg4-chassiset (v6smk: value
+1972/1719 = deg4mx-klassen ved samme LR-fase; policy begrenset av
+een-dags-korpus som ventet), ORT-load groenn, gate kjoert.
+
 ## Gate-regel (uendret fra Stage C-protokollen)
 
 Sammenlign mot 512-16-baselinen ved samme posisjonstall; value-regelen

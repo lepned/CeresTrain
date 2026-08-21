@@ -898,10 +898,22 @@ def Train():
   _MIRROR_PRIMARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_PRIMARY')
   _MIRROR_SECONDARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_SECONDARY')
 
-  primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
-                               rank, world_size, NUM_DATASET_WORKERS,
-                               BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
-                               file_mirror_prob=_MIRROR_PRIMARY)
+  # Primary source: TPG shards (default) or direct LC0 v6 .gz chunks
+  # (Data config "SourceType": "DirectFromV6" — zero-storage path for
+  # training straight from pre-rescored LC0 data; see v6_dataset.py).
+  if str(getattr(config, 'Data_SourceType', '') or '') == 'DirectFromV6':
+    from v6_dataset import V6ChunkDataset
+    primary_dataset = V6ChunkDataset(TPG_TRAIN_DIR, batch_size_forward // world_size,
+                                     config.Data_WDLLabelSmoothing,
+                                     rank, world_size, NUM_DATASET_WORKERS,
+                                     BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip,
+                                     config.Exec_TestFlag,
+                                     file_mirror_prob=_MIRROR_PRIMARY)
+  else:
+    primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
+                                 rank, world_size, NUM_DATASET_WORKERS,
+                                 BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
+                                 file_mirror_prob=_MIRROR_PRIMARY)
 
   # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
   # Triggered when both Data_TrainingFilesDirectory2 is set AND Data_RatioSet1ToSet2 > 0.

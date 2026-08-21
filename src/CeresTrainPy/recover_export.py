@@ -30,7 +30,7 @@ NUM_POS     = sys.argv[3]
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 config = Configuration('.', os.path.join(OUTPUTS_DIR, "configs", TRAINING_ID))
-NAME = 'lepdev_' + TRAINING_ID
+NAME = os.environ.get('CERES_HOST_PREFIX', 'lepdev') + '_' + TRAINING_ID
 
 model = CeresNet(None, config,
                  policy_loss_weight=config.Opt_LossPolicyMultiplier,

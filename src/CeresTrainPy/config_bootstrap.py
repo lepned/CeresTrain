@@ -65,6 +65,12 @@ BOOTSTRAP_ENV_MAP = {
     'SecondaryLossStvalueMult': 'CERES_SECONDARY_LOSS_STVALUE_MULT',
     'MixProloguePositions': 'CERES_MIX_PROLOGUE_POSITIONS',
     'FileMirrorAug': 'CERES_FILE_MIRROR_AUG',
+    # DirectFromV6 chunk-reader knobs (v6_dataset.py): record downsampling
+    # (decorrelation; random per pass, so the full corpus stays reachable
+    # across epochs, unlike gen-tpg's permanent skip) and the per-worker
+    # raw-record shuffle pool (RAM = pool * workers * 8.4 KB).
+    'V6SkipCount': 'CERES_V6_SKIP_COUNT',
+    'V6ShufflePool': 'CERES_V6_SHUFFLE_POOL',
     'KeepDrawProb': 'CERES_KEEP_DRAW_PROB',
 }
 
