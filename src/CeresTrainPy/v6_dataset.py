@@ -171,10 +171,17 @@ class V6ChunkDataset(TPGDataset):
     self.max_resultq_delta = _knob(max_resultq_delta, 'CERES_V6_MAX_RESULTQ_DELTA', 0.0, float)
     # NOTE: num_files_to_skip counts CHUNKS (games, ~100 pos) here, not TPG
     # shards (millions of pos) — semantically different from the TPG path.
-    entries = [('fs', p) for p in
-               sorted(glob.glob(os.path.join(root_dir, '**', '*.gz'), recursive=True))]
-    for tp in sorted(glob.glob(os.path.join(root_dir, '**', '*.tar'), recursive=True)):
-      entries += self._index_tar(tp)
+    # TrainingFilesDirectory accepts MULTIPLE roots separated by ';' (e.g.
+    # "/data/t91_v7_op1;/data/cv2" — combine same-version corpora living in
+    # different places; mixing is volume-proportional after the flat entry
+    # shuffle). All roots must hold the same record version (pinning applies
+    # across the union).
+    entries = []
+    for root in [r.strip() for r in str(root_dir).split(';') if r.strip()]:
+      entries += [('fs', p) for p in
+                  sorted(glob.glob(os.path.join(root, '**', '*.gz'), recursive=True))]
+      for tp in sorted(glob.glob(os.path.join(root, '**', '*.tar'), recursive=True)):
+        entries += self._index_tar(tp)
     if num_files_to_skip:
       entries = entries[num_files_to_skip:]
     if not entries:
@@ -457,9 +464,16 @@ class V6ChunkDataset(TPGDataset):
 
     v7x = None
     if 'cens_q_st' in recs.dtype.names:
+      # 4th component (beyond the TPG .v7x sidecar triple): the opponent's
+      # reply move (opponent-policy aux target, Monroe idea). NO_MOVE/out-of-
+      # range -> -1 sentinel (masked out of the loss). 99.1% populated in
+      # both Kovax v7 corpora (measured 2026-08-21).
+      _opp = recs['opp_played_idx'].astype(np.int32)
+      _opp = np.where(_opp < 1858, _opp, -1).reshape(-1, 1)
       v7x = (np.nan_to_num(recs['cens_q_st']).astype(np.float32).reshape(-1, 1),
              np.nan_to_num(recs['cens_d_st']).astype(np.float32).reshape(-1, 1),
-             np.nan_to_num(recs['z_provenance']).astype(np.uint8).reshape(-1, 1))
+             np.nan_to_num(recs['z_provenance']).astype(np.uint8).reshape(-1, 1),
+             _opp)
 
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
             unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,
@@ -500,7 +514,7 @@ class V6ChunkDataset(TPGDataset):
       for i0 in range(0, len(recs), CONVERT_BLOCK):
         block = recs[i0:i0 + CONVERT_BLOCK]
         out = self._records_to_arrays(block)
-        v7x = out[13]
+        v7x = out[13]                        # 3- or 4-tuple (len-agnostic below)
         for b0 in range(0, len(block), B):
           sl = slice(b0, b0 + B)
           v7x_b = tuple(a[sl] for a in v7x) if v7x is not None else None

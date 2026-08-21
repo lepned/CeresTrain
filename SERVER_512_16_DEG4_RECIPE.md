@@ -194,16 +194,33 @@ representasjonen DANNES i 100-400M-vinduet — stabilisatorene maa beskytte
 formasjonsfasen, ikke bare reparere halen; (3) RPE hoerer til fra steg 0 og kan
 ikke varmstartes inn.
 
-Konfig-pakken for det friske loepet (alle punkter med maalt evidens):
+Konfig-pakken for det friske loepet (alle punkter med maalt evidens).
+DATASTI: DirectFromV6 paa v7-korpusene direkte (IKKE TPG) — de nye v7-feltene
+(OppPlayedIndex m.fl.) finnes kun der, og partiniva-miksingen motvirker
+aera-komponenten av oscillasjonen. Flere kataloger skilles med ';' —
+miksing blir volum-proporsjonal (cv2 ~1/3 av T91 => ~25 % av stroemmen):
 ```json
-net-config:  "DualPlanePolicyGradScale": 0.25,
-             "UseRPE": true
-opt-config:  "LossValueMultiplier": 2.0
+data-config: "SourceType": "DirectFromV6",
+             "TrainingFilesDirectory": "/path/t91_v7_op1;/path/cv2",
+             "V6SkipCount": 30, "V6ShufflePool": 50000,
+             "V6MaxResultQDelta": 1.2
+net-config:  "DualPlanePolicyGradScale": 0.25
+opt-config:  "LossValueMultiplier": 2.0,
+             "LossOppPolicyMultiplier": 0.1,
+             "AuxFeaturesPerSquare": 0, "LossQDeviationMultiplier": 0
+env:         CERES_SHUFFLE_SEED=<fast tall>, CERES_NUM_DATASET_WORKERS=4 per rank
 ```
+- Opponent-policy aux (LossOppPolicyMultiplier 0.1): Monroe-ideen (+5 % hos LC0),
+  target = v7 OppPlayedIndex (99 % populert i begge korpus), training-only hode,
+  -1 maskert. Validert: enhets-smoke + 1M integrert trening
+  (opp_policy_loss 6.34 -> 4.80; random-baseline 7.5).
 - grad-scale 0.25: kirurgisk verifisert (P-plan-grad x0.25, decode-vekter x1.0,
   value-grad x1.0), null inferenskost
-- UseRPE true: deg4nr-ablasjonen maalte RPE-fjerning til -15/-36 OOD-policy paa
-  spilldata-miks (value upaavirket) — foerste loep kjoerte uten
+- RPE: DROPPET etter kostmaaling (2026-08-21 kveld): TRT-serving-kost maalt til
+  ~11 % EPS paa 256-10 (dp2 vs dp2nr, begge ordrer) og ~10-16 % paa 512-15
+  (rpe512-probe vs deg3-512) — kosten krymper IKKE med bredde. Mot +15-36
+  OOD-policy (Nodes=1, usikker overfoering til spill) er nettoen marginal-til-
+  negativ ved fast tenketid. Arkivert som maalt-og-avvist for serving-nett.
 - value-masse 2.0: Kovax-adopsjon #1
 - Survival-anker: IKKE i dette loepet (brukerbeslutning) — staar som senere kandidat
 - Datasti: TPG som foer (DirectFromV6 tas i loepet ETTER, saa feilsoeking ikke maa

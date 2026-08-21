@@ -530,6 +530,18 @@ class CeresNet(nn.Module):
       _serve_txt = f', SERVE-BLEND lambda={self.opt_serve_blend} (in export graph!)' if self.opt_serve_blend > 0 else ' (training-only)'
       print(f'[ceres_net] OPTIMISTIC-POLICY aux head enabled: w={self.opt_policy_weight}, '
             f'strength={self.opt_strength}, alpha={self.opt_alpha}{_serve_txt}')
+    # Opponent-policy aux head (Monroe/LC0 idea, +5% there; unlocked 2026-08-21
+    # by v7 records carrying OppPlayedIndex — 99% populated in both Kovax
+    # corpora). Predicts the OPPONENT'S REPLY move (their stm-relative 1858
+    # frame) from our position — forces threat/response modeling, aimed at the
+    # measured intermezzo/calculation weakness. Training-only (never exported);
+    # target 'opp_played_idx' arrives only from DirectFromV6 v7 sources, and
+    # the loss masks -1 (no reply / non-v7 batches contribute nothing).
+    self.opp_policy_weight = float(getattr(config, 'Opt_LossOppPolicyMultiplier', 0) or 0)
+    if self.opp_policy_weight > 0:
+      self.oppp_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, 0)
+      print(f'[ceres_net] OPPONENT-POLICY aux head enabled: w={self.opp_policy_weight} '
+            f'(training-only; target = v7 OppPlayedIndex, -1 masked)')
 
     self.hlg_weight = float(getattr(config, 'Opt_HLGaussWeight', 0) or 0)
     if self.hlg_weight > 0:
@@ -1622,6 +1634,10 @@ class CeresNet(nn.Module):
     if self.opt_policy_weight > 0 and self.training:
       self._last_opt_out = self.opt_head(fS_policy)
 
+    # Opponent-policy aux head (see __init__): training-only stash.
+    if self.opp_policy_weight > 0 and self.training:
+      self._last_oppp_out = self.oppp_head(fS_policy)
+
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
     policy_out = self.policy_head(fS_policy)
 
@@ -1907,6 +1923,21 @@ class CeresNet(nn.Module):
     # aux head, weighted toward positions where value1 UNDERESTIMATES the
     # target in units of the unc head's predicted error. Weight-normalized so
     # the logged number stays a per-effective-sample CE.
+    # Opponent-policy aux (see __init__): CE against the opponent's reply
+    # move; -1 targets (no reply / batches without v7 data) are masked, and
+    # a batch with zero valid targets contributes exactly 0.
+    oppp_loss = 0
+    _oppp = getattr(self, '_last_oppp_out', None)
+    if _oppp is not None and not gradient_norm_logging_mode:
+      self._last_oppp_out = None
+      _ot = batch.get('opp_played_idx', None) if hasattr(batch, 'get') else None
+      if _ot is not None:
+        _ot = _ot.reshape(-1).long()
+        _ovalid = (_ot >= 0) & (_ot < 1858)
+        if bool(_ovalid.any()):
+          oppp_loss = torch.nn.functional.cross_entropy(
+              _oppp.float()[_ovalid], _ot[_ovalid])
+
     opt_loss = 0
     _opt = getattr(self, '_last_opt_out', None)
     if _opt is not None and not gradient_norm_logging_mode:
@@ -2159,6 +2190,7 @@ class CeresNet(nn.Module):
         + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
+        + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
 
@@ -2183,6 +2215,7 @@ class CeresNet(nn.Module):
           + self.action_loss_weight * action_loss
           + self.action_uncertainty_loss_weight * action_uncertainty_loss
           + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
+        + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
           # policy family (unlike the depth probes, which span both).
@@ -2301,6 +2334,8 @@ class CeresNet(nn.Module):
         self._log("hlgauss_value_loss" + stat_suffix, hlg_loss, step=num_pos)
       if not isinstance(opt_loss, int):
         self._log("optimistic_policy_loss" + stat_suffix, opt_loss, step=num_pos)
+      if not isinstance(oppp_loss, int):
+        self._log("opp_policy_loss" + stat_suffix, oppp_loss, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not isinstance(refiner_ploss, int):

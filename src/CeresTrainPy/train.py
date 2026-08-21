@@ -120,12 +120,16 @@ TPG_TRAIN_DIR = config.Data_TrainingFilesDirectory
 if TPG_TRAIN_DIR is None:
   print('ERROR: TrainingFilesDirectory is null')
   exit(1)
-elif not os.path.isdir(TPG_TRAIN_DIR): 
-  print('ERROR: TrainingFilesDirectory does not exist:', TPG_TRAIN_DIR)
-  exit(1)
-elif not os.listdir(TPG_TRAIN_DIR):
-  print(f"ERROR: The directory TrainingFilesDirectory ('{TPG_TRAIN_DIR}') is empty.")
-  exit(1)
+else:
+  # DirectFromV6 accepts MULTIPLE ';'-separated roots (v6_dataset.py);
+  # validate each part so a typo in any of them still fails loudly here.
+  for _dir_part in [d.strip() for d in str(TPG_TRAIN_DIR).split(';') if d.strip()]:
+    if not os.path.isdir(_dir_part):
+      print('ERROR: TrainingFilesDirectory does not exist:', _dir_part)
+      exit(1)
+    if not os.listdir(_dir_part):
+      print(f"ERROR: The directory TrainingFilesDirectory ('{_dir_part}') is empty.")
+      exit(1)
 
 
 def print_model_trainable_details(model):
@@ -875,7 +879,9 @@ def Train():
   # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work
   # (zstd decompression + TPG parsing) is the bottleneck. Note: V3 aux features are baked
   # into the TPG record and read directly, so CERES_AUX_FEATURES_PER_SQUARE adds no recompute.
-  count_zst_files = len([f for f in fnmatch.filter(os.listdir(TPG_TRAIN_DIR), '*.zst') if not f.endswith('.tgt.zst')])
+  # (TPG_TRAIN_DIR may be a ';'-separated multi-root list for DirectFromV6.)
+  count_zst_files = sum(len([f for f in fnmatch.filter(os.listdir(_d.strip()), '*.zst') if not f.endswith('.tgt.zst')])
+                        for _d in str(TPG_TRAIN_DIR).split(';') if _d.strip())
   _DEFAULT_NUM_DATASET_WORKERS = 0 if sys.platform.startswith("win") else 1
   NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))
   if NUM_DATASET_WORKERS != _DEFAULT_NUM_DATASET_WORKERS:
@@ -1470,7 +1476,7 @@ def Train():
       # can exist on exactly one side of a resume. Handle both directions LOUDLY here
       # instead of dying in the strict load (the head is auxiliary/training-only, so
       # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.')
+      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.')
       # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
       # exist on one side of a resume — they are zero-init, so the net is bit-identical
       # to the base at step 0 and fresh-initializing them is exactly right.

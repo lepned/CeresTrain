@@ -804,10 +804,14 @@ class TPGDataset(Dataset):
         # V7-extras sidecar values (V7_EXTRAS_SIDECAR_SPEC.md), each [B, 1]:
         # censored q_st/d_st are STM-relative (TPG convention); z-provenance codes
         # 0=orig result, 1=syzygy, 2=deblunder-noise, 3=deblunder-unintended, 4=op1-8man.
-        cens_q, cens_d, prov = v7x
+        cens_q, cens_d, prov = v7x[0], v7x[1], v7x[2]
         filtered_dict['censored_q_st'] = filter_tensor(torch.tensor(cens_q, dtype=torch.float32), mod_value)
         filtered_dict['censored_d_st'] = filter_tensor(torch.tensor(cens_d, dtype=torch.float32), mod_value)
         filtered_dict['z_provenance'] = filter_tensor(torch.tensor(prov, dtype=torch.uint8), mod_value)
+        # Optional 4th component (DirectFromV6 v7 records only, not in TPG
+        # .v7x sidecars): opponent's reply move index, -1 = none/masked.
+        if len(v7x) > 3:
+          filtered_dict['opp_played_idx'] = filter_tensor(torch.tensor(v7x[3], dtype=torch.int64), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]
