@@ -93,6 +93,12 @@ class Configuration:
     # batches per 1 secondary). Default: None / 0 = single-source (legacy behaviour).
     self.Data_TrainingFilesDirectory2 = config_data.get('TrainingFilesDirectory2', None)
     self.Data_RatioSet1ToSet2 = int(config_data.get('RatioSet1ToSet2', 0))
+    # DirectFromV6 knobs (v6_dataset.py); None = fall back to env/default.
+    # These live in the DATA config (review finding 15: the opt-config
+    # bootstrap bridge alone made the recipe's data-config examples no-ops).
+    self.Data_V6SkipCount = config_data.get('V6SkipCount', None)
+    self.Data_V6ShufflePool = config_data.get('V6ShufflePool', None)
+    self.Data_V6MaxResultQDelta = config_data.get('V6MaxResultQDelta', None)
 
     # Initialize class members from config_exec
     self.Exec_ID = config_exec.get('ID', 'TEST')

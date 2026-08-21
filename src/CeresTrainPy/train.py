@@ -901,14 +901,22 @@ def Train():
   # Primary source: TPG shards (default) or direct LC0 v6 .gz chunks
   # (Data config "SourceType": "DirectFromV6" — zero-storage path for
   # training straight from pre-rescored LC0 data; see v6_dataset.py).
-  if str(getattr(config, 'Data_SourceType', '') or '') == 'DirectFromV6':
+  _IS_V6_SOURCE = str(getattr(config, 'Data_SourceType', '') or '') == 'DirectFromV6'
+  if _IS_V6_SOURCE:
+    # q-deviation targets do not exist in v6 records; the loader yields zeros,
+    # so a nonzero loss weight would silently train the head toward zero.
+    assert float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) == 0, \
+        'DirectFromV6 requires LossQDeviationMultiplier=0 (no q-deviation data in v6 records)'
     from v6_dataset import V6ChunkDataset
     primary_dataset = V6ChunkDataset(TPG_TRAIN_DIR, batch_size_forward // world_size,
                                      config.Data_WDLLabelSmoothing,
                                      rank, world_size, NUM_DATASET_WORKERS,
                                      BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip,
                                      config.Exec_TestFlag,
-                                     file_mirror_prob=_MIRROR_PRIMARY)
+                                     file_mirror_prob=_MIRROR_PRIMARY,
+                                     skip_count=getattr(config, 'Data_V6SkipCount', None),
+                                     shuffle_pool=getattr(config, 'Data_V6ShufflePool', None),
+                                     max_resultq_delta=getattr(config, 'Data_V6MaxResultQDelta', None))
   else:
     primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
                                  rank, world_size, NUM_DATASET_WORKERS,
@@ -1291,6 +1299,12 @@ def Train():
   # Survival head requires sidecar targets in (at least some of) the batches.
   if getattr(core, 'survival_target_weight', 0) > 0:
     _sidecar_mode = (os.environ.get('CERES_TPG_TARGET_SIDECAR', '0') or '0').strip().lower()
+    if _IS_V6_SOURCE:
+      # v6/v7 chunks carry no survival labels at all (review finding 12: the
+      # sidecar file-listing below would either die on tar dirs or, worse,
+      # let the head train with zero supervision under '=1').
+      raise ValueError('CERES_SURVIVAL_TARGET_WEIGHT > 0 is unsupported with '
+                       'SourceType DirectFromV6 (no survival labels in v6/v7 records)')
     if _sidecar_mode in ('0', ''):
       raise ValueError('CERES_SURVIVAL_TARGET_WEIGHT > 0 requires CERES_TPG_TARGET_SIDECAR=1 or auto '
                        '(and a corpus generated with gen-tpg --survival-horizon)')
@@ -1306,7 +1320,13 @@ def Train():
 
   # Provenance-weighted value loss (CERES_VALUE_PROV_WEIGHTS) needs the v7x sidecars
   # actually loaded, else the weighting is a silent whole-run no-op.
-  if (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip():
+  if (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip() and _IS_V6_SOURCE:
+    # DirectFromV6 supplies v7x IN-BAND from v7 records (no sidecar files);
+    # verify via the corpus diagnosis instead of listing .v7x.zst files.
+    if 7 not in getattr(primary_dataset, '_diag_versions', set()):
+      raise ValueError('CERES_VALUE_PROV_WEIGHTS set but the DirectFromV6 corpus is not '
+                       'v7 (no z_provenance available in v6 records)')
+  elif (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip():
     _v7x_mode_pw = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
     if _v7x_mode_pw in ('0', ''):
       raise ValueError('CERES_VALUE_PROV_WEIGHTS set but CERES_TPG_V7X_SIDECAR is off — '
@@ -1320,7 +1340,11 @@ def Train():
                          f'.v7x.zst sidecars found in any dataset dir: {_dirs_pw}')
 
   # Short-term value head requires V7-extras sidecar targets (censored q_st/d_st).
-  if getattr(core, 'stvalue_weight', 0) > 0:
+  if getattr(core, 'stvalue_weight', 0) > 0 and _IS_V6_SOURCE:
+    if 7 not in getattr(primary_dataset, '_diag_versions', set()):
+      raise ValueError('CERES_STVALUE_WEIGHT > 0 but the DirectFromV6 corpus is not v7 '
+                       '(no censored q_st/d_st in v6 records)')
+  elif getattr(core, 'stvalue_weight', 0) > 0:
     _v7x_mode = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
     if _v7x_mode in ('0', ''):
       raise ValueError('CERES_STVALUE_WEIGHT > 0 requires CERES_TPG_V7X_SIDECAR=1 or auto '
