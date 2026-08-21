@@ -29,13 +29,28 @@ errs, warns = [], []
 dirs = [('primary', data.get('TrainingFilesDirectory'))]
 if data.get('TrainingFilesDirectory2') and int(data.get('RatioSet1ToSet2') or 0) > 0:
     dirs.append(('secondary', data['TrainingFilesDirectory2']))
+is_v6 = str(data.get('SourceType', '')) == 'DirectFromV6'
 for label, d in dirs:
     if not d:
         errs.append(f'{label} corpus not set'); continue
     if 'EDIT/ME' in d:
         errs.append(f'{label} corpus is still the placeholder: {d}'); continue
-    if not os.path.isdir(d):
-        errs.append(f'{label} corpus directory does not exist: {d}'); continue
+    # DirectFromV6 accepts ';'-separated multi-root lists (see config.split_roots);
+    # validate each root's existence but skip the TPG shard-count math — v6 sources
+    # shard at the chunk-entry level, not the file level, so nproc*workers does not
+    # constrain them the same way.
+    roots = [r.strip() for r in str(d).split(';') if r.strip()] if is_v6 else [d]
+    if not roots:
+        errs.append(f'{label} corpus is an empty/separator-only list: {d!r}'); continue
+    if len(roots) > 1 and not is_v6:
+        errs.append(f"{label}: ';'-separated lists are only supported for SourceType "
+                    f'DirectFromV6 (got {data.get("SourceType")!r}): {d}'); continue
+    missing = [r for r in roots if not os.path.isdir(r)]
+    if missing:
+        errs.append(f'{label} corpus director{"ies" if len(missing)>1 else "y"} do(es) not exist: '
+                    + '; '.join(missing)); continue
+    if is_v6:
+        continue
     shards = [f for f in glob.glob(os.path.join(d, '*.zst'))
               if not f.endswith('.tgt.zst') and not f.endswith('.v7x.zst')]
     need = nproc * workers
