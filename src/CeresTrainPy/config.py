@@ -501,6 +501,9 @@ class Configuration:
     self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)
     self.NetDef_MoveDegreeDecode = config_net_def.get('MoveDegreeDecode', False)
     self.NetDef_DualPlaneRelGains = config_net_def.get('DualPlaneRelGains', False)
+    self.NetDef_DualPlaneRelDegrees2 = config_net_def.get('DualPlaneRelDegrees2', False)
+    self.NetDef_DualPlaneKingFlight = config_net_def.get('DualPlaneKingFlight', False)
+    self.NetDef_DualPlaneKingZone = config_net_def.get('DualPlaneKingZone', False)
     # Value min/max pool side-channels (2026-08 tactics toolbox T1.2): trunk
     # amin/amax over squares into the value family's hidden pre-activation.
     # Zero-init no-op add-on (the 'inject' class).

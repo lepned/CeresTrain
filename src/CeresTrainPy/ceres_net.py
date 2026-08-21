@@ -743,7 +743,22 @@ class CeresNet(nn.Module):
                                   softmin_heads=_dp_smh,
                                   interleave_cross=_dp_il,
                                   rel_degrees=bool(getattr(config, 'NetDef_DualPlaneRelDegrees', False)),
-                                  rel_gains=bool(getattr(config, 'NetDef_DualPlaneRelGains', False)))
+                                  rel_gains=bool(getattr(config, 'NetDef_DualPlaneRelGains', False)),
+                                  rel_degrees2=bool(getattr(config, 'NetDef_DualPlaneRelDegrees2', False)),
+                                  king_flight=bool(getattr(config, 'NetDef_DualPlaneKingFlight', False)),
+                                  king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)))
+      if getattr(config, 'NetDef_DualPlaneRelDegrees2', False):
+        print(f'[ceres_net] DUAL-PLANE REL-DEGREES-2 enabled: second-order coverage '
+              f'(targets/attackers, 2x{_dp_rel_C} ch) -> zero-init token features '
+              f'(exact step-0 no-op)')
+      if getattr(config, 'NetDef_DualPlaneKingFlight', False):
+        print(f'[ceres_net] DUAL-PLANE KING-FLIGHT enabled: 8-neighbor flight-zone '
+              f'in-degree ({_dp_rel_C} ch) + occupancy into king tokens, '
+              f'zero-init (exact step-0 no-op)')
+      if getattr(config, 'NetDef_DualPlaneKingZone', False):
+        print(f'[ceres_net] DUAL-PLANE KING-ZONE (kf2) enabled: per-piece coverage of '
+              f'both king 3x3 zones ({_dp_rel_C} ch each) from e_rows, '
+              f'zero-init (exact step-0 no-op)')
       if getattr(config, 'NetDef_DualPlaneRelDegrees', False):
         print(f'[ceres_net] DUAL-PLANE REL-DEGREES enabled: 2x{_dp_rel_C} degree channels -> '
               f'zero-init token features (exact step-0 no-op)')

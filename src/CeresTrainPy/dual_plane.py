@@ -132,7 +132,10 @@ class DualPlane(nn.Module):
                ffn_mult: int = 2, softmin_heads: int = 2,
                interleave_cross: bool = False,
                rel_degrees: bool = False,
-               rel_gains: bool = False):
+               rel_degrees2: bool = False,
+               rel_gains: bool = False,
+               king_flight: bool = False,
+               king_zone: bool = False):
     super().__init__()
     self.dp = dp
     # interleave_cross: apply the (weight-shared, zero-init) S-plane
@@ -159,6 +162,57 @@ class DualPlane(nn.Module):
     if rel_degrees:
       self.deg_proj = nn.Linear(2 * rel_channels, dp, bias=False)
       nn.init.zeros_(self.deg_proj.weight)
+    # SECOND-ORDER degrees (2026-08-20 night; the computation-over-relations
+    # class that produced both wins, one hop deeper): per channel, how
+    # COVERED are the pieces I target (sum_j rel[i,j]*indeg[j]) and how
+    # covered are the pieces targeting me (sum_j rel[j,i]*indeg[j]) — the
+    # exchange-calculus primitives ("my target is defended twice", "my
+    # attacker is protected") as DESCRIPTIVE counting, not a material prior
+    # (sac-rule compliant: no piece values anywhere). Two tiny per-channel
+    # matmuls over the already-gathered rel_pair, kept in source dtype (the
+    # kf-v1 lesson: never .float() a big tensor before reducing it).
+    self.rel_degrees2 = rel_degrees2
+    if rel_degrees2:
+      self.deg2_proj = nn.Linear(2 * rel_channels, dp, bias=False)
+      nn.init.zeros_(self.deg2_proj.weight)
+    # kf2 (2026-08-20 night, after kf-v1 parked): the SAME flight-zone
+    # information delivered to the tokens that USE it — every piece gets its
+    # own per-channel coverage of the two king zones ("how much of the enemy
+    # king's 3x3 do I cover / how much of my own king's do I defend"),
+    # instead of a summary parked in the king's token that attention must
+    # learn to route (v1's measured failure: mate themes flat, forcing
+    # themes taxed). Reads the ALREADY-GATHERED e_rows tensor — no full-E
+    # reduction (v1's 9% TRT cost class avoided by construction).
+    # Descriptive facts only; zero-init projection => exact step-0 no-op.
+    self.king_zone = king_zone
+    if king_zone:
+      self.kz_proj = nn.Linear(2 * rel_channels, dp, bias=False)
+      nn.init.zeros_(self.kz_proj.weight)
+    # King flight-zone features v1 (catalogue idea #6; PARKED on evidence —
+    # neutral aggregate, ~9% TRT cost — but kept flag-gated for the record).
+    # Per king: each of the 8 neighbor squares contributes its per-channel
+    # in-degree from E ("who covers this flight square"), its 13-dim
+    # occupancy and an on-board bit; the concat is zero-init projected into
+    # the KING'S OWN token before the P-blocks.
+    self.king_flight = king_flight
+    if king_flight or king_zone:
+      _nbr = torch.zeros(64, 8, dtype=torch.long)
+      _onb = torch.zeros(64, 8)
+      _dirs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+      for sq in range(64):
+        f, r = sq % 8, sq // 8
+        for j, (df, dr) in enumerate(_dirs):
+          nf, nr = f + df, r + dr
+          if 0 <= nf < 8 and 0 <= nr < 8:
+            _nbr[sq, j] = nr * 8 + nf
+            _onb[sq, j] = 1.0
+          else:
+            _nbr[sq, j] = sq          # off-board: self-pad, on-board bit 0
+      self.register_buffer('kf_nbr', _nbr, persistent=False)
+      self.register_buffer('kf_onb', _onb, persistent=False)
+      if king_flight:
+        self.kf_proj = nn.Linear(8 * (rel_channels + 13 + 1), dp, bias=False)
+        nn.init.zeros_(self.kf_proj.weight)
     self.blocks = nn.ModuleList([
         DualPlanePBlock(dp, heads, rel_channels, ffn_mult, norm_type,
                         softmin_heads=softmin_heads, rel_gains=rel_gains)
@@ -198,6 +252,45 @@ class DualPlane(nn.Module):
       # are masked from keys/pools everywhere downstream).
       _deg = torch.cat([rel_pair.sum(dim=2), rel_pair.sum(dim=1)], dim=-1)   # [B, 32, 2C]
       x = x + self.deg_proj(_deg.to(x.dtype))
+
+    if self.rel_degrees2:
+      _rp = rel_pair.permute(0, 3, 1, 2)                   # [B, C, 32, 32], source dtype
+      _ind = _rp.sum(dim=2)                                # [B, C, 32] coverage of slot j
+      _t2 = torch.matmul(_rp, _ind.unsqueeze(-1)).squeeze(-1)                 # my targets' coverage
+      _a2 = torch.matmul(_rp.transpose(2, 3), _ind.unsqueeze(-1)).squeeze(-1) # my attackers' coverage
+      _d2 = torch.cat([_t2, _a2], dim=1).permute(0, 2, 1)  # [B, 32, 2C]
+      x = x + self.deg2_proj(_d2.to(x.dtype))
+
+    if self.king_zone:
+      # kf2: per-piece coverage of both king zones, read from e_rows (piece ->
+      # all squares) which is already gathered above. Zone = king square + its
+      # 8 neighbors (off-board self-pads contribute the king square again —
+      # harmless, uniform). Channel layout: kings at 6 (ours), 12 (theirs).
+      _kz_feats = []
+      for _kch in (12, 6):                                 # enemy zone first, then own
+        _ksq = squares13[:, :, _kch].argmax(dim=1)         # [B]
+        _zone = torch.cat([_ksq.unsqueeze(1), self.kf_nbr[_ksq]], dim=1)   # [B, 9]
+        _zi = _zone.reshape(B, 1, 9, 1).expand(-1, 32, -1, C)
+        _kz_feats.append(torch.gather(e_rows, 2, _zi).sum(dim=2))          # [B, 32, C]
+      x = x + self.kz_proj(torch.cat(_kz_feats, dim=-1).to(x.dtype))
+
+    if self.king_flight:
+      # v1 (parked): king-token flight-zone summary. Sum in the source dtype
+      # and cast the SMALL result — a .float() before the reduce materializes
+      # the whole [B,64,64,C] tensor in fp32 (~7.6 % eager cost measured
+      # 2026-08-20).
+      _indeg_all = vis_E.sum(dim=1).float()                # [B, 64, C] who-covers-square
+      for _kch in (6, 12):
+        _ksq = squares13[:, :, _kch].argmax(dim=1)         # [B]
+        _knb = self.kf_nbr[_ksq]                           # [B, 8]
+        _deg_n = torch.gather(_indeg_all, 1,
+                              _knb.unsqueeze(-1).expand(-1, -1, _indeg_all.shape[-1]))
+        _occ_n = torch.gather(squares13, 1, _knb.unsqueeze(-1).expand(-1, -1, 13))
+        _onb_n = self.kf_onb[_ksq].unsqueeze(-1)           # [B, 8, 1]
+        _kf = torch.cat([_deg_n.to(x.dtype), _occ_n.to(x.dtype), _onb_n.to(x.dtype)],
+                        dim=-1).reshape(B, -1)             # [B, 8*(C+14)]
+        _kmask = (sel == _ksq.unsqueeze(1)).to(x.dtype).unsqueeze(-1)   # [B, 32, 1]
+        x = x + _kmask * self.kf_proj(_kf).unsqueeze(1)
 
     def _cross_read(xp):
       qx = self.x_q(self.x_ln_p(xp))
