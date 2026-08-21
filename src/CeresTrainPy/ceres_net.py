@@ -759,6 +759,11 @@ class CeresNet(nn.Module):
         print(f'[ceres_net] DUAL-PLANE KING-ZONE (kf2) enabled: per-piece coverage of '
               f'both king 3x3 zones ({_dp_rel_C} ch each) from e_rows, '
               f'zero-init (exact step-0 no-op)')
+      self.dp_policy_grad_scale = float(getattr(config, 'NetDef_DualPlanePolicyGradScale', 1.0) or 1.0)
+      if self.dp_policy_grad_scale != 1.0:
+        print(f'[ceres_net] DUAL-PLANE POLICY-GRAD SCALE enabled: policy-decode gradients '
+              f'into shared P-tokens x {self.dp_policy_grad_scale} (forward identity; '
+              f'value gradients and decode weights unscaled)')
       if getattr(config, 'NetDef_DualPlaneRelDegrees', False):
         print(f'[ceres_net] DUAL-PLANE REL-DEGREES enabled: 2x{_dp_rel_C} degree channels -> '
               f'zero-init token features (exact step-0 no-op)')
@@ -1624,8 +1629,22 @@ class CeresNet(nn.Module):
     # destination-square x piece-slot, mapped to from-squares via the slot
     # one-hot, then flat-gathered per move on the constant to*64+from table.
     if self.use_dual_plane and self.dp_policy_decode and _dp_tokens is not None:
+      # POLICY-GRAD SCALE (2026-08-21, server value-oscillation diagnosis):
+      # the P-plane is a SMALL pool shared by the policy decode (strong,
+      # committing gradients) and the value injects (weak) — policy
+      # continuously reshapes the representation value reads, giving value
+      # its peak-then-oscillate profile while baseline (trunk-only value)
+      # stays sluggish-but-stable. This op is forward-IDENTITY but scales
+      # the policy-decode gradients flowing INTO the shared tokens by alpha
+      # (<1 damps policy's reshaping power; decode WEIGHTS still train at
+      # full rate; value gradients untouched). Eval/export graphs are
+      # unchanged (gated on self.training).
+      _dpt = _dp_tokens
+      if self.dp_policy_grad_scale != 1.0 and self.training:
+        _a = self.dp_policy_grad_scale
+        _dpt = _dp_tokens * _a + _dp_tokens.detach() * (1.0 - _a)
       _q = self.dp_pol_q(flow)                                   # [B, 64, dq] (zero-init => 0)
-      _p = self.dp_pol_p(_dp_tokens) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
+      _p = self.dp_pol_p(_dpt) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
       _pair = torch.matmul(_q, _p.transpose(1, 2))               # [B, 64to, 32slot]
       _sl1h = torch.nn.functional.one_hot(_dp_sel, 64).to(_pair.dtype)  # [B, 32, 64from]
       _tofrom = torch.matmul(_pair, _sl1h)                       # [B, 64to, 64from]
@@ -1637,8 +1656,8 @@ class CeresNet(nn.Module):
       # Empty to-squares contribute exactly 0 (unselected/occ-masked slots).
       if getattr(self, 'dp_victim_decode', False):
         _occm = _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)
-        _pa = self.dpv_a(_dp_tokens) * _occm                     # [B, 32, dq]
-        _pb = self.dpv_b(_dp_tokens) * _occm
+        _pa = self.dpv_a(_dpt) * _occm                           # [B, 32, dq] (grad-scaled read)
+        _pb = self.dpv_b(_dpt) * _occm
         _pp = torch.matmul(_pa, _pb.transpose(1, 2))             # [B, 32m, 32v]
         _ftsq = torch.matmul(_sl1h.transpose(1, 2),
                              torch.matmul(_pp.to(_sl1h.dtype), _sl1h))  # [B, 64from, 64to]
