@@ -191,6 +191,7 @@ class V6ChunkDataset(TPGDataset):
                            f'({a!r} inside {b!r}) — chunks under the overlap would be '
                            f'enumerated twice (2x sampling weight)')
     entries = []
+    entries_by_root = []
     for root in roots:
       root_entries = [('fs', p) for p in
                       sorted(glob.glob(os.path.join(root, '**', '*.gz'), recursive=True))]
@@ -202,6 +203,7 @@ class V6ChunkDataset(TPGDataset):
       if num_files_to_skip:
         root_entries = root_entries[num_files_to_skip:]
       entries += root_entries
+      entries_by_root.append((root, root_entries))
     if not entries:
       raise FileNotFoundError(f'DirectFromV6: no .gz chunks or .tar archives under {root_dir}')
     # Rank-consistent shuffle (finding 6): all ranks must produce the SAME
@@ -221,7 +223,7 @@ class V6ChunkDataset(TPGDataset):
     self._zfiltered = 0
     if self.max_resultq_delta > 0:
       print(f'[v6_dataset] z-integrity filter ON: drop |best_q - result_q| > {self.max_resultq_delta}')
-    self._startup_diagnosis(entries)
+    self._startup_diagnosis(entries_by_root)
     _n_tar = sum(1 for e in entries if e[0] == 'tar')
     print(f'[v6_dataset] {root_dir}: {len(entries):,} chunks ({_n_tar:,} in-tar), '
           f'skip_count={self.skip_count}, pool={self.pool_size:,}, '
@@ -230,29 +232,37 @@ class V6ChunkDataset(TPGDataset):
 
   # ---- startup diagnosis ------------------------------------------------
 
-  def _startup_diagnosis(self, entries, sample_n=100):
+  def _startup_diagnosis(self, entries_by_root, sample_n=100):
     """Sample chunks and report what this corpus IS: record version(s) and
     rescore/deblunder status. Nothing in v6 marks a set as (not-)deblundered,
     but deblundering writes CONTINUOUS z values — any non-integer result_q
     proves it; v7 provenance codes 2/3 prove it directly (1/4 = rescored).
     Every run self-reports its data provenance instead of relying on
-    folklore about a directory."""
-    step = max(1, len(entries) // sample_n)
+    folklore about a directory.
+    Sampling is a fixed quota PER ROOT (action review finding 7: a stride over
+    the union can miss a small root entirely, defeating the same-version
+    check exactly when it matters)."""
+    quota = max(20, sample_n // max(1, len(entries_by_root)))
+    sample = []
+    for root, root_entries in entries_by_root:
+      step = max(1, len(root_entries) // quota)
+      sample += [(root, e) for e in root_entries[::step][:quota]]
     versions, provs, rq_nonint, rq_n = set(), set(), 0, 0
+    version_roots = {}                       # version -> set of roots seen in
     opp_pop, act_pop, v7_n = 0, 0, 0
-    for e in entries[::step][:sample_n]:
+    for _root, e in sample:
       data = self._read_entry(e)
       if data is None or len(data) < 8:
         continue
       ver = int(np.frombuffer(data[:4], dtype='<u4')[0])
+      versions.add(ver)
+      version_roots.setdefault(ver, set()).add(_root)
       if ver == 6:
         recs = np.frombuffer(data, dtype=V6_DTYPE, count=len(data) // V6_RECORD_BYTES)
       elif ver == 7:
         recs = np.frombuffer(data, dtype=V7_DTYPE, count=len(data) // V7_RECORD_BYTES)
       else:
-        versions.add(ver)
         continue
-      versions.add(ver)
       rq = np.nan_to_num(recs['result_q'])
       rq_nonint += int((np.abs(rq - np.round(rq)) > 1e-6).sum())
       rq_n += len(rq)
@@ -279,9 +289,10 @@ class V6ChunkDataset(TPGDataset):
     # would pin differently per worker/rank — rank-divergent batch keys (NCCL
     # hang under static_graph) and ~half the corpus silently dropped.
     if len(versions & {6, 7}) > 1:
-      raise ValueError(f'DirectFromV6: mixed record versions {sorted(versions)} across '
-                       f'TrainingFilesDirectory roots — all roots must hold the SAME '
-                       f'version (v6 and v7 cannot be combined in one source)')
+      _vr = {v: sorted(version_roots.get(v, set())) for v in sorted(versions)}
+      raise ValueError(f'DirectFromV6: mixed record versions across TrainingFilesDirectory '
+                       f'roots ({_vr}) — all roots must hold the SAME version '
+                       f'(v6 and v7 cannot be combined in one source)')
     deblundered = (rq_nonint > 0) or bool(provs & {2, 3})
     rescored = bool(provs & {1, 4})
     parts = [f'versions={sorted(versions)}']
@@ -522,9 +533,16 @@ class V6ChunkDataset(TPGDataset):
       _opp = recs['opp_played_idx'].astype(np.int32)
       _opp = np.where(_opp < 1858, _opp, -1).reshape(-1, 1)
       # Components 5-7: played-move action target (idx, q-after, d-after);
-      # idx -1 = invalid (last ply / NO_MOVE), masked in the loss.
+      # idx -1 = invalid, masked in the loss. Invalid means: out-of-range/
+      # NO_MOVE, OR NaN q_after_played (action review finding 3: nan_to_num
+      # would otherwise fabricate a q=0 'dead draw' target — and if a chunk
+      # ever packs multiple games, every internal game boundary has
+      # NaN q_after with an in-range played_idx and a d_after borrowed from
+      # the NEXT game's first record; this mask kills those per record
+      # instead of trusting corpus-level luck).
       _apidx = recs['played_idx'].astype(np.int32)
-      _apidx = np.where(_apidx < 1858, _apidx, -1).reshape(-1, 1)
+      _ap_ok = (_apidx < 1858) & ~np.isnan(recs['q_after_played'])
+      _apidx = np.where(_ap_ok, _apidx, -1).reshape(-1, 1)
       v7x = V7Extras(cens_q=np.nan_to_num(recs['cens_q_st']).astype(np.float32).reshape(-1, 1),
                      cens_d=np.nan_to_num(recs['cens_d_st']).astype(np.float32).reshape(-1, 1),
                      prov=np.nan_to_num(recs['z_provenance']).astype(np.uint8).reshape(-1, 1),

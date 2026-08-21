@@ -120,6 +120,17 @@ def save_model(NAME : str,
     convert_type = _model_dtype
     model_nocompile.eval()
 
+    # Optional serving-speed strip (action review finding 10): the action head
+    # costs ~9-12% TRT EPS when its [B,1858,3] output is in the graph, but the
+    # training benefit lives in the trunk weights — CERES_EXPORT_STRIP_ACTION=1
+    # makes eval-mode forward emit the cheap unc alias in the 'action' slot
+    # (same as when the head is disabled), so the exported graph omits the
+    # head entirely while training/backprop is unaffected.
+    if (os.environ.get('CERES_EXPORT_STRIP_ACTION', '0') or '0').strip() not in ('0', ''):
+      _strip_target = getattr(model_nocompile, 'core', model_nocompile)
+      _strip_target.export_strip_action = True
+      print('INFO: EXPORT_STRIP_ACTION enabled — action head omitted from exported graphs')
+
 
     # AOT export. Works (generates .so file), but seemingly slower than ONNX export options.
     if False and CONVERT_ONLY:

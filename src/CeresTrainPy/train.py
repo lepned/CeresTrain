@@ -1308,7 +1308,15 @@ def Train():
       or getattr(core, 'placement_value_weight', 0) > 0 or getattr(core, 'survival_target_weight', 0) > 0
       or getattr(core, 'stvalue_weight', 0) > 0 or getattr(core, 'depth_probes_enabled', False)
       or getattr(core, 'opp_policy_weight', 0) > 0
-      or getattr(core, 'opt_policy_weight', 0) > 0) and WORLD_SIZE > 1:
+      or getattr(core, 'opt_policy_weight', 0) > 0
+      # Remaining stash-only heads (2026-08-21 action review finding 2 — the
+      # guard must cover EVERY head whose loss is built from a module stash,
+      # not just the currently-planned recipe's):
+      or getattr(core, 'soft_policy_weight', 0) > 0
+      or getattr(core, 'hlg_weight', 0) > 0
+      or getattr(core, 'value_contrast_weight', 0) > 0
+      or getattr(core, 'use_value_depth_attention', False)
+      or getattr(core, 'refiner_deep_sup_weight', 0) > 0) and WORLD_SIZE > 1:
     if not _static_graph:
       raise NotImplementedError(
         'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy aux heads '
@@ -1396,11 +1404,25 @@ def Train():
       if 7 not in getattr(primary_dataset, '_diag_versions', set()):
         raise ValueError(f'{_aux_name} > 0 but the DirectFromV6 corpus is not v7 '
                          f'(no OppPlayedIndex/QAfterPlayedMove in v6 records)')
+      if BOARDS_PER_BATCH != 1:
+        # 4-board mode calls compute_loss four times against the SAME batch
+        # dict, so board N's aux output would be scored against board 1's
+        # targets (action review finding 9). Unreachable today (DirectFromV6
+        # forces 1-board) — this keeps it loud if that ever changes.
+        raise ValueError(f'{_aux_name} > 0 is not supported with BOARDS_PER_BATCH={BOARDS_PER_BATCH}')
+      # NaN q_after targets are masked per-record in the loader, so partial
+      # population is SAFE (just proportionally less signal) — the gate's job
+      # is only to catch a corpus whose ExtraV7 tail was never written.
+      # Healthy corpora measure ~99% (per-game last records are the gap).
       _pop = getattr(primary_dataset, _pop_attr, None)
-      if _pop is not None and _pop < 0.01:
+      if _pop is not None and _pop < 0.05:
         raise ValueError(f'{_aux_name} > 0 but only {_pop:.1%} of sampled v7 records carry a '
                          f'populated target — this corpus\'s ExtraV7 tail looks zero-filled; '
                          f'training would push the head toward garbage (finding 7)')
+      if _pop is not None and _pop < 0.90:
+        print(f'[train] WARNING: {_aux_name} target only {_pop:.1%} populated in the sampled '
+              f'corpus (healthy v7 measures ~99%) — masked records train nothing, so the '
+              f'effective aux data volume is reduced accordingly', flush=True)
 
   # Curriculum prologue (CERES_MIX_PROLOGUE_POSITIONS): serve ONLY secondary
   # (e.g. puzzle) batches for the first N positions, then switch to the normal
@@ -1510,55 +1532,65 @@ def Train():
     # model_nocompile.state_dict() which has un-prefixed keys. Loading into
     # model_nocompile sidesteps the prefix mismatch and updates the underlying
     # parameters that `model` shares.
+    # Aux-head prefix registry — SINGLE SOURCE OF TRUTH for "params that can
+    # legitimately exist on exactly one side of a resume" (2026-08-21 action
+    # review finding 6: the LoRA remap kept a second, divergent hardcoded
+    # list). Consumed by BOTH the non-LoRA reconciliation below and the LoRA
+    # base-checkpoint remap.
+    #
+    # Config/env-gated heads, auxiliary/training-only — dropping or
+    # fresh-initializing them never corrupts the served heads. (action_head is
+    # exported but zero-impact on the other heads; fresh-init is exactly the
+    # from-scratch state.)
+    _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.', 'action_head.')
+    # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
+    # exist on one side of a resume — they are zero-init, so the net is bit-identical
+    # to the base at step 0 and fresh-initializing them is exactly right.
+    #
+    # Deliberately NOT extended to 'replace'. That mode rewires the value family's
+    # INPUT, so a fresh-initialized value_premap would feed the trained value head a
+    # random private vector. It is tempting to rely on 'replace' also resizing
+    # value_head/value2/unc/hlg (load_state_dict rejects a size mismatch even with
+    # strict=False), but the widths COINCIDE whenever 64*ValueHeadChannels ==
+    # HEAD_IN_SIZE — and since HEAD_IN_SIZE = 64 * (HEAD_PREMAP_PER_SQUARE // 4),
+    # at EMBEDDING_DIM 256 that collapses to simply ValueHeadChannels ==
+    # HeadWidthMultiplier (at 384/mult 2 it is ValueHeadChannels == 3). Exactly the
+    # small channel counts a C-ablation would sweep. With every shape matching, the
+    # load would succeed and the corruption would be announced by nothing louder than
+    # an INFO line. Leaving the prefixes out here routes that case into the strict
+    # load / _missing_other check instead, which raises.
+    if getattr(model_nocompile, 'value_priv_inject_mode', False):
+      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
+    # Vis edge-bias params (CERES_VIS_EDGE_BIAS/_GATES): the form-A projections
+    # are top-level ('vis_edge_proj.') but the B/C gate params live NESTED in
+    # each layer's attention (transformer_layer.N.attention.attack_gate_*), so
+    # prefix matching can't express them — use a predicate. All are zero-init,
+    # so fresh-initializing on resume reproduces the base net exactly (same
+    # rationale as the 'inject' private-value front-end above).
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('vis_edge_proj.',)
+    # Dual-plane family + 2026-08-20/21 modules (review finding #5): all are
+    # exact step-0 no-ops (zero-init couplings), so fresh-init on warm start
+    # reproduces the base net — same contract as the inject front-end.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + (
+        'dual_plane.', 'dp_value_inject.', 'dp_value2_inject.', 'dp_pol_q.',
+        'dp_pol_p.', 'dpva_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
+        'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_')
+    # Graph-route heads + tactic refiner (2026-08 tactical program): the
+    # refiner is top-level ('tactical_refiner.'), the route params live
+    # nested per attention layer (transformer_layer.N.attention.graph_route_*).
+    # Both are exact step-0 no-ops (zero-init proj_out / tanh-zero gate), so
+    # fresh-initializing on warm-start reproduces the base net exactly.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('tactical_refiner.',)
+    # Value min/max pool injectors (NetDef ValueHeadMinMaxPool): top-level,
+    # zero-init — fresh-initializing on warm start reproduces the base net.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_pool_inject.', 'value2_pool_inject.')
+    def _is_aux_key(k):
+      return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k
+
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
-      # Placement value head is env-gated (CERES_PLACEMENT_VALUE_WEIGHT), so its params
-      # can exist on exactly one side of a resume. Handle both directions LOUDLY here
-      # instead of dying in the strict load (the head is auxiliary/training-only, so
-      # dropping or fresh-initializing it never corrupts the served heads).
-      _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.')
-      # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
-      # exist on one side of a resume — they are zero-init, so the net is bit-identical
-      # to the base at step 0 and fresh-initializing them is exactly right.
-      #
-      # Deliberately NOT extended to 'replace'. That mode rewires the value family's
-      # INPUT, so a fresh-initialized value_premap would feed the trained value head a
-      # random private vector. It is tempting to rely on 'replace' also resizing
-      # value_head/value2/unc/hlg (load_state_dict rejects a size mismatch even with
-      # strict=False), but the widths COINCIDE whenever 64*ValueHeadChannels ==
-      # HEAD_IN_SIZE — and since HEAD_IN_SIZE = 64 * (HEAD_PREMAP_PER_SQUARE // 4),
-      # at EMBEDDING_DIM 256 that collapses to simply ValueHeadChannels ==
-      # HeadWidthMultiplier (at 384/mult 2 it is ValueHeadChannels == 3). Exactly the
-      # small channel counts a C-ablation would sweep. With every shape matching, the
-      # load would succeed and the corruption would be announced by nothing louder than
-      # an INFO line. Leaving the prefixes out here routes that case into the strict
-      # load / _missing_other check instead, which raises.
-      if getattr(model_nocompile, 'value_priv_inject_mode', False):
-        _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_premap.', 'value_priv_inject.', 'value2_priv_inject.')
-      # Vis edge-bias params (CERES_VIS_EDGE_BIAS/_GATES): the form-A projections
-      # are top-level ('vis_edge_proj.') but the B/C gate params live NESTED in
-      # each layer's attention (transformer_layer.N.attention.attack_gate_*), so
-      # prefix matching can't express them — use a predicate. All are zero-init,
-      # so fresh-initializing on resume reproduces the base net exactly (same
-      # rationale as the 'inject' private-value front-end above).
-      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('vis_edge_proj.',)
-      # Dual-plane family + 2026-08-20/21 modules (review finding #5): all are
-      # exact step-0 no-ops (zero-init couplings), so fresh-init on warm start
-      # reproduces the base net — same contract as the inject front-end.
-      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + (
-          'dual_plane.', 'dp_value_inject.', 'dp_value2_inject.', 'dp_pol_q.',
-          'dp_pol_p.', 'dpva_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
-          'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_')
-      # Graph-route heads + tactic refiner (2026-08 tactical program): the
-      # refiner is top-level ('tactical_refiner.'), the route params live
-      # nested per attention layer (transformer_layer.N.attention.graph_route_*).
-      # Both are exact step-0 no-ops (zero-init proj_out / tanh-zero gate), so
-      # fresh-initializing on warm-start reproduces the base net exactly.
-      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('tactical_refiner.',)
-      # Value min/max pool injectors (NetDef ValueHeadMinMaxPool): top-level,
-      # zero-init — fresh-initializing on warm start reproduces the base net.
-      _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_pool_inject.', 'value2_pool_inject.')
-      def _is_aux_key(k):
-        return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k
+      # Placement value head etc. are config/env-gated, so their params can
+      # exist on exactly one side of a resume. Handle both directions LOUDLY
+      # here instead of dying in the strict load.
       _ckpt_model_sd = loaded["model"]
       _model_has_placement = any(_is_aux_key(k) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if _is_aux_key(k)]
@@ -1622,12 +1654,11 @@ def Train():
           name_in_checkpoint = name.replace("original_layer.", "") if "original_layer" in name else name
           if name_in_checkpoint in loaded["model"]:
             new_state_dict[name] = loaded["model"][name_in_checkpoint]
-          elif name.startswith(('oppp_head.', 'opt_head.', 'hlg_head.', 'sp_head.',
-                                'action_head.', 'stvalue_', 'vc_head.')):
+          elif _is_aux_key(name):
             # Aux head newer than the base checkpoint (review 2026-08-21
-            # finding 9: the unconditional index raised KeyError at startup
-            # for the standard LoRA-from-orig flow) — keep init values, the
-            # head trains from scratch during the fine-tune.
+            # finding 9; action review finding 6: reuse the SAME registry as
+            # the non-LoRA path, not a second hand-maintained list) — keep
+            # init values, the head trains from scratch during the fine-tune.
             pass
           else:
             raise KeyError(f'LoRA base checkpoint is missing required weight {name_in_checkpoint!r} '

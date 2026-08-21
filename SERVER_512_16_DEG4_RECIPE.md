@@ -255,7 +255,10 @@ andre value-forsterkeren i koe — BYGD OG VALIDERT 2026-08-21:
   og MCTS konsumerer via ActionWDLForMove.
 - TRT-kost MAALT (EB cmp actsmk vs run2pkg, begge ordrer): ~9-12 % EPS.
   Kosten er VALGFRI ved serving: tren med hodet (value-signal inn i trunken),
-  strippes ev. fra eksporten for full fart — beslutning per nett, ikke per run.
+  strippes fra eksporten for full fart — beslutning per nett, ikke per run.
+  Strip: `CERES_EXPORT_STRIP_ACTION=1` foran recover_export (eller treningens
+  eksport) — verifisert ende-til-ende: graf uten hodet (91.9 vs 97.9 MB),
+  'action'-output blir [B,1]-alias som naar hodet er av.
 
 ## Gate-regel (uendret fra Stage C-protokollen)
 

@@ -216,6 +216,11 @@ class CeresNet(nn.Module):
     # Ceres TRT evaluator detects by name and MCTS consumes via
     # ActionWDLForMove; only the training signal differs.
     self.action_played_weight = float(getattr(config, 'Opt_LossActionPlayedMultiplier', 0) or 0)
+    if self.action_played_weight > 0 and action_loss_weight > 0:
+      # One head, two different target definitions (4-board sequence targets
+      # vs v7 played-move targets) — action review finding 9.
+      raise ValueError('LossActionPlayedMultiplier and LossActionMultiplier are mutually '
+                       'exclusive (both would train action_head on conflicting targets)')
     if action_loss_weight > 0 or self.action_played_weight > 0:
       self.action_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858 * 3, _other_rd)
       if self.action_played_weight > 0:
@@ -734,6 +739,13 @@ class CeresNet(nn.Module):
     # value1/value2 hidden pre-activation. S-plane untouched; policy
     # isolation provable. Requires UseVisEdgeBias (E is the relation source).
     self.use_dual_plane = bool(getattr(config, 'NetDef_UseDualPlane', False))
+    # Loud rejection OUTSIDE the dual-plane branch (action review finding 5):
+    # a grad-scale value with UseDualPlane off used to be a completely silent
+    # no-op — no banner, no attr, arm runs as a byte-identical control.
+    _dpgs_cfg = getattr(config, 'NetDef_DualPlanePolicyGradScale', None)
+    if not self.use_dual_plane and _dpgs_cfg is not None and float(_dpgs_cfg) != 1.0:
+      raise ValueError('DualPlanePolicyGradScale is set but NetDef_UseDualPlane is off — '
+                       'the knob would be a silent no-op and the arm a hidden control')
     if self.use_dual_plane:
       from dual_plane import DualPlane
       # Same source-tensor rationale as the pool asserts (review finding #9):
@@ -787,9 +799,12 @@ class CeresNet(nn.Module):
       _dpgs = getattr(config, 'NetDef_DualPlanePolicyGradScale', 1.0)
       self.dp_policy_grad_scale = float(1.0 if _dpgs is None else _dpgs)
       if self.dp_policy_grad_scale != 1.0:
-        assert getattr(config, 'NetDef_DualPlanePolicyDecode', False), \
-          'DualPlanePolicyGradScale != 1.0 requires DualPlanePolicyDecode (the scale is ' \
-          'applied inside the policy-decode branch; without decode the knob is a no-op)'
+        # ValueError, not assert: house convention for config-combo guards
+        # (asserts vanish under python -O) — action review finding 5.
+        if not getattr(config, 'NetDef_DualPlanePolicyDecode', False):
+          raise ValueError('DualPlanePolicyGradScale != 1.0 requires DualPlanePolicyDecode '
+                           '(the scale is applied inside the policy-decode branch; without '
+                           'decode the knob is a no-op)')
         print(f'[ceres_net] DUAL-PLANE POLICY-GRAD SCALE enabled: policy-decode gradients '
               f'into shared P-tokens x {self.dp_policy_grad_scale} (forward identity; '
               f'value gradients and decode weights unscaled)')
@@ -1678,8 +1693,16 @@ class CeresNet(nn.Module):
         # is exactly 0 in any dtype (same bits), so forward == x to the bit;
         # gradient wrt x is exactly _a. The a*x + (1-a)*x.detach() form differed
         # by 1-2 ulp under bf16, breaking step-0 parity comparisons.
+        # Inf caveat (action review finding 8): inf - inf = NaN, so a +/-inf
+        # activation would silently become NaN here where the old form kept it
+        # inf (visible to the existing non-finite guards). The where keeps the
+        # bit-exact path for finite elements and propagates inf unchanged;
+        # gradient stays exactly _a either way.
         _a = self.dp_policy_grad_scale
-        _dpt = _dp_tokens.detach() + (_dp_tokens - _dp_tokens.detach()) * _a
+        _dpt_d = _dp_tokens.detach()
+        _dpt = torch.where(torch.isfinite(_dpt_d),
+                           _dpt_d + (_dp_tokens - _dpt_d) * _a,
+                           _dp_tokens * _a + _dpt_d * (1.0 - _a))
       _q = self.dp_pol_q(flow)                                   # [B, 64, dq] (zero-init => 0)
       _p = self.dp_pol_p(_dpt) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
       _pair = torch.matmul(_q, _p.transpose(1, 2))               # [B, 64to, 32slot]
@@ -1794,6 +1817,11 @@ class CeresNet(nn.Module):
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
     _want_action = self.action_loss_weight > 0 or getattr(self, 'action_played_weight', 0) > 0
+    # Export strip (set by save_model via CERES_EXPORT_STRIP_ACTION): in eval
+    # mode emit the cheap unc alias instead, so the exported graph omits the
+    # [B,1858,3] head (~9-12% TRT EPS) while training still uses it.
+    if getattr(self, 'export_strip_action', False) and not self.training:
+      _want_action = False
     action_out             = self.action_head(fS_others).reshape(-1, 1858, 3) if _want_action else unc_out
     if getattr(self, 'action_played_weight', 0) > 0 and self.training:
       self._last_actionp_out = action_out
@@ -1970,6 +1998,12 @@ class CeresNet(nn.Module):
           _rows = torch.arange(_actp.size(0), device=_actp.device)[_avalid]
           _pred = _actp[_rows, _apidx[_avalid]]
           actp_loss = torch.nn.functional.cross_entropy(_pred.float(), _tgt)
+          if SUBTRACT_ENTROPY:
+            # House convention (action review finding 11): subtract the soft
+            # target's entropy so the logged number is a true KL — otherwise
+            # the WDL target entropy (~0.9-1.0) dominates the scalar and a
+            # d-distribution shift between corpora reads as a regression.
+            actp_loss = actp_loss + (_tgt * _tgt.clamp_min(1e-12).log()).sum(-1).mean()
         else:
           # DDP participation term (see the survival template above): keeps
           # action_head in the backward's used-parameter set on all-invalid
