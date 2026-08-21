@@ -155,6 +155,46 @@ Validert ende-til-ende lokalt 2026-08-21: startpos-anker + felt-sanity
 1972/1719 = deg4mx-klassen ved samme LR-fase; policy begrenset av
 een-dags-korpus som ventet), ORT-load groenn, gate kjoert.
 
+## Value-oscillasjon (observert 400M-1B paa foerste 512-16-deg4-loep) — diagnose og kur
+
+**Symptom:** EB-value alternerer med ~100M-periode fra 400M (500M ned, 600M opp, ...);
+TB viser value/value2/unc oscillerende mens policy og qk-clip er friske. Baseline uten
+dual-plane: daarligere niva men stabilere.
+
+**Diagnose (to komponenter som komponerer):**
+1. DELT-POOL-MEKANISMEN: P-planet (~500k params) deles av policy-decoden (sterke,
+   committende gradienter) og value-injectene (svake). Policy omformer kontinuerlig
+   representasjonen value leser -> dp gir bedre value-NIVA men hoeyere varians enn
+   baseline (trunk-only value = sloev men stabil). At value2 oscillerer i takt tross
+   0.04-vekt beviser at det er representasjons-drevet, ikke loss-konkurranse.
+2. Aera-nonstasjonaritet i korpuset (T91: remisrate/sluttspilltetthet/eval-skarphet
+   drifter med tar-dato; shard-granulaer lesing) gir ~100M-periodisiteten.
+   DirectFromV6 mikser paa partiniva og fjerner denne komponenten i senere loep.
+
+**Kur (validert kirurgisk lokalt, commit 18e5b84):**
+```json
+net-config:  "DualPlanePolicyGradScale": 0.25
+opt-config:  "LossValueMultiplier": 2.0
+```
+- Grad-scale: forward-IDENTITET (null inferenskost, bit-lik funksjon); skalerer kun
+  policy-decodens gradienter INN i de delte P-tokene (verifisert eksakt: P-plan-grad
+  x0.25, decode-vekter x1.0, value-grad x1.0). Demper policys omformingskraft over
+  poolen; 5M-smoke viste moderat tidlig policy-etterslep (-52 P) som forventet nar
+  den raskeste laereren dempes — gevinsten er stabilitet paa 400M+-skala.
+- Value-masse 2.0: Kovax-adopsjon #1 (hans objektiv er ~50 % value; vaart ~20-25 %) —
+  adresserer at trunken flytter seg for policy paa values bekostning.
+- Tillegg hvis korpuset har .tgt.zst-sidecars (t91_skip1_v2_surv-navnet antyder det):
+  survival-aux med liten vekt gir value-familien committende gradienter i P-planet
+  som motvekt (dpsv malte +21/+22 value-grip lokalt).
+
+**Anbefalt testdesign naar 1B-loepet er ferdig — forlengelses-arm 1B -> ~1.3B:**
+resume fra 1B-checkpointen med de to noeklene over og forlenget lav-LR-hale
+(value konsoliderer i lav-LR-regimet). Gir ren A/B paa SAMME nett: oscillasjons-
+aeraen 400M-1B vs post-fiks-aeraen, ~6 t ved 14K pos/s. Suksesskriterium:
+EB-value ved 1.1/1.2/1.3B slutter aa alternere (flatt/monotont, ikke niva-hopp),
+og TB value/value2/unc roer seg mot dagens sagtann. Reserve hvis dempingen ikke
+rekker: value-privat P-blokk (fork etter siste delte blokk, kun value-gradienter).
+
 ## Gate-regel (uendret fra Stage C-protokollen)
 
 Sammenlign mot 512-16-baselinen ved samme posisjonstall; value-regelen
