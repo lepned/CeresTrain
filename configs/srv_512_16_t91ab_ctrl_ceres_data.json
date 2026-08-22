@@ -1,0 +1,13 @@
+{
+    "SourceType": "DirectFromPositionGenerator",
+    "TPGFixedSet1": null,
+    "TPGFixedSet2": null,
+    "NumTPGFixedSet1BatchesReturnedForSet2": 0,
+    "TrainingFilesDirectory": "/EDIT/ME/PATH/TO/T91_TPG",
+    "TrainingFilesDirectory2": null,
+    "RatioSet1ToSet2": 0,
+    "NumTPGFilesToSkip": 0,
+    "TARPositionSkipCount": 30,
+    "FractionQ": 1,
+    "WDLLabelSmoothing": 0
+}

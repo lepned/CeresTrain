@@ -247,6 +247,77 @@ class LossCalculator():
     return 100 * acc
 
 
+  def value_metrics(self, target: torch.Tensor, output: torch.Tensor) -> dict:
+    """Base-rate-aware value diagnostics (added 2026-08-22).
+
+    Plain argmax accuracy has two defects that make cross-run reads unsound:
+
+    1. It is dominated by the corpus draw rate. An "always draw" predictor
+       scores exactly the draw fraction, so a corpus with 4 pp more draws looks
+       4 pp better at identical skill. Our own T80/T91 gap is ~5 pp, so every
+       value_acc comparison across those two corpora has been contaminated.
+    2. It is blind to SHARPNESS. Predicting 0.34/0.33/0.33 and 0.9/0.05/0.05
+       score the same. This project's documented value pathology is that the
+       head is COMPRESSED rather than weak — so the headline metric cannot see
+       the actual problem.
+
+    Everything here is base-rate normalised and/or sharpness-sensitive, so the
+    numbers stay comparable when the corpus changes.
+    """
+    with torch.no_grad():
+      t = target.float()
+      p = torch.softmax(output.float(), dim=-1)
+      tc = t.argmax(dim=1)
+      pc = p.argmax(dim=1)
+      n = max(t.shape[0], 1)
+
+      # Reference: accuracy of always predicting the majority class.
+      base_rate = torch.bincount(tc, minlength=3).float().max() / n
+      acc = (pc == tc).float().mean()
+      # 0 = no better than always-majority, 1 = perfect. Base-rate free.
+      # A single-class batch makes the denominator 0; the clamp keeps it finite
+      # but would still emit a huge value that wrecks the TB axis, so report 0
+      # (undefined skill) instead. torch.where keeps this sync-free.
+      _headroom = 1.0 - base_rate
+      skill = torch.where(_headroom > 1e-4,
+                          (acc - base_rate) / _headroom.clamp(min=1e-6),
+                          torch.zeros_like(acc))
+
+      # Balanced accuracy = mean per-class recall; an always-draw predictor
+      # scores 1/3 regardless of how drawish the corpus is. Vectorised to
+      # avoid per-class host syncs.
+      correct = (pc == tc).float()
+      ones = torch.ones_like(correct)
+      cls_total = torch.zeros(3, device=t.device, dtype=correct.dtype).index_add_(0, tc, ones)
+      cls_hit = torch.zeros(3, device=t.device, dtype=correct.dtype).index_add_(0, tc, correct)
+      recall = cls_hit / cls_total.clamp(min=1.0)
+      bal_acc = recall.sum() / (cls_total > 0).float().sum().clamp(min=1.0)
+
+      # Brier skill score against the batch climatology (the mean target).
+      # Proper scoring rule: rewards honest probabilities, not a lucky argmax,
+      # and the climatology reference divides out the base rate.
+      brier = ((p - t) ** 2).sum(dim=1).mean()
+      clim = t.mean(dim=0, keepdim=True)
+      brier_base = ((clim - t) ** 2).sum(dim=1).mean()
+      # Degenerate batch (all targets identical): climatology is perfect, the
+      # reference Brier is ~0, and the ratio explodes. Skill against a perfect
+      # reference is undefined — report 0 rather than a nonsense magnitude.
+      bss = torch.where(brier_base > 1e-6,
+                        1.0 - brier / brier_base.clamp(min=1e-9),
+                        torch.zeros_like(brier))
+
+      # Dispersion of the predicted scalar q — measures compression directly.
+      # unbiased=False: this is the spread of THIS batch, not an estimate of a
+      # wider population, and the Bessel correction would make n==1 produce NaN.
+      q_spread = (p[:, 0] - p[:, 2]).std(unbiased=False)
+
+    return {'value_base_rate': 100.0 * base_rate,
+            'value_skill': skill,
+            'value_bal_acc': 100.0 * bal_acc,
+            'value_bss': bss,
+            'value_q_spread': q_spread}
+
+
   def entropy(self, probabilities : torch.Tensor):
     # entropy is same as cross entropy with itself
     clipped_probabilities = torch.clamp(probabilities + 1e-6, min=1e-6)

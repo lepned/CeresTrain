@@ -68,6 +68,38 @@ class DualPlanePBlock(nn.Module):
     # W_eff = rel_proj.weight * (1 + delta): zero-init delta => exact no-op,
     # and the modulator can only scale relations the net has already grown
     # (gradient reaches gain_mlp only once rel_proj is nonzero).
+    #
+    # ⛔⛔ DO NOT ENABLE FOR ANY NET THAT WILL BE SERVED — TRT-UNSERVABLE.
+    # Measured 2026-08-22, matched pair (rgsmk vs t91pkg, same chassis/corpus/
+    # steps, only this flag differs), EB cmp both orders on a CACHED engine,
+    # reproduced independently by the user:
+    #     rel-gains  547 EPS   vs   control  25,050 EPS   =  46x SLOWER.
+    # Not a measurement artifact and not an export bug:
+    #   * ORT runs both at the SAME speed (0.597 s vs 0.603 s / 64 pos), so the
+    #     arithmetic is free — this is purely a TRT compilation outcome.
+    #   * The graph diff is exactly 4 extra MatMul nodes (one per P-block) whose
+    #     SECOND operand is dynamic: 50 -> 54 dynamic-weight MatMuls, while the
+    #     178 constant-weight ones are unchanged.
+    #   * Cause: the control's rel_proj weight is CONSTANT, so TRT bakes it in
+    #     and collapses the batch into the GEMM's M dimension — one big
+    #     [B*1024, C] x [C, H]. Here W_eff is per-sample, so the batch cannot
+    #     collapse: it becomes B separate [1024, C] x [C, H] GEMMs per block
+    #     (~900 tiny launches per forward at batch 224), with K=C=20 and N=H,
+    #     far too skinny for tensor cores. TRT then picks generic tactics —
+    #     visible as a SMALLER engine (69.9 MB vs 75.8 MB) despite more layers.
+    # NOT fixable by re-exporting: delta depends on the channel c, so it cannot
+    # be factored out of the sum over c. Channel selectivity IS the mechanism,
+    # and it is also exactly what makes it unservable.
+    # Servable redesigns if the hypothesis is worth revisiting:
+    #   (a) per-HEAD gain only (delta over (b,h), not c) — then it factors out
+    #       to delta * sharedGEMM, essentially free, but loses "which relation
+    #       type matters now", which was the point;
+    #   (b) let delta pick among K fixed channel-weightings — K constant GEMMs
+    #       plus a per-sample weighting of K scalars, still fusable.
+    # Also note the ORIGINAL 5M verdict ("policy-neutral", parked) is suspect
+    # for an unrelated reason: gain_mlp's gradient is proportional to rel_proj's
+    # magnitude, which is zero-init, so the modulator barely activates inside a
+    # short run. The hypothesis is untested; only this IMPLEMENTATION is dead.
     self.rel_gains = rel_gains
     if rel_gains:
       self.gain_mlp = nn.Linear(dp, heads * rel_channels, bias=False)

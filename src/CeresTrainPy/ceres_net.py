@@ -812,6 +812,13 @@ class CeresNet(nn.Module):
         print(f'[ceres_net] DUAL-PLANE REL-DEGREES enabled: 2x{_dp_rel_C} degree channels -> '
               f'zero-init token features (exact step-0 no-op)')
       if getattr(config, 'NetDef_DualPlaneRelGains', False):
+        print('[ceres_net] ⛔ WARNING: DualPlaneRelGains is TRT-UNSERVABLE — measured '
+              '46x slower under TensorRT (547 vs 25,050 EPS, cached engine, both orders, '
+              '2026-08-22). ORT shows the arithmetic is free, so this is a TRT '
+              'compilation outcome: the per-sample W_eff turns one big constant-weight '
+              'GEMM into B tiny dynamic-weight GEMMs per block. Fine for research runs '
+              'that will never be served; see dual_plane.py for servable redesigns.',
+              flush=True)
         print(f'[ceres_net] DUAL-PLANE REL-GAINS enabled: per-block masked-mean -> '
               f'per-head/channel gains on relation bias ({_dp_rel_C} ch), '
               f'zero-init (exact step-0 no-op)')
@@ -2412,6 +2419,11 @@ class CeresNet(nn.Module):
       if not gradient_norm_logging_mode:
         self._log("policy_acc" + stat_suffix,policy_accuracy,  step=num_pos)
         self._log("value_acc" + stat_suffix,value_accuracy,  step=num_pos)
+        # Base-rate-aware value diagnostics: value_acc alone is inflated by a
+        # drawish corpus and is blind to compression. See losses.value_metrics.
+        if value_out is not None:
+          for _mk, _mv in loss_calc.value_metrics(value_target, value_out).items():
+            self._log(_mk + stat_suffix, _mv, step=num_pos)
 
       self._log("policy_loss" + stat_suffix, p_loss,  step=num_pos)
       self._log("value_loss" + stat_suffix, v_loss,  step=num_pos)

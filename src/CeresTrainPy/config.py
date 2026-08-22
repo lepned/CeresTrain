@@ -514,6 +514,11 @@ class Configuration:
     self.NetDef_MoveEdgeDecode = config_net_def.get('MoveEdgeDecode', False)
     self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)
     self.NetDef_MoveDegreeDecode = config_net_def.get('MoveDegreeDecode', False)
+    # ⛔ TRT-UNSERVABLE: 46x slower under TensorRT (measured 2026-08-22, matched
+    # pair, cached engine, both orders, independently reproduced). ORT shows the
+    # arithmetic is free — it is the per-sample weight matmul that TRT cannot
+    # compile well. Research-only; never enable for a net that will be served.
+    # Full analysis and servable redesigns in dual_plane.py.
     self.NetDef_DualPlaneRelGains = config_net_def.get('DualPlaneRelGains', False)
     self.NetDef_DualPlaneRelDegrees2 = config_net_def.get('DualPlaneRelDegrees2', False)
     self.NetDef_DualPlaneKingFlight = config_net_def.get('DualPlaneKingFlight', False)
