@@ -263,6 +263,61 @@ attribution for the same reason as (1).
 possible if it is ever wanted. The fresh-run decision rests on (1)-(3) above,
 not on a technical blocker.
 
+## 🅰️🅱️ THE NEXT RUN IS AN A/B: 2 x 2.5B, `srv_512_16_t91ab_{ctrl,ffn}`
+
+Committed configs, ready to launch. This supersedes the single-5B-run framing
+below — the knob rationale in every other section still applies verbatim.
+
+| | arm A `ctrl` | arm B `ffn` |
+|---|---|---|
+| `MuonAdamWScope` | `all-non-trunk` | **`ffn-only`** |
+| Muon / AdamW params | 120 / 202 | **20 / 302** |
+| GPUs | 0,1 | 2,3 (NVLink pairs) |
+| positions | 2.5B | 2.5B |
+| everything else | — | **byte-identical, same seeds** |
+
+Verified programmatically: the opt configs differ in `MuonAdamWScope` alone,
+and the net and data configs not at all.
+
+⚠ **THIS IS NOT "SPLIT-LR".** `LearningRateBase` is 0.0005 in BOTH arms and
+`LearningRateBaseHeads` / `LearningRateHeadsRatio` / `LearningRateCouplingsRatio`
+are all unset. The variable is which OPTIMIZER each parameter gets, not what
+learning rate it gets. The name has caused confusion twice; keep them apart.
+
+**What `ffn-only` does:** Muon keeps only the FFN linears; attention qkv/proj
+and smolgen move to the internal AdamW. That is the Kovax partition ("NAdam for
+attention, Muon for FFN", our AdamW standing in for his NAdam), and it acts on
+the QK-clip evidence — the load-bearing choice is taking attention matrices out
+of Muon's orthogonalization. Note how drastic it is: Muon drops to 20 params.
+
+⚠ Scope naming is inconsistent in the code: `all-non-trunk` and `final-only`
+describe what **AdamW** gets, while `ffn-only` describes what **Muon** gets.
+Read `train.py:616-648` before assuming.
+
+**Why an A/B rather than one 5B run.** The dev box's finding #5 ruled out LR
+LEVEL as the value-freeze lever (two arms 2x apart froze at the same onset; a
+5x in-run cut did not help), and moved the weight to the partition. Spending
+our largest compute on a run that tests nothing on the value axis would leave
+us in the same place a week later. 2.5B is still 2.5x any previous production
+run and 12x the ~200M floor for a readable value verdict.
+
+⚠ `MuonAdamWScope` CANNOT be changed mid-run: the optimizer-state guard resets
+momentum when the partition differs from the checkpoint. It must be set from
+step 0 — another reason this is an A/B rather than a mid-run switch.
+
+**Local de-risking done:** `ffn-only` smoked clean on T91 TPG at 1M (within
+noise of control); a separate arm at Muon 5e-4 / AdamW 8e-4 confirmed the
+partition tolerates 1.6x on attention with only sporadic QK clipping (1 head),
+so 5e-4 is not handicapping arm B. Resume correctness verified end-to-end.
+
+**Launch:** `scripts/server/launch_tactical_ab.sh <OUT> 2` (2 GPUs per arm,
+separate ports). Edit the data path in BOTH data configs first, and check
+shards >= 2 ranks x workers per arm before choosing worker count.
+
+**If arm B wins**, the validated follow-on is raising the AdamW-branch LR
+(`LearningRateBaseHeads`) — already shown safe, not folded in here because it
+would have broken the single-key design.
+
 ## 🔄 DATA-PATH CHANGE 2026-08-22 EVENING: Hetzner **T91 TPG**, not v7 chunks
 
 The next run will train on T91 **TPG shards** being downloaded to the server,
