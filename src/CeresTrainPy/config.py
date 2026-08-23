@@ -560,7 +560,13 @@ class Configuration:
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
     self.NetDef_FFNUseGlobalEveryNLayers = config_net_def.get('FFNUseGlobalEveryNLayers', 0)
     self.NetDef_HeadsActivationType = config_net_def.get('HeadsActivationType', 'ReLU')
-    self.NetDef_PriorStateDim = config_net_def.get('PriorStateDim', 64)  
+    # Default 0, NOT 64. At >0 the net gains a second ONNX input ('prior_state')
+    # for which Ceres never binds an address, so TensorRT fails CUDA-graph capture
+    # on every batch profile and the engine silently answers nothing ("No search
+    # info received from engine") — i.e. the net cannot be served at all, and the
+    # failure appears only at inference, after training. Omitting the field used to
+    # turn the feature ON; an absent field now means off. Set it explicitly to opt in.
+    self.NetDef_PriorStateDim = config_net_def.get('PriorStateDim', 0)
     self.NetDef_DeepNorm = config_net_def.get('DeepNorm', False) 
     self.NetDef_DenseFormer = config_net_def.get('DenseFormer', False) 
     self.NetDef_SmolgenDimPerSquare = config_net_def.get('SmolgenDimPerSquare', 32)
