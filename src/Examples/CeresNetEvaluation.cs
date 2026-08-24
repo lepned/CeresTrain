@@ -1000,7 +1000,7 @@ namespace CeresTrain.Examples
                                                    ENABLE_PROFILING, false, useHistory, captureOptions,
                                                   true, USE_STATE);
 
-          EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true; // ** TODO: remove/rework
+          // RETAIN_POSITION_INTERNALS removed upstream (Ceres NNRemoteProtocol v4).
           onnxEngine.ConverterToFlatFromTPG = (options, o, f1)
             => TPGConvertersToFlat.ConvertToFlatTPGFromTPG(options, o, f1);
           onnxEngine.ConverterToFlat = (options, o, history, squares, legalMoveIndices)

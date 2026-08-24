@@ -155,9 +155,9 @@ namespace CeresTrain.NNEvaluators
 
       pytorchForwardEvaluator.SetType(dataType);
 
-      // TODO: eliminate this need possibly, instead just pick up from Position
-      //       (do conversion to EncodedPosition).
-      EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS = true;
+      // NOTE: EncodedPositionBatchFlat.RETAIN_POSITION_INTERNALS was removed upstream
+      // (Ceres NNRemoteProtocol v4: "PositionsBuffer / RETAIN_POSITION_INTERNALS removed;
+      // wire flags are now content-driven"). Nothing to set here any more.
 
       PytorchForwardEvaluator = pytorchForwardEvaluator;
       LastMovePliesEnabled = lastMovePliesEnabled;
@@ -166,7 +166,13 @@ namespace CeresTrain.NNEvaluators
     }
 
     // TODO: make this more restrictive to improve performance/
-    public override InputTypes InputsRequired => LastMovePliesEnabled ? InputTypes.AllWithLastMovePlies : InputTypes.All;
+    // CompactHistories must be advertised explicitly: upstream's content-driven
+    // replacement for RETAIN_POSITION_INTERNALS (NNEvaluator.PrepareBatchInputs)
+    // only populates them when the evaluator declares the flag, and the TPG
+    // converter below requires them (same migration upstream applied to
+    // NNEvaluatorONNX in TPG mode).
+    public override InputTypes InputsRequired => (LastMovePliesEnabled ? InputTypes.AllWithLastMovePlies : InputTypes.All)
+                                                 | InputTypes.CompactHistories;
 
     public override bool HasM => true;
     public override bool IsWDL => true;
@@ -334,10 +340,9 @@ namespace CeresTrain.NNEvaluators
       TPGRecordConverter.ConvertPositionsToRawSquareBytes(positions, IncludeHistory, positions.Moves, LastMovePliesEnabled,
                                                           OptionsTorchsharp.QNegativeBlunders, OptionsTorchsharp.QPositiveBlunders,
                                                           out mgPos, squareBytesAll, legalMoveIndicesBuffer);
-#if DEBUG
-      lastPosition = lastPositionStatic = positions.PositionsBuffer.Span[0];
-
-#endif
+      // (A #if DEBUG diagnostic here captured positions.PositionsBuffer.Span[0] into
+      // lastPosition; PositionsBuffer was removed upstream (NNRemoteProtocol v4), so
+      // the diagnostic and its lastPosition consumers are retired with it.)
 
       IPositionEvaluationBatch batch = RunEvalAndExtractResultBatch(i => positions.States.Length == 0 ? default : positions.States.Span[i], 
                                                                     i => positions.Moves.Span[i], 
@@ -367,9 +372,6 @@ namespace CeresTrain.NNEvaluators
             {
               Console.WriteLine("   ok " + mgPos[i].ToPosition.FEN + " TB score: " + score + " " + MathF.Round(batch.GetV(0), 1) + " " + win);
             }
-#if DEBUG
-            Console.WriteLine(lastPosition.FinalPosition.FEN + " TB score: " + score + " " + MathF.Round(batch.GetV(0), 1));
-#endif
             Console.WriteLine();
           }
         }
