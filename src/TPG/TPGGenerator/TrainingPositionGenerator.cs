@@ -203,6 +203,11 @@ namespace CeresTrain.TPG.TPGGenerator
 
       Init();
 
+      // Dedup guard state (dedupHashCount/dedupCapReached) is per-instance, so each
+      // set in a multi-set generation starts with a fresh guard by construction —
+      // the historical bug where a cap hit in set 1 silently disabled dedup for all
+      // later sets came from these being static, not from a missing reset.
+
       Console.WriteLine();
       Console.WriteLine($"LC0 game chunks will be sourced from {Options.FilesToProcess.Count} TAR files in directory {Options.SourceDirectory}");
       Console.WriteLine();
@@ -343,8 +348,13 @@ namespace CeresTrain.TPG.TPGGenerator
       long.TryParse(Environment.GetEnvironmentVariable("TPG_MAX_DEDUP_HASHES"), out long cap) && cap > 0
         ? cap
         : 120_000_000;
-    private static long dedupHashCount = 0;
-    private static volatile bool dedupCapReached = false;
+    // Instance fields (NOT static): the guard is per-run state — the hash dictionary
+    // it protects is created per RunGeneratorLoop — and a static counter is shared
+    // with any concurrently-running generator in the same process (e.g. the
+    // TPGTorchDatasetComboHelpers background fill), where one instance's cap or
+    // reset corrupts the other's accounting. Only the cap itself stays static.
+    private long dedupHashCount = 0;
+    private volatile bool dedupCapReached = false;
 
     bool PositionAtIndexShouldBeProcessed(int i, 
                                           in EncodedTrainingPositionGame game, 
