@@ -614,38 +614,44 @@ def Train():
                      max_precond_size=999999, precondition_frequency=PRECONDITION_FREQUENCY)
   elif config.Opt_Optimizer == 'Muon':
     _muon_scope = getattr(config, 'Opt_MuonAdamWScope', 'all-non-trunk')
-    if _muon_scope == 'final-only':
-      # dje-style partition: Muon drives ALL hidden 2-D matrices (trunk, headPremap,
-      # headSharedLinear, each Head's hidden fc, smolgen prep); the internal AdamW
-      # gets only final output layers (fcFinal, single-Linear aux heads), embeddings,
-      # LoRA adapters and 1-D params (norms/biases).
-      def _use_muon(n, p):
-        if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
-        if 'embedding' in n: return False         # lookup-table-like: AdamW
-        if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
-        if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
-        if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
-        if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
-        return True
-    elif _muon_scope == 'all-non-trunk':
+    # ONE predicate table (review 2026-08-24 finding 8): the third-LR "moved set"
+    # below is defined against the 'all-non-trunk' REFERENCE partition, so the
+    # predicates must have a single definition — a retyped copy silently drifts
+    # when a scope is amended. 'lora' is excluded in ALL scopes (finding 4):
+    # 'final-only' always carried the exclusion ("orthogonalized updates
+    # unsuitable" for low-rank adapters); 'all-non-trunk'/'ffn-only' lacked it,
+    # so env-gated transformer-layer LoRA adapters ran under Muon Newton-Schulz.
+    # For non-LoRA runs the exclusion changes nothing (no matching names).
+    def _use_muon_final_only(n, p):
+      if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
+      if 'embedding' in n: return False         # lookup-table-like: AdamW
+      if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
+      if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
+      if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
+      if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
+      return True
+    def _use_muon_all_non_trunk(n, p):
       # Legacy partition: Muon only for 2-D trunk params; everything else AdamW.
       # ndim == 2 (not >= 2): Muon's ctor asserts exactly-2-D, so any >=3-D
       # trunk param (e.g. the [H, C, d_k] vis edge-bias gate tensors) must go
       # to the internal AdamW group — same rule the 'final-only' scope applies.
-      def _use_muon(n, p):
-        return p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
-    elif _muon_scope == 'ffn-only':
+      return (p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
+              and 'lora' not in n.lower())
+    def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
       # AdamW substituted for NAdam by design — the load-bearing choice is
       # taking ATTENTION matrices out of Muon's orthogonalization, which
       # suits square FFN GEMMs but may fight the spectral sensitivity of
       # QK^T products): Muon = 2-D FFN linears only; attention qkv/proj and
       # smolgen go to the internal AdamW group at base lr.
-      def _use_muon(n, p):
-        return (p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
-                and ('mlp.linear' in n or 'tactical_ffn' in n))
-    else:
+      return (_use_muon_all_non_trunk(n, p)
+              and ('mlp.linear' in n or 'tactical_ffn' in n))
+    _SCOPE_PREDS = {'final-only': _use_muon_final_only,
+                    'all-non-trunk': _use_muon_all_non_trunk,
+                    'ffn-only': _use_muon_ffn_only}
+    if _muon_scope not in _SCOPE_PREDS:
       raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only' or 'ffn-only')")
+    _use_muon = _SCOPE_PREDS[_muon_scope]
     muon_params  = [p for n, p in model.named_parameters() if p.requires_grad and _use_muon(n, p)]
     adamw_params = [p for n, p in model.named_parameters() if p.requires_grad and not _use_muon(n, p)]
     print(f"[train] Muon partition scope={_muon_scope}: {len(muon_params)} muon / {len(adamw_params)} adamw params", flush=True)
@@ -726,6 +732,8 @@ def Train():
     if _heads_ratio is not None or _coup_ratio is not None:
       _n_h = _n_c = 0
       for _pn, _pp in model.named_parameters():
+        if not _pp.requires_grad:
+          continue  # frozen (e.g. LoRA base weights): a ratio on a frozen param is inert and inflates the match count (review finding 7)
         if _heads_ratio is not None and any(f in _pn for f in _HEAD_FAMILY):
           _lr_ratios[_pp] = float(_heads_ratio); _n_h += 1
         elif _coup_ratio is not None and any(f in _pn for f in _COUPLING_FAMILY):
@@ -738,6 +746,44 @@ def Train():
         raise ValueError('LearningRateHeadsRatio set but no head-family params matched')
       if _coup_ratio is not None and _n_c == 0:
         raise ValueError('LearningRateCouplingsRatio set but no coupling-family params matched (UseDualPlane off?)')
+    # THIRD LR GROUP (2026-08-24, dev-box finding): tensors the ACTIVE scope moved
+    # OUT of Muon relative to the reference partition ('all-non-trunk') — under
+    # 'ffn-only' the attention qkv/proj and smolgen matrices. Left alone they run
+    # in the internal-AdamW group at the MUON base rate (the srv_576_16 A/B
+    # confound: partition and LR not separable), and LearningRateBaseHeads cannot
+    # fix it without also dragging heads/embeddings/norms. Implemented through the
+    # per-param lr_ratios path so the rate is schedule-proportional like the rest.
+    # NB the ratio is computed against the internal-AdamW group lr exactly as
+    # muon.py composes it (adamw_lr_ratio = adamw_lr/lr if adamw_lr else 1.0,
+    # muon.py:117) — if that composition ever changes, change this line with it.
+    _moved_lr = getattr(config, 'Opt_LearningRateBaseMovedAdamW', None)
+    if _moved_lr is not None:
+      _moved_lr = float(_moved_lr)
+      _adamw_group_lr = _heads_lr if _heads_lr is not None else LR
+      if not (_moved_lr > 0):
+        raise ValueError(f'LearningRateBaseMovedAdamW must be > 0 (got {_moved_lr}); to freeze the '
+                         f'moved tensors, freeze them explicitly rather than zeroing their LR')
+      if not (_adamw_group_lr > 0):
+        raise ValueError(f'LearningRateBaseMovedAdamW requires a positive internal-AdamW group lr '
+                         f'(LearningRateBaseHeads or LearningRateBase), got {_adamw_group_lr}')
+      _use_muon_ref = _SCOPE_PREDS['all-non-trunk']   # reference partition, single definition
+      _n_m = 0
+      for _pn, _pp in model.named_parameters():
+        if not _pp.requires_grad:
+          continue
+        if _use_muon_ref(_pn, _pp) and not _use_muon(_pn, _pp):
+          if _pp in _lr_ratios:
+            raise ValueError(f'LearningRateBaseMovedAdamW: {_pn} already carries a family LR ratio '
+                             '(overlapping LR directives are refused rather than silently composed)')
+          _lr_ratios[_pp] = _moved_lr / _adamw_group_lr
+          _n_m += 1
+      if _n_m == 0:
+        raise ValueError(f"LearningRateBaseMovedAdamW set but no tensors are moved out of Muon under "
+                         f"scope {_muon_scope!r} (reference partition 'all-non-trunk') — the key is only "
+                         f"meaningful with a narrower scope, e.g. 'ffn-only'")
+      print(f'[train] Muon THIRD-LR: {_n_m} scope-moved tensors (reference-Muon -> AdamW under '
+            f'{_muon_scope!r}) at lr={_moved_lr} (ratio {_moved_lr / _adamw_group_lr:.4g} vs their '
+            f'AdamW group lr {_adamw_group_lr}; schedule-proportional)', flush=True)
     # MuonMomentum decouples the Muon SGD-momentum from the internal-AdamW
     # beta1 (see config.py) — reference combo is momentum 0.95 / adam beta1 0.9.
     _muon_mom = config.Opt_MuonMomentum if getattr(config, 'Opt_MuonMomentum', None) is not None else config.Opt_Beta1

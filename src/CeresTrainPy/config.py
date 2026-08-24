@@ -159,6 +159,14 @@ class Configuration:
     # on heads). Mutually exclusive with LearningRateBaseHeads.
     self.Opt_LearningRateHeadsRatio = config_opt.get('LearningRateHeadsRatio', None)
     self.Opt_LearningRateCouplingsRatio = config_opt.get('LearningRateCouplingsRatio', None)
+    # Third LR group (2026-08-24, dev-box finding on the srv_576_16 A/B): absolute
+    # peak LR for tensors the ACTIVE MuonAdamWScope moved OUT of Muon relative to
+    # the reference partition ('all-non-trunk') — under 'ffn-only' the attention
+    # qkv/proj and smolgen matrices. Without this they run in the internal-AdamW
+    # group at the MUON base rate (or at LearningRateBaseHeads, dragging heads
+    # along), so partition and LR were not separable in the A/B. None/absent =
+    # legacy behavior. CONFIG-ONLY (no env override by design).
+    self.Opt_LearningRateBaseMovedAdamW = config_opt.get('LearningRateBaseMovedAdamW', None)
     # Muon momentum decoupling (Muon only): historically Beta1 fed BOTH the
     # Muon SGD-momentum and the internal-AdamW beta1, so the reference combo
     # (Muon momentum 0.95 + Adam beta1 0.9, Kovax live configs) was
