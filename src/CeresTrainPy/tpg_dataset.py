@@ -196,6 +196,13 @@ TPG_V7X_SIDECAR_MODE = _TPG_V7X_SIDECAR_MODE
 # Optional policy-target sharpening: target = alpha * one_hot(solver) + (1-alpha) * teacher.
 # Set CERES_POLICY_TARGET_ALPHA > 0 (e.g. 0.5) to enable. Default 0 = no sharpening.
 _POLICY_TARGET_ALPHA = float(os.environ.get('CERES_POLICY_TARGET_ALPHA', '0.0'))
+# MLH-gating av skarpingen (E2-proben 2026-08-25): policy-targets FLATER naer
+# avgjort slutt (top1 0.46 -> 0.19, entropi 2.4 -> 3.9 siste 20 plies) fordi
+# alle veier vinner og visits sprer seg - mens puzzles krever korteste matt.
+# CERES_POLICY_TARGET_MLH_MAX = N (plies) begrenser skarpingen til records med
+# hoyst N plies igjen av partiet, saa resten av fordelingene staar uroert.
+# 0 (default) = ingen gating (alpha gjelder alle records som foer).
+_POLICY_TARGET_MLH_MAX = float(os.environ.get('CERES_POLICY_TARGET_MLH_MAX', '0') or 0)
 
 # On-disk TPG record format: V3 (141 B/square, 9634 B/pos, 4 aux baked in) vs upstream
 # V2 (137 B/square, 9378 B/pos, no aux). Mirrors Ceres.Chess TPGRecord.USE_V3_TPG_RECORD.
@@ -209,6 +216,8 @@ if not _USE_V3_TPG and _NUM_AUX_FEATURES_PER_SQUARE != 0:
                    f'(got {_NUM_AUX_FEATURES_PER_SQUARE}) — V2 has no aux bytes on disk.')
 if _POLICY_TARGET_ALPHA > 0:
   print(f"[tpg_dataset] policy-target sharpening: alpha = {_POLICY_TARGET_ALPHA}")
+  if _POLICY_TARGET_MLH_MAX > 0:
+    print(f"[tpg_dataset]   ...MLH-gated: kun records med <= {_POLICY_TARGET_MLH_MAX:.0f} plies igjen skarpes")
 
 # Decisive-position oversampling: keep all win/loss records but keep DRAW records only with
 # probability CERES_KEEP_DRAW_PROB (default 1.0 = off). Counters draw-saturation of strong
@@ -673,6 +682,9 @@ class TPGDataset(Dataset):
               if _POLICY_TARGET_ALPHA > 0.0:
                 row_max = policies_values.max(axis=1)        # [B]
                 active = row_max > 0                          # mask out value-only rows
+                if _POLICY_TARGET_MLH_MAX > 0:
+                  # mlh her = trener-enheter (raw^2); plies = mlh * 100 (jf. E2-proben).
+                  active = active & (mlh.ravel() * 100.0 <= _POLICY_TARGET_MLH_MAX)
                 if active.any():
                   pv32 = policies_values.astype(np.float32)
                   solver_slot = pv32.argmax(axis=1)           # [B]

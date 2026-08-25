@@ -504,6 +504,19 @@ class CeresNet(nn.Module):
     self.value_rank_weight = float(os.environ.get('CERES_VALUE_RANK_WEIGHT', '0') or 0)
     if self.value_rank_weight > 0:
       print(f'[ceres_net] VALUE RANK loss enabled: in-batch pairwise ordering, w={self.value_rank_weight}')
+    # POLICY MARGIN loss (I4, 2026-08-25 probe-trio): hinge paa logit-gapet
+    # mellom target-argmax og de 4 sterkeste rivalene. Motivasjon: E1 maalte at
+    # ~52 % av alle puzzle-feil er naer-bommer (gap < 1.0) og at flathet
+    # anti-korrelerer med top-1; E2 at policy-targets FLATER naer matt.
+    # Konfidensvekting med targetens egen top-1-masse gjor at skarpingen kun
+    # presser der laereren selv er sikker (one-hot puzzle-records faar full
+    # vekt, flate naer-matt game-records nesten ingen) - vi skarper aldri mot
+    # en tilfeldig argmax av et flatt maal.
+    self.policy_margin_weight = float(os.environ.get('CERES_POLICY_MARGIN_WEIGHT', '0') or 0)
+    self.policy_margin_value = float(os.environ.get('CERES_POLICY_MARGIN_VALUE', '1.0') or 1.0)
+    if self.policy_margin_weight > 0:
+      print(f'[ceres_net] POLICY MARGIN loss enabled: hinge m={self.policy_margin_value} mot top-4 rivaler, '
+            f'konfidensvektet med target-top1, w={self.policy_margin_weight}')
     self.value_contrast_weight = float(os.environ.get('CERES_VALUE_CONTRAST_WEIGHT', '0') or 0)
     if self.value_contrast_weight > 0:
       self.vc_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 1858 * 3, 0)
@@ -1007,6 +1020,15 @@ class CeresNet(nn.Module):
           nn.init.constant_(self.dpgi_v2.bias, 4.0)
         print('[ceres_net] GATED PLANE-INJECTS enabled: sigma(W_g*fS_value) x value1/value2 '
               'pool-injects (content-conditioned plane reliance; exact step-0 no-op from scratch)')
+      # I2-ABLASJON (2026-08-26, offer-antimoensteret fra theme-matrisen):
+      # CERES_DP_NO_POOL_INJECTS=1 kobler POOL-injectene ut av value-veien og
+      # lar kun attention-lesinger (dpva/dpcv) staa igjen. Modulene beholdes
+      # (state_dict uendret => export-vaktene upaavirket); de faar bare null
+      # gradient. Kausal test: baerer poolingen materiell-prioret som skader
+      # offer-cellene, mens attention-lesing slipper unna?
+      self.dp_no_pool_injects = int(os.environ.get('CERES_DP_NO_POOL_INJECTS', '0') or 0) > 0
+      if self.dp_no_pool_injects:
+        print('[ceres_net] DP POOL-INJECTS DISABLED (I2-ablasjon): value leser planet kun via attention-veier')
       # PER-PIECE SURVIVAL AUX (training-only; value-grip hypothesis 2026-08-21):
       # predict each PIECE TOKEN's fate (captured at ply d / survives) against
       # the square-indexed survival sidecar targets gathered to piece slots.
@@ -1627,15 +1649,16 @@ class CeresNet(nn.Module):
       _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
       _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
       _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
-      _dpv = self.dp_value_inject(_dp_pool)
-      if getattr(self, 'dp_gated_injects', False):
-        _dpv = _dpv * torch.sigmoid(self.dpgi_v(fS_value))
-      _v_inject = _dpv if _v_inject is None else _v_inject + _dpv
-      if self.value2_loss_weight > 0:
-        _dpv2 = self.dp_value2_inject(_dp_pool)
+      if not getattr(self, 'dp_no_pool_injects', False):
+        _dpv = self.dp_value_inject(_dp_pool)
         if getattr(self, 'dp_gated_injects', False):
-          _dpv2 = _dpv2 * torch.sigmoid(self.dpgi_v2(fS_value))
-        _v2_inject = _dpv2 if _v2_inject is None else _v2_inject + _dpv2
+          _dpv = _dpv * torch.sigmoid(self.dpgi_v(fS_value))
+        _v_inject = _dpv if _v_inject is None else _v_inject + _dpv
+        if self.value2_loss_weight > 0:
+          _dpv2 = self.dp_value2_inject(_dp_pool)
+          if getattr(self, 'dp_gated_injects', False):
+            _dpv2 = _dpv2 * torch.sigmoid(self.dpgi_v2(fS_value))
+          _v2_inject = _dpv2 if _v2_inject is None else _v2_inject + _dpv2
       # Per-piece survival aux stash (training-only; consumed in compute_loss).
       if self.training and getattr(self, 'dp_surv_weight', 0) > 0:
         self._last_dp_surv = (self.dp_surv_head(_dp_tokens), _dp_sel, _dp_occ)
@@ -2162,6 +2185,17 @@ class CeresNet(nn.Module):
       value_rank_loss = (torch.relu(0.1 - _vr_ds * torch.sign(_vr_dt)) * _vr_m).sum() \
           / _vr_m.sum().clamp(min=1.0)
 
+    # Policy MARGIN loss (see __init__): target-argmax skal staa margin-klar av rivalene.
+    policy_margin_loss = 0
+    if self.policy_margin_weight > 0 and policy_out is not None and not gradient_norm_logging_mode:
+      _pm_t = policy_target.float()
+      _pm_conf, _pm_best = _pm_t.max(dim=1)                       # [B] target-skarphet + solver-slot
+      _pm_logits = policy_out.float()
+      _pm_best_logit = _pm_logits.gather(1, _pm_best.unsqueeze(1)).squeeze(1)
+      _pm_rivals = _pm_logits.scatter(1, _pm_best.unsqueeze(1), float('-inf')).topk(4, dim=1).values
+      _pm_h = torch.relu(self.policy_margin_value - (_pm_best_logit.unsqueeze(1) - _pm_rivals)).mean(dim=1)
+      policy_margin_loss = (_pm_conf.detach() * _pm_h).mean()
+
     # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
     # the record's WDL, every other legal move is labeled LOSS-for-STM.
     # The loss-vector label (not a flip of the record WDL) is correct across
@@ -2520,6 +2554,7 @@ class CeresNet(nn.Module):
             + depth_ctl_ploss + depth_ctl_vloss)
            if not isinstance(depth_probe_ploss, int) else 0)
         + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
+        + (self.policy_margin_weight * policy_margin_loss if not isinstance(policy_margin_loss, int) else 0)
         + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
@@ -2545,6 +2580,7 @@ class CeresNet(nn.Module):
     # depth probes (deep supervision spans both families by construction).
     if getattr(self, '_gc_probe_now', False):
       self._gc_policy_loss = (self.policy_loss_weight * p_loss
+          + (self.policy_margin_weight * policy_margin_loss if not isinstance(policy_margin_loss, int) else 0)
           + self.uncertainty_policy_weight * uncertainty_policy_loss
           + self.action_loss_weight * action_loss
           + self.action_uncertainty_loss_weight * action_uncertainty_loss
@@ -2668,6 +2704,8 @@ class CeresNet(nn.Module):
         self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
       if not isinstance(value_rank_loss, int):
         self._log("value_rank_loss" + stat_suffix, value_rank_loss, step=num_pos)
+      if not isinstance(policy_margin_loss, int):
+        self._log("policy_margin_loss" + stat_suffix, policy_margin_loss, step=num_pos)
       if not isinstance(vc_loss, int):
         self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
       if not isinstance(hlg_loss, int):

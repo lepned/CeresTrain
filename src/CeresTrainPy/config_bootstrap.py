@@ -33,6 +33,12 @@ import sys
 BOOTSTRAP_ENV_MAP = {
     # data format / sidecars
     'TPGV3': 'CERES_TPG_V3',
+    # Policy-target-skarping (I4-sporet 2026-08-25): alpha + mlh-gate.
+    'PolicyTargetAlpha': 'CERES_POLICY_TARGET_ALPHA',
+    'PolicyTargetMLHMax': 'CERES_POLICY_TARGET_MLH_MAX',
+    # Policy-margin-tap (I4): vekt + hinge-margin.
+    'PolicyMarginWeight': 'CERES_POLICY_MARGIN_WEIGHT',
+    'PolicyMarginValue': 'CERES_POLICY_MARGIN_VALUE',
     # G1-gate paa SDPA-outputen (arXiv 2505.06708; allerede implementert env-gated i
     # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
     # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
