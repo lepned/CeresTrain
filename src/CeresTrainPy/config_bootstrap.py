@@ -33,6 +33,10 @@ import sys
 BOOTSTRAP_ENV_MAP = {
     # data format / sidecars
     'TPGV3': 'CERES_TPG_V3',
+    # G1-gate paa SDPA-outputen (arXiv 2505.06708; allerede implementert env-gated i
+    # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
+    # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
+    'GatedAttentionOutput': 'CERES_GATED_ATTENTION_OUTPUT',
     'AuxFeaturesPerSquare': 'CERES_AUX_FEATURES_PER_SQUARE',
     # Per-corpus shard format. TPGV3 is the whole-run toggle; these two are the
     # explicit widths, and SquareBytes2 is what a MIXED run needs (e.g. a V3

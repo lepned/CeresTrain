@@ -128,7 +128,7 @@ if bool(_ckpt_sm) != bool(_model_sm):
     f'rebuilt model has {len(_model_sm)}. Set "SoftMinHeads" in the _ceres_net.json '
     f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
 # Guard for the dual-plane P-plane (config NetDef UseDualPlane).
-_DP_SUBSTR = ('dp_value', 'dp_pol_', 'dpva_', 'dpv_', 'dpe_w', 'dpd_', 'dpcv_', 'dpc_', 'dpch_', 'dp_surv')
+_DP_SUBSTR = ('dp_value', 'dp_pol_', 'dpva_', 'dpv_', 'dpe_w', 'dpd_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv')
 _ckpt_dp = [k for k in loaded['model'] if k.startswith('dual_plane.') or any(t in k for t in _DP_SUBSTR)]
 _model_dp = [k for k in model.state_dict() if k.startswith('dual_plane.') or any(t in k for t in _DP_SUBSTR)]
 if sorted(_ckpt_dp) != sorted(_model_dp):   # SET equality: equal-count family swaps (e.g. dpd_* out, dpv_* in) must also refuse (review 2026-08-25b finding 5)

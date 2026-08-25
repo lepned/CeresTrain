@@ -529,6 +529,8 @@ class Configuration:
     # Check-chain decode (N2, 2026-08-25): composed check/flight move channels
     # (mate-pattern geometry), zero-init into the move score.
     self.NetDef_DualPlaneCheckChain = config_net_def.get('DualPlaneCheckChain', False)
+    # Gated plane-injects (A, 2026-08-25): sigma(W_g*fS_value) x value pool-injects.
+    self.NetDef_DualPlaneGatedInjects = config_net_def.get('DualPlaneGatedInjects', False)
     self.NetDef_DualPlaneVictimDecode = config_net_def.get('DualPlaneVictimDecode', False)
     self.NetDef_MoveEdgeDecode = config_net_def.get('MoveEdgeDecode', False)
     self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)

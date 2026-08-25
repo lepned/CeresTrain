@@ -989,6 +989,24 @@ class CeresNet(nn.Module):
       if self.value2_loss_weight > 0:
         self.dp_value2_inject = nn.Linear(2 * self.dual_plane.dp, 64 * HEAD_MULT, bias=False)
         nn.init.zeros_(self.dp_value2_inject.weight)
+      # GATEDE PLAN-INJECTS (A, 2026-08-25, arXiv 2505.06708-prinsippet paa
+      # injectene): value-hodets lesing av planet er i dag REN LINEAER — men
+      # 4x-ablasjonen maalte at planet betyr 4x mer i skarpe stillinger. Gaten
+      # sigma(W_g * fS_value) gjor plan-avhengigheten INNHOLDSBETINGET paa
+      # trunk-konteksten. Injectene er zero-init, saa sigma(x)*0 = 0 => eksakt
+      # steg-0-no-op fra scratch UANSETT gate-init; bias +4 (sigma=0.982) gjor
+      # den i tillegg naer-no-op ved innsetting oppaa TRENTE injects.
+      self.dp_gated_injects = bool(getattr(config, 'NetDef_DualPlaneGatedInjects', False))
+      if self.dp_gated_injects:
+        self.dpgi_v = nn.Linear(self.VALUE_IN_SIZE, 64 * HEAD_MULT, bias=True)   # fS_value-bredden (jf. dpva)
+        nn.init.zeros_(self.dpgi_v.weight)
+        nn.init.constant_(self.dpgi_v.bias, 4.0)
+        if self.value2_loss_weight > 0:
+          self.dpgi_v2 = nn.Linear(self.VALUE_IN_SIZE, 64 * HEAD_MULT, bias=True)
+          nn.init.zeros_(self.dpgi_v2.weight)
+          nn.init.constant_(self.dpgi_v2.bias, 4.0)
+        print('[ceres_net] GATED PLANE-INJECTS enabled: sigma(W_g*fS_value) x value1/value2 '
+              'pool-injects (content-conditioned plane reliance; exact step-0 no-op from scratch)')
       # PER-PIECE SURVIVAL AUX (training-only; value-grip hypothesis 2026-08-21):
       # predict each PIECE TOKEN's fate (captured at ply d / survives) against
       # the square-indexed survival sidecar targets gathered to piece slots.
@@ -1610,9 +1628,13 @@ class CeresNet(nn.Module):
       _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
       _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
       _dpv = self.dp_value_inject(_dp_pool)
+      if getattr(self, 'dp_gated_injects', False):
+        _dpv = _dpv * torch.sigmoid(self.dpgi_v(fS_value))
       _v_inject = _dpv if _v_inject is None else _v_inject + _dpv
       if self.value2_loss_weight > 0:
         _dpv2 = self.dp_value2_inject(_dp_pool)
+        if getattr(self, 'dp_gated_injects', False):
+          _dpv2 = _dpv2 * torch.sigmoid(self.dpgi_v2(fS_value))
         _v2_inject = _dpv2 if _v2_inject is None else _v2_inject + _dpv2
       # Per-piece survival aux stash (training-only; consumed in compute_loss).
       if self.training and getattr(self, 'dp_surv_weight', 0) > 0:
