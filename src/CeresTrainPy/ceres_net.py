@@ -739,6 +739,12 @@ class CeresNet(nn.Module):
     # value1/value2 hidden pre-activation. S-plane untouched; policy
     # isolation provable. Requires UseVisEdgeBias (E is the relation source).
     self.use_dual_plane = bool(getattr(config, 'NetDef_UseDualPlane', False))
+    # Loud rejection (review 2026-08-25 finding 3): candidate read-outs without the
+    # plane would be a SILENT byte-identical control — the failure class the
+    # GradScale guard below exists to prevent.
+    if not self.use_dual_plane and (int(getattr(config, 'NetDef_DualPlaneCandidateValue', 0) or 0) > 0
+                                    or int(getattr(config, 'NetDef_DualPlaneCandidateAttention', 0) or 0) > 0):
+      raise ValueError('DualPlaneCandidateValue/DualPlaneCandidateAttention require UseDualPlane: true')
     # Loud rejection OUTSIDE the dual-plane branch (action review finding 5):
     # a grad-scale value with UseDualPlane off used to be a completely silent
     # no-op — no banner, no attr, arm runs as a byte-identical control.
@@ -885,6 +891,60 @@ class CeresNet(nn.Module):
         nn.init.zeros_(self.dpd_out.weight)
         print(f'[ceres_net] MOVE-DEGREE DECODE enabled: destination in-degree + origin '
               f'out-degree ({_dp_rel_C} ch each), zero-init (exact step-0 no-op)')
+      # CANDIDATE-VALUE READ (N3, 2026-08-25): value = max-over-moves is the
+      # ground truth of chess; today's value family never sees WHICH moves
+      # exist. Top-K policy candidates (selection + weights fully DETACHED —
+      # no gradient reaches the policy path) are summarized as (mover-token,
+      # move-edge channels, destination in-degree, origin out-degree, detached
+      # logit) features, softmax(T=2)-weighted, and injected zero-init into the
+      # value1/value2 hidden pre-activation. K>policy-argmax deliberately:
+      # value must see the threats policy does NOT choose.
+      self.dp_cand_value = int(getattr(config, 'NetDef_DualPlaneCandidateValue', 0) or 0)
+      if self.dp_cand_value > 0:
+        if not self.dp_policy_decode:
+          raise ValueError('DualPlaneCandidateValue extends DualPlanePolicyDecode (enable it)')
+        if not hasattr(self, 'dp_move_to'):
+          from lc0_moves_1858 import FROM_1858 as _F4, TO_1858 as _T4
+          self.register_buffer('dp_move_to', torch.tensor(_T4, dtype=torch.long), persistent=False)
+          self.register_buffer('dp_move_from', torch.tensor(_F4, dtype=torch.long), persistent=False)
+        self.dpcv_embed = nn.Linear(self.dual_plane.dp + 3 * _dp_rel_C + 1, 64)
+        self.dpcv_out = nn.Linear(64, 64 * HEAD_MULT, bias=False)
+        nn.init.zeros_(self.dpcv_out.weight)
+        if self.value2_loss_weight > 0:
+          self.dpcv_out2 = nn.Linear(64, 64 * HEAD_MULT, bias=False)
+          nn.init.zeros_(self.dpcv_out2.weight)
+        print(f'[ceres_net] CANDIDATE-VALUE READ enabled: top-{self.dp_cand_value} detached '
+              f'policy candidates (mover-token + edge + degrees) -> zero-init value1/value2 '
+              f'injects (exact step-0 no-op; no gradient to policy)')
+      # CANDIDATE ATTENTION RE-SCORE (N1, 2026-08-25): today every move logit is
+      # scored in ISOLATION — the Qxh7 logit never sees what the Rxh7 logit
+      # knows, and the measured 2700 failure mode is selection (792/2000 top-3
+      # vs 90/2000 top-1). Top-K candidates (selection DETACHED) become move
+      # tokens = (mover piece-token, to-square embed, the move's E channels,
+      # detached logit) that attend over EACH OTHER + the 32 piece tokens in
+      # one mini block; a zero-init scalar re-score is added back onto the K
+      # logits. Architecture, not a hinge loss: the sbm tombstone (mass-stealing
+      # margin objective) does not apply — CE and targets are untouched.
+      self.dp_cand_attn = int(getattr(config, 'NetDef_DualPlaneCandidateAttention', 0) or 0)
+      if self.dp_cand_attn > 0:
+        if not self.dp_policy_decode:
+          raise ValueError('DualPlaneCandidateAttention extends DualPlanePolicyDecode (enable it)')
+        if not hasattr(self, 'dp_move_to'):
+          from lc0_moves_1858 import FROM_1858 as _F5, TO_1858 as _T5
+          self.register_buffer('dp_move_to', torch.tensor(_T5, dtype=torch.long), persistent=False)
+          self.register_buffer('dp_move_from', torch.tensor(_F5, dtype=torch.long), persistent=False)
+        _dc = 64
+        self.dpc_embed = nn.Linear(2 * self.dual_plane.dp + _dp_rel_C + 1, _dc)
+        self.dpc_piece = nn.Linear(self.dual_plane.dp, _dc, bias=False)   # brikke-tokens -> kv-rom
+        self.dpc_q = nn.Linear(_dc, _dc, bias=False)
+        self.dpc_k = nn.Linear(_dc, _dc, bias=False)
+        self.dpc_v = nn.Linear(_dc, _dc, bias=False)
+        self.dpc_out = nn.Linear(_dc, _dc, bias=False)
+        self.dpc_score = nn.Linear(_dc, 1, bias=False)
+        nn.init.zeros_(self.dpc_score.weight)
+        print(f'[ceres_net] CANDIDATE-ATTENTION RE-SCORE enabled: top-{self.dp_cand_attn} detached '
+              f'candidates as move tokens, mutual attention over candidates + piece tokens, '
+              f'zero-init re-score onto the K logits (exact step-0 no-op)')
       self.dp_value_inject = nn.Linear(2 * self.dual_plane.dp, 64 * HEAD_MULT, bias=False)
       nn.init.zeros_(self.dp_value_inject.weight)
       if self.value2_loss_weight > 0:
@@ -1493,6 +1553,7 @@ class CeresNet(nn.Module):
     # FINAL square flow. Composes additively with the other injects.
     _dp_tokens = None
     _dp_E_dec = None
+    _dp_deg_cache = None    # (indeg, outdeg) delt mellom dpd og cand-value (review finding 9)
     if self.use_dual_plane:
       _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
       _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
@@ -1744,12 +1805,17 @@ class CeresNet(nn.Module):
       if getattr(self, 'move_degree_decode', False) and _dp_E_dec is not None:
         _indeg = _dp_E_dec.float().sum(dim=1)                    # [B, 64, C]  edges INTO j
         _outdeg = _dp_E_dec.float().sum(dim=2)                   # [B, 64, C]  edges FROM i
+        _dp_deg_cache = (_indeg, _outdeg)
         _s_in = self.dpd_in(_indeg).squeeze(-1)                  # [B, 64]
         _s_out = self.dpd_out(_outdeg).squeeze(-1)               # [B, 64]
         _corr4 = (_s_in.index_select(1, self.dp_move_to)
                   + _s_out.index_select(1, self.dp_move_from))   # [B, 1858]
         policy_out = policy_out + _corr4.to(policy_out.dtype)
 
+
+    # Candidate selection source (review finding 5): UNBLENDED logits — the serve
+    # blend below reassigns policy_out at eval, and selection must match training.
+    _pol_cand_src = policy_out
     # Policy SERVE blend (see __init__): eval/export mode only — three-way
     # logit-space mix of vanilla / optimistic / soft heads, applied BEFORE the
     # ray-context add so rc stays unscaled at any lambda. Training untouched.
@@ -1807,6 +1873,72 @@ class CeresNet(nn.Module):
                             + (_Tm * _r * self.rc_v).sum(-1) \
                             + (_Fm * _d * self.rc_w).sum(-1)
       policy_out = policy_out + _rc_add
+      _pol_cand_src = _pol_cand_src + _rc_add   # selection sees rc (review finding 6)
+    # --- Shared candidate machinery (review finding 10: ONE definition) -------
+    # _cand_base(pol_src, K, tok_read): masked-topk selection (detached) +
+    # per-candidate gathers shared by cand-attn and cand-value. tok_read chooses
+    # the token view: grad-scaled _dpt for the POLICY-side consumer (finding 4),
+    # raw _dp_tokens for the VALUE-side consumer (value grads are unscaled by
+    # design). Also returns a validity mask: with K above the pseudo-legal count
+    # the -1e4-masked garbage rows must not participate (finding 8).
+    if (getattr(self, 'dp_cand_attn', 0) > 0 or getattr(self, 'dp_cand_value', 0) > 0)        and _dp_tokens is not None:
+      _occb = _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)
+      _sl1b = torch.nn.functional.one_hot(_dp_sel, 64).to(_dp_tokens.dtype)
+      _dpnb = _dp_tokens.shape[-1]
+      _Ceb = _dp_E_dec.shape[-1]
+      _ourb = squares[:, :, 1:7].sum(-1).float()
+      def _cand_base(pol_src, K, tok_read):
+        with torch.no_grad():
+          _fok = _ourb.index_select(1, self.dp_move_from)
+          _cl = pol_src.float() + (_fok - 1.0) * 1e4
+          _cw, _ci = torch.topk(_cl, K, dim=1)
+          _val = (_cw > -5e3).float()                               # ekte kandidat?
+        _cf = self.dp_move_from[_ci]
+        _ct = self.dp_move_to[_ci]
+        _tsq = torch.matmul(_sl1b.transpose(1, 2), tok_read * _occb)
+        _mt = torch.gather(_tsq, 1, _cf.unsqueeze(-1).expand(-1, -1, _dpnb))
+        _em = torch.gather(_dp_E_dec.reshape(-1, 4096, _Ceb), 1,
+                           (_cf * 64 + _ct).unsqueeze(-1).expand(-1, -1, _Ceb))
+        return _ci, _cw, _val, _cf, _ct, _mt, _em
+
+    # Candidate-attention re-score (see __init__). Placed AFTER the rc add so
+    # selection sees every policy correction (finding 6), selecting on the
+    # UNBLENDED source (finding 5); reads the GRAD-SCALED token view so
+    # DualPlanePolicyGradScale keeps its promise on this path too (finding 4).
+    if getattr(self, 'dp_cand_attn', 0) > 0 and _dp_tokens is not None:
+      _Ka = self.dp_cand_attn
+      def _gsc(x):
+        if self.dp_policy_grad_scale != 1.0 and self.training:
+          _a = self.dp_policy_grad_scale
+          _xd = x.detach()
+          return torch.where(torch.isfinite(_xd), _xd + (x - _xd) * _a,
+                             x * _a + _xd * (1.0 - _a))
+        return x
+      _ci5, _cw5, _val5, _cf5, _ct5, _mt5, _em5 = _cand_base(_pol_cand_src, _Ka, _dpt)
+      _feats5 = torch.cat([squares[:, :, 0:13].to(_dp_tokens.dtype),
+                           self.dual_plane.filerank.to(_dp_tokens.dtype).unsqueeze(0)
+                               .expand(squares.shape[0], 64, 16)], dim=-1)
+      _tosq5 = _gsc(self.dual_plane.embed(torch.gather(
+          _feats5, 1, _ct5.unsqueeze(-1).expand(-1, -1, 29))))
+      _cft5 = torch.cat([_mt5, _tosq5, _em5.to(_dp_tokens.dtype),
+                         (_cw5 / 10.0).unsqueeze(-1).to(_dp_tokens.dtype)], dim=-1)
+      _ctok = torch.nn.functional.mish(self.dpc_embed(_cft5))
+      _pk5 = self.dpc_piece(_dpt)
+      _kv_in = torch.cat([_ctok, _pk5], dim=1)
+      _q5 = self.dpc_q(_ctok).reshape(-1, _Ka, 2, 32).transpose(1, 2)
+      _k5 = self.dpc_k(_kv_in).reshape(-1, _Ka + 32, 2, 32).transpose(1, 2)
+      _v5 = self.dpc_v(_kv_in).reshape(-1, _Ka + 32, 2, 32).transpose(1, 2)
+      _sc5 = torch.matmul(_q5, _k5.transpose(-1, -2)) * (32 ** -0.5)
+      _msk5 = torch.cat([_val5, _dp_occ.float()], dim=1)           # garbage-kandidater maskes som keys (finding 8)
+      _sc5 = _sc5 + ((_msk5 - 1.0) * 1e4).reshape(-1, 1, 1, _Ka + 32).to(_sc5.dtype)
+      _at5 = torch.matmul(torch.softmax(_sc5, dim=-1), _v5)
+      _at5 = _at5.transpose(1, 2).reshape(-1, _Ka, 64)
+      _ctok2 = _ctok + self.dpc_out(_at5)
+      _rs5 = self.dpc_score(_ctok2).squeeze(-1) * _val5.to(_ctok2.dtype)  # garbage far 0 (finding 8)
+      _cadd = torch.zeros_like(policy_out).scatter(1, _ci5, _rs5.to(policy_out.dtype))
+      policy_out = policy_out + _cadd
+      _pol_cand_src = _pol_cand_src + _cadd    # cand-value ser re-scoren
+
     # VALUE POOL CHANNELS (see __init__): concat the extreme-square summaries
     # onto the value family's head input. Separate variable — fS_value itself
     # is shared with unc/other heads and must keep its width. Same
@@ -1818,6 +1950,32 @@ class CeresNet(nn.Module):
       fS_value_v = torch.cat([fS_value, _poolc], dim=-1)
     else:
       fS_value_v = fS_value
+    # CANDIDATE-VALUE READ (see __init__). Selection on the UNBLENDED candidate
+    # source (post-rc, incl. the cand-attn re-score; review findings 5-6), via the
+    # shared _cand_base helper (finding 10) with the RAW token view — value
+    # gradients into the plane tokens are unscaled by design.
+    if getattr(self, 'dp_cand_value', 0) > 0 and _dp_tokens is not None:
+      _Kc = self.dp_cand_value
+      _ci4, _cw4, _val4, _cf4, _ct4, _mt4, _em4 = _cand_base(_pol_cand_src, _Kc, _dp_tokens)
+      with torch.no_grad():
+        _cwt4 = torch.softmax(_cw4 / 2.0, dim=1)                  # T=2; garbage underflows til ~0
+      if _dp_deg_cache is not None:                                # gjenbruk dpd-summene (finding 9)
+        _ind4, _outd4 = _dp_deg_cache
+      else:
+        _ind4 = _dp_E_dec.float().sum(dim=1)
+        _outd4 = _dp_E_dec.float().sum(dim=2)
+      _Ce4 = _dp_E_dec.shape[-1]
+      _into4 = torch.gather(_ind4, 1, _ct4.unsqueeze(-1).expand(-1, -1, _Ce4))
+      _outf4 = torch.gather(_outd4, 1, _cf4.unsqueeze(-1).expand(-1, -1, _Ce4))
+      _cfeat = torch.cat([_mt4.float(), _em4.float(), _into4, _outf4,
+                          (_cw4 / 10.0).unsqueeze(-1)], dim=-1)
+      _cemb = torch.nn.functional.mish(self.dpcv_embed(_cfeat.to(_dp_tokens.dtype)))
+      _csum = (_cemb * _cwt4.unsqueeze(-1).to(_cemb.dtype)).sum(dim=1)
+      _cvi = self.dpcv_out(_csum).to(fS_value.dtype)
+      _v_inject = _cvi if _v_inject is None else _v_inject + _cvi
+      if self.value2_loss_weight > 0:
+        _cvi2 = self.dpcv_out2(_csum).to(fS_value.dtype)
+        _v2_inject = _cvi2 if _v2_inject is None else _v2_inject + _cvi2
     value_out = self.value_head(fS_value_v, _v_inject)
     value2_out = self.value2_head(torch.cat((fS_value_v, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)

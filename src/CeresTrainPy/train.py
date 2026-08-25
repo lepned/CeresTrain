@@ -452,6 +452,7 @@ def Train():
                         or "dual_plane" in name or "dp_value" in name
                         or "dp_pol_" in name or "dpva_" in name or "dp_surv" in name
                         or "dpv_" in name or "dpe_w" in name or "dpd_" in name
+                        or "dpcv_" in name or "dpc_" in name
                         or "kdist_proj" in name or "spe_proj" in name or "cbk_" in name)
       if not keep_trainable:
         param.requires_grad = False
@@ -723,7 +724,7 @@ def Train():
                     'mlh_head.', 'qdev_upper.', 'qdev_lower.', 'headPremap.',
                     'headSharedLinear.', 'unc_policy.')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
-                        'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dp_surv_head.')
+                        'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dp_surv_head.')
     _heads_ratio = getattr(config, 'Opt_LearningRateHeadsRatio', None)
     _coup_ratio = getattr(config, 'Opt_LearningRateCouplingsRatio', None)
     assert not (_heads_ratio is not None and _heads_lr is not None), \
@@ -1619,7 +1620,7 @@ def Train():
     # reproduces the base net — same contract as the inject front-end.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + (
         'dual_plane.', 'dp_value_inject.', 'dp_value2_inject.', 'dp_pol_q.',
-        'dp_pol_p.', 'dpva_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
+        'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
         'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_')
     # Graph-route heads + tactic refiner (2026-08 tactical program): the
     # refiner is top-level ('tactical_refiner.'), the route params live

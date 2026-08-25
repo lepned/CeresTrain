@@ -518,6 +518,14 @@ class Configuration:
     self.NetDef_DualPlaneSurvivalAux = config_net_def.get('DualPlaneSurvivalAux', 0.0)
     self.NetDef_DualPlaneSurvivalK = config_net_def.get('DualPlaneSurvivalK', 4)
     self.NetDef_DualPlaneValueAttention = config_net_def.get('DualPlaneValueAttention', 0)
+    # Candidate-value read (N3, 2026-08-25): K>0 = value1/value2 read the top-K
+    # DETACHED policy candidates (mover-token + move-edge + degrees), zero-init.
+    self.NetDef_DualPlaneCandidateValue = config_net_def.get('DualPlaneCandidateValue', 0)
+    # Candidate-attention re-score (N1, 2026-08-25): K>0 = top-K detached policy
+    # candidates become move tokens with mutual attention (+ piece tokens); a
+    # zero-init scalar re-score is added onto the K logits. Architecture-side
+    # comparative move scoring — no loss/target change.
+    self.NetDef_DualPlaneCandidateAttention = config_net_def.get('DualPlaneCandidateAttention', 0)
     self.NetDef_DualPlaneVictimDecode = config_net_def.get('DualPlaneVictimDecode', False)
     self.NetDef_MoveEdgeDecode = config_net_def.get('MoveEdgeDecode', False)
     self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)

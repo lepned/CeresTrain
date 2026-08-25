@@ -128,9 +128,10 @@ if bool(_ckpt_sm) != bool(_model_sm):
     f'rebuilt model has {len(_model_sm)}. Set "SoftMinHeads" in the _ceres_net.json '
     f'config to match the training run before re-exporting. (checkpoint: {CKPT})')
 # Guard for the dual-plane P-plane (config NetDef UseDualPlane).
-_ckpt_dp = [k for k in loaded['model'] if k.startswith('dual_plane.') or 'dp_value' in k or 'dp_pol_' in k or 'dpva_' in k or 'dpv_' in k or 'dpe_w' in k or 'dpd_' in k]
-_model_dp = [k for k in model.state_dict() if k.startswith('dual_plane.') or 'dp_value' in k or 'dp_pol_' in k or 'dpva_' in k or 'dpv_' in k or 'dpe_w' in k or 'dpd_' in k]
-if bool(_ckpt_dp) != bool(_model_dp):
+_DP_SUBSTR = ('dp_value', 'dp_pol_', 'dpva_', 'dpv_', 'dpe_w', 'dpd_', 'dpcv_', 'dpc_')
+_ckpt_dp = [k for k in loaded['model'] if k.startswith('dual_plane.') or any(t in k for t in _DP_SUBSTR)]
+_model_dp = [k for k in model.state_dict() if k.startswith('dual_plane.') or any(t in k for t in _DP_SUBSTR)]
+if len(_ckpt_dp) != len(_model_dp):   # count, not bool: a missing SUBSET (e.g. dpcv_/dpc_ keys dropped from the config) must also refuse (review 2026-08-25 finding 2)
   raise ValueError(
     f'UseDualPlane mismatch: checkpoint has {len(_ckpt_dp)} dual-plane tensors, '
     f'rebuilt model has {len(_model_dp)}. Set "UseDualPlane" in the _ceres_net.json '
