@@ -29,6 +29,19 @@ namespace CeresTrain.Networks.Transformer
   /// </summary>
   public readonly record struct NetTransformerDef : ICeresNeuralNetDef
   {
+    /// <summary>
+    /// Round-trip preservation of net-config keys not modeled by this struct
+    /// (the Python trainer's NetDef keys: UseDualPlane and the DualPlane*
+    /// sub-flags, VisEdge*, UseRPE, SoftCapCutoff, PriorStateDim, ...).
+    /// Without this, AdjustAndLoadConfig's read-modify-write of
+    /// _ceres_net.json silently DELETES them before train.py can see them --
+    /// including UseDualPlane itself, which also disarms the Python-side
+    /// loud guard against orphaned sub-flags. Same pattern and rationale as
+    /// ConfigOptimization.ExtensionData (review 2026-08-25b finding 3).
+    /// </summary>
+    [System.Text.Json.Serialization.JsonExtensionData]
+    public System.Collections.Generic.Dictionary<string, System.Text.Json.JsonElement> ExtensionData { get; init; }
+
     public enum NormalizationType
     {
       /// <summary>

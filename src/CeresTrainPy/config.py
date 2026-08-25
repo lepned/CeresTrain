@@ -526,6 +526,9 @@ class Configuration:
     # zero-init scalar re-score is added onto the K logits. Architecture-side
     # comparative move scoring — no loss/target change.
     self.NetDef_DualPlaneCandidateAttention = config_net_def.get('DualPlaneCandidateAttention', 0)
+    # Check-chain decode (N2, 2026-08-25): composed check/flight move channels
+    # (mate-pattern geometry), zero-init into the move score.
+    self.NetDef_DualPlaneCheckChain = config_net_def.get('DualPlaneCheckChain', False)
     self.NetDef_DualPlaneVictimDecode = config_net_def.get('DualPlaneVictimDecode', False)
     self.NetDef_MoveEdgeDecode = config_net_def.get('MoveEdgeDecode', False)
     self.NetDef_DualPlaneRelDegrees = config_net_def.get('DualPlaneRelDegrees', False)

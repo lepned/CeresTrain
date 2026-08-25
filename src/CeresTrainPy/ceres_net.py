@@ -742,9 +742,18 @@ class CeresNet(nn.Module):
     # Loud rejection (review 2026-08-25 finding 3): candidate read-outs without the
     # plane would be a SILENT byte-identical control — the failure class the
     # GradScale guard below exists to prevent.
-    if not self.use_dual_plane and (int(getattr(config, 'NetDef_DualPlaneCandidateValue', 0) or 0) > 0
-                                    or int(getattr(config, 'NetDef_DualPlaneCandidateAttention', 0) or 0) > 0):
-      raise ValueError('DualPlaneCandidateValue/DualPlaneCandidateAttention require UseDualPlane: true')
+    if not self.use_dual_plane:
+      # Generisk vakt (review 2026-08-25b finding 2): ENHVER satt DualPlane-
+      # undernokkel uten planet er en stille byte-identisk kontroll. Feiler
+      # hoyt for hele klassen i stedet for nokkel-for-nokkel.
+      # Parametriske nokler har truthy DEFAULTS og er meningslose aa flagge;
+      # kun feature-flagg (default 0/False) indikerer intensjon.
+      _dp_param_keys = {'NetDef_DualPlanePolicyGradScale', 'NetDef_DualPlaneSoftMinHeads',
+                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK'}
+      _dp_set = [k for k, v in vars(config).items()
+                 if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
+      if _dp_set:
+        raise ValueError(f'DualPlane sub-flags set without UseDualPlane: true — silent no-op refused: {_dp_set}')
     # Loud rejection OUTSIDE the dual-plane branch (action review finding 5):
     # a grad-scale value with UseDualPlane off used to be a completely silent
     # no-op — no banner, no attr, arm runs as a byte-identical control.
@@ -945,6 +954,36 @@ class CeresNet(nn.Module):
         print(f'[ceres_net] CANDIDATE-ATTENTION RE-SCORE enabled: top-{self.dp_cand_attn} detached '
               f'candidates as move tokens, mutual attention over candidates + piece tokens, '
               f'zero-init re-score onto the K logits (exact step-0 no-op)')
+      # CHECK-CHAIN DECODE (N2, 2026-08-25): mate patterns are compositions of
+      # the check and flight channels the net already computes 1-hop. CPU
+      # prerequisite probe (3,000 mateIn2): the static composition "gives check
+      # AND the enemy king has zero free flight squares" fires on 16.2% of
+      # solution moves vs 1.0% of other legal moves (16.7x lift, near-zero
+      # false positives) — a low-recall/high-precision feature. Four per-move
+      # composed channels through a zero-init linear into the move score
+      # (dpe_w cost class; NO move simulation — current-position geometry only,
+      # same documented approximation class as the check channel itself).
+      self.dp_check_chain = bool(getattr(config, 'NetDef_DualPlaneCheckChain', False))
+      if self.dp_check_chain:
+        if not self.dp_policy_decode:
+          raise ValueError('DualPlaneCheckChain extends DualPlanePolicyDecode (enable it)')
+        # E-kilden er privat (dp_vis_module) ELLER delt (vis_channels_module,
+        # UseVisEdgeBias-chassiset) — sla opp kanal-layout fra den som finnes
+        # (review 2026-08-25b finding 1: AttributeError paa delt chassis).
+        _vismod = getattr(self, 'dp_vis_module', None) or getattr(self, 'vis_channels_module', None)
+        _fs = getattr(_vismod, 'family_slices', None) if _vismod is not None else None
+        if _fs is None or 'check' not in _fs or 'flight' not in _fs:
+          raise ValueError('DualPlaneCheckChain requires check+flight in VisEdgeFamilies')
+        self.dp_ch_check = _fs['check'].start      # [stm_out, ...] -> stm_out forst
+        self.dp_ch_flight = _fs['flight'].start
+        if not hasattr(self, 'dp_move_to'):
+          from lc0_moves_1858 import FROM_1858 as _F6, TO_1858 as _T6
+          self.register_buffer('dp_move_to', torch.tensor(_T6, dtype=torch.long), persistent=False)
+          self.register_buffer('dp_move_from', torch.tensor(_F6, dtype=torch.long), persistent=False)
+        self.dpch_w = nn.Linear(4, 1, bias=False)
+        nn.init.zeros_(self.dpch_w.weight)
+        print('[ceres_net] CHECK-CHAIN DECODE enabled: 4 composed check/flight move '
+              'channels -> zero-init move score (exact step-0 no-op)')
       self.dp_value_inject = nn.Linear(2 * self.dual_plane.dp, 64 * HEAD_MULT, bias=False)
       nn.init.zeros_(self.dp_value_inject.weight)
       if self.value2_loss_weight > 0:
@@ -1299,6 +1338,18 @@ class CeresNet(nn.Module):
       value = value.item()
     self.writer.add_scalar(name, value, step)
 
+
+  def _grad_scale_read(self, x):
+    """Bit-eksakt grad-skala-lesing av delte plan-tokens (to review-funn bakt inn:
+    2026-08-21 #12 ulp-eksakthet via x.detach()+(x-x.detach())*a; action-review #8
+    inf-inf=NaN-fellen via isfinite-where). ENESTE definisjon — brukes av decode-
+    kjeden og kandidat-attention (review 2026-08-25b finding 10)."""
+    if self.dp_policy_grad_scale != 1.0 and self.training:
+      _a = self.dp_policy_grad_scale
+      _xd = x.detach()
+      return torch.where(torch.isfinite(_xd), _xd + (x - _xd) * _a,
+                         x * _a + _xd * (1.0 - _a))
+    return x
 
   def forward(self, squares: torch.Tensor, prior_state:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(squares, list):
@@ -1755,22 +1806,7 @@ class CeresNet(nn.Module):
       # (<1 damps policy's reshaping power; decode WEIGHTS still train at
       # full rate; value gradients untouched). Eval/export graphs are
       # unchanged (gated on self.training).
-      _dpt = _dp_tokens
-      if self.dp_policy_grad_scale != 1.0 and self.training:
-        # Bit-exact identity form (review 2026-08-21 finding 12): x - x.detach()
-        # is exactly 0 in any dtype (same bits), so forward == x to the bit;
-        # gradient wrt x is exactly _a. The a*x + (1-a)*x.detach() form differed
-        # by 1-2 ulp under bf16, breaking step-0 parity comparisons.
-        # Inf caveat (action review finding 8): inf - inf = NaN, so a +/-inf
-        # activation would silently become NaN here where the old form kept it
-        # inf (visible to the existing non-finite guards). The where keeps the
-        # bit-exact path for finite elements and propagates inf unchanged;
-        # gradient stays exactly _a either way.
-        _a = self.dp_policy_grad_scale
-        _dpt_d = _dp_tokens.detach()
-        _dpt = torch.where(torch.isfinite(_dpt_d),
-                           _dpt_d + (_dp_tokens - _dpt_d) * _a,
-                           _dp_tokens * _a + _dpt_d * (1.0 - _a))
+      _dpt = self._grad_scale_read(_dp_tokens)   # se _grad_scale_read (hoisted)
       _q = self.dp_pol_q(flow)                                   # [B, 64, dq] (zero-init => 0)
       _p = self.dp_pol_p(_dpt) * _dp_occ.unsqueeze(-1).to(_dp_tokens.dtype)  # [B, 32, dq]
       _pair = torch.matmul(_q, _p.transpose(1, 2))               # [B, 64to, 32slot]
@@ -1811,6 +1847,19 @@ class CeresNet(nn.Module):
         _corr4 = (_s_in.index_select(1, self.dp_move_to)
                   + _s_out.index_select(1, self.dp_move_from))   # [B, 1858]
         policy_out = policy_out + _corr4.to(policy_out.dtype)
+
+      # Check-chain decode (see __init__): per-move composed channels.
+      if getattr(self, 'dp_check_chain', False) and _dp_E_dec is not None:
+        _chk = _dp_E_dec[..., self.dp_ch_check].float()            # [B, 64, 64] vaare sjakk-edges
+        _flc = _dp_E_dec[..., self.dp_ch_flight].float().amax(dim=1)  # [B, 64] frie fluktfelter (kolonne)
+        _nfl = _flc.sum(dim=-1, keepdim=True)                      # [B, 1] antall frie fluktfelter
+        _cmv = _chk.reshape(-1, 4096).index_select(1, self.dp_move_from * 64 + self.dp_move_to)  # [B, 1858]
+        _f1 = _cmv                                                 # gir sjakk
+        _f2 = _cmv * (_nfl == 0).float()                           # sjakk + matt-nett komplett (probens signal)
+        _f3 = _cmv * _flc.index_select(1, self.dp_move_to)         # sjakk som LANDER paa fluktfelt
+        _f4 = _cmv * (_nfl / 8.0)                                  # gradert aapenhet (forventet negativ vekt)
+        _corr5 = self.dpch_w(torch.stack([_f1, _f2, _f3, _f4], dim=-1)).squeeze(-1)
+        policy_out = policy_out + _corr5.to(policy_out.dtype)
 
 
     # Candidate selection source (review finding 5): UNBLENDED logits — the serve
@@ -1893,13 +1942,14 @@ class CeresNet(nn.Module):
           _cl = pol_src.float() + (_fok - 1.0) * 1e4
           _cw, _ci = torch.topk(_cl, K, dim=1)
           _val = (_cw > -5e3).float()                               # ekte kandidat?
+          _cwf = (_cw / 10.0) * _val                                # logit-feature; garbage->0 (fp16-overflow ved serve, review 2026-08-25b finding 4)
         _cf = self.dp_move_from[_ci]
         _ct = self.dp_move_to[_ci]
         _tsq = torch.matmul(_sl1b.transpose(1, 2), tok_read * _occb)
         _mt = torch.gather(_tsq, 1, _cf.unsqueeze(-1).expand(-1, -1, _dpnb))
         _em = torch.gather(_dp_E_dec.reshape(-1, 4096, _Ceb), 1,
                            (_cf * 64 + _ct).unsqueeze(-1).expand(-1, -1, _Ceb))
-        return _ci, _cw, _val, _cf, _ct, _mt, _em
+        return _ci, _cw, _cwf, _val, _cf, _ct, _mt, _em
 
     # Candidate-attention re-score (see __init__). Placed AFTER the rc add so
     # selection sees every policy correction (finding 6), selecting on the
@@ -1907,21 +1957,14 @@ class CeresNet(nn.Module):
     # DualPlanePolicyGradScale keeps its promise on this path too (finding 4).
     if getattr(self, 'dp_cand_attn', 0) > 0 and _dp_tokens is not None:
       _Ka = self.dp_cand_attn
-      def _gsc(x):
-        if self.dp_policy_grad_scale != 1.0 and self.training:
-          _a = self.dp_policy_grad_scale
-          _xd = x.detach()
-          return torch.where(torch.isfinite(_xd), _xd + (x - _xd) * _a,
-                             x * _a + _xd * (1.0 - _a))
-        return x
-      _ci5, _cw5, _val5, _cf5, _ct5, _mt5, _em5 = _cand_base(_pol_cand_src, _Ka, _dpt)
+      _ci5, _cw5, _cwf5, _val5, _cf5, _ct5, _mt5, _em5 = _cand_base(_pol_cand_src, _Ka, _dpt)
       _feats5 = torch.cat([squares[:, :, 0:13].to(_dp_tokens.dtype),
                            self.dual_plane.filerank.to(_dp_tokens.dtype).unsqueeze(0)
                                .expand(squares.shape[0], 64, 16)], dim=-1)
-      _tosq5 = _gsc(self.dual_plane.embed(torch.gather(
+      _tosq5 = self._grad_scale_read(self.dual_plane.embed(torch.gather(
           _feats5, 1, _ct5.unsqueeze(-1).expand(-1, -1, 29))))
       _cft5 = torch.cat([_mt5, _tosq5, _em5.to(_dp_tokens.dtype),
-                         (_cw5 / 10.0).unsqueeze(-1).to(_dp_tokens.dtype)], dim=-1)
+                         _cwf5.unsqueeze(-1).to(_dp_tokens.dtype)], dim=-1)
       _ctok = torch.nn.functional.mish(self.dpc_embed(_cft5))
       _pk5 = self.dpc_piece(_dpt)
       _kv_in = torch.cat([_ctok, _pk5], dim=1)
@@ -1956,7 +1999,7 @@ class CeresNet(nn.Module):
     # gradients into the plane tokens are unscaled by design.
     if getattr(self, 'dp_cand_value', 0) > 0 and _dp_tokens is not None:
       _Kc = self.dp_cand_value
-      _ci4, _cw4, _val4, _cf4, _ct4, _mt4, _em4 = _cand_base(_pol_cand_src, _Kc, _dp_tokens)
+      _ci4, _cw4, _cwf4, _val4, _cf4, _ct4, _mt4, _em4 = _cand_base(_pol_cand_src, _Kc, _dp_tokens)
       with torch.no_grad():
         _cwt4 = torch.softmax(_cw4 / 2.0, dim=1)                  # T=2; garbage underflows til ~0
       if _dp_deg_cache is not None:                                # gjenbruk dpd-summene (finding 9)
@@ -1968,7 +2011,7 @@ class CeresNet(nn.Module):
       _into4 = torch.gather(_ind4, 1, _ct4.unsqueeze(-1).expand(-1, -1, _Ce4))
       _outf4 = torch.gather(_outd4, 1, _cf4.unsqueeze(-1).expand(-1, -1, _Ce4))
       _cfeat = torch.cat([_mt4.float(), _em4.float(), _into4, _outf4,
-                          (_cw4 / 10.0).unsqueeze(-1)], dim=-1)
+                          _cwf4.unsqueeze(-1)], dim=-1)
       _cemb = torch.nn.functional.mish(self.dpcv_embed(_cfeat.to(_dp_tokens.dtype)))
       _csum = (_cemb * _cwt4.unsqueeze(-1).to(_cemb.dtype)).sum(dim=1)
       _cvi = self.dpcv_out(_csum).to(fS_value.dtype)
