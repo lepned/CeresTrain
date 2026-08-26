@@ -235,6 +235,9 @@ class DotProductAttention(torch.nn.Module):
     self.use_diff_attention = use_diff_attention
     if self.use_diff_attention:
       assert self.use_qkv, "DiffAttention requires use_qkv"
+      assert not use_rpe,           ('DiffAttention + RPE unsupported: sdp_diff never receives Q_rpe/K_rpe, so RPE '
+           'would be SILENTLY dropped while its parameters still exist (unused). Set '
+           'UseRPE false for diff arms, or extend sdp_diff first. (guard 2026-08-26)')
       self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
     else:
       self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
@@ -248,6 +251,22 @@ class DotProductAttention(torch.nn.Module):
       self.lambda_proj = torch.nn.Linear(self.d_model, num_attention_heads, bias=True)
       torch.nn.init.zeros_(self.lambda_proj.weight)
       torch.nn.init.constant_(self.lambda_proj.bias, -2.2)
+      # DIFF++ (2026-08-26, UseDiffAttention >= 2): de to komponentene fra
+      # originalpapiret (2410.05258) som V2 mangler — (a) lambda-init-PLAN per
+      # lag (0.2 -> 0.76 med dybden; papirets 0.8-0.6*exp(-0.3 l)) i stedet for
+      # flat 0.1, (b) per-hode RMSNorm paa den kombinerte differansen skalert
+      # med (1-lambda_init) (papirets GroupNorm — rapportert viktig for
+      # stabilitet og gevinst). Delt K beholdes fra V2.
+      self.diff_pp = int(use_diff_attention) >= 2
+      if self.diff_pp:
+        _l = self.layer_num if self.layer_num is not None else 0
+        _p = 0.8 - 0.6 * math.exp(-0.3 * _l)
+        torch.nn.init.constant_(self.lambda_proj.bias, math.log(_p / (1.0 - _p)))
+        self.diff_norm = RMSNorm(self.d_k * self.attention_multiplier)  # HUS-norm, IKKE nn.RMSNorm: fused aten-op mangler ONNX-oversettelse og TRT kjoerer den i ren FP16 (se rms_norm.py)
+        self.diff_norm_scale = 1.0 - _p
+        if not self.layer_num:
+          print(f'[dot_product_attention] DIFF++ enabled: lambda-init-plan per lag (l0 p=0.2 -> l9 p~0.76) '
+                f'+ per-hode RMSNorm * (1-lambda_init) paa differansen')
     self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
     # Gated attention output (Kimi K3 "Gated MLA" / Qwen gated-attention family).
@@ -577,6 +596,8 @@ class DotProductAttention(torch.nn.Module):
 
     attn = attn1 - lambda_t * attn2                          # [B, H, T_q, T_k]
     H = torch.matmul(attn, V)
+    if getattr(self, 'diff_pp', False):
+      H = self.diff_norm(H) * self.diff_norm_scale
     return H, attn
 
   def sdp_and_smol_or_rpe(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor, smolgen:torch.Tensor, piece_relation_bias:torch.Tensor = None,
