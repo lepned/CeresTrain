@@ -238,7 +238,17 @@ class DotProductAttention(torch.nn.Module):
       assert not use_rpe,           ('DiffAttention + RPE unsupported: sdp_diff never receives Q_rpe/K_rpe, so RPE '
            'would be SILENTLY dropped while its parameters still exist (unused). Set '
            'UseRPE false for diff arms, or extend sdp_diff first. (guard 2026-08-26)')
-      self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
+      # HALF-DIM-variant (UseDiffAttention: 3, 2026-08-26): PAPIRETS design —
+      # standard 3-veis qkv; Q og K splittes per hode i to halvdeler ETTER
+      # qk-norm, to kart aa halv dim => score-flops-PARITET med base og ingen
+      # ekstra qkv-params. Arver ++-komponentene (lambda-plan + norm).
+      self.diff_halfdim = int(use_diff_attention) == 3
+      if self.diff_halfdim:
+        assert not use_nonlinear_attention, 'half-dim diff stoetter kun linear QKV-sti'
+        assert (self.d_k * self.attention_multiplier) % 2 == 0, 'per-hode-dim maa vaere partall for half-dim diff'
+        self.qkv_multiplier = 3
+      else:
+        self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
     else:
       self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
     self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS), self.layer_num)
@@ -571,8 +581,16 @@ class DotProductAttention(torch.nn.Module):
     cancels Q1-vs-Q2 noise on top of it. Softcap unsupported in this path
     (assert in __init__ if needed)."""
     # Two attention score matrices using the same K
-    scores1 = torch.matmul(Q1, K.transpose(2, 3)) / math.sqrt(self.d_k)
-    scores2 = torch.matmul(Q2, K.transpose(2, 3)) / math.sqrt(self.d_k)
+    # Half-dim-modus: K kommer som tuple (K1, K2); hvert kart bruker sin
+    # K-halvdel og skaleres med sqrt av HALV per-hode-dim.
+    if isinstance(K, tuple):
+      K1, K2 = K
+      _dks = K1.shape[-1]
+      scores1 = torch.matmul(Q1, K1.transpose(2, 3)) / math.sqrt(_dks)
+      scores2 = torch.matmul(Q2, K2.transpose(2, 3)) / math.sqrt(_dks)
+    else:
+      scores1 = torch.matmul(Q1, K.transpose(2, 3)) / math.sqrt(self.d_k)
+      scores2 = torch.matmul(Q2, K.transpose(2, 3)) / math.sqrt(self.d_k)
 
     # Smolgen bias added to BOTH branches (Option A)
     if smolgen is not None:
@@ -771,7 +789,7 @@ class DotProductAttention(torch.nn.Module):
       V = qkv.reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier)
       V = V.permute(0, 2, 1, 3)
     elif not self.use_nonlinear_attention:
-      if self.use_diff_attention:
+      if self.use_diff_attention and not getattr(self, 'diff_halfdim', False):
         # DiffAttention V2: 4-way split (Q1, Q2, K, V); Q is doubled.
         qkv = qkv.reshape(batch_size, -1, self.num_heads, 4*self.d_k * self.attention_multiplier)
         qkv = qkv.permute(0, 2, 1, 3)
@@ -808,7 +826,13 @@ class DotProductAttention(torch.nn.Module):
         V = self.v2(v).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
 
     if self.use_qk_norm:
-      Q = self.qLN(Q)
+      # Diff-attention baerer Q som tuple (Q1, Q2) — normer begge grenene med
+      # samme qLN; delt K normeres en gang. Uten dette faar qLN en tuple og
+      # krasjer (funnet 2026-08-26 ved QK-norm + diff++-stabilisering).
+      if isinstance(Q, tuple):
+        Q = (self.qLN(Q[0]), self.qLN(Q[1]))
+      else:
+        Q = self.qLN(Q)
       K = self.kLN(K)
 
     # RPE-from-embedding experiment: project the layer-0 embedding through THIS
@@ -899,7 +923,13 @@ class DotProductAttention(torch.nn.Module):
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
       if self.use_diff_attention:
-        Q1, Q2 = Q  # unpack tuple
+        if getattr(self, 'diff_halfdim', False):
+          # Split ETTER qk-norm: full Q/K er normert, halvdelene arver det.
+          _h = (self.d_k * self.attention_multiplier) // 2
+          Q1, Q2 = Q[..., :_h], Q[..., _h:]
+          K = (K[..., :_h], K[..., _h:])
+        else:
+          Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
         H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
@@ -914,7 +944,12 @@ class DotProductAttention(torch.nn.Module):
       # exports cleanly to opset 23 as MatMul→Softmax→MatMul, and also gains
       # softcap support that the F.sdpa path was lacking.
       if self.use_diff_attention:
-        Q1, Q2 = Q  # unpack tuple
+        if getattr(self, 'diff_halfdim', False):
+          _h = (self.d_k * self.attention_multiplier) // 2
+          Q1, Q2 = Q[..., :_h], Q[..., _h:]
+          K = (K[..., :_h], K[..., _h:])
+        else:
+          Q1, Q2 = Q  # unpack tuple
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, None, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
         H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
