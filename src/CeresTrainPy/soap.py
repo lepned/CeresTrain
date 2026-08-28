@@ -140,6 +140,16 @@ class SOAP(torch.optim.Optimizer):
             params, grads, grads_proj, exp_avg, exp_avg_sq = zip(*lists, strict=True)
 
             # Bias correction
+            # Uniform-step-vakt (bugfunn 2026-08-28): 'step' er loekkevariabel-
+            # lekkasje fra SISTE param; debias-faktorene under anvendes paa ALLE
+            # params i _foreach-kallene. Med intermitterende grad=None (f.eks.
+            # sidecar-avhengige hoder) faar params ulik step-telling og ville
+            # debiases stille feil — gjoer det hoylytt til per-param-debias evt.
+            # implementeres.
+            _steps = {st["step"] for (_p, _g, _gp, _ea, _eas) in lists for st in (self.state[_p],)}
+            assert len(_steps) == 1, (
+                f'SOAP: ulik step-telling paa tvers av params ({sorted(_steps)[:5]}...) — '
+                'per-param-debias kreves for intermitterende gradienter')
             beta1, beta2, beta3 = group["betas"]
 
             beta1_ = 1 - (1 - beta1) / (1 - beta1**step)

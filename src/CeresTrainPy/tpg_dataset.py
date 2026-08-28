@@ -680,13 +680,24 @@ class TPGDataset(Dataset):
               # keeping teacher's nuance among alternatives. Skipped for rows
               # whose teacher distribution is all zero (OppDef value-only records).
               if _POLICY_TARGET_ALPHA > 0.0:
-                row_max = policies_values.max(axis=1)        # [B]
+                # PADDING-MASKE (bugfunn 2026-08-28): C# padder ved aa REPLISERE
+                # siste (index, value) i alle ubrukte slots. Uten maske teller
+                # radsummen siste trekk (92-n) ganger ekstra => skarpet target
+                # deflateres (verst i sluttspill = faa trekk = mest padding, og
+                # only-move kollapser via scatter-kollisjon). Padding = suffiks
+                # av repetert siste index; interne duplikater finnes ikke.
+                _pt_valid = np.ones_like(policies_indices, dtype=bool)
+                _pt_valid[:, 1:] = policies_indices[:, 1:] != policies_indices[:, :-1]
+                _pt_vals = np.where(_pt_valid, policies_values.astype(np.float32), 0.0)
+                row_max = _pt_vals.max(axis=1)               # [B]
                 active = row_max > 0                          # mask out value-only rows
                 if _POLICY_TARGET_MLH_MAX > 0:
                   # mlh her = trener-enheter (raw^2); plies = mlh * 100 (jf. E2-proben).
                   active = active & (mlh.ravel() * 100.0 <= _POLICY_TARGET_MLH_MAX)
                 if active.any():
-                  pv32 = policies_values.astype(np.float32)
+                  # Skarp/normaliser paa PADDING-MASKERTE verdier (_pt_vals);
+                  # solver-slot = foerste forekomst per konstruksjon av masken.
+                  pv32 = _pt_vals
                   solver_slot = pv32.argmax(axis=1)           # [B]
                   pv32[active] = pv32[active] * (1.0 - _POLICY_TARGET_ALPHA)
                   rows_active = np.where(active)[0]
@@ -696,6 +707,12 @@ class TPGDataset(Dataset):
                   row_sum = pv32[active].sum(axis=1, keepdims=True)
                   row_sum = np.where(row_sum > 0, row_sum, 1.0)
                   pv32[active] = pv32[active] / row_sum
+                  # Gjenopprett repliser-siste-invarianten saa scatter (siste
+                  # skriv vinner) forblir korrekt: padding-slots faar samme
+                  # verdi som radens siste GYLDIGE slot etter skarping.
+                  _pt_k = _pt_valid.sum(axis=1) - 1            # siste gyldige slot per rad
+                  _pt_last = pv32[np.arange(pv32.shape[0]), _pt_k]
+                  pv32 = np.where(_pt_valid, pv32, _pt_last[:, None])
                   policies_values = pv32.astype(np.float16)
 
               # Square records: 141 bytes/sq for V3 shards (137 base + 4 baked aux),
@@ -741,7 +758,9 @@ class TPGDataset(Dataset):
                   if survival is not None:
                     survival = survival[_keep]
                   if v7x is not None:
-                    v7x = tuple(a[_keep] for a in v7x)
+                    # v7x-slicing (bugfunn 2026-08-28): tuple() degraderte namedtuplen
+                    # (mistet .cens_q) og kraesjet paa None-felter — v6-moensteret.
+                    v7x = type(v7x)(*[a[_keep] if a is not None else None for a in v7x])
 
               # File-mirror augmentation (see module header). Eligibility read
               # from square 0's castling flags (channels 112-115, replicated
@@ -909,19 +928,6 @@ class TPGMixedDataset(Dataset):
     return self.primary[idx]
 
 
-def worker_init_fn(worker_id):
-  """
-    Initialize a worker function for a data loader.
-
-    This function sets a global variable `WORKER_ID` to the ID of the worker.
-    This method will be called in a multi-process data loading scenarios,
-    allowing us to record the identifier if this worker for later coordination use.
-
-    Args:
-        worker_id (int): An integer identifier for the worker process.
-    """
-  global WORKER_ID
-  WORKER_ID = worker_id
 
 
 

@@ -62,7 +62,6 @@ from multi_expert import MultiExpertLayer
 from save_model import save_model, save_checkpoint
 
 from AdEMAMix import AdEMAMix
-from AdEMAMixShampoo import AdEMAMixDistributedShampoo
 from soap import SOAP
 from muon import Muon
 
@@ -532,6 +531,10 @@ def Train():
               decay.add(fpn)
           elif "lora" in fpn:
               no_decay.add(fpn)
+          elif fpn.endswith('softmin_log_tau') or fpn.endswith('softmax_log_tau')                 or fpn.endswith('head_logit_temp'):
+              # (Flyttet HIT 2026-08-28 — bugfunn: grenen laa ETTER catch-all-en
+              # og var doed, stikk i strid med sin egen 2026-08-20#6-kommentar.)
+              no_decay.add(fpn)
           elif "transformer_layer" in fpn:
               decay.add(fpn)           
           elif "rpe_factor" in fpn:
@@ -544,14 +547,6 @@ def Train():
               no_decay.add(fpn)
           elif "rc_W" in fpn: # ray-context projections (plain Linear weights)
               decay.add(fpn)
-          elif fpn.endswith('softmin_log_tau') or fpn.endswith('softmax_log_tau') \
-                or fpn.endswith('head_logit_temp'):
-              # Log-scale mechanism params (trunk soft-agg taus, per-head logit
-              # temps, P-plane taus): bias-like 1-D log params. MUST precede the
-              # 'transformer_layer' catch-all — review finding 2026-08-20 #6:
-              # weight decay was pulling these toward their 1.0 no-op inits,
-              # regularizing away the very mechanisms under test.
-              no_decay.add(fpn)
           elif "dual_plane" in fpn and "log_tau" in fpn:
               # P-plane soft-min temperatures: bias-like 1-D log params.
               no_decay.add(fpn)
@@ -603,9 +598,7 @@ def Train():
   STEPS_AdEMAMix_WARMUP = (num_warmup_positions() // 2) // config.Opt_BatchSizeBackwardPass
 
   # Loss and optimizer
-  if config.Opt_Optimizer == 'SGD':
-    optimizer = optim.SGD(optim_groups, lr=LR*0, momentum=config.Opt_Beta1, weight_decay=WEIGHT_DECAY)
-  elif config.Opt_Optimizer == 'NAdamW':
+  if config.Opt_Optimizer == 'NAdamW':
     optimizer = optim.NAdam(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2), decoupled_weight_decay=True)
   elif config.Opt_Optimizer == 'AdamW':
     optimizer = optim.AdamW(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2), fused=True)
@@ -795,8 +788,6 @@ def Train():
       print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':
     optimizer = AdEMAMix(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), alpha=config.Opt_Alpha, T_alpha_beta3= STEPS_AdEMAMix_WARMUP)
-  elif config.Opt_Optimizer == 'AdEMAMixShampoo':
-    optimizer = AdEMAMixDistributedShampoo(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2, config.Opt_Beta3), alpha=config.Opt_Alpha, T_alpha_beta3= STEPS_AdEMAMix_WARMUP)
   elif config.Opt_Optimizer == 'AdamW8bit':
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(optim_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(config.Opt_Beta1, config.Opt_Beta2))    
@@ -932,6 +923,9 @@ def Train():
 
   def worker_init_fn(worker_id):
     dataset.set_worker_id(worker_id)
+    # numpy reseedes IKKE av PyTorch ved fork (kun torch og random) — uten dette
+    # deler alle workers paa en rank identisk np.random-state (bugfunn 2026-08-28).
+    np.random.seed((torch.initial_seed() + worker_id) % (2**31))
 
   # Use two concurrent dataset workers (if more than one training data file is available).
   # Override via CERES_NUM_DATASET_WORKERS env var — useful when DataLoader CPU work
@@ -1769,7 +1763,15 @@ def Train():
               "(MuonAdamWScope change?) — starting optimizer state fresh to avoid "
               "positional state misalignment", flush=True)
         loaded_optimizer_state["state"] = {}
+    # Config vinner ved resume for ALLE optimizere (bugfunn 2026-08-28: kun
+    # Muon-grenen re-asserterte; AdamW/NAdam/SOAP fikk checkpointets gamle
+    # weight_decay/betas/eps stille tilbake). Gruppevis capture/restore saa
+    # decay/no_decay-splitten bevares.
+    _pre_load_hparams = [{k: g[k] for k in g if k != 'params'} for g in optimizer.param_groups]
     optimizer.load_state_dict(loaded_optimizer_state)
+    for _g, _pre in zip(optimizer.param_groups, _pre_load_hparams):
+      for _k, _v in _pre.items():
+        _g[_k] = _v
 
     # Re-assert construction-time Muon settings that load_state_dict clobbers
     # (or drops entirely on the fresh-state paths above):

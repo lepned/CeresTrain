@@ -136,6 +136,11 @@ class Muon(torch.optim.Optimizer):
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim == 2, p.ndim
             self.state[p]["use_muon"] = True
+        # Disjunkthets-vakt (bugfunn 2026-08-28): en param i BEGGE lister ville
+        # stille faatt use_muon overskrevet til False og ligget dobbelt i gruppen.
+        _mu_set = {id(p) for p in muon_params}
+        _overlap = [p for p in adamw_params if id(p) in _mu_set]
+        assert not _overlap, f'muon_params og adamw_params overlapper ({len(_overlap)} params)'
         for p in adamw_params:
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False

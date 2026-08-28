@@ -187,7 +187,26 @@ if _ckpt_rf and not _model_rf:
     f'Set "RefinerIters" (and matching RefinerDim/Heads/FFNMult) in the _ceres_net.json '
     f'config before re-exporting. (checkpoint: {CKPT})')
 
-missing, unexpected = model.load_state_dict(loaded['model'], strict=False)
+# UNIVERSELL NOEKKELSETT-VAKT (bugfunn 2026-08-28, guard-hull-review): eksport
+# skal reprodusere det trente nettet EKSAKT — enhver nokkeldifferanse er feil.
+# Dette dekker hullene per-familie-vaktene over ikke tok: LoRA-adaptere som
+# ville blitt stille droppet, VisEdgeFamilies-INNHOLDS-endringer (samme familie,
+# andre kanaler), enveis-retningene (config slaar PAA noe ckpt aldri trente),
+# og alle FREMTIDIGE familier uten egen vakt. Per-familie-vaktene beholdes for
+# vennlige feilmeldinger; denne er siste skanse.
+_ckpt_keys = set(loaded['model'].keys())
+_model_keys = set(model.state_dict().keys())
+if _ckpt_keys != _model_keys:
+  _only_ckpt = sorted(_ckpt_keys - _model_keys)
+  _only_model = sorted(_model_keys - _ckpt_keys)
+  raise ValueError(
+    'State-dict key-set mismatch - export would be CORRUPT. '
+    f'Keys only in checkpoint ({len(_only_ckpt)}): {_only_ckpt[:8]} ; '
+    f'keys only in rebuilt model ({len(_only_model)}): {_only_model[:8]} ; '
+    'align the _ceres_net.json config (and any env-gated features, incl. LoRA env vars) '
+    f'with the training run before re-exporting. (checkpoint: {CKPT})')
+
+missing, unexpected = model.load_state_dict(loaded['model'], strict=True)
 if missing:    print('WARN: missing keys (count={}): {}'.format(len(missing), missing[:5]))
 if unexpected: print('WARN: unexpected keys (count={}): {}'.format(len(unexpected), unexpected[:5]))
 

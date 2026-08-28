@@ -542,7 +542,7 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    target_softmax = F.softmax(target, dim=-1)
+    target_softmax = F.softmax(target.detach(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28)
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
     loss = self.ce_loss.forward(output, target_softmax) - entropy
 
@@ -554,7 +554,7 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    target_softmax = F.softmax(target, dim=-1)
+    target_softmax = F.softmax(target.detach(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28)
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
     loss = self.ce_loss(output, target_softmax) - entropy
    

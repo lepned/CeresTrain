@@ -783,8 +783,10 @@ class CeresNet(nn.Module):
       from tactical_adapter import gtab_enabled as _dp_gtab_enabled
       assert not _dp_gtab_enabled(), \
           'UseDualPlane is incompatible with GTAB (P-plane would read the non-adapter stream)'
-      _dp_fams = tuple(f for f in VisibilityChannels.FAMILY_ORDER
-                       if f in str(getattr(config, 'NetDef_VisEdgeFamilies', '')))
+      # Gjenbruk den kanoniske parsen (bugfunn 2026-08-28): re-parsing av raa
+      # config-streng med '' som default divergerte fra 679-684 (case/default)
+      # => feil _dp_rel_C og shape-krasj langt fra aarsaken.
+      _dp_fams = self._vis_edge_families
       assert _dp_fams, 'UseDualPlane needs VisEdgeFamilies for its relation channels'
       _dp_rel_C = 4 * len(_dp_fams)
       # Relation source: reuse the S-plane's vis_edge_E when UseVisEdgeBias is
@@ -1475,7 +1477,7 @@ class CeresNet(nn.Module):
 
     if self.prior_state_dim > 0:
       # Append prior state to the input if is available for this position.
-      append_tensor = prior_state if prior_state is not None else torch.zeros(squares.shape[0], NUM_TOKENS_INPUT, self.prior_state_dim).to(flow.device).to(torch.bfloat16)
+      append_tensor = prior_state if prior_state is not None else torch.zeros(squares.shape[0], NUM_TOKENS_INPUT, self.prior_state_dim).to(flow.device).to(flow.dtype)  # foelg compute-dtype, ikke hardkodet bf16 (bugfunn 2026-08-28)
       append_tensor = append_tensor.reshape(squares.shape[0], NUM_TOKENS_INPUT, self.prior_state_dim)
       flow_squares = torch.cat((flow_squares, append_tensor), dim=-1)
 
@@ -1588,7 +1590,7 @@ class CeresNet(nn.Module):
       _gates = [layer._last_tsb_gate for layer in self.transformer_layer
                 if getattr(layer, '_last_tsb_gate', None) is not None]
       if len(_gates) > 0:
-        self._last_tsb_gates = torch.stack(_gates, dim=0)  # [num_layers, B, 1, 1]
+        self._last_tsb_gates = torch.stack(_gates, dim=0) if self.training else None  # training-gated (dynamo-eksport avviser attributt-mutasjon; bugfunn 2026-08-28)  # [num_layers, B, 1, 1]
       else:
         self._last_tsb_gates = None
 
@@ -1607,7 +1609,7 @@ class CeresNet(nn.Module):
     if self.use_gtab:
       flow_aux = self.tactical_adapter(flow_post_embed)   # [B, 64, dim]
       g_x      = self.tactical_gate(flow_post_embed)      # [B, 1, 1]
-      self._last_gate_value = g_x                          # cached for sparsity loss + diagnostics
+      self._last_gate_value = g_x if self.training else None  # training-gated (bugfunn 2026-08-28)                          # cached for sparsity loss + diagnostics
       if self.gtab_value_only:
         # Compute two head front-end paths.
         flow_value  = flow + g_x * flow_aux                  # value-side: with adapter
@@ -2192,7 +2194,15 @@ class CeresNet(nn.Module):
       _pm_conf, _pm_best = _pm_t.max(dim=1)                       # [B] target-skarphet + solver-slot
       _pm_logits = policy_out.float()
       _pm_best_logit = _pm_logits.gather(1, _pm_best.unsqueeze(1)).squeeze(1)
-      _pm_rivals = _pm_logits.scatter(1, _pm_best.unsqueeze(1), float('-inf')).topk(4, dim=1).values
+      # Rivaler kun blant LOVLIGE trekk (bugfunn 2026-08-28): CE presser aldri
+      # illegale logits ned (de er maskert i policy_loss), saa uten denne masken
+      # kunne hinge-budsjettet lekke til aa presse utrente illegale logits i
+      # stedet for aa skjerpe det lovlige gapet E1 motiverte tapet med.
+      # target > 0 = samme lovlighets-proxy som policy_loss bruker.
+      _pm_illegal = _pm_t <= 0
+      _pm_rivals = _pm_logits.masked_fill(_pm_illegal, float('-inf'))                              .scatter(1, _pm_best.unsqueeze(1), float('-inf')).topk(4, dim=1).values
+      # < 5 lovlige trekk => -inf-rivaler; hinge blir eksakt 0 der (relu av -inf-gap).
+      _pm_rivals = _pm_rivals.clamp_min(-1e9)
       _pm_h = torch.relu(self.policy_margin_value - (_pm_best_logit.unsqueeze(1) - _pm_rivals)).mean(dim=1)
       policy_margin_loss = (_pm_conf.detach() * _pm_h).mean()
 
@@ -2350,7 +2360,12 @@ class CeresNet(nn.Module):
     if self.config.NetDef_TrainOn4BoardSequences:
       # TO DO: probably the multiplier_action_loss should somehow be propagated into the gradient norms when these are calculated
       action_loss = multiplier_action_loss * loss_calc.action_loss(action_target, action_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.action_loss_weight)
-      action_uncertainty_loss = multiplier_action_loss * self.action_uncertainty_loss_weight * loss_calc.action_unc_loss(torch.abs(action_target - action_out), action_uncertainty_out, gradient_norm_logging_mode, self.action_uncertainty_loss_weight)
+      # Bugfunn 2026-08-28: (a) vekten ble anvendt HER OG i total_loss => vekt^2
+      # (soesterlinjen action_loss anvender kun multiplier_action_loss); (b) target
+      # |action_target - action_out| var ikke detached => huber-tapet dyttet
+      # action-hodet mot unc-hodets prediksjon (samme lekkasje opt-tapet
+      # eksplisitt detacher mot).
+      action_uncertainty_loss = multiplier_action_loss * loss_calc.action_unc_loss(torch.abs(action_target - action_out).detach(), action_uncertainty_out, gradient_norm_logging_mode, self.action_uncertainty_loss_weight)
       # We have two value scores and want them to be consistent modulo inversion (prior_board and this_board).
       # The value of this board is taken to be "more definitive" so it is the target (however this assumes policy was correct....)
       value_diff_loss = 0 if self.value_diff_loss_weight == 0 or prior_value_out == None else loss_calc.value_diff_loss(value_out, prior_value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_diff_loss_weight)

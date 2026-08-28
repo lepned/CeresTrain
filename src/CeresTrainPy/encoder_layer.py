@@ -162,7 +162,7 @@ class EncoderLayer(torch.nn.Module):
       mlp_input = self.ln2(out1) if self.pre_norm else out1
 
       if self.moe and self.smoe_mode == 'ReplaceLinear':
-        assert self.ffn_activation_type in ('ReLUSquared') # SoftMoEBatchedDual currently only supports ReLUSquared
+        assert self.ffn_activation_type in ('ReLUSquared',)  # tuple, ikke streng-substring (bugfunn 2026-08-28) # SoftMoEBatchedDual currently only supports ReLUSquared
         mlp_output = self.moe(mlp_input)
       else:
         (mlp_before_linear2, mlp_output) = self.mlp(mlp_input)
@@ -179,7 +179,7 @@ class EncoderLayer(torch.nn.Module):
         if self.tsb is not None:
           tactical_out, gate_value = self.tsb(mlp_input)
           mlp_output = mlp_output + gate_value * tactical_out
-          self._last_tsb_gate = gate_value
+          self._last_tsb_gate = gate_value if self.training else None  # training-gated (dynamo-eksport; bugfunn 2026-08-28)
         else:
           self._last_tsb_gate = None
 
