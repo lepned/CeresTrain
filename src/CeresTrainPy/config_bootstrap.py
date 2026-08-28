@@ -43,6 +43,13 @@ BOOTSTRAP_ENV_MAP = {
     # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
     # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
     'GatedAttentionOutput': 'CERES_GATED_ATTENTION_OUTPUT',
+    # Parameterfrie forward-matte-knotter (bugfunn 2026-08-28, runde 2): begge
+    # leses fra env i __init__ og etterlater INGEN spor i state_dict — den
+    # universelle noekkelsett-vakten i recover_export kan per konstruksjon ikke
+    # fange dem. Uten broen bygger en re-eksport i friskt shell stille en annen
+    # funksjon enn den trente (ucappet SwiGLU / andre rotasjonsfrekvenser).
+    'FFNSoftCap': 'CERES_FFN_SOFTCAP',
+    'RopeBase': 'ROPE_BASE',
     'AuxFeaturesPerSquare': 'CERES_AUX_FEATURES_PER_SQUARE',
     # Per-corpus shard format. TPGV3 is the whole-run toggle; these two are the
     # explicit widths, and SquareBytes2 is what a MIXED run needs (e.g. a V3

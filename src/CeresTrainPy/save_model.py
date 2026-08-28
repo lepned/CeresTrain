@@ -243,6 +243,13 @@ def save_model(NAME : str,
           # while internal weights are still FP32.
           sample_inputs = (torch.rand(256, 64, TOTAL_INPUT_FEATURES_PER_SQUARE).to(torch.float32).to(_model_device),
                             torch.rand(256, 64, config.NetDef_PriorStateDim).to(torch.float32).to(_model_device))
+          # Bugfunn 2026-08-28 (runde 2): under BFloat16Pure er modellen bf16 —
+          # fp32-inputs x bf16-vekter feiler i trace, unntaket ble slukt av
+          # blanket-except'en og runs fikk ALDRI .onnx. Kast en kopi til fp32
+          # saa "Export an FP32 ONNX first" faktisk gjelder begge sider.
+          if next(model_nocompile.parameters()).dtype != torch.float32:
+            import copy as _copy
+            model_nocompile = _copy.deepcopy(model_nocompile).float().eval()
           # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
           # only calls setTensorAddress on inputNames[0] — additional inputs are
           # never bound, causing enqueueV3 to fail with "Address is not set for
@@ -307,9 +314,23 @@ def save_model(NAME : str,
             # well-trained models whose fine-tuned weights are often below 1e-7.
             # 1e-10 preserves the full FP16 representable range (subnormals ~6e-8,
             # below which hardware returns 0, which is the correct behavior).
+            # Bugfunn 2026-08-28 (runde 2): max_finite_val=1e4 klemte stille
+            # enhver vekt/konstant i (1e4, 65504] et helt tiaar under fp16-taket;
+            # 65504 bevarer hele det representerbare omraadet (grafens egne
+            # +-1e4-maskekonstanter er uansett godt innenfor). ReduceLogSumExp
+            # blokkeres fra fp16: dual_planes soft-min bruker logsumexp(-x) der
+            # exp overfloder fp16 for |x| > ~11 — treningen kjoerer disse oeyene
+            # i fp32 (.float()), og Cast-reconcile-passet under demoterte dem;
+            # blokklisten gjenoppretter paritet (konverteren setter selv inn
+            # fp32-caster rundt blokkerte noder).
+            try:
+              from onnxconverter_common.float16 import DEFAULT_OP_BLOCK_LIST as _DBL
+            except ImportError:
+              _DBL = []
             onnx_model_16 = convert_float_to_float16(
                 onnx_model, keep_io_types=False,
-                min_positive_val=1e-10, max_finite_val=1e4)
+                min_positive_val=1e-10, max_finite_val=65504.0,
+                op_block_list=list(_DBL) + ['ReduceLogSumExp'])
             # RECONCILE Cast attributes with the converted graph. The converter
             # rewrites tensor types wholesale but leaves pre-existing Cast nodes'
             # `to` attribute untouched, so a graph-internal Cast(to=FLOAT) whose

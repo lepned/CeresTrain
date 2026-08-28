@@ -150,6 +150,11 @@ class SOAP(torch.optim.Optimizer):
             assert len(_steps) == 1, (
                 f'SOAP: ulik step-telling paa tvers av params ({sorted(_steps)[:5]}...) — '
                 'per-param-debias kreves for intermitterende gradienter')
+            # Runde-2-funn: bruk den asserterte uniforme verdien, IKKE den
+            # loekke-lekkede 'step' — en init-branch-param sist i gruppen setter
+            # step=0 uten aa vaere i lists (assert passerer) og ga ZeroDivision
+            # i beta**0-debiasen under.
+            step = next(iter(_steps))
             beta1, beta2, beta3 = group["betas"]
 
             beta1_ = 1 - (1 - beta1) / (1 - beta1**step)

@@ -120,9 +120,12 @@ class AdEMAMix(Optimizer):
 
             denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
 
-            step_size = lr / bias_correction1
-
             if weight_decay != 0:
                 param.add_(param, alpha=-weight_decay * lr)
 
-            param.addcdiv_(exp_avg + alpha_t * exp_avg_slow_i, denom, value=-step_size)
+            # Runde-2-funn: papiret (arXiv:2409.03137) biaskorrigerer KUN m1 —
+            # lr * (m1_hat + alpha*m2) / (sqrt(v_hat)+eps). Den gamle formen
+            # (lr/bc1 paa hele telleren) forsterket slow-EMA-leddet inntil
+            # 1/(1-beta1) ~ 10x tidlig (dempet i praksis av alpha-warmupen).
+            param.addcdiv_(exp_avg / bias_correction1 + alpha_t * exp_avg_slow_i,
+                           denom, value=-lr)

@@ -36,9 +36,24 @@ config = Configuration('.', os.path.join(OUTPUTS_DIR, "configs", CONFIG_ID))
 NAME = socket.gethostname() + "_" + os.path.basename(CONFIG_ID)
 
 # Plain-PyTorch model construction; pass writer=None (this script never logs).
+# Loss weights MUST come from the config (bugfunn 2026-08-28, runde 2): head
+# construction is gated on weight > 0, and eval-forward aliases missing heads
+# (value2 -> value1, mlh -> unc) — hardcoded zeros silently exported a net
+# whose value2 output was a COPY of value1 for every dual-value production run.
 model = CeresNet(
     None, config,
-    1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5,
+    policy_loss_weight=config.Opt_LossPolicyMultiplier,
+    value_loss_weight=config.Opt_LossValueMultiplier,
+    moves_left_loss_weight=config.Opt_LossMLHMultiplier,
+    unc_loss_weight=config.Opt_LossUNCMultiplier,
+    value2_loss_weight=config.Opt_LossValue2Multiplier,
+    q_deviation_loss_weight=config.Opt_LossQDeviationMultiplier,
+    value_diff_loss_weight=config.Opt_LossValueDMultiplier,
+    value2_diff_loss_weight=config.Opt_LossValue2DMultiplier,
+    action_loss_weight=config.Opt_LossActionMultiplier,
+    uncertainty_policy_weight=config.Opt_LossUncertaintyPolicyMultiplier,
+    action_uncertainty_loss_weight=config.Opt_LossActionUncertaintyMultiplier,
+    q_ratio=config.Data_FractionQ,
 )
 
 ckpt_path = os.path.join(OUTPUTS_DIR, "nets", CKPT_NAME)
@@ -59,12 +74,21 @@ for k, v in sd.items():
             nk = nk[len(prefix):]
     sd_clean[nk] = v
 
-missing, unexpected = model.load_state_dict(sd_clean, strict=False)
-print(f"Loaded. missing={len(missing)} unexpected={len(unexpected)}")
-if missing[:3]:
-    print(f"  Sample missing: {missing[:3]}")
-if unexpected[:3]:
-    print(f"  Sample unexpected: {unexpected[:3]}")
+# Universell noekkelsett-vakt (som recover_export.py): enhver differanse
+# mellom checkpoint og gjenoppbygget modell = korrupt eksport — hard stopp.
+_ckpt_keys = set(sd_clean.keys())
+_model_keys = set(model.state_dict().keys())
+if _ckpt_keys != _model_keys:
+    _only_ckpt = sorted(_ckpt_keys - _model_keys)
+    _only_model = sorted(_model_keys - _ckpt_keys)
+    raise ValueError(
+        'State-dict key-set mismatch - export would be CORRUPT. '
+        f'Keys only in checkpoint ({len(_only_ckpt)}): {_only_ckpt[:8]} ; '
+        f'keys only in rebuilt model ({len(_only_model)}): {_only_model[:8]} ; '
+        'align the _ceres_net.json config (and env-gated features) with the '
+        f'training run before re-exporting. (checkpoint: {ckpt_path})')
+model.load_state_dict(sd_clean, strict=True)
+print("Loaded (strict, key-sets identical).")
 
 model = model.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
 model.eval()

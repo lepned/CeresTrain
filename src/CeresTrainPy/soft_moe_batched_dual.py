@@ -97,7 +97,11 @@ class SoftMoEBatchedDual(nn.Module):
         if self.use_normalization:
           # See section 2.3 of the Soft MoE paper
           # Note that paper points out how needed with pre-norm (possibly not with post-norm?)
-          self.normX =  L2NormScaled(1, False)
+          # Runde-2-funn: dim=1 normaliserte over TOKEN-aksen m i [b, m, d];
+          # papiret (seksjon 2.3) og fkodom-referansen normaliserer x langs
+          # feature-aksen d — dim=2. (Stien er i dag assertet av i ceres_net;
+          # rettet saa den er korrekt om den noen gang armeres.)
+          self.normX =  L2NormScaled(2, False)
           self.normPhi = L2NormScaled(0, True)
        
         self.reset_parameters()

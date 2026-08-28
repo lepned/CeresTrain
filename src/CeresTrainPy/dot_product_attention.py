@@ -598,9 +598,17 @@ class DotProductAttention(torch.nn.Module):
       ref = ref + prb
     # QK-clip-monitor: kun kart 1 er QK-drevet (ref = smolgen-prior). PRE-softcap.
     if self.training and getattr(self, 'qk_clip_monitor', False):
-      self._last_max_logit = scores1.detach().amax(dim=(0, 2, 3))
+      _mx = scores1.detach().amax(dim=(0, 2, 3))
+      _prev = getattr(self, '_last_max_logit', None)
+      # Max over ALLE mikro-batcher i akkumuleringsvinduet (bugfunn 2026-08-28:
+      # ren overskriving lot 7/8 av vinduets spikes vaere usynlige for tau);
+      # apply_qk_clip nullstiller stashen hvert optimizer-steg.
+      self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
     if self.softcap_cutoff > 0:
+      # Begge kart cappes (runde-2-funn: ref var ucappet — asymmetrisk baade
+      # med sdp_diff og med standardstien, som capper smolgen-inklusive scores).
       scores1 = self.soft_cap(scores1, self.softcap_cutoff)
+      ref = self.soft_cap(ref, self.softcap_cutoff)
     attn1 = self.softmax(scores1)
     attn2 = self.softmax(ref)
     lambda_t = torch.sigmoid(self.lambda_proj(x)).permute(0, 2, 1).unsqueeze(-1)
@@ -648,8 +656,11 @@ class DotProductAttention(torch.nn.Module):
     # var stille inert i alle diff-kjoeringer tross QKClipTau i configen).
     # Begge kart er QK-drevne — maks over begge. PRE-softcap, som standardstien.
     if self.training and getattr(self, 'qk_clip_monitor', False):
-      self._last_max_logit = torch.maximum(scores1.detach().amax(dim=(0, 2, 3)),
-                                           scores2.detach().amax(dim=(0, 2, 3)))
+      _mx = torch.maximum(scores1.detach().amax(dim=(0, 2, 3)),
+                          scores2.detach().amax(dim=(0, 2, 3)))
+      _prev = getattr(self, '_last_max_logit', None)
+      # Max over alle mikro-batcher i vinduet (jf. kommentaren i smolref-stien).
+      self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
     # Softcap (bugfunn 2026-08-28: ble stille ignorert i diff-stiene tross
     # SoftCapCutoff i configen — husstandarden er 100). Anvendes paa begge kart
     # foer softmax, som i standardstien. Numerisk ~identitet for logits << cutoff.
@@ -737,7 +748,10 @@ class DotProductAttention(torch.nn.Module):
     # Training-only attribute stash (placement-head pattern) — contributes NOTHING
     # to the eval/export graph, which is the whole point of weight-level clipping.
     if self.training and getattr(self, 'qk_clip_monitor', False):
-      self._last_max_logit = scores.detach().amax(dim=(0, 2, 3))  # [num_heads]
+      _mx = scores.detach().amax(dim=(0, 2, 3))  # [num_heads]
+      _prev = getattr(self, '_last_max_logit', None)
+      # Max over alle mikro-batcher i vinduet (jf. kommentaren i smolref-stien).
+      self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
 
     if self.softcap_cutoff > 0:
       #softcap logits for enhanced training stability

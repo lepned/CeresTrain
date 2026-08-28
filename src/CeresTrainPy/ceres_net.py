@@ -574,7 +574,10 @@ class CeresNet(nn.Module):
     self.hlg_weight = float(getattr(config, 'Opt_HLGaussWeight', 0) or 0)
     if self.hlg_weight > 0:
       self.hlg_buckets = int(getattr(config, 'Opt_HLGaussBuckets', 32) or 32)
-      _hlg_sigma_scale = float(getattr(config, 'Opt_HLGaussSigmaScale', 0.75) or 0.75)
+      # Runde-2-funn: 'or 0.75' sluket eksplisitt 0 (one-hot-bucket-kontrakten
+      # i config.py) tilbake til 0.75 — None-sjekk i stedet for falsy-sjekk.
+      _hlg_ss = getattr(config, 'Opt_HLGaussSigmaScale', None)
+      _hlg_sigma_scale = 0.75 if _hlg_ss is None else float(_hlg_ss)
       self.hlg_sigma = _hlg_sigma_scale * (2.0 / self.hlg_buckets)
       self.hlg_head = Head(self.Activation, self.VALUE_IN_SIZE, 64 * HEAD_MULT, self.hlg_buckets, 0)
       self.register_buffer('hlg_edges', torch.linspace(-1.0, 1.0, self.hlg_buckets + 1), persistent=False)
@@ -2359,13 +2362,15 @@ class CeresNet(nn.Module):
 
     if self.config.NetDef_TrainOn4BoardSequences:
       # TO DO: probably the multiplier_action_loss should somehow be propagated into the gradient norms when these are calculated
-      action_loss = multiplier_action_loss * loss_calc.action_loss(action_target, action_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.action_loss_weight)
+      # Runde-2-funn: board 1 kalles med action_target/action_out=None
+      # (train.py-call-siten) — ubetingede kall ville krasje paa F.softmax(None).
+      action_loss = 0 if action_target is None or action_out is None else           multiplier_action_loss * loss_calc.action_loss(action_target, action_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.action_loss_weight)
       # Bugfunn 2026-08-28: (a) vekten ble anvendt HER OG i total_loss => vekt^2
       # (soesterlinjen action_loss anvender kun multiplier_action_loss); (b) target
       # |action_target - action_out| var ikke detached => huber-tapet dyttet
       # action-hodet mot unc-hodets prediksjon (samme lekkasje opt-tapet
       # eksplisitt detacher mot).
-      action_uncertainty_loss = multiplier_action_loss * loss_calc.action_unc_loss(torch.abs(action_target - action_out).detach(), action_uncertainty_out, gradient_norm_logging_mode, self.action_uncertainty_loss_weight)
+      action_uncertainty_loss = 0 if action_target is None or action_out is None or action_uncertainty_out is None else           multiplier_action_loss * loss_calc.action_unc_loss(torch.abs(action_target - action_out).detach(), action_uncertainty_out, gradient_norm_logging_mode, self.action_uncertainty_loss_weight)
       # We have two value scores and want them to be consistent modulo inversion (prior_board and this_board).
       # The value of this board is taken to be "more definitive" so it is the target (however this assumes policy was correct....)
       value_diff_loss = 0 if self.value_diff_loss_weight == 0 or prior_value_out == None else loss_calc.value_diff_loss(value_out, prior_value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_diff_loss_weight)

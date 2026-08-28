@@ -946,6 +946,9 @@ def Train():
   # Requires batch_size_forward divisible by world_size and >= world_size files.
   world_size = WORLD_SIZE
   rank = RANK
+  assert batch_size_forward % world_size == 0,       (f'BatchSizeForwardPass ({batch_size_forward}) must be divisible by world_size '
+       f'({world_size}) — floor-division would silently shrink the effective batch '
+       f'below what the config claims (documented requirement above; bugfunn 2026-08-28)')
   # Per-stream file-mirror override (default: both streams inherit the global
   # CERES_FILE_MIRROR_AUG). E.g. mirror only the puzzle secondary in a mixed run:
   #   CERES_FILE_MIRROR_AUG_PRIMARY=0 CERES_FILE_MIRROR_AUG_SECONDARY=0.5
@@ -1315,13 +1318,16 @@ def Train():
     print(f'[train] EMA weight averaging enabled: period={EMA_PERIOD} opt-steps, '
           f'max_n={EMA_MAX_N} ({len(_ema_sd)} tensors; dual export <ckpt>ema.onnx)')
     if WORLD_SIZE > 1:
-      # The period counts OPTIMIZER STEPS, and each step consumes WORLD_SIZE times
-      # more positions under DDP — so the same value averages over a WORLD_SIZE
-      # times longer stretch of training than it did on one GPU. Divide
-      # EMAPeriodSteps by the GPU count to reproduce a single-GPU-validated recipe.
-      print(f'[train] EMA under DDP: shadow on rank 0 only; period is in optimizer '
-            f'steps, so it now spans {WORLD_SIZE}x more positions than single-GPU '
-            f'(divide EMAPeriodSteps by {WORLD_SIZE} to match a 1-GPU recipe)', flush=True)
+      # KORRIGERT 2026-08-28 (runde-2-review): den gamle teksten her paastod at
+      # hvert steg konsumerer WORLD_SIZE ganger flere posisjoner og ba operatoren
+      # dele EMAPeriodSteps paa GPU-antallet — det er FEIL. BatchSizeForwardPass
+      # er GLOBAL og deles paa ranks (se kommentaren ved world_size-oppsettet),
+      # saa ett optimizer-steg konsumerer noeyaktig BatchSizeBackwardPass
+      # posisjoner uansett world size. En 1-GPU-validert EMA-oppskrift skal
+      # brukes UENDRET under DDP.
+      print(f'[train] EMA under DDP: shadow on rank 0 only; one optimizer step '
+            f'consumes the same global positions as single-GPU — use the '
+            f'single-GPU-validated EMAPeriodSteps UNCHANGED', flush=True)
 
   # Aux heads (placement/survival/stvalue/depth-probes) under DDP.
   #

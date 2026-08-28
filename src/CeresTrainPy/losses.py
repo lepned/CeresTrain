@@ -346,7 +346,10 @@ class LossCalculator():
       # for cross-run comparability; only the RETURNED loss is reweighted.
       _log_loss = _ce_i.mean() - entropy
     else:
-      loss = self.ce_loss.forward(output, target) - entropy
+      # fp32-vern (runde-2-funn): under BFloat16Pure (ingen autocast) ville
+      # log_softmax over 1858 logits ellers regnes i bf16 — value-stiene har
+      # dette vernet eksplisitt (_prov_weighted_ce), policy manglet det.
+      loss = self.ce_loss.forward(output.float(), target.float()) - entropy
       _log_loss = loss
 
     self.PENDING_POLICY_LOSS += _log_loss.item() if not calc_grad_norm_mode else 0
@@ -542,9 +545,9 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    target_softmax = F.softmax(target.detach(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28)
+    target_softmax = F.softmax(target.detach().float(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28); fp32 = BFloat16Pure-vern
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
-    loss = self.ce_loss.forward(output, target_softmax) - entropy
+    loss = self.ce_loss.forward(output.float(), target_softmax) - entropy
 
     self.PENDING_VALUE_DIFF_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('value_diff', loss, loss_wt) if calc_grad_norm_mode else loss
@@ -554,9 +557,9 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    target_softmax = F.softmax(target.detach(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28)
+    target_softmax = F.softmax(target.detach().float(), dim=-1)  # maalsiden skal ikke motta gradient (bugfunn 2026-08-28); fp32 = BFloat16Pure-vern
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
-    loss = self.ce_loss(output, target_softmax) - entropy
+    loss = self.ce_loss(output.float(), target_softmax) - entropy
    
     self.PENDING_VALUE2_DIFF_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('value2_diff', loss, loss_wt) if calc_grad_norm_mode else loss
@@ -566,9 +569,9 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    target_softmax = F.softmax(target, dim=-1)
+    target_softmax = F.softmax(target.float(), dim=-1)
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
-    loss = self.ce_loss(output, target_softmax) - entropy
+    loss = self.ce_loss(output.float(), target_softmax) - entropy
   
     self.PENDING_ACTION_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('action', loss, loss_wt) if calc_grad_norm_mode else loss
