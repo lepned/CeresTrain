@@ -765,7 +765,11 @@ class CeresNet(nn.Module):
       # Parametriske nokler har truthy DEFAULTS og er meningslose aa flagge;
       # kun feature-flagg (default 0/False) indikerer intensjon.
       _dp_param_keys = {'NetDef_DualPlanePolicyGradScale', 'NetDef_DualPlaneSoftMinHeads',
-                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK'}
+                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK',
+                        # HOTFIX 2026-08-29 (runde-3-funn 1): BlockRepeat har truthy
+                        # default 1 og maa unntas — uten dette feilet ALLE
+                        # ikke-dual-plane-configer aa konstruere siden 997f684.
+                        'NetDef_DualPlaneBlockRepeat'}
       _dp_set = [k for k, v in vars(config).items()
                  if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
       if _dp_set:
