@@ -235,6 +235,12 @@ class DotProductAttention(torch.nn.Module):
     self.use_diff_attention = use_diff_attention
     if self.use_diff_attention:
       assert self.use_qkv, "DiffAttention requires use_qkv"
+      assert not use_rope, ('DiffAttention + RoPE unsupported: V2/nonlinear crashes on the Q-tuple, and '
+           'half-dim would silently split RoPE file/rank geometry across the two maps. (guard 2026-08-28)')
+      assert not use_rel_bias, ('DiffAttention + UseRelBias unsupported: rel_bias is never added in the diff '
+           'paths (params would exist untrained). (guard 2026-08-28)')
+      assert not use_head_logit_temp, ('DiffAttention + UseHeadLogitTemp unsupported: temp is only applied in '
+           'the standard path (param would be dead weight). (guard 2026-08-28)')
       assert not use_rpe,           ('DiffAttention + RPE unsupported: sdp_diff never receives Q_rpe/K_rpe, so RPE '
            'would be SILENTLY dropped while its parameters still exist (unused). Set '
            'UseRPE false for diff arms, or extend sdp_diff first. (guard 2026-08-26)')
@@ -242,10 +248,17 @@ class DotProductAttention(torch.nn.Module):
       # standard 3-veis qkv; Q og K splittes per hode i to halvdeler ETTER
       # qk-norm, to kart aa halv dim => score-flops-PARITET med base og ingen
       # ekstra qkv-params. Arver ++-komponentene (lambda-plan + norm).
+      # SMOLGEN-REFERANSE (UseDiffAttention: 4, 2026-08-27): kart 2 er IKKE et
+      # Q2K-kart men softmax over selve smolgen-biasen — det posisjonsbetingede
+      # prioret "dit man ser fra strukturen alene". attn = softmax(QK+smolgen)
+      # - lambda*softmax(smolgen): subtraherer prior-massen, innholdsdrevet
+      # oppmerksomhet staar igjen. INGEN ekstra projeksjoner (qkv=3), kun en
+      # ekstra softmax paa eksisterende tensor => billigste diff-variant.
+      self.diff_smolref = int(use_diff_attention) == 4
       self.diff_halfdim = int(use_diff_attention) == 3
-      if self.diff_halfdim:
-        assert not use_nonlinear_attention, 'half-dim diff stoetter kun linear QKV-sti'
-        assert (self.d_k * self.attention_multiplier) % 2 == 0, 'per-hode-dim maa vaere partall for half-dim diff'
+      if self.diff_halfdim or self.diff_smolref:
+        assert not use_nonlinear_attention, 'half-dim/smolref-diff stoetter kun linear QKV-sti'
+        assert self.diff_smolref or (self.d_k * self.attention_multiplier) % 2 == 0, 'per-hode-dim maa vaere partall for half-dim diff'
         self.qkv_multiplier = 3
       else:
         self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
@@ -571,6 +584,33 @@ class DotProductAttention(torch.nn.Module):
     return score
 
  
+  def sdp_diff_smolref(self, Q:torch.Tensor, K:torch.Tensor, V:torch.Tensor,
+                       smolgen:torch.Tensor, x:torch.Tensor,
+                       piece_relation_bias:torch.Tensor = None):
+    """Smolgen-referanse-diff (UseDiffAttention: 4): kart 2 = softmax over
+    smolgen-prioret selv. Ingen Q2 — billigste diff-variant."""
+    scores1 = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.d_k)
+    scores1 = scores1 + smolgen
+    ref = smolgen
+    if piece_relation_bias is not None:
+      prb = piece_relation_bias.to(scores1.dtype)
+      scores1 = scores1 + prb
+      ref = ref + prb
+    # QK-clip-monitor: kun kart 1 er QK-drevet (ref = smolgen-prior). PRE-softcap.
+    if self.training and getattr(self, 'qk_clip_monitor', False):
+      self._last_max_logit = scores1.detach().amax(dim=(0, 2, 3))
+    if self.softcap_cutoff > 0:
+      scores1 = self.soft_cap(scores1, self.softcap_cutoff)
+    attn1 = self.softmax(scores1)
+    attn2 = self.softmax(ref)
+    lambda_t = torch.sigmoid(self.lambda_proj(x)).permute(0, 2, 1).unsqueeze(-1)
+    attn = attn1 - lambda_t * attn2
+    H = torch.matmul(attn, V)
+    if getattr(self, 'diff_pp', False):
+      H = self.diff_norm(H) * self.diff_norm_scale
+    return H, attn
+
+
   def sdp_diff(self, Q1:torch.Tensor, Q2:torch.Tensor, K:torch.Tensor, V:torch.Tensor,
                smolgen:torch.Tensor, x:torch.Tensor,
                piece_relation_bias:torch.Tensor = None):
@@ -604,6 +644,18 @@ class DotProductAttention(torch.nn.Module):
       scores1 = scores1 + prb
       scores2 = scores2 + prb
 
+    # QK-clip-monitor (bugfunn 2026-08-28: diff-stiene stashet aldri => klippen
+    # var stille inert i alle diff-kjoeringer tross QKClipTau i configen).
+    # Begge kart er QK-drevne — maks over begge. PRE-softcap, som standardstien.
+    if self.training and getattr(self, 'qk_clip_monitor', False):
+      self._last_max_logit = torch.maximum(scores1.detach().amax(dim=(0, 2, 3)),
+                                           scores2.detach().amax(dim=(0, 2, 3)))
+    # Softcap (bugfunn 2026-08-28: ble stille ignorert i diff-stiene tross
+    # SoftCapCutoff i configen — husstandarden er 100). Anvendes paa begge kart
+    # foer softmax, som i standardstien. Numerisk ~identitet for logits << cutoff.
+    if self.softcap_cutoff > 0:
+      scores1 = self.soft_cap(scores1, self.softcap_cutoff)
+      scores2 = self.soft_cap(scores2, self.softcap_cutoff)
     attn1 = self.softmax(scores1)
     attn2 = self.softmax(scores2)
 
@@ -789,7 +841,7 @@ class DotProductAttention(torch.nn.Module):
       V = qkv.reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier)
       V = V.permute(0, 2, 1, 3)
     elif not self.use_nonlinear_attention:
-      if self.use_diff_attention and not getattr(self, 'diff_halfdim', False):
+      if self.use_diff_attention and not getattr(self, 'diff_halfdim', False) and not getattr(self, 'diff_smolref', False):
         # DiffAttention V2: 4-way split (Q1, Q2, K, V); Q is doubled.
         qkv = qkv.reshape(batch_size, -1, self.num_heads, 4*self.d_k * self.attention_multiplier)
         qkv = qkv.permute(0, 2, 1, 3)
@@ -923,14 +975,17 @@ class DotProductAttention(torch.nn.Module):
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
       if self.use_diff_attention:
-        if getattr(self, 'diff_halfdim', False):
+        if getattr(self, 'diff_smolref', False):
+          H_cat, A = self.sdp_diff_smolref(Q, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
+        elif getattr(self, 'diff_halfdim', False):
           # Split ETTER qk-norm: full Q/K er normert, halvdelene arver det.
           _h = (self.d_k * self.attention_multiplier) // 2
           Q1, Q2 = Q[..., :_h], Q[..., _h:]
           K = (K[..., :_h], K[..., _h:])
+          H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
         else:
           Q1, Q2 = Q  # unpack tuple
-        H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
+          H_cat, A = self.sdp_diff(Q1, Q2, K, V, smolgen, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
         H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, smolgen, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
     else:
@@ -944,6 +999,7 @@ class DotProductAttention(torch.nn.Module):
       # exports cleanly to opset 23 as MatMul→Softmax→MatMul, and also gains
       # softcap support that the F.sdpa path was lacking.
       if self.use_diff_attention:
+        assert not getattr(self, 'diff_smolref', False), 'smolref-diff krever smolgen'
         if getattr(self, 'diff_halfdim', False):
           _h = (self.d_k * self.attention_multiplier) // 2
           Q1, Q2 = Q[..., :_h], Q[..., _h:]
