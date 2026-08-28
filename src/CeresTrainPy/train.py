@@ -1297,6 +1297,20 @@ def Train():
   # from the live weights at boot (n=0) and re-warmed within ~EMAMaxN periods.
   EMA_PERIOD = int(getattr(config, 'Opt_EMAPeriodSteps', 0) or 0)
   EMA_MAX_N = int(getattr(config, 'Opt_EMAMaxN', 10) or 10)
+  if EMA_PERIOD < 0:
+    # AUTO-modus (2026-08-28, user-doktrine): EMA-vinduet = CHECKPOINT-CADENCEN.
+    # Et absolutt steg-tall skalerer ikke med horisonten (100/10 = 4,5M pos =
+    # 0,1 % av et 4B-run), mens ckpt-intervallet allerede ER det horisont-
+    # bevisste tallet i configen. Vindu ~ (MaxN+1)*period*bwd_batch settes lik
+    # CheckpointFrequencyNumPositions => ema-eksporten ved ckpt N er snittet av
+    # aeraen siden N-1, og lengre vinduer kan rekonstrueres offline ved aa
+    # snitte ema-eksporter. Aktiveres med "EMAPeriodSteps": -1.
+    _ckpt_freq = int(getattr(config, 'Opt_CheckpointFrequencyNumPositions', 200_000_000))
+    EMA_PERIOD = max(1, round(_ckpt_freq / ((EMA_MAX_N + 1) * config.Opt_BatchSizeBackwardPass)))
+    if IS_MASTER:
+      print(f'[train] EMA AUTO: window = checkpoint cadence ({_ckpt_freq:,} pos) '
+            f'=> EMAPeriodSteps {EMA_PERIOD} (MaxN {EMA_MAX_N}, '
+            f'bwd {config.Opt_BatchSizeBackwardPass})', flush=True)
   _ema_sd = None
   _ema_n = 0
   _ema_opt_steps = 0

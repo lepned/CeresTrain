@@ -35,7 +35,7 @@
     "LRDecayShape": "cosine",
     "LRMinFactor": 0.1,
     "QKClipTau": 30.0,
-    "EMAPeriodSteps": 50,
+    "EMAPeriodSteps": 100,
     "EMAMaxN": 10,
     "HLGaussWeight": 0,
     "SoftPolicyWeight": 0,

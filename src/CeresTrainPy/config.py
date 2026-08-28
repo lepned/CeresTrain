@@ -542,6 +542,10 @@ class Configuration:
     # Full analysis and servable redesigns in dual_plane.py.
     self.NetDef_DualPlaneRelGains = config_net_def.get('DualPlaneRelGains', False)
     self.NetDef_DualPlaneRelDegrees2 = config_net_def.get('DualPlaneRelDegrees2', False)
+    # Boelge 1 (2026-08-28): vektdelt blokk-dybde i P-planet. (Diff-attention i
+    # P-blokkene ble bygget og SLETTET samme dag: policy-noeytral @10M og
+    # TRT-doed 54x — RelGains-klassen.)
+    self.NetDef_DualPlaneBlockRepeat = int(config_net_def.get('DualPlaneBlockRepeat', 1) or 1)
     self.NetDef_DualPlaneKingFlight = config_net_def.get('DualPlaneKingFlight', False)
     self.NetDef_DualPlaneKingZone = config_net_def.get('DualPlaneKingZone', False)
     self.NetDef_DualPlanePolicyGradScale = config_net_def.get('DualPlanePolicyGradScale', 1.0)

@@ -813,7 +813,11 @@ class CeresNet(nn.Module):
                                   rel_gains=bool(getattr(config, 'NetDef_DualPlaneRelGains', False)),
                                   rel_degrees2=bool(getattr(config, 'NetDef_DualPlaneRelDegrees2', False)),
                                   king_flight=bool(getattr(config, 'NetDef_DualPlaneKingFlight', False)),
-                                  king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)))
+                                  king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)),
+                                  block_repeat=int(getattr(config, 'NetDef_DualPlaneBlockRepeat', 1) or 1))
+      if int(getattr(config, 'NetDef_DualPlaneBlockRepeat', 1) or 1) > 1:
+        print(f'[ceres_net] DUAL-PLANE BLOCK-REPEAT enabled: hver P-blokk kjoeres '
+              f'{int(getattr(config, "NetDef_DualPlaneBlockRepeat", 1))}x med delte vekter')
       if getattr(config, 'NetDef_DualPlaneRelDegrees2', False):
         print(f'[ceres_net] DUAL-PLANE REL-DEGREES-2 enabled: second-order coverage '
               f'(targets/attackers, 2x{_dp_rel_C} ch) -> zero-init token features '

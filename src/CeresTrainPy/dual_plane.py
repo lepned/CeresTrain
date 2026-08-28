@@ -163,6 +163,7 @@ class DualPlane(nn.Module):
                dp: int = 128, heads: int = 4, layers: int = 2,
                ffn_mult: int = 2, softmin_heads: int = 2,
                interleave_cross: bool = False,
+               block_repeat: int = 1,
                rel_degrees: bool = False,
                rel_degrees2: bool = False,
                rel_gains: bool = False,
@@ -245,6 +246,12 @@ class DualPlane(nn.Module):
       if king_flight:
         self.kf_proj = nn.Linear(8 * (rel_channels + 13 + 1), dp, bias=False)
         nn.init.zeros_(self.kf_proj.weight)
+    # VEKTDELT DYBDE (boelge 1, 2026-08-28): hver blokk kjoeres block_repeat
+    # ganger med DELTE vekter — mer beregning uten nye frihetsgrader, svaret
+    # paa at raa kapasitetsvekst vasket ut gevinsten (57->26) mens P-LAG-
+    # stigen viste at dybde betaler. Blokkene er residuale, saa repetisjon
+    # er velformet.
+    self.block_repeat = max(1, int(block_repeat))
     self.blocks = nn.ModuleList([
         DualPlanePBlock(dp, heads, rel_channels, ffn_mult, norm_type,
                         softmin_heads=softmin_heads, rel_gains=rel_gains)
@@ -332,7 +339,8 @@ class DualPlane(nn.Module):
       return xp + self.x_out(torch.matmul(a, vx))
 
     for blk in self.blocks:
-      x = blk(x, rel_pair, pad_bias)
+      for _rep in range(self.block_repeat):
+        x = blk(x, rel_pair, pad_bias)
       if self.interleave_cross:
         x = _cross_read(x)
     if not self.interleave_cross:
