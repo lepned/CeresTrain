@@ -160,7 +160,6 @@ class DotProductAttention(torch.nn.Module):
                use_rpe : bool = False,
                use_rpe_v : bool = True,
                rpe_factor_shared  = None,
-               use_rel_bias: bool = False,
                use_nonlinear_attention: bool = False,
                use_rope : bool = False,
                test : bool = False,
@@ -188,7 +187,6 @@ class DotProductAttention(torch.nn.Module):
     self.use_smolgen = smolgenPrepLayer is not None    
     self.use_rpe = use_rpe
     self.use_rpe_v = use_rpe_v
-    self.use_rel_bias = use_rel_bias
     self.use_rope = use_rope
     self.use_nonlinear_attention = use_nonlinear_attention
     self.use_qk_norm = use_qk_norm
@@ -233,14 +231,23 @@ class DotProductAttention(torch.nn.Module):
     # stays single — produces two attention maps, subtracts with per-token
     # sigmoid(lambda) gate to cancel attention noise.
     self.use_diff_attention = use_diff_attention
+    if not use_qkv:
+      # Runde-3-guards (2026-08-29): V-only-modusen har Q=K=None — disse
+      # kombinasjonene dereferer dem paa foerste forward.
+      assert not use_qk_norm and not use_rope and vis_gate_channels == 0           and graph_route_channels == 0,           'use_qkv=False stoetter ikke qk-norm/rope/vis-gates/graph-route (Q/K er None)'
     if self.use_diff_attention:
       assert self.use_qkv, "DiffAttention requires use_qkv"
       assert not use_rope, ('DiffAttention + RoPE unsupported: V2/nonlinear crashes on the Q-tuple, and '
            'half-dim would silently split RoPE file/rank geometry across the two maps. (guard 2026-08-28)')
-      assert not use_rel_bias, ('DiffAttention + UseRelBias unsupported: rel_bias is never added in the diff '
-           'paths (params would exist untrained). (guard 2026-08-28)')
       assert not use_head_logit_temp, ('DiffAttention + UseHeadLogitTemp unsupported: temp is only applied in '
            'the standard path (param would be dead weight). (guard 2026-08-28)')
+      # Runde-3-guards (2026-08-29): LSE-aggregering og graph-route finnes kun i
+      # standardstien — kombinert med diff ville params staa utrente mens nettet
+      # stille trener som plain-head. Vis-gates krasjer paa Q-tupelen i V2/nonlinear.
+      assert softmin_heads == 0 and softmax_agg_heads == 0,           'DiffAttention + SoftMin/SoftMaxAgg heads unsupported: LSE-aggregeringen finnes ikke i diff-stiene'
+      assert graph_route_channels == 0,           'DiffAttention + UseGraphRouteHeads unsupported: blendingen finnes ikke i diff-stiene'
+      assert vis_gate_channels == 0,           'DiffAttention + vis edge gates unsupported (Q er tuple i V2/nonlinear-stiene)'
+      assert attention_multiplier == 1,           'DiffAttention + AttentionMultiplier > 1 unsupported: diff-stienes skalering bruker sqrt(d_k) (runde-4-guard)'
       assert not use_rpe,           ('DiffAttention + RPE unsupported: sdp_diff never receives Q_rpe/K_rpe, so RPE '
            'would be SILENTLY dropped while its parameters still exist (unused). Set '
            'UseRPE false for diff arms, or extend sdp_diff first. (guard 2026-08-26)')
@@ -478,9 +485,6 @@ class DotProductAttention(torch.nn.Module):
       if self.use_rpe_v:
         torch.nn.init.kaiming_uniform_(self.rpe_v, a=0.1)
 
-    if self.use_rel_bias:
-      self.rel_bias = torch.nn.Parameter(torch.zeros(self.num_heads, RPE_INNER_DIM * RPE_INNER_DIM))
-
     self.smolgen_per_square_dim = smolgen_per_square_dim
     self.smolgen_intermediate_dim = smolgen_intermediate_dim
 
@@ -545,13 +549,15 @@ class DotProductAttention(torch.nn.Module):
   def apply_qk_clip(self, tau):
     """Returns number of heads clipped this call (0 if none / not applicable)."""
     m = getattr(self, '_last_max_logit', None)
+    # Reset FOER early-returns (runde-3): ellers akkumulerer qk-norm/-qkv-moduler
+    # en hele-kjoeringen-max i stedet for per-vindu-max som kommentarene lover.
+    self._last_max_logit = None
     if m is None or not self.use_qkv:
       return 0
     if self.use_qk_norm:
       # qLN/kLN renormalize Q/K after projection, so weight scaling cannot
       # change the logits — QK-clip is structurally ineffective here.
       return 0
-    self._last_max_logit = None
     gamma = (tau / m.clamp(min=1e-6)).clamp(max=1.0)
     clipped = int((gamma < 0.9999).sum().item())
     if clipped == 0:
@@ -719,10 +725,9 @@ class DotProductAttention(torch.nn.Module):
       # consider using scaling below as (3 * self.d_k) due to extra terms
        
     if self.use_qkv:
-      scores = scores / math.sqrt(self.d_k)
-
-    if self.use_rel_bias:
-      scores = scores + torch.reshape(self.rel_bias @ self.rpe_factor, [-1, 64, 64])
+      # Runde-3-fiks: per-hode Q/K-dim er d_k*attention_multiplier — gammel
+      # sqrt(d_k) kjoerte logits sqrt(mult) varme for multiplier > 1.
+      scores = scores / math.sqrt(self.d_k * self.attention_multiplier)
 
     if not self.use_qkv:
       scores = smolgen / math.sqrt(self.d_k)

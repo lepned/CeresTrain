@@ -778,6 +778,11 @@ class TPGDataset(Dataset):
                   _pip[_pipv] = _MIRROR_PERM1858[_pip[_pipv]].astype(np.int16)
                   policy_index_in_parent[_sel] = _pip
                   if survival is not None:
+                    # Runde-3-fiks: frombuffer-batcher er read-only — in-place-
+                    # skrivet krasjet foerste speilede batch naar sidecar-K ==
+                    # horisont (vanligste tilfelle). Kopier ved behov.
+                    if not survival.flags.writeable:
+                      survival = survival.copy()
                     survival[_sel] = survival[_sel][:, _MIRROR_PERM64]
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
@@ -904,6 +909,15 @@ class TPGMixedDataset(Dataset):
     self.primary.set_worker_id(worker_id)
     if self.secondary is not None:
       self.secondary.set_worker_id(worker_id)
+      # Runde-3-fiks (burst-klumping): alle workers traff cycle_pos==ratio paa
+      # samme per-worker-indeks, og DataLoaderens round-robin la da alle W
+      # sekundaer-batchene paa W PAAFOELGENDE globale steg — med akkumulering
+      # >= W ble hele optimizer-steg 100 % sekundaer i stedet for 1-av-(ratio+1)-
+      # utvanning. Faseforskyv syklusen per worker saa de globale stegene
+      # spres jevnt. Deterministisk (kun worker_id-avhengig).
+      _nw = max(1, int(self.primary.num_workers or 1))  # bar tilgang med vilje: rename skal feile hoyt (burst-fiksen ville ellers stille doe)
+      self._cycle_phase = (int(worker_id) * (self.ratio + 1)) // _nw
+    
 
   def _tagged_secondary(self, idx):
     item = self.secondary[idx]
@@ -921,7 +935,7 @@ class TPGMixedDataset(Dataset):
       self.counter += 1
       return self._tagged_secondary(idx)
     # Cycle of length (ratio+1): positions 0..ratio-1 are primary; position ratio is secondary.
-    cycle_pos = (self.counter - self.prologue) % (self.ratio + 1)
+    cycle_pos = (self.counter - self.prologue + getattr(self, '_cycle_phase', 0)) % (self.ratio + 1)
     self.counter += 1
     if cycle_pos == self.ratio:
       return self._tagged_secondary(idx)

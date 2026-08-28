@@ -82,7 +82,10 @@ class MLP2Layer(torch.nn.Module):
         # Wrap with CERES_LORA_FFN_RANK_DIV (same gate as linear1/linear2) so
         # FFN-LoRA experiments adapt the gate too — without this, prior FFN
         # ablations only adapted one of the two FFN paths.
-        self.linear3 = _maybe_wrap_lora(torch.nn.Linear(model_dim, ffn_inner_dim, bias=False), self.layer_num)
+        # Runde-3-fiks 2026-08-29: linear3 leser samme post-global-concat-input
+        # som linear1 (jf. forward) — in-dim maa matche, ellers krasjer
+        # FFNUseGlobalEveryNLayers + SwiGLU paa foerste forward.
+        self.linear3 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=False), self.layer_num)
 
     self.activation_fn = to_activation(activation_type)
 

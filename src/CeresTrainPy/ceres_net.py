@@ -655,7 +655,7 @@ class CeresNet(nn.Module):
     else:
       self.smolgenPrepLayer = None
 
-    if config.NetDef_UseRPE or config.NetDef_UseRelBias:
+    if config.NetDef_UseRPE:
       self.rpe_factor_shared = torch.nn.Parameter(make_rpe_map(), requires_grad=False)
     else:
       self.rpe_factor_shared = None
@@ -772,6 +772,8 @@ class CeresNet(nn.Module):
                         'NetDef_DualPlaneBlockRepeat'}
       _dp_set = [k for k, v in vars(config).items()
                  if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
+      _dp_set += [k for k in ('NetDef_MoveEdgeDecode', 'NetDef_MoveDegreeDecode')
+                  if bool(getattr(config, k, False))]   # runde-3: konsumeres kun i plane-grenen
       if _dp_set:
         raise ValueError(f'DualPlane sub-flags set without UseDualPlane: true — silent no-op refused: {_dp_set}')
     # Loud rejection OUTSIDE the dual-plane branch (action review finding 5):
@@ -993,12 +995,13 @@ class CeresNet(nn.Module):
       if self.dp_check_chain:
         if not self.dp_policy_decode:
           raise ValueError('DualPlaneCheckChain extends DualPlanePolicyDecode (enable it)')
-        # E-kilden er privat (dp_vis_module) ELLER delt (vis_channels_module,
-        # UseVisEdgeBias-chassiset) — sla opp kanal-layout fra den som finnes
-        # (review 2026-08-25b finding 1: AttributeError paa delt chassis).
-        _vismod = getattr(self, 'dp_vis_module', None) or getattr(self, 'vis_channels_module', None)
-        _fs = getattr(_vismod, 'family_slices', None) if _vismod is not None else None
-        if _fs is None or 'check' not in _fs or 'flight' not in _fs:
+        # Runde-3-fiks 2026-08-29 (init-rekkefoelge-bug): vis_channels_module
+        # lages FOERST SENERE i __init__, saa delt-chassis-oppslaget (2026-08-25b
+        # finding 1) virket aldri — utled layouten direkte fra den kanoniske
+        # familie-parsen i stedet (samme konstruksjon som chess_geometry:
+        # 4 kanaler per familie i _dp_fams-rekkefoelge).
+        _fs = {f: slice(4 * i, 4 * i + 4) for i, f in enumerate(_dp_fams)}
+        if 'check' not in _fs or 'flight' not in _fs:
           raise ValueError('DualPlaneCheckChain requires check+flight in VisEdgeFamilies')
         self.dp_ch_check = _fs['check'].start      # [stm_out, ...] -> stm_out forst
         self.dp_ch_flight = _fs['flight'].start
@@ -1141,10 +1144,8 @@ class CeresNet(nn.Module):
                       use_rpe=config.NetDef_UseRPE, 
                       use_rpe_v=config.NetDef_UseRPE_V,
                       rpe_factor_shared=self.rpe_factor_shared,
-                      use_rel_bias=config.NetDef_UseRelBias,
                       use_rope=config.NetDef_UseRoPE,
                       use_nonlinear_attention=config.NetDef_NonLinearAttention,
-                      dual_attention_mode = config.NetDef_DualAttentionMode if not config.Exec_TestFlag else (config.NetDef_DualAttentionMode if i % 2 == 1 else 'None'),
                       test = config.Exec_TestFlag,
                       use_diff_attention = config.NetDef_UseDiffAttention,
                       tsb_enabled = getattr(config, 'NetDef_TSB_Enabled', False),
@@ -1897,8 +1898,8 @@ class CeresNet(nn.Module):
       # Move-degree decode (see __init__): square-level degree scores gathered
       # per move at the destination (in-degree) and origin (out-degree).
       if getattr(self, 'move_degree_decode', False) and _dp_E_dec is not None:
-        _indeg = _dp_E_dec.float().sum(dim=1)                    # [B, 64, C]  edges INTO j
-        _outdeg = _dp_E_dec.float().sum(dim=2)                   # [B, 64, C]  edges FROM i
+        _indeg = _dp_E_dec.sum(dim=1).float()  # sum i kilde-dtype, cast det LILLE resultatet (kf-v1-regelen)                    # [B, 64, C]  edges INTO j
+        _outdeg = _dp_E_dec.sum(dim=2).float()                   # [B, 64, C]  edges FROM i (kf-v1-regelen, runde-4: ogsaa denne)
         _dp_deg_cache = (_indeg, _outdeg)
         _s_in = self.dpd_in(_indeg).squeeze(-1)                  # [B, 64]
         _s_out = self.dpd_out(_outdeg).squeeze(-1)               # [B, 64]
@@ -2063,7 +2064,7 @@ class CeresNet(nn.Module):
       if _dp_deg_cache is not None:                                # gjenbruk dpd-summene (finding 9)
         _ind4, _outd4 = _dp_deg_cache
       else:
-        _ind4 = _dp_E_dec.float().sum(dim=1)
+        _ind4 = _dp_E_dec.sum(dim=1).float()  # kf-v1-regelen: ikke materialiser [B,64,64,C] i fp32
         _outd4 = _dp_E_dec.float().sum(dim=2)
       _Ce4 = _dp_E_dec.shape[-1]
       _into4 = torch.gather(_ind4, 1, _ct4.unsqueeze(-1).expand(-1, -1, _Ce4))
@@ -2127,12 +2128,23 @@ class CeresNet(nn.Module):
       if self._gradnorm_log_count % self._gradnorm_log_every == 0:
         LOG_PER_LOSS_GRADIENT_NORMS = True
     if LOG_PER_LOSS_GRADIENT_NORMS and log_stats:
+      # Runde-3-fiks 2026-08-29: proben zero_grad()-er per hode — midt i et
+      # akkumuleringsvindu visket den ut mikro-batch 1..k-1 og ga et stille
+      # skjevt optimizer-steg paa hvert probet intervall. Snapshot/restore av
+      # akkumulerte gradienter goer proben eksakt ikke-destruktiv (probe-modusen
+      # er uansett dokumentert som kort maalemodus paa singel GPU).
+      _acc_grads = {n: p.grad.detach().clone() for n, p in self.named_parameters()
+                    if p.grad is not None}
       self.compute_loss_or_gradnorm(loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
                                     value2_out, q_deviation_lower_out, q_deviation_upper_out, uncertainty_policy_out,
                                     prior_value_out, prior_value2_out,
                                     action_target, action_out, action_uncertainty_out,
                                     multiplier_action_loss,
                                     num_pos, last_lr, log_stats, gradient_norm_logging_mode = True)
+      if _acc_grads:
+        for _n, _p in self.named_parameters():
+          if _n in _acc_grads:
+            _p.grad = _acc_grads[_n]
        
     return self.compute_loss_or_gradnorm (loss_calc, batch, policy_out, value_out, moves_left_out, unc_out,
                                           value2_out, q_deviation_lower_out, q_deviation_upper_out, uncertainty_policy_out,
@@ -2226,6 +2238,9 @@ class CeresNet(nn.Module):
     # wrongly stay a draw); defender-side records in the line -> every move
     # still loses (a flip would wrongly label them WINS). Non-solution moves
     # are the heuristic side of the label, so they get 1/4 weight.
+    # NB (runde-3, dokumentert avvik): vc-CE trekker IKKE fra target-entropien
+    # slik naboene gjoer — logget verdi flyter derfor med korpusets remisrate.
+    # Gradienten er upaavirket; les vc kun innen samme korpus.
     vc_loss = 0
     _vc = getattr(self, '_last_vc_out', None)
     if _vc is not None and not gradient_norm_logging_mode:
@@ -2352,8 +2367,13 @@ class CeresNet(nn.Module):
         # policy loss) and destabilized the s7 preflight at peak LR.
         opt_loss = (_op_w * _op_ce).mean()
 
-    v2_loss = 0 if value2_out is None else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
-    ml_loss = 0 if moves_left_out is None else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
+    # Runde-3-fiks 2026-08-29: gate paa VEKT i tillegg til None — forward
+    # substituerer dummy-aliaser (value2->value1, mlh/qdev/unc_policy->unc)
+    # for eksport-signaturen, saa None-gating alene scoret aliasene som ekte
+    # tap: plausible-men-falske TB-kurver, korrupte GRADNORM-attribusjoner
+    # (full ekstra backward per alias) og bortkastet compute per steg.
+    v2_loss = 0 if value2_out is None or value2_out is value_out else loss_calc.value2_loss(wdl_blend, value2_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value2_loss_weight, provenance=z_provenance)
+    ml_loss = 0 if moves_left_out is None or moves_left_out is unc_out else loss_calc.moves_left_loss(moves_left_target, moves_left_out, gradient_norm_logging_mode, self.moves_left_loss_weight)
     # UNC SELF-ERROR mode (config UncSelfError; see config.py): train unc toward
     # the STUDENT's own realized squared value error (lc0 ValueErrorLoss
     # semantics) instead of the teacher-time |DeltaQVersusV| data field.
@@ -2364,8 +2384,8 @@ class CeresNet(nn.Module):
         _ue_qt = (value_target[:, 0] - value_target[:, 2]).float()
         unc_target = ((_ue_qp - _ue_qt) ** 2).unsqueeze(-1)
     u_loss = 0 if unc_out is None else loss_calc.unc_loss(unc_target, unc_out, gradient_norm_logging_mode, self.unc_loss_weight)
-    q_deviation_lower_loss = 0 if q_deviation_lower_out is None else loss_calc.q_deviation_lower_loss(q_deviation_lower_target, q_deviation_lower_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
-    q_deviation_upper_loss = 0 if q_deviation_upper_out is None else loss_calc.q_deviation_upper_loss(q_deviation_upper_target, q_deviation_upper_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
+    q_deviation_lower_loss = 0 if q_deviation_lower_out is None or q_deviation_lower_out is unc_out else loss_calc.q_deviation_lower_loss(q_deviation_lower_target, q_deviation_lower_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
+    q_deviation_upper_loss = 0 if q_deviation_upper_out is None or q_deviation_upper_out is unc_out else loss_calc.q_deviation_upper_loss(q_deviation_upper_target, q_deviation_upper_out, gradient_norm_logging_mode, self.q_deviation_loss_weight)
 
 
     if self.config.NetDef_TrainOn4BoardSequences:
@@ -2389,7 +2409,7 @@ class CeresNet(nn.Module):
       value_diff_loss = 0
       value2_diff_loss = 0
 
-    uncertainty_policy_loss = 0 if uncertainty_policy_out is None else loss_calc.uncertainty_policy_loss(uncertainty_policy_target, uncertainty_policy_out, gradient_norm_logging_mode, self.uncertainty_policy_weight)
+    uncertainty_policy_loss = 0 if uncertainty_policy_out is None or uncertainty_policy_out is unc_out else loss_calc.uncertainty_policy_loss(uncertainty_policy_target, uncertainty_policy_out, gradient_norm_logging_mode, self.uncertainty_policy_weight)
 
     # Placement value head (aux): same CE-minus-entropy as value_loss, against the same
     # value_target, via LossCalculator (comparable magnitude + LAST_* interval averaging
@@ -2517,10 +2537,11 @@ class CeresNet(nn.Module):
     # class-0 squares masked. Same consume-and-clear + sidecar-less-batch
     # zero-read pattern as the square survival head above.
     dp_surv_loss = 0
+    _dp_surv_participation_only = False
     _dps = getattr(self, '_last_dp_surv', None)
+    if _dps is not None and not gradient_norm_logging_mode:
+      self._last_dp_surv = None   # runde-4: clear UBETINGET (vekt-0-batcher lot graf-stashen ligge)
     if getattr(self, 'dp_surv_weight', 0) > 0 and _dps is not None and value_out is not None:
-      if not gradient_norm_logging_mode:
-        self._last_dp_surv = None
       _dps_out, _dps_sel, _dps_occ = _dps
       _dps_tgt_sq = batch.get('survival', None)
       if _dps_tgt_sq is not None:
@@ -2537,8 +2558,10 @@ class CeresNet(nn.Module):
               _dps_out[_m].float(), _tgt_p[_m])
         else:
           dp_surv_loss = 0.0 * _dps_out.float().sum()
+          _dp_surv_participation_only = True
       else:
         dp_surv_loss = 0.0 * _dps_out.float().sum()
+        _dp_surv_participation_only = True
 
     # Short-term value aux head: CE against the WDL built from censored q_st/d_st
     # (V7-extras sidecar; STM-relative, matching TPG conventions), optionally weighted
@@ -2712,14 +2735,22 @@ class CeresNet(nn.Module):
           for _mk, _mv in loss_calc.value_metrics(value_target, value_out).items():
             self._log(_mk + stat_suffix, _mv, step=num_pos)
 
-      self._log("policy_loss" + stat_suffix, p_loss,  step=num_pos)
+      # Runde-3/4: i VANLIG modus logges den rene CE-en (losses stasher den —
+      # returverdien kan baere sibling-margin/only-move-reweighting); i
+      # gnorm-modus ER p_loss selve gradientnormen og skal logges som foer.
+      # Bar attributt-tilgang med vilje: rename skal feile hoyt, ikke stille
+      # falle tilbake til den kontaminerte verdien.
+      self._log("policy_loss" + stat_suffix,
+                p_loss if gradient_norm_logging_mode else loss_calc._last_policy_log_loss,
+                step=num_pos)
       self._log("value_loss" + stat_suffix, v_loss,  step=num_pos)
-      self._log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
+      if not isinstance(v2_loss, int):
+        self._log("value2_loss" + stat_suffix, v2_loss,  step=num_pos)
       if self.placement_value_weight > 0 and not isinstance(placement_loss, int):
         self._log("placement_value_loss" + stat_suffix, placement_loss, step=num_pos)
       if self.survival_target_weight > 0 and not isinstance(survival_loss, int)           and not _survival_participation_only:
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
-      if getattr(self, 'dp_surv_weight', 0) > 0 and not isinstance(dp_surv_loss, int):
+      if getattr(self, 'dp_surv_weight', 0) > 0 and not isinstance(dp_surv_loss, int)           and not _dp_surv_participation_only:
         self._log("dp_survival_loss" + stat_suffix, dp_surv_loss, step=num_pos)
       if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int)           and not _stvalue_participation_only:
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
@@ -2785,11 +2816,17 @@ class CeresNet(nn.Module):
             self._log(f"pda_alpha_d{_d:02d}", _pa_mean[_d], step=num_pos)
           self._log("pda_alpha_entropy", -(_pa * (_pa + 1e-9).log()).sum(dim=1).mean(), step=num_pos)
           self._log("pda_alpha_mean_depth", (_pa * torch.arange(_pa.shape[1], device=_pa.device, dtype=_pa.dtype)).sum(dim=1).mean(), step=num_pos)
-      self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
-      self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
-      self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
-      self._log("q_deviation_lower_loss" + stat_suffix, q_deviation_lower_loss, step=num_pos)
-      self._log("q_deviation_upper_loss" + stat_suffix, q_deviation_upper_loss, step=num_pos)
+      # Runde-3: avslaatte hoder (int 0) logges ikke — ingen null/garbage-kurver.
+      if not isinstance(ml_loss, int):
+        self._log("moves_left_loss" + stat_suffix, ml_loss, step=num_pos)
+      if not isinstance(u_loss, int):
+        self._log("unc_loss" + stat_suffix, u_loss, step=num_pos)
+      if not isinstance(uncertainty_policy_loss, int):
+        self._log("unc_policy_loss" + stat_suffix, uncertainty_policy_loss, step=num_pos)
+      if not isinstance(q_deviation_lower_loss, int):
+        self._log("q_deviation_lower_loss" + stat_suffix, q_deviation_lower_loss, step=num_pos)
+      if not isinstance(q_deviation_upper_loss, int):
+        self._log("q_deviation_upper_loss" + stat_suffix, q_deviation_upper_loss, step=num_pos)
       self._log("value_diff_loss" + stat_suffix, value_diff_loss, step=num_pos)
       self._log("value2_diff_loss" + stat_suffix, value2_diff_loss, step=num_pos)
       self._log("action_loss" + stat_suffix, action_loss, step=num_pos)

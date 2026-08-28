@@ -124,15 +124,20 @@ def bootstrap_env_from_config(outputs_dir, training_id, quiet=False, configs_dir
     settings is worse than stopping.
     """
     applied = {}
+    _dir = configs_dir if configs_dir is not None else os.path.join(outputs_dir, 'configs')
+    path = os.path.join(_dir, str(training_id) + '_ceres_opt.json')
+    if not os.path.isfile(path):
+        if not quiet:
+            print(f'[bootstrap] no opt-config at {path}; env-only run')
+        return applied
     try:
-        _dir = configs_dir if configs_dir is not None else os.path.join(outputs_dir, 'configs')
-        path = os.path.join(_dir, str(training_id) + '_ceres_opt.json')
-        if not os.path.isfile(path):
-            if not quiet:
-                print(f'[bootstrap] no opt-config at {path}; env-only run')
-            return applied
         with open(path, encoding='utf-8') as f:
             cfg = json.load(f)
+    except OSError as e:
+        # Transient IO paa en fil som FINNES er verdt aa stoppe for — stille
+        # droppede settings er verre enn stopp (modulens eget prinsipp).
+        raise SystemExit(f'[bootstrap] ERROR: could not read {path}: {e}')
+    if True:  # runde-4: resten av broen har INGEN except — bugs skal propagere hoyt
         # Collect EVERYTHING first, apply atomically afterwards — a malformed
         # "Env" section must not leave a half-bridged environment behind.
         pending = {}
@@ -163,8 +168,4 @@ def bootstrap_env_from_config(outputs_dir, training_id, quiet=False, configs_dir
             if not quiet:
                 print(f'[bootstrap] {k}={v} (from config)')
         applied = pending
-    except SystemExit:
-        raise
-    except Exception as e:  # never let the bootstrap kill a legacy env-driven run
-        print(f'[bootstrap] WARNING: config->env bridge failed ({e}); using env as-is')
     return applied

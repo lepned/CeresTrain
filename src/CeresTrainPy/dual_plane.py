@@ -105,6 +105,7 @@ class DualPlanePBlock(nn.Module):
       self.gain_mlp = nn.Linear(dp, heads * rel_channels, bias=False)
       nn.init.zeros_(self.gain_mlp.weight)
     if softmin_heads > 0:
+      assert softmin_heads <= heads,           f'DualPlaneSoftMinHeads ({softmin_heads}) > heads ({heads}) — tau-broadcast kolliderer (runde-3-vern)'
       self.softmin_log_tau = nn.Parameter(torch.zeros(softmin_heads))
     self.ln2 = make_norm(norm_type, dp)
     self.ffn1 = nn.Linear(dp, ffn_mult * dp, bias=False)
@@ -272,8 +273,13 @@ class DualPlane(nn.Module):
     B = squares13.shape[0]
     occ = 1.0 - squares13[:, :, 0]                       # [B, 64]
     # Deterministic slot selection: occupancy + tiny positional tie-break.
-    tie = torch.arange(64, device=squares13.device, dtype=occ.dtype) * 1e-4
-    sel = torch.topk(occ + tie, k=32, dim=1).indices     # [B, 32]
+    # Runde-3/4: tie-break i fp32 OG med steg > fp16-ulp (9.8e-4 ved 1.0) —
+    # fp16-eksporten regner Add-en i fp16 (Add er ikke paa blokklisten), saa
+    # 1e-4 kollapset der. 2e-3-steget (maks 64*2e-3=0.128 << 1.0-gapet mot
+    # tomme felter) overlever begge presisjoner; settet var alltid riktig,
+    # dette gjelder slot-ORDEN/bit-paritet eager-vs-ORT/TRT.
+    tie = torch.arange(64, device=squares13.device, dtype=torch.float32) * 2e-3
+    sel = torch.topk(occ.float() + tie, k=32, dim=1).indices     # [B, 32]
     slot_occ = torch.gather(occ, 1, sel)                 # [B, 32] 1=piece, 0=empty
     feats = torch.cat([squares13,
                        self.filerank.to(squares13.dtype).unsqueeze(0).expand(B, 64, 16)],

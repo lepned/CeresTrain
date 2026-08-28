@@ -40,10 +40,9 @@ class EncoderLayer(torch.nn.Module):
                 use_rpe : bool = False, 
                 use_rpe_v : bool = True,
                 rpe_factor_shared  = None,
-                use_rel_bias: bool = False,
                 use_nonlinear_attention: bool = False,
                 use_rope: bool = False,
-                dual_attention_mode : str = 'None', test : bool = False,
+                test : bool = False,
                 use_diff_attention : bool = False,
                 tsb_enabled : bool = False, tsb_ffn_multiplier : int = 1,
                 tsb_gate_bias_init : float = -4.0, tsb_gate_mlp_hidden_divisor : int = 8,
@@ -70,7 +69,6 @@ class EncoderLayer(torch.nn.Module):
     self.use_qkv = use_qkv
     self.attention_multiplier = attention_multiplier
     self.dropout_rate = dropout_rate
-    self.dual_attention_mode = dual_attention_mode
     self.ffn_hidden_size = ffn_hidden_size
     
     self.ln1 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
@@ -78,7 +76,7 @@ class EncoderLayer(torch.nn.Module):
                                          use_qkv,softcap_cutoff, use_qk_norm, attention_multiplier,
                                          smolgen_per_square_dim, smolgen_intermediate_dim, smolgen_head_divisor, smolgenPrepLayer, smolgen_activation_type,
                                          smolgen_delta_rank,
-                                         use_rpe, use_rpe_v, rpe_factor_shared, use_rel_bias, use_nonlinear_attention, use_rope, test, layer_num=layerNum,
+                                         use_rpe, use_rpe_v, rpe_factor_shared, use_nonlinear_attention, use_rope, test, layer_num=layerNum,
                                          use_diff_attention=use_diff_attention,
                                          vis_gate_channels=vis_gate_channels, vis_gate_mode=vis_gate_mode,
                                          graph_route_channels=graph_route_channels,
@@ -87,15 +85,6 @@ class EncoderLayer(torch.nn.Module):
                                          use_head_logit_temp=use_head_logit_temp)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
-
-    if self.dual_attention_mode in ('DualAttentionAndFFN', 'DualAttentionOnly'):
-      NUM_ATTENTION2_HEADS = 8 
-      self.attention2 = DotProductAttention(hidden_size, hidden_size, NUM_ATTENTION2_HEADS, num_tokens_q//NUM_ATTENTION2_HEADS, norm_type, layernorm_eps,
-                                           1, 0, 0, 0, None, smolgen_activation_type, False, None, None, None, None, test, layer_num=layerNum)
-      self.ln3 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
-      if self.dual_attention_mode == 'DualAttentionAndFFN':
-        self.mlp2 = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum) 
-        self.ln4 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
     if self.dropout_rate > 0:
       self.dropout_attn = torch.nn.Dropout(self.dropout_rate)
@@ -124,6 +113,9 @@ class EncoderLayer(torch.nn.Module):
     # Per-block parallel SwiGLU FFN (smaller than the SP FFN by tsb_ffn_multiplier)
     # plus a per-block scalar gate. Output is sp_ffn + g * tactical_ffn.
     # Initialized to zero output so forward is bit-identical to non-TSB at step 0.
+    # Runde-3-guard: TSB krever SwiGLU — stille ignorering gjorde at en
+    # «TSB-arm» kunne trene uten TSB uten varsel.
+    assert not (bool(tsb_enabled) and (ffn_activation_type != 'SwiGLU' or ffn_hidden_size <= 0)),         'TSBConfig.Enabled krever FFNActivationType SwiGLU og ffn_hidden_size > 0 (var: %s / %s)' % (ffn_activation_type, ffn_hidden_size)
     self.tsb_enabled = bool(tsb_enabled) and ffn_activation_type == 'SwiGLU' and ffn_hidden_size > 0
     if self.tsb_enabled:
       tsb_ffn_inner = hidden_size * int(tsb_ffn_multiplier)
@@ -199,23 +191,6 @@ class EncoderLayer(torch.nn.Module):
           out2 = self.ln2(out1 * self.alpha + mlp_output)
     else:
       out2 = out1
-
-    if self.dual_attention_mode != 'None':
-      if self.pre_norm:
-        attn3_input = self.ln3(out2).permute(0, 2, 1)
-        attn_output3 = self.attention2(attn3_input, attn3_input, attn3_input, out2.permute(0, 2, 1)).permute(0, 2, 1)
-        out3 = out2 * self.alpha + attn_output3
-        if self.dual_attention_mode == 'DualAttentionAndFFN':
-          (_, mlp_output2) = self.mlp2(self.ln4(out3))
-          out3 = out3 * self.alpha + mlp_output2
-      else:
-        out3_tr = out2.permute(0, 2, 1)
-        attn_output3 = self.attention2(out3_tr, out3_tr, out3_tr, out3_tr).permute(0, 2, 1)
-        out3 = self.ln3(out2 * self.alpha + attn_output3)
-        if self.dual_attention_mode == 'DualAttentionAndFFN':
-          (_, mlp_output2) = self.mlp2(out3)
-          out3 = self.ln4(out3 * self.alpha + mlp_output2)
-      out2 = out3
 
     return out2
 

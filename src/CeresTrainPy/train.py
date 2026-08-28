@@ -224,6 +224,13 @@ MAX_POSITIONS = config.Opt_NumTrainingPositions
 
 if config.NetDef_TrainOn4BoardSequences:
   BOARDS_PER_BATCH = 4
+  # Runde-3-vern (2026-08-29, data-agent funn 2+3): draw-filteret dropper
+  # enkeltrader og speilingen speiler dem uavhengig — begge bryter 4-board-
+  # kjedens 'index % 4'-antagelse og gir STILLE feil supervisjon (barn som
+  # ikke hoerer til forelderen / speilvendt action-slot).
+  assert float(os.environ.get('CERES_KEEP_DRAW_PROB', '1') or 1) >= 1.0,       '4-board-modus er inkompatibel med CERES_KEEP_DRAW_PROB < 1 (record-kjeden forskyves)'
+  for _mev in ('CERES_FILE_MIRROR_AUG', 'CERES_FILE_MIRROR_AUG_PRIMARY', 'CERES_FILE_MIRROR_AUG_SECONDARY'):
+    assert float(os.environ.get(_mev, '0') or 0) == 0.0,         f'4-board-modus er inkompatibel med {_mev} (per-record-speiling bryter kjedekoherensen)'
 else:
   BOARDS_PER_BATCH = 1  
 
@@ -718,7 +725,9 @@ def Train():
                     'mlh_head.', 'qdev_upper.', 'qdev_lower.', 'headPremap.',
                     'headSharedLinear.', 'unc_policy.')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
-                        'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.')
+                        'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
+                        # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
+                        'dpv_a.', 'dpv_b.', 'dpe_w.', 'dpd_in.', 'dpd_out.')
     _heads_ratio = getattr(config, 'Opt_LearningRateHeadsRatio', None)
     _coup_ratio = getattr(config, 'Opt_LearningRateCouplingsRatio', None)
     assert not (_heads_ratio is not None and _heads_lr is not None), \
@@ -808,7 +817,8 @@ def Train():
     # After warmup phase, the LR is held constant until some fraction of training is complete
     # and thereafter ramps down using a truncated consine decay, terminating around 0.10
     FRAC_START_DECAY = config.Opt_LRBeginDecayAtFractionComplete
-    MIN_LR = float(getattr(config, 'Opt_LRMinFactor', 0.05) or 0.05)
+    _mlr = getattr(config, 'Opt_LRMinFactor', None)
+    MIN_LR = 0.05 if _mlr is None else float(_mlr)  # runde-4: 'or' slukte eksplisitt 0 (full anneal til null)
     WARMUP_POS = num_warmup_positions()
 
     if num_pos < WARMUP_POS:
@@ -1007,6 +1017,10 @@ def Train():
                                    BOARDS_PER_BATCH, 0, config.Exec_TestFlag,
                                    square_bytes=_sec_square_bytes,
                                    sidecar_mode=_sec_sidecar_mode,
+                                   # Runde-3: samme demotering for v7x som for survival —
+                                   # 'required' er en paastand om PRIMAEREN; en sidecar-loes
+                                   # puzzle-sekundaer skal ikke drepe kjoeringen.
+                                   v7x_mode='auto' if os.environ.get('CERES_TPG_V7X_SIDECAR', '0') in ('1', 'required') else None,
                                    file_mirror_prob=_MIRROR_SECONDARY)
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
@@ -1049,11 +1063,23 @@ def Train():
   if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'soft_policy_weight', 0) or 0) > 0:
     SECONDARY_WEIGHT_OVERRIDES['soft_policy_weight'] = SECONDARY_POLICY_MULT * float(core.soft_policy_weight)
   if SECONDARY_VALUE2_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['value2_loss_weight']  = SECONDARY_VALUE2_MULT
+  # Runde-3 (2026-08-29): value_rank er value-familie, policy_margin/refiner-
+  # deep-sup er policy-familie, dp_surv foelger survival-multen — alle lakk
+  # forbi rutingen (samme klasse som hlg/opt/sp-tettingene over).
+  if SECONDARY_VALUE_MULT is not None and float(getattr(core, 'value_rank_weight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['value_rank_weight'] = SECONDARY_VALUE_MULT * float(core.value_rank_weight)
+  if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'policy_margin_weight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['policy_margin_weight'] = SECONDARY_POLICY_MULT * float(core.policy_margin_weight)
+  if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'refiner_deep_sup_weight', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['refiner_deep_sup_weight'] = SECONDARY_POLICY_MULT * float(core.refiner_deep_sup_weight)
   if SECONDARY_AUX_MULT is not None:
     for _aux_attr in ('unc_loss_weight', 'q_deviation_loss_weight', 'uncertainty_policy_weight', 'moves_left_loss_weight'):
       SECONDARY_WEIGHT_OVERRIDES[_aux_attr] = SECONDARY_AUX_MULT
   if SECONDARY_PLACEMENT_MULT is not None: SECONDARY_WEIGHT_OVERRIDES['placement_value_weight'] = SECONDARY_PLACEMENT_MULT
-  if SECONDARY_SURVIVAL_MULT  is not None: SECONDARY_WEIGHT_OVERRIDES['survival_target_weight'] = SECONDARY_SURVIVAL_MULT
+  if SECONDARY_SURVIVAL_MULT  is not None:
+    SECONDARY_WEIGHT_OVERRIDES['survival_target_weight'] = SECONDARY_SURVIVAL_MULT
+    if float(getattr(core, 'dp_surv_weight', 0) or 0) > 0:
+      SECONDARY_WEIGHT_OVERRIDES['dp_surv_weight'] = SECONDARY_SURVIVAL_MULT * float(core.dp_surv_weight)
   if SECONDARY_STVALUE_MULT   is not None: SECONDARY_WEIGHT_OVERRIDES['stvalue_weight'] = SECONDARY_STVALUE_MULT
 
   if SECONDARY_WEIGHT_OVERRIDES:
@@ -1079,8 +1105,11 @@ def Train():
   # replacement if few eligible) so torch.compile sees one extra static shape.
   # BOARDS_PER_BATCH==1 path only. Adds no parameters; export graph unchanged.
   # Config-first, env-fallback (see config.py note).
-  MIRROR_CONS_WEIGHT = (float(getattr(config, 'Opt_MirrorConsWeight', 0) or 0)
-                        or float(os.environ.get('CERES_VALUE_MIRROR_CONS_WEIGHT', '0') or 0))
+  # Runde-4: eksplisitt config-0 SKAL vinne over en eksportert env-var
+  # (kontrollarm-fellen); kun fravaerende/None config faller til env.
+  _mcw_cfg = getattr(config, 'Opt_MirrorConsWeight', None)
+  MIRROR_CONS_WEIGHT = (float(_mcw_cfg) if _mcw_cfg is not None
+                        else float(os.environ.get('CERES_VALUE_MIRROR_CONS_WEIGHT', '0') or 0))
   MIRROR_CONS_FRAC = (float(getattr(config, 'Opt_MirrorConsFraction', 0) or 0)
                       or float(os.environ.get('CERES_VALUE_MIRROR_CONS_FRAC', '0.25') or 0.25))
   _cfg_focal = float(getattr(config, 'Opt_ValueFocalGamma', 0) or 0)
@@ -1097,8 +1126,12 @@ def Train():
   # Hysteresis controller state (see config.py): mode starts ACTIVE; smoothed
   # level tracks the term with momentum 0.98 (~50-batch horizon).
   MIRROR_PROBE_STEPS = int(getattr(config, 'Opt_MirrorConsProbeSteps', 0) or 0)
-  MIRROR_AUTO_LOW = float(getattr(config, 'Opt_MirrorConsAutoLow', 0.003))
-  MIRROR_AUTO_HIGH = float(getattr(config, 'Opt_MirrorConsAutoHigh', 0.008))
+  MIRROR_AUTO_LOW = float(getattr(config, 'Opt_MirrorConsAutoLow', 0.0015))   # runde-4: fallback = config-default
+  MIRROR_AUTO_HIGH = float(getattr(config, 'Opt_MirrorConsAutoHigh', 0.003))
+  # Runde-4-validering: reaktivering blender nivaaet til ~HIGH/2 — med
+  # LOW >= HIGH/2 re-latcher kontrolleren dormant etter EN batch (evig
+  # 1-paa/N-av-oscillasjon); LOW >= HIGH flapper permanent.
+  assert MIRROR_AUTO_LOW < MIRROR_AUTO_HIGH / 2,       f'MirrorConsAutoLow ({MIRROR_AUTO_LOW}) maa vaere < AutoHigh/2 ({MIRROR_AUTO_HIGH/2}) — hysterese-latch-fellen'
   _mirror_active = True
   _mirror_level = None
   _mirror_step = 0
@@ -1296,7 +1329,13 @@ def Train():
   # running average. Deliberately NOT persisted across resume: re-initialized
   # from the live weights at boot (n=0) and re-warmed within ~EMAMaxN periods.
   EMA_PERIOD = int(getattr(config, 'Opt_EMAPeriodSteps', 0) or 0)
-  EMA_MAX_N = int(getattr(config, 'Opt_EMAMaxN', 10) or 10)
+  _ema_maxn_cfg = getattr(config, 'Opt_EMAMaxN', None)
+  EMA_MAX_N = 10 if _ema_maxn_cfg is None else int(_ema_maxn_cfg)  # runde-3: 'or 10' slukte eksplisitt 0
+  if EMA_MAX_N <= 0 and EMA_PERIOD != 0:
+    # Runde-4: MaxN 0 ga en skygge som oppdaterte men ALDRI eksporterte
+    # (_ema_n forble 0) — tolk som eksplisitt AV, hoylytt.
+    print('[train] EMA disabled: EMAMaxN <= 0 (shadow would never export)', flush=True)
+    EMA_PERIOD = 0
   if EMA_PERIOD < 0:
     # AUTO-modus (2026-08-28, user-doktrine): EMA-vinduet = CHECKPOINT-CADENCEN.
     # Et absolutt steg-tall skalerer ikke med horisonten (100/10 = 4,5M pos =
@@ -1305,7 +1344,9 @@ def Train():
     # CheckpointFrequencyNumPositions => ema-eksporten ved ckpt N er snittet av
     # aeraen siden N-1, og lengre vinduer kan rekonstrueres offline ved aa
     # snitte ema-eksporter. Aktiveres med "EMAPeriodSteps": -1.
-    _ckpt_freq = int(getattr(config, 'Opt_CheckpointFrequencyNumPositions', 200_000_000))
+    _ckpt_freq = int(getattr(config, 'Opt_CheckpointFrequencyNumPositions', 200_000_000) or 0)
+    assert _ckpt_freq > 0, ('EMAPeriodSteps: -1 (auto = ckpt-cadence) krever '
+                            'CheckpointFrequencyNumPositions > 0 (runde-3-vern)')
     EMA_PERIOD = max(1, round(_ckpt_freq / ((EMA_MAX_N + 1) * config.Opt_BatchSizeBackwardPass)))
     if IS_MASTER:
       print(f'[train] EMA AUTO: window = checkpoint cadence ({_ckpt_freq:,} pos) '
@@ -1529,8 +1570,6 @@ def Train():
     print_model_trainable_details(model)
 
 
-  NUM_POS_TO_SKIP = 0
-  
   COMPUTE_FLOPS = False # WARNING: This is disabled because it causes dramatically higher VRAM usage on GPU 0, use only to generate stats.
   FLOPS_CALCULATED = False
   
@@ -1757,6 +1796,22 @@ def Train():
     groups_match = (len(current_param_groups) == len(loaded_param_groups)
                     and all(len(cg["params"]) == len(lg["params"])
                             for cg, lg in zip(current_param_groups, loaded_param_groups)))
+    if groups_match:
+      # Runde-4-vern: load_state_dict mapper per-param-state POSISJONELT.
+      # Antall alene fanger ikke en count-bevarende omorganisering — sjekk at
+      # formene stemmer posisjon for posisjon; mismatch = hard feil i stedet
+      # for stille re-noekling av momentene til feil params. (Reorder blant
+      # like-formede params forblir udetekterbar — dokumentert restrisiko.)
+      _cur_params = [p for g in current_param_groups for p in g['params']]
+      _st = loaded_optimizer_state.get('state', {})
+      for _idx, _pp in enumerate(_cur_params):
+        _ps = _st.get(_idx)
+        if _ps is None: continue
+        for _k, _v in _ps.items():
+          if torch.is_tensor(_v) and _v.dim() > 0 and tuple(_v.shape) != tuple(_pp.shape):
+            raise ValueError(
+                f'Optimizer-resume: state[{_idx}][{_k}] shape {tuple(_v.shape)} != param shape '
+                f'{tuple(_pp.shape)} — count-preserving reorder detected; refusing silent moment re-keying')
     if not groups_match:
       print(f"[checkpoint-resume] optimizer param_groups mismatch "
             f"(current={len(current_param_groups)} vs loaded={len(loaded_param_groups)}) — "
@@ -1847,7 +1902,10 @@ def Train():
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
     print("INFO: LOAD_CHECKPOINT", config.Opt_CheckpointResumeFromFileName, num_pos)
 
-    # NUM_POS_TO_SKIP = num_pos # enable this line if want to skip training data already seen (but slow)
+    # NB (runde-4-dok): en resume starter shard-sekvensen fra fil 0 igjen —
+    # tidligste data re-trenes. Det gamle NUM_POS_TO_SKIP-maskineriet var doedt
+    # (aldri lest) og er fjernet; A/B mellom resumed og kontinuerlig kjoering
+    # maa ta hoyde for replay av tidlige shards.
     del loaded
 
   # ----------------------------------------------------------------------
@@ -1907,13 +1965,15 @@ def Train():
     # forward (only policy_out and value_out matter for KL) and can be discarded.
     # Missing keys would still indicate a real mismatch — log them for visibility.
     ref_load_result = ref_model.load_state_dict(ref_loaded["model"], strict=False)
-    if (ref_load_result.missing_keys or ref_load_result.unexpected_keys):
-      print(f"INFO: KL_ANCHOR_REF_LOAD missing={len(ref_load_result.missing_keys)} "
-            f"unexpected={len(ref_load_result.unexpected_keys)}")
-      if ref_load_result.missing_keys:
-        print(f"  missing: {ref_load_result.missing_keys[:5]}{'...' if len(ref_load_result.missing_keys) > 5 else ''}")
-      if ref_load_result.unexpected_keys:
-        print(f"  unexpected: {ref_load_result.unexpected_keys[:5]}{'...' if len(ref_load_result.unexpected_keys) > 5 else ''}")
+    # Runde-4 (to agenter konvergerte): MISSING keys betyr at referansen har
+    # TILFELDIG initialiserte lag — ankeret ville regularisere mot delvis
+    # stoey hele kjoeringen. Hard feil; unexpected er fortsatt ok aa droppe.
+    if ref_load_result.missing_keys:
+      raise ValueError(f'KL-anchor reference mismatch: {len(ref_load_result.missing_keys)} missing keys '
+                       f'(first: {ref_load_result.missing_keys[:5]}) — reference would be partially RANDOM. '
+                       f'Align the ref config/checkpoint.')
+    if ref_load_result.unexpected_keys:
+      print(f"INFO: KL_ANCHOR_REF_LOAD unexpected={len(ref_load_result.unexpected_keys)} (discarded)")
     del ref_loaded
     ref_model = ref_model.to(device).to(torch.bfloat16)
     ref_model.eval()
@@ -2432,7 +2492,15 @@ def Train():
 
         if config.Opt_LossActionMultiplier > 0:
           action2_played_move_indices = sub_batch['policy_index_in_parent'].to(dtype=torch.int)
-          extracted_action1_out = action_out1[torch.arange(0, action_out1.size(0)), action2_played_move_indices.squeeze(-1)]
+          # Runde-3: -1 = 'ingen forelder' (TPGRecord.cs) — Python-wrap til slot
+          # 1857 ga stille vilkaarlig supervisjon; clamp + null-maske raden.
+          # NB (runde-4-dok): gradienten er korrekt drept, men CE(uniform, target)
+          # for de maskerte radene inflaterer fortsatt LOGGET action-snitt
+          # proporsjonalt med -1-andelen; eksakt fiks krever per-rad-vekt i
+          # action_loss (legacy-modus — akseptert avvik).
+          _a2_valid = (action2_played_move_indices.squeeze(-1) >= 0).to(action_out1.dtype)
+          action2_played_move_indices = action2_played_move_indices.clamp_min(0)
+          extracted_action1_out = action_out1[torch.arange(0, action_out1.size(0)), action2_played_move_indices.squeeze(-1)] * _a2_valid.unsqueeze(-1)
           extracted_action1_out = extracted_action1_out[:, wdl_reverse]
         else:
           extracted_action1_out = None
@@ -2452,7 +2520,9 @@ def Train():
 
         if config.Opt_LossActionMultiplier > 0:
           action3_played_move_indices = sub_batch['policy_index_in_parent'].to(dtype=torch.int)
-          extracted_action2_out = action_out2[torch.arange(0, action_out2.size(0)), action3_played_move_indices.squeeze(-1)]
+          _a3_valid = (action3_played_move_indices.squeeze(-1) >= 0).to(action_out2.dtype)
+          action3_played_move_indices = action3_played_move_indices.clamp_min(0)
+          extracted_action2_out = action_out2[torch.arange(0, action_out2.size(0)), action3_played_move_indices.squeeze(-1)] * _a3_valid.unsqueeze(-1)
           extracted_action2_out = extracted_action2_out[:, wdl_reverse]
         else:
           extracted_action2_out = None
@@ -2473,7 +2543,9 @@ def Train():
 
 
           action4_played_move_indices = sub_batch['policy_index_in_parent'].to(dtype=torch.int)
-          extracted_action1_other_out = action_out1[torch.arange(0, action_out1.size(0)), action4_played_move_indices.squeeze(-1)]
+          _a4_valid = (action4_played_move_indices.squeeze(-1) >= 0).to(action_out1.dtype)
+          action4_played_move_indices = action4_played_move_indices.clamp_min(0)
+          extracted_action1_other_out = action_out1[torch.arange(0, action_out1.size(0)), action4_played_move_indices.squeeze(-1)] * _a4_valid.unsqueeze(-1)
           extracted_action1_other_out = extracted_action1_other_out[:, wdl_reverse]
           
           loss4 = core.compute_loss(loss_calc, sub_batch, None, None, None, None,
@@ -2676,7 +2748,11 @@ def Train():
     # first checkpoint fire at ~200M instead of ~100M). The modulo check was
     # only ever needed for cross-rank synchronization in multi-GPU runs; this is
     # single-GPU, so the diff-threshold alone is correct and safer.
-    if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions):
+    if config.Opt_CheckpointFrequencyNumPositions > 0 and (num_pos - last_save_model_pos >= config.Opt_CheckpointFrequencyNumPositions)         and batch_accumulation_counter % num_batches_gradient_accumulate == 0:
+      # Runde-4 (siste betingelse): lagre kun paa AKKUMULERINGSVINDU-grenser —
+      # foer kunne navnet/num_pos telle inntil accum-1 mikro-batcher hvis
+      # gradienter aldri anvendes ved resume (og bryte load-stiens
+      # multiplum-antagelse). Forsinkelsen er < ett optimizer-steg.
       # Only rank 0 writes checkpoint/ONNX/TS — all ranks hold identical (DDP-synced)
       # weights, so rank 0's copy is authoritative; letting every rank write the same
       # paths would corrupt the files. last_save_model_pos is still advanced on every
@@ -2740,7 +2816,15 @@ def Train():
                     + config.Opt_LossValueDMultiplier * loss_calc.LAST_VALUE_DIFF_LOSS
                     + config.Opt_LossValue2DMultiplier * loss_calc.LAST_VALUE2_DIFF_LOSS
                      
-                    + config.Opt_LossActionMultiplier * loss_calc.LAST_ACTION_LOSS)
+                    + config.Opt_LossActionMultiplier * loss_calc.LAST_ACTION_LOSS
+                    # Runde-3 (2026-08-29): manglende ledd med eksisterende LAST_*-
+                    # akkumulatorer — konsoll-totalen underrapporterte aux-tunge runs.
+                    # (compute_loss-nivaa-aux uten LAST_* — vc/hlg/opt/sp/oppp/margin
+                    # m.fl. — er fortsatt utenfor; linjen er dokumentert approksimativ.)
+                    + config.Opt_LossActionUncertaintyMultiplier * getattr(loss_calc, 'LAST_ACTION_UNCERTAINTY_LOSS', 0)
+                    + float(getattr(core, 'placement_value_weight', 0) or 0) * getattr(loss_calc, 'LAST_PLACEMENT_VALUE_LOSS', 0)
+                    + float(getattr(core, 'survival_target_weight', 0) or 0) * getattr(loss_calc, 'LAST_SURVIVAL_LOSS', 0)
+                    + float(getattr(core, 'stvalue_weight', 0) or 0) * getattr(loss_calc, 'LAST_STVALUE_LOSS', 0))
 
         
       # Note that this output line is parsed by the C# class CeresTrainProgressLoggingLine
@@ -2815,5 +2899,14 @@ def Train():
   if IS_MASTER:
     print("INFO: EXIT_STATUS", "SUCCESS")
 
-Train()
+# Runde-4: unntak ga tidligere INGEN EXIT_STATUS-linje (C#-siden ser bare
+# stillhet) og under DDP hang oevrige ranks i collective til NCCL-timeout.
+# Fang, meld hoylytt i det parsbare formatet, og re-raise for full traceback.
+try:
+  Train()
+except SystemExit:
+  raise
+except BaseException as _train_exc:
+  print("INFO: EXIT_STATUS", "FAILURE", type(_train_exc).__name__, str(_train_exc)[:300], flush=True)
+  raise
 

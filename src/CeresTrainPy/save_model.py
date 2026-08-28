@@ -19,6 +19,38 @@ import torch
 from config import Configuration, TOTAL_INPUT_FEATURES_PER_SQUARE
 from lora import collect_and_save_lora_parameters, merge_lora_to_model
 
+# Runde-4: eksplisitt op_block_list ERSTATTER konverterens interne default —
+# importeres paa MODUL-nivaa saa et miljoe uten onnxconverter-common feiler
+# hoyt ved oppstart i stedet for at fp16-konverteringen stille mister alle 28
+# standard-beskyttelsene (eller etterlater en fp32-fil i fp16-slotten).
+from onnxconverter_common.float16 import DEFAULT_OP_BLOCK_LIST as _FP16_DEFAULT_OP_BLOCK_LIST
+
+
+def _deepcopy_model_for_export(live_model):
+  """Deepcopy som taaler live treningsmodeller: SummaryWriter (ikke picklebar)
+  og graf-tilkoblede _last_*-stasher (ogsaa TUPLER av tensorer, og i UNDERMODULER
+  — runde-4-funn: begge klassene fikk deepcopy til aa krasje stille bak
+  blanket-excepten) detaches foer kopien og gjenopprettes etterpaa."""
+  import copy as _copy
+  _writer = getattr(live_model, 'writer', None)
+  live_model.writer = None
+  _saved = []
+  def _has_tensor(v):
+    if torch.is_tensor(v): return True
+    if isinstance(v, (tuple, list)): return any(torch.is_tensor(x) for x in v)
+    return False
+  for _mod in live_model.modules():
+    for _an, _av in list(vars(_mod).items()):
+      if _an.startswith('_last_') and _av is not None and _has_tensor(_av):
+        _saved.append((_mod, _an, _av))
+        setattr(_mod, _an, None)
+  try:
+    return _copy.deepcopy(live_model)
+  finally:
+    live_model.writer = _writer
+    for _mod, _an, _av in _saved:
+      setattr(_mod, _an, _av)
+
 
 def save_checkpoint(NAME : str,
                OUTPUTS_DIR : str,
@@ -107,14 +139,7 @@ def save_model(NAME : str,
       # serialize an empty .lora bin (observed 2026-07-22, k2hstd probe).
       # The SummaryWriter is detached during the copy (not deep-copyable);
       # the export copy never logs.
-      import copy as _copy
-      _live_model = model_nocompile
-      _writer = getattr(_live_model, 'writer', None)
-      _live_model.writer = None
-      try:
-        model_nocompile = _copy.deepcopy(_live_model)
-      finally:
-        _live_model.writer = _writer
+      model_nocompile = _deepcopy_model_for_export(model_nocompile)
       merge_lora_to_model(model_nocompile)
 
     convert_type = _model_dtype
@@ -248,8 +273,10 @@ def save_model(NAME : str,
           # blanket-except'en og runs fikk ALDRI .onnx. Kast en kopi til fp32
           # saa "Export an FP32 ONNX first" faktisk gjelder begge sider.
           if next(model_nocompile.parameters()).dtype != torch.float32:
-            import copy as _copy
-            model_nocompile = _copy.deepcopy(model_nocompile).float().eval()
+            # Runde-3/4: bruk felles-hjelperen (writer + alle _last_*-stasher
+            # i ALLE moduler, ogsaa tupler — runde-4 fant hullene i den forste
+            # versjonen av denne fiksen).
+            model_nocompile = _deepcopy_model_for_export(model_nocompile).float().eval()
           # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
           # only calls setTensorAddress on inputNames[0] — additional inputs are
           # never bound, causing enqueueV3 to fail with "Address is not set for
@@ -323,10 +350,7 @@ def save_model(NAME : str,
             # i fp32 (.float()), og Cast-reconcile-passet under demoterte dem;
             # blokklisten gjenoppretter paritet (konverteren setter selv inn
             # fp32-caster rundt blokkerte noder).
-            try:
-              from onnxconverter_common.float16 import DEFAULT_OP_BLOCK_LIST as _DBL
-            except ImportError:
-              _DBL = []
+            _DBL = _FP16_DEFAULT_OP_BLOCK_LIST  # modul-nivaa-import (runde-4)
             onnx_model_16 = convert_float_to_float16(
                 onnx_model, keep_io_types=False,
                 min_positive_val=1e-10, max_finite_val=65504.0,

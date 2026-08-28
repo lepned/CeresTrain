@@ -135,6 +135,14 @@ class LossCalculator():
     self.PENDING_PLACEMENT_VALUE_LOSS = 0
     self.PENDING_SURVIVAL_LOSS = 0
     self.PENDING_SURVIVAL_ACC = 0
+    # Runde-4: egne tellere — disse tapene akkumulerer bare paa batcher MED
+    # target (sidecar/4-board-avhengig); deling paa PENDING_COUNT ga nettopp
+    # den nevner-utvanningen participation-fiksen skulle hindre (kurver leste
+    # 2x lavt ved 50 % sidecar-loese shards).
+    self.PENDING_SURVIVAL_COUNT = 0
+    self.PENDING_STVALUE_COUNT = 0
+    self.PENDING_VALUE_DIFF_COUNT = 0
+    self.PENDING_VALUE2_DIFF_COUNT = 0
     self.PENDING_STVALUE_LOSS = 0
     self.PENDING_VALUE_ACC = 0
     self.PENDING_POLICY_ACC = 0
@@ -163,23 +171,23 @@ class LossCalculator():
 
   @property
   def LAST_SURVIVAL_LOSS(self):
-    return self.PENDING_SURVIVAL_LOSS / self.PENDING_COUNT
+    return self.PENDING_SURVIVAL_LOSS / max(1, self.PENDING_SURVIVAL_COUNT)
 
   @property
   def LAST_SURVIVAL_ACC(self):
-    return self.PENDING_SURVIVAL_ACC / self.PENDING_COUNT
+    return self.PENDING_SURVIVAL_ACC / max(1, self.PENDING_SURVIVAL_COUNT)
 
   @property
   def LAST_STVALUE_LOSS(self):
-    return self.PENDING_STVALUE_LOSS / self.PENDING_COUNT
+    return self.PENDING_STVALUE_LOSS / max(1, self.PENDING_STVALUE_COUNT)
   
   @property
   def LAST_VALUE_DIFF_LOSS(self):
-    return self.PENDING_VALUE_DIFF_LOSS / self.PENDING_COUNT
+    return self.PENDING_VALUE_DIFF_LOSS / max(1, self.PENDING_VALUE_DIFF_COUNT)
   
   @property
   def LAST_VALUE2_DIFF_LOSS(self):
-    return self.PENDING_VALUE2_DIFF_LOSS / self.PENDING_COUNT
+    return self.PENDING_VALUE2_DIFF_LOSS / max(1, self.PENDING_VALUE2_DIFF_COUNT)
 
   @property
   def LAST_POLICY_LOSS(self):
@@ -353,6 +361,10 @@ class LossCalculator():
       _log_loss = loss
 
     self.PENDING_POLICY_LOSS += _log_loss.item() if not calc_grad_norm_mode else 0
+    # Runde-3: eksponer den RENE CE-en for TB ogsaa — sibling-margin/only-move-
+    # reweighting laa inne i returverdien og brOEt logge-invarianten
+    # («logget tall = uvektet CE for kryssrun-sammenlignbarhet»).
+    self._last_policy_log_loss = _log_loss
     if POLICY_SIBLING_MARGIN_WEIGHT > 0:
       # Sibling-margin hinge (see module header). Computed on the MASKED
       # logits, so illegal moves (at MASK_POLICY_VALUE) can never be the
@@ -508,6 +520,7 @@ class LossCalculator():
     if not calc_grad_norm_mode:
       self.PENDING_SURVIVAL_LOSS += loss.item()
       self.PENDING_SURVIVAL_ACC += 100.0 * (pred_graded == target_graded).float().mean().item()
+      self.PENDING_SURVIVAL_COUNT += 1
     return self.calc_loss_grad_norm('survival', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
@@ -537,7 +550,9 @@ class LossCalculator():
       loss = (per_rec * rec_wt).sum() / rec_wt.sum().clamp_min(1e-6) - entropy
     else:
       loss = self.ce_loss.forward(output, target) - entropy
-    self.PENDING_STVALUE_LOSS += loss.item() if not calc_grad_norm_mode else 0
+    if not calc_grad_norm_mode:
+      self.PENDING_STVALUE_LOSS += loss.item()
+      self.PENDING_STVALUE_COUNT += 1
     return self.calc_loss_grad_norm('stvalue', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
@@ -549,7 +564,9 @@ class LossCalculator():
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
     loss = self.ce_loss.forward(output.float(), target_softmax) - entropy
 
-    self.PENDING_VALUE_DIFF_LOSS += loss.item() if not calc_grad_norm_mode else 0
+    if not calc_grad_norm_mode:
+      self.PENDING_VALUE_DIFF_LOSS += loss.item()
+      self.PENDING_VALUE_DIFF_COUNT += 1
     return self.calc_loss_grad_norm('value_diff', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
@@ -561,7 +578,9 @@ class LossCalculator():
     entropy = self.entropy(target_softmax) if subtract_entropy else 0.0
     loss = self.ce_loss(output.float(), target_softmax) - entropy
    
-    self.PENDING_VALUE2_DIFF_LOSS += loss.item() if not calc_grad_norm_mode else 0
+    if not calc_grad_norm_mode:
+      self.PENDING_VALUE2_DIFF_LOSS += loss.item()
+      self.PENDING_VALUE2_DIFF_COUNT += 1
     return self.calc_loss_grad_norm('value2_diff', loss, loss_wt) if calc_grad_norm_mode else loss
 
 
@@ -582,8 +601,8 @@ class LossCalculator():
       self.model.zero_grad()
 
     # Scale the loss to similar range as other losses.
-    self.POST_SCALE = 5.0
-    loss = self.POST_SCALE * F.huber_loss(output, target, reduction="mean", delta=0.5)
+    _POST_SCALE = 5.0
+    loss = _POST_SCALE * F.huber_loss(output.float(), target.float(), reduction="mean", delta=0.5)  # fp32 = BFloat16Pure-vern (runde 4)
     self.PENDING_MLH_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('moves_left', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -593,8 +612,8 @@ class LossCalculator():
       self.model.zero_grad()
 
     # Scale the loss to similar range as other losses.
-    self.POST_SCALE = 150.0
-    loss = self.POST_SCALE * F.huber_loss(output, target, reduction="mean", delta=0.5)
+    _POST_SCALE = 150.0
+    loss = _POST_SCALE * F.huber_loss(output.float(), target.float(), reduction="mean", delta=0.5)  # fp32 (runde 4)
     self.PENDING_UNC_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('uncertainty', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -603,8 +622,8 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    self.POST_SCALE = 10.0
-    loss = self.POST_SCALE * nn.MSELoss().forward(output, target)
+    _POST_SCALE = 10.0
+    loss = _POST_SCALE * nn.MSELoss().forward(output.float(), target.float())  # fp32 (runde 4)
     self.PENDING_Q_DEVIATION_LOWER_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('qdev_lower', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -613,8 +632,8 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    self.POST_SCALE = 10.0
-    loss = self.POST_SCALE * nn.MSELoss().forward(output, target)
+    _POST_SCALE = 10.0
+    loss = _POST_SCALE * nn.MSELoss().forward(output.float(), target.float())  # fp32 (runde 4)
     self.PENDING_Q_DEVIATION_UPPER_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('qdev_upper', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -623,8 +642,8 @@ class LossCalculator():
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
-    self.POST_SCALE = 10.0
-    loss = self.POST_SCALE * nn.MSELoss().forward(output, target)
+    _POST_SCALE = 10.0
+    loss = _POST_SCALE * nn.MSELoss().forward(output.float(), target.float())  # fp32 (runde 4)
     self.PENDING_UNCERTAINTY_POLICY_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('policy_unc', loss, loss_wt) if calc_grad_norm_mode else loss
 
@@ -634,8 +653,8 @@ class LossCalculator():
       self.model.zero_grad()
 
     # Scale the loss to similar range as other losses.
-    self.POST_SCALE = 150.0
-    loss = self.POST_SCALE * F.huber_loss(output, target, reduction="mean", delta=0.5)
+    _POST_SCALE = 150.0
+    loss = _POST_SCALE * F.huber_loss(output.float(), target.float(), reduction="mean", delta=0.5)  # fp32 (runde 4)
     self.PENDING_ACTION_UNCERTAINTY_LOSS += loss.item() if not calc_grad_norm_mode else 0
     return self.calc_loss_grad_norm('action_uncertainty', loss, loss_wt) if calc_grad_norm_mode else loss
     

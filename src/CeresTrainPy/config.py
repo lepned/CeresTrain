@@ -576,7 +576,9 @@ class Configuration:
         f"({self.NetDef_LoopCount}) for looped transformer.")
     self.NetDef_NumHeads = config_net_def.get('NumHeads', 8)
     self.NetDef_UseQKV = config_net_def.get('UseQKV', True)
-    self.NetDef_DualAttentionMode = config_net_def.get('DualAttentionMode', 'None')
+    # DualAttentionMode SLETTET 2026-08-29 (runde 3): posisjonsarg-drift gjorde
+    # modusen krasjende ved konstruksjon; uoevd gjennom flere signatur-migreringer.
+    assert config_net_def.get('DualAttentionMode', 'None') in ('None', None, ''),         'DualAttentionMode er fjernet (doede moduser slettes per repo-policy)'
     self.NetDef_PreNorm = config_net_def.get('PreNorm', False)
     self.NetDef_NormType = config_net_def.get('NormType', 'LayerNorm')
     self.NetDef_AttentionMultiplier = config_net_def.get('AttentionMultiplier', 1)
@@ -585,6 +587,9 @@ class Configuration:
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
     self.NetDef_FFNUseGlobalEveryNLayers = config_net_def.get('FFNUseGlobalEveryNLayers', 0)
     self.NetDef_HeadsActivationType = config_net_def.get('HeadsActivationType', 'ReLU')
+    # Runde-3: 'SwiGLU' i hodene var stille ren SiLU (ingen gate-linear i Head)
+    # — navnet loey om arkitekturen. Avvis; bruk 'Mish'/'SiLU' e.l. eksplisitt.
+    assert self.NetDef_HeadsActivationType != 'SwiGLU',         "HeadsActivationType 'SwiGLU' er ugyldig (ingen gate i Head — det ville vaert ren SiLU)"
     # Default 0, NOT 64. At >0 the net gains a second ONNX input ('prior_state')
     # for which Ceres never binds an address, so TensorRT fails CUDA-graph capture
     # on every batch profile and the engine silently answers nothing ("No search
@@ -625,7 +630,9 @@ class Configuration:
       raise ValueError(f"HeadSharedLinearDiv must be >= 1, got {self.NetDef_HeadSharedLinearDiv}")
     self.NetDef_UseRPE = config_net_def.get('UseRPE', False)
     self.NetDef_UseRPE_V = config_net_def.get('UseRPE_V', True)
-    self.NetDef_UseRelBias = config_net_def.get('UseRelBias', False)
+    # UseRelBias SLETTET 2026-08-29 (runde 3): modusen refererte self.rpe_factor
+    # som ALDRI ble tildelt — den har aldri kunnet kjoere. RPE superseder.
+    assert not config_net_def.get('UseRelBias', False), 'UseRelBias er fjernet (virket aldri) — bruk UseRPE'
     self.NetDef_UseRoPE = config_net_def.get('UseRoPE', False)
     # Differential Attention V2 (Microsoft Apr 2026): doubles Q heads (Q1, Q2
     # split), computes two attention maps, subtracts with per-token sigmoid(λ)
@@ -646,6 +653,11 @@ class Configuration:
     self.NetDef_SoftMoE_NumSlotsPerExpert = soft_moe_config.get('NumSlotsPerExpert', 0)
     self.NetDef_SoftMoE_UseNormalization = soft_moe_config.get('UseNormalization', False)
     self.NetDef_SoftMoE_UseBias = soft_moe_config.get('UseBias', True)
+    # Runde-3-validering: NumExperts>0 med MoEMode 'None' krasjet foerst ved
+    # forward (assert i encoder_layer); motsatt kombinasjon var stille no-op.
+    _moe_on = str(self.NetDef_SoftMoE_MoEMode) not in ('None', '', 'none')
+    assert _moe_on == (int(self.NetDef_SoftMoE_NumExperts or 0) > 0),         (f'SoftMoEConfig inkonsistent: MoEMode={self.NetDef_SoftMoE_MoEMode!r} '
+         f'med NumExperts={self.NetDef_SoftMoE_NumExperts} — sett begge eller ingen')
     # Fine-grained MoE: pre-projects ffn_dim -> ExpertInputDim before phi
     # routing + expert processing. Only meaningful in ReplaceLinearSecondLayer
     # mode. 0 disables (default — experts process full ffn_dim).
