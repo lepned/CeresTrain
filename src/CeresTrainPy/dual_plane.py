@@ -46,7 +46,8 @@ class DualPlanePBlock(nn.Module):
   """Pre-norm piece-plane encoder block with additive relation bias."""
 
   def __init__(self, dp: int, heads: int, rel_channels: int, ffn_mult: int,
-               norm_type: str, softmin_heads: int = 0, rel_gains: bool = False):
+               norm_type: str, softmin_heads: int = 0, rel_gains: bool = False,
+               edge_update: bool = False):
     super().__init__()
     assert dp % heads == 0
     self.dp, self.heads, self.dk = dp, heads, dp // heads
@@ -107,6 +108,23 @@ class DualPlanePBlock(nn.Module):
     if softmin_heads > 0:
       assert softmin_heads <= heads,           f'DualPlaneSoftMinHeads ({softmin_heads}) > heads ({heads}) — tau-broadcast kolliderer (runde-3-vern)'
       self.softmin_log_tau = nn.Parameter(torch.zeros(softmin_heads))
+    # LAERT KANT-OPPDATERING (boelge 6, 2026-08-29 — EGT-ens manglende halvdel):
+    # kanten leser sine to endepunkt-noder + seg selv og oppdateres residualt;
+    # attention-biasen leser deretter LEVENDE kanter, og node-tokenene faar en
+    # degree-refresh fra dem (aggregeringsruten — vinnerveien per softmax-doer-
+    # doktrinen, konvergent maalt i begge programmene). Zero-init paa BEGGE
+    # output-projeksjonene => eksakt step-0 no-op; inputs er rike (rel_gains-
+    # laerdommen: gradientvei fra steg en). Kun dense ops (dpdiff-TRT-lekse).
+    self.edge_update = edge_update
+    if edge_update:
+      _h = 32
+      self.eu_e = nn.Linear(rel_channels, _h)
+      self.eu_i = nn.Linear(dp, _h, bias=False)
+      self.eu_j = nn.Linear(dp, _h, bias=False)
+      self.eu_out = nn.Linear(_h, rel_channels, bias=False)
+      nn.init.zeros_(self.eu_out.weight)
+      self.eu_deg = nn.Linear(2 * rel_channels, dp, bias=False)
+      nn.init.zeros_(self.eu_deg.weight)
     self.ln2 = make_norm(norm_type, dp)
     self.ffn1 = nn.Linear(dp, ffn_mult * dp, bias=False)
     self.ffn2 = nn.Linear(ffn_mult * dp, dp, bias=False)
@@ -114,7 +132,15 @@ class DualPlanePBlock(nn.Module):
 
   def forward(self, x, rel_pair, pad_bias):
     # x [B, 32, dp]; rel_pair [B, 32, 32, C]; pad_bias [B, 1, 1, 32]
+    # Returnerer (x, rel_pair) — kant-tilstanden traades gjennom blokkene.
     B = x.shape[0]
+    if self.edge_update:
+      _ei = self.eu_i(x).unsqueeze(2)                      # [B,32,1,h]
+      _ej = self.eu_j(x).unsqueeze(1)                      # [B,1,32,h]
+      _ee = self.eu_e(rel_pair.to(x.dtype))                # [B,32,32,h]
+      rel_pair = rel_pair.to(x.dtype) + self.eu_out(torch.nn.functional.mish(_ee + _ei + _ej))
+      # degree-refresh fra levende kanter (samme aksesemantikk som rel_degrees)
+      x = x + self.eu_deg(torch.cat([rel_pair.sum(dim=2), rel_pair.sum(dim=1)], dim=-1))
     h = self.ln1(x)
     q, k, v = self.qkv(h).chunk(3, dim=-1)
     q = q.reshape(B, 32, self.heads, self.dk).transpose(1, 2)
@@ -154,7 +180,7 @@ class DualPlanePBlock(nn.Module):
     out = out.transpose(1, 2).reshape(B, 32, self.dp)
     x = x + self.proj(out)
     x = x + self.ffn2(self.act(self.ffn1(self.ln2(x))))
-    return x
+    return x, rel_pair
 
 
 class DualPlane(nn.Module):
@@ -164,7 +190,7 @@ class DualPlane(nn.Module):
                dp: int = 128, heads: int = 4, layers: int = 2,
                ffn_mult: int = 2, softmin_heads: int = 2,
                interleave_cross: bool = False,
-               block_repeat: int = 1,
+               edge_update: bool = False,
                rel_degrees: bool = False,
                rel_degrees2: bool = False,
                rel_gains: bool = False,
@@ -247,15 +273,10 @@ class DualPlane(nn.Module):
       if king_flight:
         self.kf_proj = nn.Linear(8 * (rel_channels + 13 + 1), dp, bias=False)
         nn.init.zeros_(self.kf_proj.weight)
-    # VEKTDELT DYBDE (boelge 1, 2026-08-28): hver blokk kjoeres block_repeat
-    # ganger med DELTE vekter — mer beregning uten nye frihetsgrader, svaret
-    # paa at raa kapasitetsvekst vasket ut gevinsten (57->26) mens P-LAG-
-    # stigen viste at dybde betaler. Blokkene er residuale, saa repetisjon
-    # er velformet.
-    self.block_repeat = max(1, int(block_repeat))
     self.blocks = nn.ModuleList([
         DualPlanePBlock(dp, heads, rel_channels, ffn_mult, norm_type,
-                        softmin_heads=softmin_heads, rel_gains=rel_gains)
+                        softmin_heads=softmin_heads, rel_gains=rel_gains,
+                        edge_update=edge_update)
         for _ in range(layers)])
     # Cross-read P->S on the FINAL square flow.
     self.x_ln_p = make_norm(norm_type, dp)
@@ -345,8 +366,7 @@ class DualPlane(nn.Module):
       return xp + self.x_out(torch.matmul(a, vx))
 
     for blk in self.blocks:
-      for _rep in range(self.block_repeat):
-        x = blk(x, rel_pair, pad_bias)
+      x, rel_pair = blk(x, rel_pair, pad_bias)
       if self.interleave_cross:
         x = _cross_read(x)
     if not self.interleave_cross:

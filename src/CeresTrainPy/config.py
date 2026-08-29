@@ -545,7 +545,12 @@ class Configuration:
     # Boelge 1 (2026-08-28): vektdelt blokk-dybde i P-planet. (Diff-attention i
     # P-blokkene ble bygget og SLETTET samme dag: policy-noeytral @10M og
     # TRT-doed 54x — RelGains-klassen.)
-    self.NetDef_DualPlaneBlockRepeat = int(config_net_def.get('DualPlaneBlockRepeat', 1) or 1)
+    # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
+    self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)
+    # DualPlaneBlockRepeat SLETTET 2026-08-29 (boelge 5): vektdelt dybde SKADET
+    # den rike planen 2v2-seeds (mate-value 58/38 vs kzcaps 80/82) og var
+    # noeytral paa fattig base — intet brukstilfelle igjen.
+    assert int(config_net_def.get('DualPlaneBlockRepeat', 1) or 1) == 1,         'DualPlaneBlockRepeat er fjernet (falsifisert boelge 5) — bruk kz+dp192-oppskriften'
     self.NetDef_DualPlaneKingFlight = config_net_def.get('DualPlaneKingFlight', False)
     self.NetDef_DualPlaneKingZone = config_net_def.get('DualPlaneKingZone', False)
     self.NetDef_DualPlanePolicyGradScale = config_net_def.get('DualPlanePolicyGradScale', 1.0)

@@ -765,11 +765,7 @@ class CeresNet(nn.Module):
       # Parametriske nokler har truthy DEFAULTS og er meningslose aa flagge;
       # kun feature-flagg (default 0/False) indikerer intensjon.
       _dp_param_keys = {'NetDef_DualPlanePolicyGradScale', 'NetDef_DualPlaneSoftMinHeads',
-                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK',
-                        # HOTFIX 2026-08-29 (runde-3-funn 1): BlockRepeat har truthy
-                        # default 1 og maa unntas — uten dette feilet ALLE
-                        # ikke-dual-plane-configer aa konstruere siden 997f684.
-                        'NetDef_DualPlaneBlockRepeat'}
+                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK'}
       _dp_set = [k for k, v in vars(config).items()
                  if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
       _dp_set += [k for k in ('NetDef_MoveEdgeDecode', 'NetDef_MoveDegreeDecode')
@@ -820,10 +816,11 @@ class CeresNet(nn.Module):
                                   rel_degrees2=bool(getattr(config, 'NetDef_DualPlaneRelDegrees2', False)),
                                   king_flight=bool(getattr(config, 'NetDef_DualPlaneKingFlight', False)),
                                   king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)),
-                                  block_repeat=int(getattr(config, 'NetDef_DualPlaneBlockRepeat', 1) or 1))
-      if int(getattr(config, 'NetDef_DualPlaneBlockRepeat', 1) or 1) > 1:
-        print(f'[ceres_net] DUAL-PLANE BLOCK-REPEAT enabled: hver P-blokk kjoeres '
-              f'{int(getattr(config, "NetDef_DualPlaneBlockRepeat", 1))}x med delte vekter')
+                                  edge_update=bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)))
+      if getattr(config, 'NetDef_DualPlaneEdgeUpdate', False):
+        print('[ceres_net] DUAL-PLANE EDGE-UPDATE enabled: laert residual kant-oppdatering '
+              'per P-blokk (E_ij <- E_ij + f(E_ij, x_i, x_j), zero-init) + degree-refresh '
+              'fra levende kanter inn i tokenene (exact step-0 no-op)')
       if getattr(config, 'NetDef_DualPlaneRelDegrees2', False):
         print(f'[ceres_net] DUAL-PLANE REL-DEGREES-2 enabled: second-order coverage '
               f'(targets/attackers, 2x{_dp_rel_C} ch) -> zero-init token features '
