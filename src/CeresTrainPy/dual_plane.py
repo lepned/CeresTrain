@@ -291,6 +291,16 @@ class DualPlane(nn.Module):
   def forward(self, squares13, vis_E, s_flow):
     """squares13 [B,64,13] one-hot; vis_E [B,64,64,C]; s_flow [B,64,S].
     Returns [B, 2*dp] pooled piece summary (masked mean + masked soft-min)."""
+    x, rel_pair, sel, slot_occ = self.run_pblocks(squares13, vis_E,
+                                                  s_flow if self.interleave_cross else None)
+    p, xt, sl, oc = self.finish(x, s_flow, sel, slot_occ)
+    return p, xt, sl, oc
+
+  def run_pblocks(self, squares13, vis_E, interleave_s_flow=None):
+    """Fase 1 (boelge 9): alt som er TRUNK-UAVHENGIG — embed, feature-injects
+    og P-blokkene (med levende kanter). Muliggjoer kant->trunk-eksport: fasen
+    kan kjoeres FOER trunken, og de ferdig-utviklede kantene bias-loeftes inn
+    i trunk-attention. Returns (x_tokens, rel_pair_final, sel, slot_occ)."""
     B = squares13.shape[0]
     occ = 1.0 - squares13[:, :, 0]                       # [B, 64]
     # Deterministic slot selection: occupancy + tiny positional tie-break.
@@ -358,19 +368,30 @@ class DualPlane(nn.Module):
         _kmask = (sel == _ksq.unsqueeze(1)).to(x.dtype).unsqueeze(-1)   # [B, 32, 1]
         x = x + _kmask * self.kf_proj(_kf).unsqueeze(1)
 
-    def _cross_read(xp):
-      qx = self.x_q(self.x_ln_p(xp))
-      s_n = self.x_ln_s(s_flow)
-      kx, vx = self.x_k(s_n), self.x_v(s_n)
-      a = torch.softmax(torch.matmul(qx, kx.transpose(1, 2)) * (self.dp ** -0.5), dim=-1)
-      return xp + self.x_out(torch.matmul(a, vx))
-
+    # NB (boelge 9): interleave_cross er inkompatibel med fase-splitten
+    # (cross-read trenger s_flow inne i blokk-loekka) — avvises hoeyt i
+    # ceres_net naar kant->trunk er paa. I fase-splitt-modus kjoeres
+    # cross-read kun i finish().
     for blk in self.blocks:
       x, rel_pair = blk(x, rel_pair, pad_bias)
       if self.interleave_cross:
-        x = _cross_read(x)
+        # Review-funn (boelge 9): s_flow som ARG, aldri modul-attributt — en
+        # graf-tensor paa modulen drepte deepcopy-eksporten for interleave-armer.
+        assert interleave_s_flow is not None, 'interleave_cross krever s_flow inn i run_pblocks'
+        x = self._cross_read(x, interleave_s_flow)
+    return x, rel_pair, sel, slot_occ
+
+  def _cross_read(self, xp, s_flow):
+    qx = self.x_q(self.x_ln_p(xp))
+    s_n = self.x_ln_s(s_flow)
+    kx, vx = self.x_k(s_n), self.x_v(s_n)
+    a = torch.softmax(torch.matmul(qx, kx.transpose(1, 2)) * (self.dp ** -0.5), dim=-1)
+    return xp + self.x_out(torch.matmul(a, vx))
+
+  def finish(self, x, s_flow, sel, slot_occ):
+    """Fase 2: cross-read mot trunk-flow + pools."""
     if not self.interleave_cross:
-      x = _cross_read(x)
+      x = self._cross_read(x, s_flow)
     x = self.out_ln(x)
     # Masked pools over REAL pieces only.
     w = slot_occ.unsqueeze(-1)                           # [B, 32, 1]

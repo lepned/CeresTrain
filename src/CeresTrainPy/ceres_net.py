@@ -817,6 +817,23 @@ class CeresNet(nn.Module):
                                   king_flight=bool(getattr(config, 'NetDef_DualPlaneKingFlight', False)),
                                   king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)),
                                   edge_update=bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)))
+      # KANT->TRUNK (boelge 9, 2026-08-30): planets ferdig-utviklede kanter
+      # loeftes til [B,H,64,64]-bias paa trunk-attention (via one-hot-scatter,
+      # dense matmuls). Teorigrunnlag: Kovax' rute-modell + klipp-stillhets-
+      # funnet (kantruten avlaster attention-logits — naa ogsaa i trunken).
+      # Zero-init => eksakt step-0 no-op. Krever edge_update (levende kanter);
+      # inkompatibel med DualPlaneInterleave (fase-splitten).
+      self.dp_edge_to_trunk = bool(getattr(config, 'NetDef_DualPlaneEdgeToTrunk', False))
+      if self.dp_edge_to_trunk:
+        if not bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)):
+          raise ValueError('DualPlaneEdgeToTrunk krever DualPlaneEdgeUpdate (levende kanter) — '
+                           'uten den loeftes STATISKE kanter (skjult kontroll). ValueError per hus-konvensjon (-O).')
+        if _dp_il:
+          raise ValueError('DualPlaneEdgeToTrunk er inkompatibel med DualPlaneInterleave (fase-splitt)')
+        self.e2t_proj = nn.Linear(_dp_rel_C, self.NUM_HEADS, bias=False)
+        nn.init.zeros_(self.e2t_proj.weight)
+        print(f'[ceres_net] DUAL-PLANE EDGE-TO-TRUNK enabled: levende kanter -> zero-init '
+              f'[B,{self.NUM_HEADS},64,64]-bias paa alle trunk-lag (fase-splittet plan)')
       if getattr(config, 'NetDef_DualPlaneEdgeUpdate', False):
         print('[ceres_net] DUAL-PLANE EDGE-UPDATE enabled: laert residual kant-oppdatering '
               'per P-blokk (E_ij <- E_ij + f(E_ij, x_i, x_j), zero-init) + degree-refresh '
@@ -1430,6 +1447,35 @@ class CeresNet(nn.Module):
     vis_edge_biases = None
     if self.use_vis_edge_bias:
       vis_edge_E = self.vis_channels_module(squares[:, :, 0:13])  # [B, 64, 64, C]
+    # Boelge 9: kjoer planets trunk-uavhengige fase FOER trunken og loeft de
+    # levende kantene inn som attention-bias (komponerer additivt med PRB/ray;
+    # konsumeres av lag-loekka via piece_relation_bias_tensor).
+    _e2t_state = None
+    if self.use_dual_plane and getattr(self, 'dp_edge_to_trunk', False):
+      _e2t_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
+      # NB (review-funn 5): flow er enda raa squares her (fp32) — planet kjoerer
+      # fase 1 i fp32-inputs under autocast, mot monolitt-stiens post-trunk-dtype;
+      # ufarlig (autocast styrer matmuls), men A/B-delta mot kzedge inkluderer
+      # denne mikro-presisjonsforskjellen.
+      _e2t_x, _e2t_rel, _e2t_sel, _e2t_occ = self.dual_plane.run_pblocks(
+          squares[:, :, 0:13].to(flow.dtype), _e2t_E)
+      _e2t_state = (_e2t_x, _e2t_rel, _e2t_sel, _e2t_occ, _e2t_E)
+      _S = torch.nn.functional.one_hot(_e2t_sel, 64).to(flow.dtype)          # [B,32,64]
+      _bh = self.e2t_proj(_e2t_rel)                                          # [B,32,32,H]
+      # To-matmul-form i stedet for 3-input-einsum (review boelge 9): TRTs
+      # Einsum-lag er dokumentert maks 2 inputs — vaar stack viste seg aa
+      # taale noden empirisk (gates+EPS kjoerte), men matmul-formen er
+      # strengt portabel og raskere. Identisk matte: S^T @ bh @ S per hode.
+      # NB (dokumentert design-avvik, review-funn 3): loeftet er UMASKERT —
+      # tomme slots (skjevt hoyindeks-valgte felter) faar sine laerte
+      # kant-verdier scattret til ekte feltpar naar proj trener seg vekk fra
+      # null. Slik ble 1151-gevinsten MAALT; en both-empty-maskert variant er
+      # flagget oppfoelgingsarm foer horisont-adopsjon.
+      _bhp = _bh.permute(0, 3, 1, 2)                                         # [B,H,32,32]
+      _b64 = torch.matmul(_S.transpose(1, 2).unsqueeze(1),
+                          torch.matmul(_bhp, _S.unsqueeze(1)))               # [B,H,64,64]
+      piece_relation_bias_tensor = _b64 if piece_relation_bias_tensor is None           else piece_relation_bias_tensor + _b64
+    if self.use_vis_edge_bias:
       if self.vis_edge_shared:
         _vb0 = self.vis_edge_proj[0](vis_edge_E).permute(0, 3, 1, 2)
         vis_edge_biases = [_vb0] * self.NUM_DISTINCT_LAYERS
@@ -1657,9 +1703,14 @@ class CeresNet(nn.Module):
     _dp_E_dec = None
     _dp_deg_cache = None    # (indeg, outdeg) delt mellom dpd og cand-value (review finding 9)
     if self.use_dual_plane:
-      _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
-      _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
-      _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
+      if _e2t_state is not None:
+        _e2t_x, _e2t_rel, _dp_sel, _dp_occ, _dp_E = _e2t_state
+        _dp_E_dec = _dp_E
+        _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane.finish(_e2t_x, flow, _dp_sel, _dp_occ)
+      else:
+        _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
+        _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
+        _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
       if not getattr(self, 'dp_no_pool_injects', False):
         _dpv = self.dp_value_inject(_dp_pool)
         if getattr(self, 'dp_gated_injects', False):
