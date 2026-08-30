@@ -1128,14 +1128,17 @@ def Train():
   MIRROR_PROBE_STEPS = int(getattr(config, 'Opt_MirrorConsProbeSteps', 0) or 0)
   MIRROR_AUTO_LOW = float(getattr(config, 'Opt_MirrorConsAutoLow', 0.0015))   # runde-4: fallback = config-default
   MIRROR_AUTO_HIGH = float(getattr(config, 'Opt_MirrorConsAutoHigh', 0.003))
-  # Runde-4-validering: reaktivering blender nivaaet til ~HIGH/2 — med
-  # LOW >= HIGH/2 re-latcher kontrolleren dormant etter EN batch (evig
-  # 1-paa/N-av-oscillasjon); LOW >= HIGH flapper permanent.
-  assert MIRROR_AUTO_LOW < MIRROR_AUTO_HIGH / 2,       f'MirrorConsAutoLow ({MIRROR_AUTO_LOW}) maa vaere < AutoHigh/2 ({MIRROR_AUTO_HIGH/2}) — hysterese-latch-fellen'
   _mirror_active = True
   _mirror_level = None
   _mirror_step = 0
   if MIRROR_CONS_WEIGHT > 0:
+    # HOTFIX 2026-08-30: latch-vakten fra runde 4 var (a) UGATET — den drepte
+    # ogsaa kjoeringer med mekanismen helt AV, og (b) brukte streng ulikhet som
+    # config-defaultene selv (0.0015 = 0.003/2) ligger noeyaktig PAA. Analysen:
+    # reaktivering blender nivaaet til ~raw/2 der raw > HIGH strengt, saa
+    # LOW == HIGH/2 overlever marginalt — <= er riktig grense. Vakten hoerer
+    # naturligvis KUN hjemme naar termostaten faktisk er armert.
+    assert MIRROR_AUTO_LOW <= MIRROR_AUTO_HIGH / 2,         f'MirrorConsAutoLow ({MIRROR_AUTO_LOW}) maa vaere <= AutoHigh/2 ({MIRROR_AUTO_HIGH/2}) — hysterese-latch-fellen'
     if BOARDS_PER_BATCH != 1:
       raise NotImplementedError('CERES_VALUE_MIRROR_CONS_WEIGHT is only implemented for BOARDS_PER_BATCH==1')
     if WORLD_SIZE > 1:
