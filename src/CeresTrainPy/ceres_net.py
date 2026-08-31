@@ -856,7 +856,9 @@ class CeresNet(nn.Module):
                                   rel_degrees2=bool(getattr(config, 'NetDef_DualPlaneRelDegrees2', False)),
                                   king_flight=bool(getattr(config, 'NetDef_DualPlaneKingFlight', False)),
                                   king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)),
-                                  edge_update=bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)))
+                                  edge_update=bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)),
+                                  triplet_attention=getattr(config, 'NetDef_DualPlaneTripletAttention', False),
+                                  triplet_heads=int(getattr(config, 'NetDef_DualPlaneTripletHeads', 4) or 4))
       # KANT->TRUNK (boelge 9, 2026-08-30): planets ferdig-utviklede kanter
       # loeftes til [B,H,64,64]-bias paa trunk-attention (via one-hot-scatter,
       # dense matmuls). Teorigrunnlag: Kovax' rute-modell + klipp-stillhets-

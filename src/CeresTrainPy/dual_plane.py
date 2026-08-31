@@ -47,7 +47,9 @@ class DualPlanePBlock(nn.Module):
 
   def __init__(self, dp: int, heads: int, rel_channels: int, ffn_mult: int,
                norm_type: str, softmin_heads: int = 0, rel_gains: bool = False,
-               edge_update: bool = False):
+               edge_update: bool = False,
+               triplet_attention: bool = False,
+               triplet_heads: int = 4):
     super().__init__()
     assert dp % heads == 0
     self.dp, self.heads, self.dk = dp, heads, dp // heads
@@ -125,6 +127,23 @@ class DualPlanePBlock(nn.Module):
       nn.init.zeros_(self.eu_out.weight)
       self.eu_deg = nn.Linear(2 * rel_channels, dp, bias=False)
       nn.init.zeros_(self.eu_deg.weight)
+    # BOELGE 12 (TGT/ICML-24 + Kovax pair_stream): trippel-interaksjon — to par
+    # som deler en node faar snakke direkte. 3-legeme-fakta (roentgen, binding,
+    # batteri, avdekker) er EN komposisjon; dagens blokker maa gaa node-omveien.
+    # Plassering PRE-TRUNK i planet = der alle gevinstene vaare kom (kz/edge);
+    # ingen nye serielle trunk-noder (boelge-10/11-attribusjonen).
+    self.triplet_attention = bool(triplet_attention)
+    if triplet_attention:
+      # TGT-vinnerformen: kant (i,j) attenderer over k via score(i,k)+(k,j),
+      # aggregerer verdier fra (k,j). ta_out = stiens null. Hoder konfigurerbare
+      # (serve-kost ~lineaer i heads x siter); dv holder th*tv = 16 konstant.
+      _th = max(1, int(triplet_heads)); _tv = max(1, 16 // _th)
+      self._th, self._tv = _th, _tv
+      self.ta_q = nn.Linear(rel_channels, _th, bias=False)
+      self.ta_k = nn.Linear(rel_channels, _th, bias=False)
+      self.ta_v = nn.Linear(rel_channels, _th * _tv, bias=False)
+      self.ta_out = nn.Linear(_th * _tv, rel_channels, bias=False)
+      nn.init.zeros_(self.ta_out.weight)
     self.ln2 = make_norm(norm_type, dp)
     self.ffn1 = nn.Linear(dp, ffn_mult * dp, bias=False)
     self.ffn2 = nn.Linear(ffn_mult * dp, dp, bias=False)
@@ -141,6 +160,17 @@ class DualPlanePBlock(nn.Module):
       rel_pair = rel_pair.to(x.dtype) + self.eu_out(torch.nn.functional.mish(_ee + _ei + _ej))
       # degree-refresh fra levende kanter (samme aksesemantikk som rel_degrees)
       x = x + self.eu_deg(torch.cat([rel_pair.sum(dim=2), rel_pair.sum(dim=1)], dim=-1))
+    if self.triplet_attention:
+      _rp = rel_pair.to(x.dtype)
+      _sq = self.ta_q(_rp)                                       # [B,32,32,h] som (i,k)
+      _sk = self.ta_k(_rp)                                       # [B,32,32,h] som (k,j)
+      # score[b,i,j,k,h] = q(i,k) + k(k,j); softmax over k i fp32.
+      _sc = _sq.unsqueeze(2) + _sk.permute(0, 2, 1, 3).unsqueeze(1)  # [B,i,j,k,h]
+      _al = torch.softmax(_sc.float(), dim=3).to(x.dtype)        # [B,32,32,32,h]
+      _v = self.ta_v(_rp).reshape(*_rp.shape[:3], self._th, self._tv)  # [B,32(k),32(j),h,v]
+      _agg = torch.einsum('bijkh,bkjhv->bijhv', _al, _v)
+      rel_pair = rel_pair + self.ta_out(
+          _agg.reshape(*_agg.shape[:3], self._th * self._tv)).to(rel_pair.dtype)
     h = self.ln1(x)
     q, k, v = self.qkv(h).chunk(3, dim=-1)
     q = q.reshape(B, 32, self.heads, self.dk).transpose(1, 2)
@@ -195,7 +225,9 @@ class DualPlane(nn.Module):
                rel_degrees2: bool = False,
                rel_gains: bool = False,
                king_flight: bool = False,
-               king_zone: bool = False):
+               king_zone: bool = False,
+               triplet_attention = False,
+               triplet_heads: int = 4):
     super().__init__()
     self.dp = dp
     # interleave_cross: apply the (weight-shared, zero-init) S-plane
@@ -276,8 +308,12 @@ class DualPlane(nn.Module):
     self.blocks = nn.ModuleList([
         DualPlanePBlock(dp, heads, rel_channels, ffn_mult, norm_type,
                         softmin_heads=softmin_heads, rel_gains=rel_gains,
-                        edge_update=edge_update)
-        for _ in range(layers)])
+                        edge_update=edge_update,
+                        # int N = tat kun i de SISTE N blokkene; True = alle.
+                        triplet_attention=(bool(triplet_attention) if isinstance(triplet_attention, bool)
+                                           else _bi >= layers - int(triplet_attention)),
+                        triplet_heads=triplet_heads)
+        for _bi in range(layers)])
     # Cross-read P->S on the FINAL square flow.
     self.x_ln_p = make_norm(norm_type, dp)
     self.x_ln_s = make_norm(norm_type, s_dim)

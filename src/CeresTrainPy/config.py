@@ -555,6 +555,23 @@ class Configuration:
     self.NetDef_PolicyDepthAttention = None if _pda is None else int(_pda)
     # Boelge 9 (2026-08-30): levende kanter som trunk-attention-bias (fase-splittet plan).
     self.NetDef_DualPlaneEdgeToTrunkMask = config_net_def.get('DualPlaneEdgeToTrunkMask', False)
+    # FJERNET 09-01 (boelge 10-12-fasit): trunk-EGT (begge dietter), begge
+    # doer-formene og triangel-formen skuffet paa gates/EPS og er SLETTET.
+    # Hoylytt avvisning (BlockRepeat-konvensjonen): gamle configs skal feile
+    # synlig, ikke stille miste mekanismen sin.
+    for _dead in ('DualPlaneTrunkEGT', 'DualPlaneTrunkEGTLogit',
+                  'DualPlaneMultDoor', 'DualPlaneMultDoorPostNorm',
+                  'DualPlaneTriangle'):
+      if config_net_def.get(_dead):
+        raise ValueError(_dead + ' er FJERNET (boelge 10-12, 2026-09-01): mekanismen er slettet - '
+                         'se project_dual_plane_concept for fasit. Fjern noekkelen fra configen.')
+    # Boelge 12-overlever: trippel-ATTENTION i planet (TGT ICML-24-vinnerformen,
+    # replikert > triangel hos oss). bool True = alle P-blokker; int N = siste N.
+    self.NetDef_DualPlaneTripletAttention = config_net_def.get('DualPlaneTripletAttention', False)
+    if (not isinstance(self.NetDef_DualPlaneTripletAttention, bool)
+        and int(self.NetDef_DualPlaneTripletAttention) < 0):
+      raise ValueError('DualPlaneTripletAttention: int-formen maa vaere >= 0 (N = siste N P-blokker)')
+    self.NetDef_DualPlaneTripletHeads = int(config_net_def.get('DualPlaneTripletHeads', 4) or 4)
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)
