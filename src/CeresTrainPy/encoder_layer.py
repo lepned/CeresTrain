@@ -31,6 +31,8 @@ class EncoderLayer(torch.nn.Module):
                 use_global : bool = False,
                 smolgen_per_square_dim : int = 0, smolgen_intermediate_dim : int = 0,
                 smolgen_head_divisor : int = 1, smolgenPrepLayer = None,
+                smol_basis_k : int = 0, smol_basis_bank = None,
+                smol_static_mode : int = 0, smol_static_bank = None, smol_rel_bins = None,
                 smolgen_activation_type : str = 'None',
                 smolgen_delta_rank : int = 0,
                 attention_multiplier : int = 1,
@@ -82,7 +84,10 @@ class EncoderLayer(torch.nn.Module):
                                          graph_route_channels=graph_route_channels,
                                          softmin_heads=softmin_heads,
                                          softmax_agg_heads=softmax_agg_heads,
-                                         use_head_logit_temp=use_head_logit_temp)
+                                         use_head_logit_temp=use_head_logit_temp,
+                                         smol_basis_k=smol_basis_k, smol_basis_bank=smol_basis_bank,
+                                         smol_static_mode=smol_static_mode, smol_static_bank=smol_static_bank,
+                                         smol_rel_bins=smol_rel_bins)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 

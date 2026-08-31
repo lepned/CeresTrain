@@ -545,7 +545,16 @@ class Configuration:
     # Boelge 1 (2026-08-28): vektdelt blokk-dybde i P-planet. (Diff-attention i
     # P-blokkene ble bygget og SLETTET samme dag: policy-noeytral @10M og
     # TRT-doed 54x — RelGains-klassen.)
+    # SMOLBASIS (2026-08-31, Kovax-idé): K>0 erstatter smolgen-generatoren med
+    # statisk tabellbank + per-lags koeffisienter.
+    self.NetDef_SmolgenStaticBasisK = int(config_net_def.get('SmolgenStaticBasisK', 0) or 0)
+    self.NetDef_SmolgenStaticMode = int(config_net_def.get('SmolgenStaticMode', 0) or 0)
+    # PDA config-ifisert 2026-08-31 (vda-laerdommen: mekanismer skal ha config-
+    # noekkel, ikke env-only). None-sjekket: eksplisitt 0 slaar env-fallbacken.
+    _pda = config_net_def.get('PolicyDepthAttention', None)
+    self.NetDef_PolicyDepthAttention = None if _pda is None else int(_pda)
     # Boelge 9 (2026-08-30): levende kanter som trunk-attention-bias (fase-splittet plan).
+    self.NetDef_DualPlaneEdgeToTrunkMask = config_net_def.get('DualPlaneEdgeToTrunkMask', False)
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)

@@ -381,7 +381,11 @@ class CeresNet(nn.Module):
     # projection: the policy path is bit-identical at init. Parameter names keep
     # the 'vda_' prefix deliberately: train.py's partition rule ('vda_query' ->
     # no_decay) and the aux-head resume prefixes ('vda_') then apply unchanged.
-    self.pda_mode = int(os.environ.get('CERES_POLICY_DEPTH_ATTENTION', '0') or 0)
+    # Config-foerst (2026-08-31), env-fallback for legacy — eksplisitt config-0
+    # overstyrer en eksportert env-var (MirrorConsWeight-moensteret).
+    _pda_cfg = getattr(config, 'NetDef_PolicyDepthAttention', None)
+    self.pda_mode = (int(_pda_cfg) if _pda_cfg is not None
+                     else int(os.environ.get('CERES_POLICY_DEPTH_ATTENTION', '0') or 0))
     assert self.pda_mode in (0, 1), f'CERES_POLICY_DEPTH_ATTENTION must be 0/1, got {self.pda_mode}'
     if self.pda_mode:
       if not self.use_value_depth_attention:
@@ -644,7 +648,43 @@ class CeresNet(nn.Module):
       
     EPS = 1E-6
     
-    if SMOLGEN_PER_SQUARE_DIM > 0 and SMOLGEN_INTERMEDIATE_DIM > 0:
+    # SMOLBASIS (Kovax-idé 2026-08-31): erstatt hele smolgen-generatoren
+    # (~8,4M params paa 256x10 = ~40 %% av nettet!) med K statiske laerte
+    # 64x64-basistabeller per hode + en bitteliten per-lags koeffisient-
+    # generator (~1/26 params). Rangproben maalte effektiv rang ~31 paa vaar
+    # trente smolgen — dette er den FUNKSJONELLE testen av om hoyrangs-
+    # innholdet betyr noe. Bank init randn*0.05, koeff zero-init i DPA
+    # (rel_gains-laerdommen: signalvei fra steg en, no-op ved step 0).
+    # SMBSTATIC (trinn 2+3, 2026-08-31): Kovax' sterkeste form — REN statisk
+    # tabell per hode, delt over alle lag, ingen conditioner.
+    #   mode 1 = fri 64x64 per hode (~33k)   mode 2 = 15x15-relativ (~1.8k)
+    # Zero-init (tabellen ER outputen — direkte gradient, ingen rel_gains-felle).
+    self.smol_static_mode = int(getattr(config, 'NetDef_SmolgenStaticMode', 0) or 0)
+    assert self.smol_static_mode in (0, 1, 2)
+    if self.smol_static_mode == 1:
+      self.smol_static_bank = nn.Parameter(torch.zeros(self.NUM_HEADS, NUM_TOKENS_NET * NUM_TOKENS_NET))
+    elif self.smol_static_mode == 2:
+      self.smol_static_bank = nn.Parameter(torch.zeros(self.NUM_HEADS, 225))
+      qf = torch.arange(64) % 8; qr = torch.arange(64) // 8
+      _bins = ((qf[None, :] - qf[:, None]) + 7) * 15 + ((qr[None, :] - qr[:, None]) + 7)
+      self.register_buffer('smol_rel_bins', _bins.reshape(-1).long(), persistent=False)
+    if self.smol_static_mode > 0:
+      print(f'[ceres_net] SMBSTATIC enabled (mode {self.smol_static_mode}): '
+            f'{"fri 64x64" if self.smol_static_mode==1 else "15x15-RELATIV"} statisk tabell per hode, '
+            f'delt over lag ({self.smol_static_bank.numel()/1e3:.1f}k params) — ERSTATTER smolgen, INGEN conditioner')
+    self.smol_basis_k = int(getattr(config, 'NetDef_SmolgenStaticBasisK', 0) or 0)
+    assert not (self.smol_basis_k > 0 and self.smol_static_mode > 0), 'velg EN smolgen-erstatning'
+    if self.smol_static_mode > 0:
+      self.smolgenPrepLayer = None
+    elif self.smol_basis_k > 0:
+      self.smol_basis_bank = nn.Parameter(
+          torch.randn(self.NUM_HEADS, self.smol_basis_k, NUM_TOKENS_NET * NUM_TOKENS_NET) * 0.05)
+      self.smolgenPrepLayer = None
+      print(f'[ceres_net] SMOLBASIS enabled: {self.smol_basis_k} statiske basistabeller/hode '
+            f'({self.NUM_HEADS}x{self.smol_basis_k}x4096 = '
+            f'{self.NUM_HEADS*self.smol_basis_k*4096/1e3:.0f}k params, delt bank) '
+            f'+ per-lags zero-init koeffisienter — ERSTATTER smolgen-generatoren')
+    elif SMOLGEN_PER_SQUARE_DIM > 0 and SMOLGEN_INTERMEDIATE_DIM > 0:
       self.smolgenPrepLayer = nn.Linear(SMOLGEN_INTERMEDIATE_DIM // config.NetDef_SmolgenToHeadDivisor, NUM_TOKENS_NET * NUM_TOKENS_NET)
       # Optional LoRA wrap of the shared smolgen prep layer (gated by
       # CERES_LORA_SMOLGEN_RANK_DIV). Per-attention sm1/sm2/sm3 are wrapped
@@ -824,6 +864,9 @@ class CeresNet(nn.Module):
       # Zero-init => eksakt step-0 no-op. Krever edge_update (levende kanter);
       # inkompatibel med DualPlaneInterleave (fase-splitten).
       self.dp_edge_to_trunk = bool(getattr(config, 'NetDef_DualPlaneEdgeToTrunk', False))
+      self.dp_e2t_mask = bool(getattr(config, 'NetDef_DualPlaneEdgeToTrunkMask', False))
+      if self.dp_e2t_mask and not self.dp_edge_to_trunk:
+        raise ValueError('DualPlaneEdgeToTrunkMask krever DualPlaneEdgeToTrunk (ellers stille inert — review-funn 6)')
       if self.dp_edge_to_trunk:
         if not bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)):
           raise ValueError('DualPlaneEdgeToTrunk krever DualPlaneEdgeUpdate (levende kanter) — '
@@ -1152,6 +1195,11 @@ class CeresNet(nn.Module):
                       smolgen_intermediate_dim = SMOLGEN_INTERMEDIATE_DIM,
                       smolgen_head_divisor = config.NetDef_SmolgenToHeadDivisor,
                       smolgenPrepLayer = self.smolgenPrepLayer,
+                      smol_basis_k = getattr(self, 'smol_basis_k', 0),
+                      smol_basis_bank = getattr(self, 'smol_basis_bank', None),
+                      smol_static_mode = getattr(self, 'smol_static_mode', 0),
+                      smol_static_bank = getattr(self, 'smol_static_bank', None),
+                      smol_rel_bins = getattr(self, 'smol_rel_bins', None),
                       smolgen_activation_type = config.NetDef_SmolgenActivationType,
                       smolgen_delta_rank = config.NetDef_SmolgenDeltaRank,
                       alpha=self.alpha, layerNum=i, dropout_rate=self.DROPOUT_RATE,
@@ -1471,6 +1519,13 @@ class CeresNet(nn.Module):
       # kant-verdier scattret til ekte feltpar naar proj trener seg vekk fra
       # null. Slik ble 1151-gevinsten MAALT; en both-empty-maskert variant er
       # flagget oppfoelgingsarm foer horisont-adopsjon.
+      if getattr(self, 'dp_e2t_mask', False):
+        # BOTH-EMPTY-MASK (flagget oppfoelgingsarm, review-funn 3): null kanter
+        # der BEGGE slots er tomme (ren stoey paa skjevt valgte felter);
+        # piece<->tomfelt beholdes (kontroll-/fluktdekning = mekanismens poeng).
+        _occf = _e2t_occ.to(_bh.dtype)
+        _pm = 1.0 - (1.0 - _occf).unsqueeze(2) * (1.0 - _occf).unsqueeze(1)  # [B,32,32]
+        _bh = _bh * _pm.unsqueeze(-1)
       _bhp = _bh.permute(0, 3, 1, 2)                                         # [B,H,32,32]
       _b64 = torch.matmul(_S.transpose(1, 2).unsqueeze(1),
                           torch.matmul(_bhp, _S.unsqueeze(1)))               # [B,H,64,64]

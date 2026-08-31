@@ -170,7 +170,9 @@ class DotProductAttention(torch.nn.Module):
                graph_route_channels : int = 0,
                softmin_heads : int = 0,
                softmax_agg_heads : int = 0,
-               use_head_logit_temp : bool = False) -> None:
+               use_head_logit_temp : bool = False,
+               smol_basis_k : int = 0, smol_basis_bank = None,
+               smol_static_mode : int = 0, smol_static_bank = None, smol_rel_bins = None) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -184,7 +186,22 @@ class DotProductAttention(torch.nn.Module):
     self.smolgen_head_divisor = smolgen_head_divisor
     self.test = test    
     self.use_qkv = use_qkv
-    self.use_smolgen = smolgenPrepLayer is not None    
+    # SMOLBASIS: banken (delt, registrert i ceres_net) gjemmes i tuple saa den
+    # ikke re-registreres per lag; per-lags koeffisient-linear er zero-init =>
+    # smolgen-biaset er eksakt 0 ved step 0 (banken selv er randn — signalvei).
+    self.smol_static_mode = int(smol_static_mode or 0)
+    if self.smol_static_mode > 0 and smol_static_bank is not None:
+      self._smol_static_ref = (smol_static_bank, smol_rel_bins)
+    self.smol_basis_k = int(smol_basis_k or 0)
+    if self.smol_basis_k > 0 and smol_basis_bank is not None:
+      self._smol_basis_bank_ref = (smol_basis_bank,)
+      self.smol_coeff_ln = make_norm(norm_type, kv_channels * num_attention_heads, eps=layernorm_eps)
+      self.smol_coeff = torch.nn.Linear(kv_channels * num_attention_heads, num_attention_heads * self.smol_basis_k)
+      torch.nn.init.zeros_(self.smol_coeff.weight)
+      torch.nn.init.zeros_(self.smol_coeff.bias)
+    self.use_smolgen = (smolgenPrepLayer is not None
+                        or (self.smol_basis_k > 0 and smol_basis_bank is not None)
+                        or (self.smol_static_mode > 0 and smol_static_bank is not None))    
     self.use_rpe = use_rpe
     self.use_rpe_v = use_rpe_v
     self.use_rope = use_rope
@@ -489,7 +506,7 @@ class DotProductAttention(torch.nn.Module):
     self.smolgen_intermediate_dim = smolgen_intermediate_dim
 
 
-    if self.use_smolgen:
+    if self.use_smolgen and smolgenPrepLayer is not None:   # smolbasis-modus lager INGEN sm-lag
       self.wrapped_smolgen_prep_layer = LinearWrapper(smolgenPrepLayer) # wrap so shared layer is not re-registered
       self.sm1 = _maybe_wrap_smolgen_lora(torch.nn.Linear(self.d_model, smolgen_per_square_dim))
       self.sm2 = _maybe_wrap_smolgen_lora(torch.nn.Linear(num_tokens_q * smolgen_per_square_dim, smolgen_intermediate_dim))
@@ -499,6 +516,8 @@ class DotProductAttention(torch.nn.Module):
 
     # Variant A: per-layer low-rank zero-init delta added to the shared
     # smolgenPrepLayer output. Only active when smolgen is on AND rank > 0.
+    if smolgen_delta_rank > 0 and (self.smol_basis_k > 0 or self.smol_static_mode > 0):
+      raise ValueError('SmolgenDeltaRank er inkompatibel med smolbasis/smbstatic (delta-modulene ville vaert doedvekt)')
     self.use_smolgen_delta = self.use_smolgen and smolgen_delta_rank > 0
     if self.use_smolgen_delta:
       self.smolgen_delta = SmolgenPerLayerDelta(
@@ -816,6 +835,23 @@ class DotProductAttention(torch.nn.Module):
   
 
   def calc_smolgen(self, x:torch.Tensor) -> torch.Tensor:
+    if self.smol_static_mode > 0:
+      _bank, _bins = self._smol_static_ref
+      if self.smol_static_mode == 2:
+        # Review-funn 1: .to(device) BYTTER buffer-objekter (Parameter beholdes
+        # in-place) => tuple-referansen holdt CPU-bins. Flytt ved bruk (billig).
+        _t = _bank.index_select(1, _bins.to(_bank.device)).reshape(self.num_heads, self.num_tokens_q, self.num_tokens_q)
+      else:
+        _t = _bank.reshape(self.num_heads, self.num_tokens_q, self.num_tokens_q)
+      _dt = torch.get_autocast_dtype('cuda') if (torch.is_autocast_enabled() and _t.is_cuda) else x.dtype
+      return _t.unsqueeze(0).to(_dt).expand(x.shape[0], -1, -1, -1)   # review-funn 5: unngaa fp32-promotering av score-kjeden
+    if self.smol_basis_k > 0:
+      # SMOLBASIS: global mean-pool -> [B, H, K]-koeffisienter -> tabellbank.
+      _g = self.smol_coeff_ln(x.mean(dim=1))                                 # [B, D] (normert — smbR-divergens-fiksen)
+      _c = self.smol_coeff(_g).reshape(-1, self.num_heads, self.smol_basis_k)  # [B,H,K]
+      _bank = self._smol_basis_bank_ref[0].to(_c.dtype)                      # [H,K,4096]
+      _t = torch.matmul(_c.transpose(0, 1), _bank).transpose(0, 1)           # [B,H,4096]
+      return _t.reshape(-1, self.num_heads, self.num_tokens_q, self.num_tokens_q)
     smolgen = self.sm1(x)
     smolgen = smolgen.reshape(-1, self.num_tokens_q * self.smolgen_per_square_dim)
 

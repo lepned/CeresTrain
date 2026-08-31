@@ -557,6 +557,13 @@ def Train():
           elif "dual_plane" in fpn and "log_tau" in fpn:
               # P-plane soft-min temperatures: bias-like 1-D log params.
               no_decay.add(fpn)
+          elif "smol_basis_bank" in fpn or "smol_static_bank" in fpn:
+              # Smolbasis/smbstatic-tabellbankene: raa logit-tabeller, ikke
+              # projeksjonsvekter — embedding-konvensjonen (no decay). NB
+              # no_decay er INERT under Muon (muon.py bruker gruppe-wd paa alt);
+              # Muon-ortogonaliserings-unntaket haandteres separat i
+              # _use_muon_final_only (review-funn 3/4 2026-09-01).
+              no_decay.add(fpn)
           elif "cbk_keys" in fpn or "cbk_vals" in fpn:
               # Tactical-codebook motif tables: embedding-like raw matrices
               # (row = motif), not projection weights — follow the embedding
@@ -627,6 +634,7 @@ def Train():
       if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
       if 'embedding' in n: return False         # lookup-table-like: AdamW
       if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
+      if 'smol_basis_bank' in n or 'smol_static_bank' in n: return False  # raa logit-tabeller, ikke vektmatriser (review-funn 3)
       if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
       if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
       if 'dpe_w' in n or 'dpd_' in n or 'dpch_w' in n or 'dpc_score' in n: return False  # 1-row zero-init decode couplings: Newton-Schulz fixed-spectral-norm on rank-1 zero-init is the wrong class (review 2026-08-25b finding 9)
