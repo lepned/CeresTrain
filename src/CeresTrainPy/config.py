@@ -575,6 +575,26 @@ class Configuration:
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)
+    # BOELGE 13 / P1 (2026-09-02, "Edge Stream Diagnosis"): PAR-SUPERVISJON paa
+    # planets laerte kant-tilstand. Diagnosen: kantene har aldri hatt et eget
+    # treningsmaal (TGT mister 13 % uten avstandstapet; AF2 distogram; EGT
+    # aux-avstand) — hos oss naar gradienten kantene bare via null-initierte
+    # lesere -> softmax -> e2t (160 params). Tre noekler:
+    #   DualPlaneEdgeAuxWithhold  familier (subset av VisEdgeFamilies) som
+    #       FJERNES fra planets input og i stedet blir BCE-MAAL for kant-
+    #       tilstanden (Kovax' anti-substitusjonsform: maalet kan bare naas
+    #       ved aa KOMPONERE det, ikke lese det av). Uten aux-vekt = "withheld
+    #       control"-armen (samme input, ingen supervisjon).
+    #   DualPlaneEdgeAuxDetach    probe-modus: hodet trener, planet faar INGEN
+    #       gradient fra aux (stop-gradient) — maaler dekodbarhet, ikke laering.
+    #   opt LossDualPlaneEdgePiMultiplier   pi-kant: soeke-policyens masse paa
+    #       brikke-par-trekk (fra-brikke -> til-brikke) + null-boette, CE.
+    #   opt LossDualPlaneEdgeRelMultiplier  BCE paa de tilbakeholdte familiene.
+    # Kun trening; eksportgrafen er uendret (null serving-kost).
+    self.NetDef_DualPlaneEdgeAuxWithhold = str(config_net_def.get('DualPlaneEdgeAuxWithhold', '') or '')
+    self.NetDef_DualPlaneEdgeAuxDetach = bool(config_net_def.get('DualPlaneEdgeAuxDetach', False))
+    self.Opt_LossDualPlaneEdgePiMultiplier = float(config_opt.get('LossDualPlaneEdgePiMultiplier', 0) or 0)
+    self.Opt_LossDualPlaneEdgeRelMultiplier = float(config_opt.get('LossDualPlaneEdgeRelMultiplier', 0) or 0)
     # DualPlaneBlockRepeat SLETTET 2026-08-29 (boelge 5): vektdelt dybde SKADET
     # den rike planen 2v2-seeds (mate-value 58/38 vs kzcaps 80/82) og var
     # noeytral paa fattig base — intet brukstilfelle igjen.

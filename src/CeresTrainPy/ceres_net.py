@@ -835,9 +835,35 @@ class CeresNet(nn.Module):
       # Gjenbruk den kanoniske parsen (bugfunn 2026-08-28): re-parsing av raa
       # config-streng med '' som default divergerte fra 679-684 (case/default)
       # => feil _dp_rel_C og shape-krasj langt fra aarsaken.
-      _dp_fams = self._vis_edge_families
-      assert _dp_fams, 'UseDualPlane needs VisEdgeFamilies for its relation channels'
+      _dp_fams_all = self._vis_edge_families
+      assert _dp_fams_all, 'UseDualPlane needs VisEdgeFamilies for its relation channels'
+      # BOELGE 13 / P1 (2026-09-02): EDGE-AUX — par-supervisjon paa planets
+      # kant-tilstand (se config.py for noekkel-semantikken). WITHHOLD fjerner
+      # familier fra planets input (og dermed fra ALLE plan-side konsumenter:
+      # rel_proj/e2t/degrees/move-edge-decode — alt som er dimensjonert av
+      # _dp_rel_C) og gjoer dem til BCE-maal for den laerte kant-tilstanden.
+      # S-planets egen vis_edge_E (UseVisEdgeBias) er uroert.
+      _dp_wh_raw = [f.strip().lower() for f in
+                    str(getattr(config, 'NetDef_DualPlaneEdgeAuxWithhold', '') or '').split(',') if f.strip()]
+      for _f in _dp_wh_raw:
+        assert _f in _dp_fams_all, \
+            f'DualPlaneEdgeAuxWithhold: {_f!r} er ikke i VisEdgeFamilies {_dp_fams_all} (kan bare holde tilbake det som finnes)'
+      self.dp_eaux_withhold = tuple(f for f in VisibilityChannels.FAMILY_ORDER if f in _dp_wh_raw)
+      _dp_fams = tuple(f for f in _dp_fams_all if f not in self.dp_eaux_withhold)
+      assert _dp_fams, 'DualPlaneEdgeAuxWithhold kan ikke holde tilbake ALLE familiene — planet trenger minst en relasjonskanal'
       _dp_rel_C = 4 * len(_dp_fams)
+      self.dp_eaux_pi_w = float(getattr(config, 'Opt_LossDualPlaneEdgePiMultiplier', 0) or 0)
+      self.dp_eaux_rel_w = float(getattr(config, 'Opt_LossDualPlaneEdgeRelMultiplier', 0) or 0)
+      self.dp_eaux_detach = bool(getattr(config, 'NetDef_DualPlaneEdgeAuxDetach', False))
+      self.dp_eaux_on = (self.dp_eaux_pi_w > 0) or (self.dp_eaux_rel_w > 0)
+      if self.dp_eaux_detach and not self.dp_eaux_on:
+        raise ValueError('DualPlaneEdgeAuxDetach uten LossDualPlaneEdgePi/RelMultiplier > 0 er en stille no-op (skjult kontroll)')
+      if self.dp_eaux_rel_w > 0 and not self.dp_eaux_withhold:
+        raise ValueError('LossDualPlaneEdgeRelMultiplier > 0 krever DualPlaneEdgeAuxWithhold (ellers er maalet en identitets-avlesning av inputen)')
+      if self.dp_eaux_on and not (bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False))
+                                  or bool(getattr(config, 'NetDef_DualPlaneTripletAttention', False))):
+        raise ValueError('Edge-aux krever en LAERT kant-tilstand (DualPlaneEdgeUpdate og/eller DualPlaneTripletAttention) — '
+                         'uten den er kantene den statiske E og hodet en linear probe paa inputen')
       # Relation source: reuse the S-plane's vis_edge_E when UseVisEdgeBias is
       # on; on a BARE chassis (the A1 one-key-delta design: dp1 = nvc +
       # UseDualPlane) build a private VisibilityChannels and compute E solely
@@ -845,6 +871,51 @@ class CeresNet(nn.Module):
       self.dp_private_vis = not bool(getattr(config, 'NetDef_UseVisEdgeBias', False))
       if self.dp_private_vis:
         self.dp_vis_module = VisibilityChannels(families=_dp_fams)
+      if self.dp_eaux_withhold:
+        # Shared-E case: the S-plane tensor carries ALL families in canonical
+        # order, 4 channels each — select the plane's and the withheld subsets.
+        # Private case: a second tiny VisibilityChannels builds the targets.
+        _idx = {f: [4 * i + o for o in range(4)] for i, f in enumerate(_dp_fams_all)}
+        self.register_buffer('dp_plane_ch_idx',
+                             torch.tensor(sum((_idx[f] for f in _dp_fams), []), dtype=torch.long),
+                             persistent=False)
+        self.register_buffer('dp_eaux_ch_idx',
+                             torch.tensor(sum((_idx[f] for f in self.dp_eaux_withhold), []), dtype=torch.long),
+                             persistent=False)
+        if self.dp_private_vis and self.dp_eaux_rel_w > 0:
+          # fork_rng: VisibilityChannels runs a construction-time random probe
+          # (the out/in swap identity), which would advance the global stream
+          # and break bit-pairing with the withheld control (caught by
+          # test_dual_plane_edge_aux.py on the very first run).
+          with torch.random.fork_rng(devices=[]):
+            self.dp_eaux_vis_module = VisibilityChannels(families=self.dp_eaux_withhold)
+        if not self.dp_eaux_on:
+          print(f'[ceres_net] DUAL-PLANE EDGE-AUX WITHHELD CONTROL: {self.dp_eaux_withhold} fjernet fra '
+                f'planets input ({_dp_rel_C} kanaler igjen), INGEN kant-supervisjon (kontrollarmen)')
+      if self.dp_eaux_on:
+        # Readout: ONE linear head on the final [B,32,32,C] edge state ->
+        # [pi-edge logit (1)] + [withheld relation logits (4 per family)].
+        # NONZERO init (the whole point: a live gradient into the edges from
+        # step 0 — the zero-init product-rule cascade is the diagnosed
+        # bottleneck) drawn from a FIXED module-local key, as plain
+        # nn.Parameters (an nn.Linear would draw from the global RNG stream and
+        # shift every later init => the arm would not be bit-paired with its
+        # control; Kovax-invarianten). Not part of the served graph.
+        _T = (1 if self.dp_eaux_pi_w > 0 else 0) + (4 * len(self.dp_eaux_withhold) if self.dp_eaux_rel_w > 0 else 0)
+        _g = torch.Generator().manual_seed(0x0E6E)
+        _w = torch.empty(_T, _dp_rel_C)
+        _w.uniform_(-(_dp_rel_C ** -0.5), _dp_rel_C ** -0.5, generator=_g)
+        self.dp_eaux_w = nn.Parameter(_w)
+        self.dp_eaux_b = nn.Parameter(torch.zeros(_T))
+        if self.dp_eaux_pi_w > 0:
+          from lc0_moves_1858 import FROM_1858 as _F7, TO_1858 as _T7
+          self.register_buffer('dp_eaux_mv_ft',
+                               torch.tensor(_F7, dtype=torch.long) * 64 + torch.tensor(_T7, dtype=torch.long),
+                               persistent=False)   # [1858] from*64+to
+        print(f'[ceres_net] DUAL-PLANE EDGE-AUX enabled: pi-edge w={self.dp_eaux_pi_w}, '
+              f'rel w={self.dp_eaux_rel_w} on withheld {self.dp_eaux_withhold} '
+              f'({_T} targets from {_dp_rel_C} edge channels, nonzero fixed-key init'
+              f'{", DETACHED probe: no gradient into the plane" if self.dp_eaux_detach else ""}; training-only)')
       _dp_smh = int(getattr(config, 'NetDef_DualPlaneSoftMinHeads', 2) or 0)
       _dp_dim = int(getattr(config, 'NetDef_DualPlaneDim', 128) or 128)
       _dp_layers = int(getattr(config, 'NetDef_DualPlaneLayers', 2) or 2)
@@ -1461,6 +1532,23 @@ class CeresNet(nn.Module):
     self.writer.add_scalar(name, value, step)
 
 
+  def _dp_plane_E(self, vis_edge_E, squares13):
+    """Boelge 13: planets relasjonskilde, med WITHHOLD-splitten.
+    Returns (E_plane [B,64,64,C_plane], E_tgt [B,64,64,4W] or None).
+    E_plane feeds every plane-side consumer (P-blocks, e2t, decodes); E_tgt is
+    the withheld families, built only when the rel-aux loss will consume them
+    (training) — never in eval/export, so the served graph is unchanged."""
+    _need_tgt = self.training and getattr(self, 'dp_eaux_rel_w', 0) > 0
+    if vis_edge_E is not None:
+      if not getattr(self, 'dp_eaux_withhold', ()):
+        return vis_edge_E, None
+      _Ep = vis_edge_E.index_select(3, self.dp_plane_ch_idx)
+      _Et = vis_edge_E.index_select(3, self.dp_eaux_ch_idx) if _need_tgt else None
+      return _Ep, _Et
+    _Ep = self.dp_vis_module(squares13)
+    _Et = self.dp_eaux_vis_module(squares13) if _need_tgt else None
+    return _Ep, _Et
+
   def _grad_scale_read(self, x):
     """Bit-eksakt grad-skala-lesing av delte plan-tokens (to review-funn bakt inn:
     2026-08-21 #12 ulp-eksakthet via x.detach()+(x-x.detach())*a; action-review #8
@@ -1505,8 +1593,9 @@ class CeresNet(nn.Module):
     # levende kantene inn som attention-bias (komponerer additivt med PRB/ray;
     # konsumeres av lag-loekka via piece_relation_bias_tensor).
     _e2t_state = None
+    _dp_E_tgt = None     # boelge 13: withheld-family targets [B,64,64,4W] (training + rel-aux only)
     if self.use_dual_plane and getattr(self, 'dp_edge_to_trunk', False):
-      _e2t_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
+      _e2t_E, _dp_E_tgt = self._dp_plane_E(vis_edge_E, squares[:, :, 0:13])
       # NB (review-funn 5): flow er enda raa squares her (fp32) — planet kjoerer
       # fase 1 i fp32-inputs under autocast, mot monolitt-stiens post-trunk-dtype;
       # ufarlig (autocast styrer matmuls), men A/B-delta mot kzedge inkluderer
@@ -1767,11 +1856,25 @@ class CeresNet(nn.Module):
       if _e2t_state is not None:
         _e2t_x, _e2t_rel, _dp_sel, _dp_occ, _dp_E = _e2t_state
         _dp_E_dec = _dp_E
+        _dp_rel_final = _e2t_rel
         _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane.finish(_e2t_x, flow, _dp_sel, _dp_occ)
       else:
-        _dp_E = vis_edge_E if vis_edge_E is not None else self.dp_vis_module(squares[:, :, 0:13])
+        _dp_E, _dp_E_tgt = self._dp_plane_E(vis_edge_E, squares[:, :, 0:13])
         _dp_E_dec = _dp_E   # kept for the move-edge decode (shared or private source)
-        _dp_pool, _dp_tokens, _dp_sel, _dp_occ = self.dual_plane(squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
+        _dp_pool, _dp_tokens, _dp_sel, _dp_occ, _dp_rel_final = self.dual_plane(
+            squares[:, :, 0:13].to(flow.dtype), _dp_E, flow)
+      # EDGE-AUX stash (boelge 13, training-only; consumed in compute_loss):
+      # readout on the FINAL edge state (the tensor e2t lifts), plus the
+      # withheld-family targets double-gathered to the same slot pairs.
+      if self.training and getattr(self, 'dp_eaux_on', False):
+        _ea_rel = _dp_rel_final.detach() if self.dp_eaux_detach else _dp_rel_final
+        _ea_logits = torch.nn.functional.linear(_ea_rel.float(), self.dp_eaux_w, self.dp_eaux_b)   # [B,32,32,T]
+        _ea_tgt = None
+        if _dp_E_tgt is not None:
+          _Bt, _Ct = _dp_E_tgt.shape[0], _dp_E_tgt.shape[-1]
+          _ea_rows = torch.gather(_dp_E_tgt, 1, _dp_sel.reshape(_Bt, 32, 1, 1).expand(-1, -1, 64, _Ct))
+          _ea_tgt = torch.gather(_ea_rows, 2, _dp_sel.reshape(_Bt, 1, 32, 1).expand(-1, 32, -1, _Ct)).float()
+        self._last_dp_eaux = (_ea_logits, _dp_sel, _dp_occ, _ea_tgt)
       if not getattr(self, 'dp_no_pool_injects', False):
         _dpv = self.dp_value_inject(_dp_pool)
         if getattr(self, 'dp_gated_injects', False):
@@ -2450,6 +2553,69 @@ class CeresNet(nn.Module):
         oppp_loss = 0.0 * _oppp.float().sum()
         _oppp_participation_only = True
 
+    # EDGE-AUX (boelge 13 / P1): par-supervisjon paa planets kant-tilstand.
+    # Two targets on the final [B,32,32,C] edge state, both restricted to
+    # PIECE-PIECE slot pairs (the plane's competence; empty slots masked):
+    #   pi-edge: the search policy's mass on moves between two piece squares
+    #            (captures; castling too under king-takes-rook encoding),
+    #            scattered from the 1858 move list onto (from,to) and gathered
+    #            to slot pairs, plus a NULL bucket = the remaining (quiet) mass.
+    #            Legality-masked softmax-CE minus target entropy (house KL form).
+    #   rel:     BCE against the withheld visibility families (xray/pinray/...)
+    #            that were REMOVED from the plane's input — reachable only by
+    #            composing the families it still sees (anti-substitution form).
+    # Logged: losses, pi top-1, capture share, per-family BCE and separation
+    # (mean sigmoid on positives minus negatives = the decodability probe).
+    dpe_pi_loss = 0
+    dpe_rel_loss = 0
+    _dpe_log = {}
+    _dpe = getattr(self, '_last_dp_eaux', None)
+    if _dpe is not None and not gradient_norm_logging_mode:
+      self._last_dp_eaux = None
+      _ea_lg, _ea_sel, _ea_occ, _ea_tgt = _dpe
+      _Be = _ea_lg.shape[0]
+      _occf = _ea_occ.float()
+      _pairm = _occf.unsqueeze(2) * _occf.unsqueeze(1)                       # [B,32,32] both real pieces
+      _col = 0
+      if self.dp_eaux_pi_w > 0:
+        _pl = _ea_lg[..., 0]                                                 # [B,32,32]
+        _col = 1
+        _pt = policy_target.float()
+        _flat = torch.zeros(_Be, 4096, device=_pt.device, dtype=_pt.dtype).index_add_(1, self.dp_eaux_mv_ft, _pt)
+        _flatl = torch.zeros(_Be, 4096, device=_pt.device, dtype=_pt.dtype).index_add_(1, self.dp_eaux_mv_ft, (_pt > 0).float())
+        _pidx = (_ea_sel.unsqueeze(2) * 64 + _ea_sel.unsqueeze(1)).reshape(_Be, 1024)   # from*64+to per slot pair
+        _tm = torch.gather(_flat, 1, _pidx).reshape(_Be, 32, 32) * _pairm          # capture mass on piece pairs
+        _lm = (torch.gather(_flatl, 1, _pidx).reshape(_Be, 32, 32) > 0) & (_pairm > 0)
+        _null = (1.0 - _tm.sum(dim=(1, 2))).clamp_min(0.0)                        # quiet mass -> null bucket
+        _lgm = torch.where(_lm, _pl, torch.full_like(_pl, -1e4)).reshape(_Be, 1024)
+        _lgm = torch.cat([_lgm, torch.zeros(_Be, 1, device=_pl.device, dtype=_pl.dtype)], dim=1)   # null logit fixed at 0
+        _tg = torch.cat([_tm.reshape(_Be, 1024), _null.unsqueeze(1)], dim=1)
+        _tg = _tg / _tg.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        _lp = torch.log_softmax(_lgm, dim=1)
+        _ce = -(_tg * _lp).sum(dim=1)
+        _ent = -(_tg * _tg.clamp_min(1e-12).log()).sum(dim=1)
+        dpe_pi_loss = (_ce - _ent).mean()
+        with torch.no_grad():
+          _dpe_log['dp_edge_pi_top1'] = (_lgm.argmax(dim=1) == _tg.argmax(dim=1)).float().mean()
+          _dpe_log['dp_edge_pi_capshare'] = (1.0 - _null).mean()
+      if self.dp_eaux_rel_w > 0 and _ea_tgt is not None:
+        _rl = _ea_lg[..., _col:]                                             # [B,32,32,4W]
+        _bce = torch.nn.functional.binary_cross_entropy_with_logits(_rl, _ea_tgt, reduction='none')
+        _pm4 = _pairm.unsqueeze(-1)
+        _den = _pm4.sum() * _rl.shape[-1]
+        dpe_rel_loss = (_bce * _pm4).sum() / _den.clamp_min(1.0)
+        with torch.no_grad():
+          _sg = torch.sigmoid(_rl)
+          for _fi, _fam in enumerate(self.dp_eaux_withhold):
+            _sl = slice(4 * _fi, 4 * _fi + 4)
+            _t4, _s4, _b4 = _ea_tgt[..., _sl], _sg[..., _sl], _bce[..., _sl]
+            _pos = (_t4 > 0.5).float() * _pm4
+            _neg = (_t4 <= 0.5).float() * _pm4
+            _dpe_log['dp_edge_rel_' + _fam + '_bce'] = (_b4 * _pm4).sum() / (_pm4.sum() * 4).clamp_min(1.0)
+            _dpe_log['dp_edge_rel_' + _fam + '_sep'] = ((_s4 * _pos).sum() / _pos.sum().clamp_min(1.0)
+                                                        - (_s4 * _neg).sum() / _neg.sum().clamp_min(1.0))
+            _dpe_log['dp_edge_rel_' + _fam + '_rate'] = _pos.sum() / _pm4.sum().clamp_min(1.0) / 4
+
     opt_loss = 0
     _opt = getattr(self, '_last_opt_out', None)
     if _opt is not None and not gradient_norm_logging_mode:
@@ -2721,7 +2887,9 @@ class CeresNet(nn.Module):
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
-        + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
+        + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
+        + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
+        + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
 
     # POLICY/VALUE GRADIENT-CONFLICT PROBE (config GradConflictProbeSteps; the
     # measurement lives in train.py). When armed for this step, stash the two family
@@ -2748,6 +2916,8 @@ class CeresNet(nn.Module):
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
+          # pi-edge is a policy-target CE (rel-aux is neither family: kept out).
+          + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
           # policy family (unlike the depth probes, which span both).
           + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
@@ -2884,6 +3054,12 @@ class CeresNet(nn.Module):
         self._log("opp_policy_loss" + stat_suffix, oppp_loss, step=num_pos)
       if not isinstance(actp_loss, int) and not _actp_participation_only:
         self._log("action_played_loss" + stat_suffix, actp_loss, step=num_pos)
+      if not isinstance(dpe_pi_loss, int):
+        self._log("dp_edge_pi_loss" + stat_suffix, dpe_pi_loss, step=num_pos)
+      if not isinstance(dpe_rel_loss, int):
+        self._log("dp_edge_rel_loss" + stat_suffix, dpe_rel_loss, step=num_pos)
+      for _k, _v in _dpe_log.items():
+        self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not isinstance(refiner_ploss, int):

@@ -638,6 +638,7 @@ def Train():
       if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
       if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
       if 'dpe_w' in n or 'dpd_' in n or 'dpch_w' in n or 'dpc_score' in n: return False  # 1-row zero-init decode couplings: Newton-Schulz fixed-spectral-norm on rank-1 zero-init is the wrong class (review 2026-08-25b finding 9)
+      if 'dp_eaux_' in n: return False           # edge-aux readout [T, C] (boelge 13): a training-only final layer, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -1686,7 +1687,10 @@ def Train():
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + (
         'dual_plane.', 'dp_value_inject.', 'dp_value2_inject.', 'dp_pol_q.',
         'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.', 'dpv_a.', 'dpv_b.', 'dpe_w.',
-        'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_')
+        'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_',
+        # Edge-aux readout (boelge 13): training-only head, never in the served
+        # graph, so fresh-init on warm start changes nothing the base net does.
+        'dp_eaux_')
     # Graph-route heads + tactic refiner (2026-08 tactical program): the
     # refiner is top-level ('tactical_refiner.'), the route params live
     # nested per attention layer (transformer_layer.N.attention.graph_route_*).

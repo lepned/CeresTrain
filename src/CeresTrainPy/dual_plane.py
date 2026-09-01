@@ -326,11 +326,14 @@ class DualPlane(nn.Module):
 
   def forward(self, squares13, vis_E, s_flow):
     """squares13 [B,64,13] one-hot; vis_E [B,64,64,C]; s_flow [B,64,S].
-    Returns [B, 2*dp] pooled piece summary (masked mean + masked soft-min)."""
+    Returns (pooled [B, 2*dp] (masked mean + masked soft-min), tokens [B,32,dp],
+    sel [B,32], slot_occ [B,32], rel_pair_final [B,32,32,C]). The final edge
+    state is exposed for the edge-aux supervision (boelge 13); it is the same
+    tensor the e2t path lifts, so the two paths supervise the same object."""
     x, rel_pair, sel, slot_occ = self.run_pblocks(squares13, vis_E,
                                                   s_flow if self.interleave_cross else None)
     p, xt, sl, oc = self.finish(x, s_flow, sel, slot_occ)
-    return p, xt, sl, oc
+    return p, xt, sl, oc, rel_pair
 
   def run_pblocks(self, squares13, vis_E, interleave_s_flow=None):
     """Fase 1 (boelge 9): alt som er TRUNK-UAVHENGIG — embed, feature-injects
