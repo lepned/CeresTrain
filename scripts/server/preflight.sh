@@ -82,9 +82,14 @@ if nproc > 1:
         if float(opt.get(k, 0) or 0) > 0:
             warns.append(f'{k} > 0 needs CERES_DDP_STATIC_GRAPH=1 under DDP')
     ema = int(opt.get('EMAPeriodSteps', 0) or 0)
-    if ema:
-        warns.append(f'EMAPeriodSteps={ema} counts OPTIMIZER steps; a 1-GPU recipe of {ema*nproc} '
-                     f'corresponds to {ema} here (verify it was divided by nproc={nproc})')
+    # KORRIGERT 2026-09-01: det gamle raadet 'del paa nproc' var MATEMATISK FEIL
+    # (BatchSizeForwardPass er GLOBAL og deles paa ranks => ett optimizer-steg
+    # konsumerer samme antall posisjoner uansett world size; falsifisert 08-28).
+    # En 1-GPU-validert EMA-oppskrift brukes UENDRET under DDP. -1 = auto
+    # (vindu = ckpt-cadencen) og trenger ingen advarsel.
+    if ema > 0:
+        warns.append(f'EMAPeriodSteps={ema}: brukes UENDRET fra 1-GPU-oppskriften '
+                     f'(global batch deles paa ranks - IKKE del paa nproc; husstandard 100/10, -1 = auto)')
 
 print(f'  corpora     : {", ".join(l for l, _ in dirs)}')
 print(f'  format      : TPGV3={opt.get("TPGV3")} SquareBytes2={opt.get("SquareBytes2")} aux={aux}')

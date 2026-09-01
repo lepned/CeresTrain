@@ -805,7 +805,11 @@ class CeresNet(nn.Module):
       # Parametriske nokler har truthy DEFAULTS og er meningslose aa flagge;
       # kun feature-flagg (default 0/False) indikerer intensjon.
       _dp_param_keys = {'NetDef_DualPlanePolicyGradScale', 'NetDef_DualPlaneSoftMinHeads',
-                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK'}
+                        'NetDef_DualPlaneDim', 'NetDef_DualPlaneLayers', 'NetDef_DualPlaneSurvivalK',
+                        # Hotfix 2026-09-01 (BlockRepeat-klassen, fanget av 320-kanari):
+                        # TripletHeads har truthy DEFAULT (4) og fyrte guarden for ALLE
+                        # no-plane-configs siden d2bafdb. Parametrisk, ikke intensjons-flagg.
+                        'NetDef_DualPlaneTripletHeads'}
       _dp_set = [k for k, v in vars(config).items()
                  if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
       _dp_set += [k for k in ('NetDef_MoveEdgeDecode', 'NetDef_MoveDegreeDecode')
