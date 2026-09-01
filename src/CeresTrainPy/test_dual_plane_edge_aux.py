@@ -157,6 +157,16 @@ def main():
     assert torch.equal(sd_c[k], sd_a[k]), f'bit-pairing broken at {k}'
   print('  construction + bit-pairing OK (aux vs withheld control identical outside dp_eaux_*)')
 
+  # --- 2b. optimizer-build contract: the weight-decay partition must cover the
+  # raw nn.Parameters (bench bug 09-02: ea4fe1a died at train.py's partition
+  # assert before step 0 because no branch matched dp_eaux_*).
+  from wd_partition import partition_weight_decay
+  for m, tag in ((ctrl, 'ctrl'), (aux, 'aux'), (probe, 'probe')):
+    dec, nodec = partition_weight_decay(m)          # asserts completeness itself
+    if tag != 'ctrl':
+      assert 'dp_eaux_w' in nodec and 'dp_eaux_b' in nodec, (tag, 'dp_eaux_* must be no_decay')
+  print('  weight-decay partition OK (dp_eaux_* covered, no_decay)')
+
   # --- 3. training forward + loss + gradient routing -----------------------
   for m, tag, want_plane_grad in ((aux, 'supervised', True), (probe, 'detached probe', False)):
     m.train(); m.zero_grad(set_to_none=True)

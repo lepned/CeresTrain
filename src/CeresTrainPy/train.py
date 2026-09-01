@@ -522,75 +522,14 @@ def Train():
     model = torch.compile(model, mode=config.Opt_PyTorchCompileMode, dynamic=False)
   
   # carefully set weight decay to apply only to appropriate subset of parameters
-  # based on code from: https://github.com/karpathy/minGPT
-  whitelist_weight_modules = (torch.nn.Linear, SoftMoEBatchedDual, MultiExpertLayer)
-  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm, DerfNorm, DyTNorm)
-
-  decay = set()
-  no_decay = set()
-
-  for mn, m in model.named_modules():
-      for pn, p in m.named_parameters():
-          fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-          if pn.endswith('bias'):
-              no_decay.add(fpn)
-          elif "rpe" in fpn:
-              decay.add(fpn)
-          elif "lora" in fpn:
-              no_decay.add(fpn)
-          elif fpn.endswith('softmin_log_tau') or fpn.endswith('softmax_log_tau')                 or fpn.endswith('head_logit_temp'):
-              # (Flyttet HIT 2026-08-28 — bugfunn: grenen laa ETTER catch-all-en
-              # og var doed, stikk i strid med sin egen 2026-08-20#6-kommentar.)
-              no_decay.add(fpn)
-          elif "transformer_layer" in fpn:
-              decay.add(fpn)           
-          elif "rpe_factor" in fpn:
-              pass
-          elif "alphas" in fpn: # for Denseformer
-              decay.add(fpn)
-          elif "vda_query" in fpn: # depth-attention pseudo-query (bare 1-D vector, bias-like)
-              no_decay.add(fpn)
-          elif "rc_btype" in fpn or "rc_u" in fpn or "rc_v" in fpn or "rc_w" in fpn: # ray-context bare vectors (bias-like)
-              no_decay.add(fpn)
-          elif "rc_W" in fpn: # ray-context projections (plain Linear weights)
-              decay.add(fpn)
-          elif "dual_plane" in fpn and "log_tau" in fpn:
-              # P-plane soft-min temperatures: bias-like 1-D log params.
-              no_decay.add(fpn)
-          elif "smol_basis_bank" in fpn or "smol_static_bank" in fpn:
-              # Smolbasis/smbstatic-tabellbankene: raa logit-tabeller, ikke
-              # projeksjonsvekter — embedding-konvensjonen (no decay). NB
-              # no_decay er INERT under Muon (muon.py bruker gruppe-wd paa alt);
-              # Muon-ortogonaliserings-unntaket haandteres separat i
-              # _use_muon_final_only (review-funn 3/4 2026-09-01).
-              no_decay.add(fpn)
-          elif "cbk_keys" in fpn or "cbk_vals" in fpn:
-              # Tactical-codebook motif tables: embedding-like raw matrices
-              # (row = motif), not projection weights — follow the embedding
-              # convention (no decay; also keeps them out of Muon's
-              # orthogonalization, which targets true weight matrices).
-              no_decay.add(fpn)
-          elif ".mem_" in fpn:
-              decay.add(fpn)
-          elif "mlp.linear" in fpn:
-              decay.add(fpn)
-          elif "qkv" in fpn:
-              decay.add(fpn)
-          elif "embedding" in fpn:
-              no_decay.add(fpn)
-          elif isinstance(m, blacklist_weight_modules):
-              no_decay.add(fpn)
-          elif isinstance(m, whitelist_weight_modules):
-              decay.add(fpn)
-
-  
+  # based on code from: https://github.com/karpathy/minGPT. The loop lives in
+  # wd_partition.py (2026-09-02) so tests can run it: the edge-aux raw
+  # nn.Parameters (ea4fe1a) died HERE on the bench before step 0 while the
+  # smoke test, which never built the optimizer, passed.
+  from wd_partition import partition_weight_decay
+  decay, no_decay = partition_weight_decay(model)
   param_dict = {pn: p for pn, p in model.named_parameters()}
-  inter_params = decay & no_decay
-  union_params = decay | no_decay
-  assert len(inter_params) == 0, "parameters %s appear in both decay/no_decay sets" % (str(inter_params), )
-  assert len(param_dict.keys() - union_params) == 0, "parameters %s were not fully partitioned into decay/no_decay sets" \
-                                              % (str(param_dict.keys() - union_params), ) 
-        
+
   optim_groups = [
       {"params": [param_dict[pn] for pn in sorted(list(decay))  if "rpe_factor" not in pn], "weight_decay": WEIGHT_DECAY},
       {"params": [param_dict[pn] for pn in sorted(list(no_decay)) if "rpe_factor" not in pn], "weight_decay": 0.0},
