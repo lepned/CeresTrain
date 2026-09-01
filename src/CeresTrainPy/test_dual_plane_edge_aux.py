@@ -229,6 +229,36 @@ def main():
       _ = m(sq, None)
     assert getattr(m, '_last_dp_eaux', None) is None
     print(f'  path OK ({tag}): loss {float(loss.detach()):.4f}')
+
+  # --- 6. wave-3 mechanisms: ET-form triplet + nonzero reader init -----------
+  et, _ = build({'DualPlaneEdgeAuxWithhold': WH, 'DualPlaneTripletAttention': 1, 'DualPlaneTripletHeads': 2,
+                 'DualPlaneTripletForm': 'et'},
+                {'LossDualPlaneEdgePiMultiplier': 0.05, 'LossDualPlaneEdgeRelMultiplier': 2.0}, 'et')
+  assert hasattr(et.dual_plane.blocks[-1], 'ta_v2') and not hasattr(et.dual_plane.blocks[0], 'ta_v2')
+  et.train(); et.zero_grad(set_to_none=True)
+  loss = run_loss(et, batch, sq); assert torch.isfinite(loss); loss.backward()
+  assert et.dual_plane.blocks[-1].ta_v2.weight.grad is not None, 'ET composed value must receive gradient'
+  et.eval()
+  with torch.no_grad(): _ = et(sq, None)
+  print(f'  ET-form triplet OK: loss {float(loss.detach()):.4f}')
+  try:
+    build({'DualPlaneTripletForm': 'et'}, {}, 'rej'); raise SystemExit('FAIL: TripletForm without TripletAttention not rejected')
+  except ValueError as e:
+    print(f'  rejection OK (form-without-triplet): {str(e)[:70]}')
+  ri, _ = build({'DualPlaneEdgeAuxWithhold': WH, 'DualPlaneReaderInit': 0.02},
+                {'LossDualPlaneEdgePiMultiplier': 0.05, 'LossDualPlaneEdgeRelMultiplier': 2.0}, 'ri')
+  sd_r = ri.state_dict()
+  readers = [k for k in sd_r if any(t in k for t in ('rel_proj', 'eu_out', 'eu_deg', 'e2t_proj'))]
+  assert readers and all(sd_r[k].abs().sum() > 0 for k in readers), 'readers must be nonzero'
+  assert not torch.equal(sd_r['dual_plane.blocks.0.rel_proj.weight'], sd_r['dual_plane.blocks.1.rel_proj.weight']), 'blocks must differ'
+  for k in sd_a:
+    if k in sd_r and k not in readers:
+      assert torch.equal(sd_a[k], sd_r[k]), f'reader-init broke pairing at {k}'
+  ri.eval(); aux.eval()
+  with torch.no_grad():
+    o_r = ri(sq, None)[0]; o_a = aux(sq, None)[0]
+  assert not torch.equal(o_r, o_a), 'reader init must change step-0 outputs (by design)'
+  print(f'  reader-init OK: {len(readers)} reader tensors nonzero, all other tensors bit-paired with aux')
   print('ALL OK')
 
 

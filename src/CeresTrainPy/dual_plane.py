@@ -49,7 +49,10 @@ class DualPlanePBlock(nn.Module):
                norm_type: str, softmin_heads: int = 0, rel_gains: bool = False,
                edge_update: bool = False,
                triplet_attention: bool = False,
-               triplet_heads: int = 4):
+               triplet_heads: int = 4,
+               triplet_form: str = 'tgt',
+               reader_init: float = 0.0,
+               reader_seed: int = 0x0EA0):
     super().__init__()
     assert dp % heads == 0
     self.dp, self.heads, self.dk = dp, heads, dp // heads
@@ -58,10 +61,24 @@ class DualPlanePBlock(nn.Module):
     self.ln1 = make_norm(norm_type, dp)
     self.qkv = nn.Linear(dp, 3 * dp, bias=False)
     self.proj = nn.Linear(dp, dp, bias=False)
+    # READER INIT (boelge 13 / P2, 2026-09-02): every path from the edge state
+    # into the tokens/attention is zero-init (rel_proj, eu_out, eu_deg, ta_out,
+    # and e2t_proj in ceres_net). The Edge Stream Diagnosis names that the
+    # product-rule cascade: the edge update's gradient is proportional to a
+    # reader weight that starts at exactly 0. reader_init > 0 replaces the
+    # zeros with uniform(-s, s) from a FIXED key (no global RNG draw => the
+    # arm stays bit-paired with its zero-init control on every other tensor).
+    # 0.0 (default) = the historical exact step-0 no-op.
+    self.reader_init = float(reader_init or 0.0)
+    # Per-block seed (blocks differ) and a call counter (readers within a block
+    # differ); the generator is built per call so no torch.Generator lives on
+    # the module (deepcopy/export safety).
+    self._reader_seed = int(reader_seed)
+    self._reader_calls = 0
     # Relation-typed bias: per-head zero-init projection of the gathered
     # edge channels. Zero-init => block starts as PLAIN attention.
     self.rel_proj = nn.Linear(rel_channels, heads, bias=False)
-    nn.init.zeros_(self.rel_proj.weight)
+    self._init_reader(self.rel_proj.weight)
     # Relational-type modulation ("P-plane smolgen", catalogue idea, 2026-08-20):
     # a masked mean of the block's normed piece tokens conditions per-head,
     # per-channel GAINS on the relation-bias weights — the global position
@@ -124,30 +141,57 @@ class DualPlanePBlock(nn.Module):
       self.eu_i = nn.Linear(dp, _h, bias=False)
       self.eu_j = nn.Linear(dp, _h, bias=False)
       self.eu_out = nn.Linear(_h, rel_channels, bias=False)
-      nn.init.zeros_(self.eu_out.weight)
+      self._init_reader(self.eu_out.weight)
       self.eu_deg = nn.Linear(2 * rel_channels, dp, bias=False)
-      nn.init.zeros_(self.eu_deg.weight)
+      self._init_reader(self.eu_deg.weight)
     # BOELGE 12 (TGT/ICML-24 + Kovax pair_stream): trippel-interaksjon — to par
     # som deler en node faar snakke direkte. 3-legeme-fakta (roentgen, binding,
     # batteri, avdekker) er EN komposisjon; dagens blokker maa gaa node-omveien.
     # Plassering PRE-TRUNK i planet = der alle gevinstene vaare kom (kz/edge);
     # ingen nye serielle trunk-noder (boelge-10/11-attribusjonen).
     self.triplet_attention = bool(triplet_attention)
+    self.triplet_form = (triplet_form or 'tgt').lower()
+    assert self.triplet_form in ('tgt', 'et'), f'DualPlaneTripletForm: {triplet_form!r} (tgt|et)'
     if triplet_attention:
-      # TGT-vinnerformen: kant (i,j) attenderer over k via score(i,k)+(k,j),
-      # aggregerer verdier fra (k,j). ta_out = stiens null. Hoder konfigurerbare
-      # (serve-kost ~lineaer i heads x siter); dv holder th*tv = 16 konstant.
       _th = max(1, int(triplet_heads)); _tv = max(1, 16 // _th)
       self._th, self._tv = _th, _tv
-      self.ta_q = nn.Linear(rel_channels, _th, bias=False)
-      self.ta_k = nn.Linear(rel_channels, _th, bias=False)
-      self.ta_v = nn.Linear(rel_channels, _th * _tv, bias=False)
+      if self.triplet_form == 'tgt':
+        # TGT-vinnerformen: kant (i,j) attenderer over k via score(i,k)+(k,j),
+        # aggregerer verdier fra (k,j). ta_out = stiens null. Hoder konfigurerbare
+        # (serve-kost ~lineaer i heads x siter); dv holder th*tv = 16 konstant.
+        # NB (Edge Stream Diagnosis 09-02): additive score, value from ONE edge
+        # => this is closer to TGT's *aggregation* form than its attention form.
+        self.ta_q = nn.Linear(rel_channels, _th, bias=False)
+        self.ta_k = nn.Linear(rel_channels, _th, bias=False)
+        self.ta_v = nn.Linear(rel_channels, _th * _tv, bias=False)
+      else:
+        # EDGE-TRANSFORMER form (Bergen et al. NeurIPS'21; Mueller et al. 2024,
+        # exactly 3-WL): alpha_ikj = softmax_k(q_ik . k_kj / sqrt(dq)) and the
+        # VALUE is the elementwise COMPOSITION of the two edges,
+        # v = V1 E_ik (.) V2 E_kj. ET's ablation: value from one edge only drops
+        # CLUTRR k=6 from 82.0 to 54.4 — the composition IS the mechanism.
+        # dq = tv so th*(dq+tv) stays small; ta_out = the path's single zero.
+        self._dq = _tv
+        self.ta_q = nn.Linear(rel_channels, _th * self._dq, bias=False)
+        self.ta_k = nn.Linear(rel_channels, _th * self._dq, bias=False)
+        self.ta_v = nn.Linear(rel_channels, _th * _tv, bias=False)     # V1 (on E_ik)
+        self.ta_v2 = nn.Linear(rel_channels, _th * _tv, bias=False)    # V2 (on E_kj)
       self.ta_out = nn.Linear(_th * _tv, rel_channels, bias=False)
-      nn.init.zeros_(self.ta_out.weight)
+      self._init_reader(self.ta_out.weight)
     self.ln2 = make_norm(norm_type, dp)
     self.ffn1 = nn.Linear(dp, ffn_mult * dp, bias=False)
     self.ffn2 = nn.Linear(ffn_mult * dp, dp, bias=False)
     self.act = nn.Mish()
+
+  def _init_reader(self, w):
+    """Zero (default) or fixed-key uniform(-s, s) init of an edge READER weight."""
+    if self.reader_init > 0:
+      g = torch.Generator().manual_seed(self._reader_seed + 101 * self._reader_calls)
+      self._reader_calls += 1
+      with torch.no_grad():
+        w.uniform_(-self.reader_init, self.reader_init, generator=g)
+    else:
+      nn.init.zeros_(w)
 
   def forward(self, x, rel_pair, pad_bias):
     # x [B, 32, dp]; rel_pair [B, 32, 32, C]; pad_bias [B, 1, 1, 32]
@@ -160,7 +204,7 @@ class DualPlanePBlock(nn.Module):
       rel_pair = rel_pair.to(x.dtype) + self.eu_out(torch.nn.functional.mish(_ee + _ei + _ej))
       # degree-refresh fra levende kanter (samme aksesemantikk som rel_degrees)
       x = x + self.eu_deg(torch.cat([rel_pair.sum(dim=2), rel_pair.sum(dim=1)], dim=-1))
-    if self.triplet_attention:
+    if self.triplet_attention and self.triplet_form == 'tgt':
       _rp = rel_pair.to(x.dtype)
       _sq = self.ta_q(_rp)                                       # [B,32,32,h] som (i,k)
       _sk = self.ta_k(_rp)                                       # [B,32,32,h] som (k,j)
@@ -169,6 +213,27 @@ class DualPlanePBlock(nn.Module):
       _al = torch.softmax(_sc.float(), dim=3).to(x.dtype)        # [B,32,32,32,h]
       _v = self.ta_v(_rp).reshape(*_rp.shape[:3], self._th, self._tv)  # [B,32(k),32(j),h,v]
       _agg = torch.einsum('bijkh,bkjhv->bijhv', _al, _v)
+      rel_pair = rel_pair + self.ta_out(
+          _agg.reshape(*_agg.shape[:3], self._th * self._tv)).to(rel_pair.dtype)
+    elif self.triplet_attention:
+      # ET form: alpha_ikj = softmax_k(q_ik . k_kj / sqrt(dq));
+      # agg_ij = sum_k alpha_ikj * (V1 E_ik (.) V2 E_kj).
+      _rp = rel_pair.to(x.dtype)
+      _B3 = _rp.shape[:3]
+      _q = self.ta_q(_rp).reshape(*_B3, self._th, self._dq)         # [B,i,k,h,d]
+      _k = self.ta_k(_rp).reshape(*_B3, self._th, self._dq)         # [B,k,j,h,d]
+      _sc = torch.einsum('bikhd,bkjhd->bijkh', _q, _k) * (self._dq ** -0.5)
+      _al = torch.softmax(_sc.float(), dim=3).to(x.dtype)            # [B,i,j,k,h]
+      _v1 = self.ta_v(_rp).reshape(*_B3, self._th, self._tv)        # [B,i,k,h,v]
+      _v2 = self.ta_v2(_rp).reshape(*_B3, self._th, self._tv)       # [B,k,j,h,v]
+      # Composed value without materialising [B,i,j,k,h,v]: fold v1 into the
+      # attention weights one value-channel at a time (tv is small), then
+      # contract over k against v2.
+      _cols = []
+      for _c in range(self._tv):
+        _aw = _al * _v1[..., _c].unsqueeze(2)                          # [B,i,j,k,h]
+        _cols.append(torch.einsum('bijkh,bkjh->bijh', _aw, _v2[..., _c]))
+      _agg = torch.stack(_cols, dim=-1)                                # [B,i,j,h,v]
       rel_pair = rel_pair + self.ta_out(
           _agg.reshape(*_agg.shape[:3], self._th * self._tv)).to(rel_pair.dtype)
     h = self.ln1(x)
@@ -227,7 +292,9 @@ class DualPlane(nn.Module):
                king_flight: bool = False,
                king_zone: bool = False,
                triplet_attention = False,
-               triplet_heads: int = 4):
+               triplet_heads: int = 4,
+               triplet_form: str = 'tgt',
+               reader_init: float = 0.0):
     super().__init__()
     self.dp = dp
     # interleave_cross: apply the (weight-shared, zero-init) S-plane
@@ -312,7 +379,10 @@ class DualPlane(nn.Module):
                         # int N = tat kun i de SISTE N blokkene; True = alle.
                         triplet_attention=(bool(triplet_attention) if isinstance(triplet_attention, bool)
                                            else _bi >= layers - int(triplet_attention)),
-                        triplet_heads=triplet_heads)
+                        triplet_heads=triplet_heads,
+                        triplet_form=triplet_form,
+                        reader_init=reader_init,
+                        reader_seed=0x0EA0 + 17 * _bi)
         for _bi in range(layers)])
     # Cross-read P->S on the FINAL square flow.
     self.x_ln_p = make_norm(norm_type, dp)

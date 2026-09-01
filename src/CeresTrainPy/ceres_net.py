@@ -809,7 +809,9 @@ class CeresNet(nn.Module):
                         # Hotfix 2026-09-01 (BlockRepeat-klassen, fanget av 320-kanari):
                         # TripletHeads har truthy DEFAULT (4) og fyrte guarden for ALLE
                         # no-plane-configs siden d2bafdb. Parametrisk, ikke intensjons-flagg.
-                        'NetDef_DualPlaneTripletHeads'}
+                        'NetDef_DualPlaneTripletHeads',
+                        # boelge 13: parametriske (default ''/0.0, men navngitte former er truthy)
+                        'NetDef_DualPlaneTripletForm', 'NetDef_DualPlaneReaderInit'}
       _dp_set = [k for k, v in vars(config).items()
                  if k.startswith('NetDef_DualPlane') and k not in _dp_param_keys and bool(v)]
       _dp_set += [k for k in ('NetDef_MoveEdgeDecode', 'NetDef_MoveDegreeDecode')
@@ -933,7 +935,16 @@ class CeresNet(nn.Module):
                                   king_zone=bool(getattr(config, 'NetDef_DualPlaneKingZone', False)),
                                   edge_update=bool(getattr(config, 'NetDef_DualPlaneEdgeUpdate', False)),
                                   triplet_attention=getattr(config, 'NetDef_DualPlaneTripletAttention', False),
-                                  triplet_heads=int(getattr(config, 'NetDef_DualPlaneTripletHeads', 4) or 4))
+                                  triplet_heads=int(getattr(config, 'NetDef_DualPlaneTripletHeads', 4) or 4),
+                                  triplet_form=(str(getattr(config, 'NetDef_DualPlaneTripletForm', '') or '') or 'tgt'),
+                                  reader_init=float(getattr(config, 'NetDef_DualPlaneReaderInit', 0) or 0))
+      self.dp_reader_init = float(getattr(config, 'NetDef_DualPlaneReaderInit', 0) or 0)
+      if str(getattr(config, 'NetDef_DualPlaneTripletForm', '') or '') and \
+          not getattr(config, 'NetDef_DualPlaneTripletAttention', False):
+        raise ValueError('DualPlaneTripletForm er satt uten DualPlaneTripletAttention (stille no-op)')
+      if self.dp_reader_init > 0:
+        print(f'[ceres_net] DUAL-PLANE READER-INIT: edge readers (rel_proj/eu_out/eu_deg/ta_out/e2t_proj) '
+              f'uniform(+-{self.dp_reader_init}) from fixed keys — NOT a step-0 no-op by design')
       # KANT->TRUNK (boelge 9, 2026-08-30): planets ferdig-utviklede kanter
       # loeftes til [B,H,64,64]-bias paa trunk-attention (via one-hot-scatter,
       # dense matmuls). Teorigrunnlag: Kovax' rute-modell + klipp-stillhets-
@@ -951,7 +962,12 @@ class CeresNet(nn.Module):
         if _dp_il:
           raise ValueError('DualPlaneEdgeToTrunk er inkompatibel med DualPlaneInterleave (fase-splitt)')
         self.e2t_proj = nn.Linear(_dp_rel_C, self.NUM_HEADS, bias=False)
-        nn.init.zeros_(self.e2t_proj.weight)
+        if self.dp_reader_init > 0:
+          with torch.no_grad():
+            self.e2t_proj.weight.uniform_(-self.dp_reader_init, self.dp_reader_init,
+                                          generator=torch.Generator().manual_seed(0x0EA0 + 9999))
+        else:
+          nn.init.zeros_(self.e2t_proj.weight)
         print(f'[ceres_net] DUAL-PLANE EDGE-TO-TRUNK enabled: levende kanter -> zero-init '
               f'[B,{self.NUM_HEADS},64,64]-bias paa alle trunk-lag (fase-splittet plan)')
       if getattr(config, 'NetDef_DualPlaneEdgeUpdate', False):

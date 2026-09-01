@@ -572,6 +572,13 @@ class Configuration:
         and int(self.NetDef_DualPlaneTripletAttention) < 0):
       raise ValueError('DualPlaneTripletAttention: int-formen maa vaere >= 0 (N = siste N P-blokker)')
     self.NetDef_DualPlaneTripletHeads = int(config_net_def.get('DualPlaneTripletHeads', 4) or 4)
+    # Boelge 13 / P3 (2026-09-02): trippel-FORM. '' / 'tgt' = dagens additive
+    # score + verdi fra EN kant (naermest TGTs aggregasjonsform); 'et' = Edge-
+    # Transformer-formen (q.k-score over delt node + KOMPONERT verdi V1 E_ik (.) V2 E_kj).
+    self.NetDef_DualPlaneTripletForm = str(config_net_def.get('DualPlaneTripletForm', '') or '')
+    # Boelge 13 / P2: ikke-null fast-noekkel-init av kant-LESERNE (rel_proj, eu_out,
+    # eu_deg, ta_out, e2t_proj) — bryter produktregel-kaskaden. 0 = null-init (default).
+    self.NetDef_DualPlaneReaderInit = float(config_net_def.get('DualPlaneReaderInit', 0) or 0)
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)
