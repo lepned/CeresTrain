@@ -591,8 +591,10 @@ class Configuration:
     self.NetDef_MoveTokenFFNMult = int(config_net_def.get('MoveTokenFFNMult', 2) or 2)
     self.NetDef_MoveTokenMax = int(config_net_def.get('MoveTokenMax', 128) or 128)
     self.NetDef_MoveTokenValueInject = bool(config_net_def.get('MoveTokenValueInject', True))
+    self.NetDef_MoveTokenPolBias = bool(config_net_def.get('MoveTokenPolBias', True))
     if not self.NetDef_UseMoveTokens:
-      for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax'):
+      for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
+                 'MoveTokenValueInject', 'MoveTokenPolBias'):
         if _k in config_net_def:
           raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)

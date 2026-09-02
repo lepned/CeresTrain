@@ -114,7 +114,7 @@ class MoveTokenBlock(nn.Module):
 class MoveTokenDecoder(nn.Module):
   def __init__(self, s_dim: int, norm_type: str, dm: int = 160, layers: int = 3,
                heads: int = 4, ffn_mult: int = 2, max_tokens: int = 128,
-               value_inject_dim: int = 0, value2: bool = False):
+               value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True):
     super().__init__()
     self.dm, self.M = dm, max_tokens
     # Candidate source: private visibility module ('vis' family only). Its
@@ -168,7 +168,12 @@ class MoveTokenDecoder(nn.Module):
     self.pol = nn.Linear(dm, 4, bias=False)
     with torch.no_grad():
       self.pol.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0B))
-    self.mt_pol_bias = nn.Parameter(torch.zeros(1858))
+    # Per-move bias table (1858). pol_bias=False keeps it as a frozen zero BUFFER so the
+    # graph/diagnostics are unchanged and the token features must carry the whole logit.
+    if pol_bias:
+      self.mt_pol_bias = nn.Parameter(torch.zeros(1858))
+    else:
+      self.register_buffer('mt_pol_bias', torch.zeros(1858), persistent=False)
     # Value inject (zero-init, separate per head — the dp_value_inject pattern).
     self.value_inject_dim = value_inject_dim
     if value_inject_dim > 0:

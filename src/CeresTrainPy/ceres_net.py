@@ -1556,6 +1556,7 @@ class CeresNet(nn.Module):
         raise ValueError('UseMoveTokens: OptimisticPolicyServeBlend/SoftPolicyServeBlend must be 0 '
                          '(eval-only blend would leak MLP-head logits onto absent moves)')
       _mt_vi = bool(getattr(config, 'NetDef_MoveTokenValueInject', True))
+      _mt_pb = bool(getattr(config, 'NetDef_MoveTokenPolBias', True))
       self.move_tokens = MoveTokenDecoder(
           s_dim=self.EMBEDDING_DIM, norm_type=config.NetDef_NormType,
           dm=int(getattr(config, 'NetDef_MoveTokenDim', 160) or 160),
@@ -1564,13 +1565,14 @@ class CeresNet(nn.Module):
           ffn_mult=int(getattr(config, 'NetDef_MoveTokenFFNMult', 2) or 2),
           max_tokens=int(getattr(config, 'NetDef_MoveTokenMax', 128) or 128),
           value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
-          value2=self.value2_loss_weight > 0)
+          value2=self.value2_loss_weight > 0, pol_bias=_mt_pb)
       _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
       print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
             f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
             f'({_n_mt:,} params); policy = per-token 4-slot logits scattered to 1858 + per-move bias '
             f'(MLP policy head bypassed; its params stay in the ckpt, unused); '
-            f'value inject {"on" if _mt_vi else "off"}; absent-move floor {-30.0}')
+            f'value inject {"on" if _mt_vi else "off"}; per-move bias {"on" if _mt_pb else "OFF (frozen zero)"}; '
+            f'absent-move floor {-30.0}')
 
 
   def _rpe_genphase_biases(self, emb):
