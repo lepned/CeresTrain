@@ -579,6 +579,22 @@ class Configuration:
     # Boelge 13 / P2: ikke-null fast-noekkel-init av kant-LESERNE (rel_proj, eu_out,
     # eu_deg, ta_out, e2t_proj) — bryter produktregel-kaskaden. 0 = null-init (default).
     self.NetDef_DualPlaneReaderInit = float(config_net_def.get('DualPlaneReaderInit', 0) or 0)
+    # MOVE-TOKEN DECODER (design B, 2026-09-02, move_tokens.py): action-centric
+    # read-out — one token per in-graph pseudo-legal from-to pair, small decoder
+    # (self-attn among moves + cross-attn to squares + FFN), policy = per-token
+    # logits scattered to 1858 (owns the policy; MLP head bypassed), value =
+    # zero-init inject of pooled move state. Config-only.
+    self.NetDef_UseMoveTokens = bool(config_net_def.get('UseMoveTokens', False))
+    self.NetDef_MoveTokenDim = int(config_net_def.get('MoveTokenDim', 160) or 160)
+    self.NetDef_MoveTokenLayers = int(config_net_def.get('MoveTokenLayers', 3) or 3)
+    self.NetDef_MoveTokenHeads = int(config_net_def.get('MoveTokenHeads', 4) or 4)
+    self.NetDef_MoveTokenFFNMult = int(config_net_def.get('MoveTokenFFNMult', 2) or 2)
+    self.NetDef_MoveTokenMax = int(config_net_def.get('MoveTokenMax', 128) or 128)
+    self.NetDef_MoveTokenValueInject = bool(config_net_def.get('MoveTokenValueInject', True))
+    if not self.NetDef_UseMoveTokens:
+      for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax'):
+        if _k in config_net_def:
+          raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)

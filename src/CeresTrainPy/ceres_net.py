@@ -1534,6 +1534,44 @@ class CeresNet(nn.Module):
     self.use_tsb = bool(getattr(config, 'NetDef_TSB_Enabled', False))
     self._last_tsb_gates = None  # set in forward() when TSB is active
 
+    # MOVE-TOKEN DECODER (design B, 2026-09-02; see move_tokens.py). Constructed
+    # LAST so every pre-existing parameter keeps its init (bit-pairing with the
+    # control). Owns the policy: the MLP head is bypassed, so every other policy
+    # owner is refused loudly (the plane's decode, fromto form, ray-context, and
+    # the eval-only serve blends that would reassign policy_out at export).
+    self.use_move_tokens = bool(getattr(config, 'NetDef_UseMoveTokens', False))
+    self._last_mt = None
+    if self.use_move_tokens:
+      from move_tokens import MoveTokenDecoder
+      if getattr(self, 'dp_policy_decode', False):
+        raise ValueError('UseMoveTokens owns the policy: DualPlanePolicyDecode (and its candidate/'
+                         'victim/edge/degree/check-chain decodes) must be off')
+      if getattr(self, 'dp_cand_attn', 0) > 0 or getattr(self, 'dp_cand_value', 0) > 0:
+        raise ValueError('UseMoveTokens: DualPlaneCandidateAttention/CandidateValue must be 0 '
+                         '(they re-score policy_out and would read absent-move floors as candidates)')
+      if self.policy_head_form != 'mlp' or self.ray_context_mode > 0:
+        raise ValueError('UseMoveTokens is incompatible with PolicyHeadForm=fromto / RayContext '
+                         '(two policy owners; ray-context would also add onto absent-move floors)')
+      if self.opt_serve_blend > 0 or self.soft_serve_blend > 0:
+        raise ValueError('UseMoveTokens: OptimisticPolicyServeBlend/SoftPolicyServeBlend must be 0 '
+                         '(eval-only blend would leak MLP-head logits onto absent moves)')
+      _mt_vi = bool(getattr(config, 'NetDef_MoveTokenValueInject', True))
+      self.move_tokens = MoveTokenDecoder(
+          s_dim=self.EMBEDDING_DIM, norm_type=config.NetDef_NormType,
+          dm=int(getattr(config, 'NetDef_MoveTokenDim', 160) or 160),
+          layers=int(getattr(config, 'NetDef_MoveTokenLayers', 3) or 3),
+          heads=int(getattr(config, 'NetDef_MoveTokenHeads', 4) or 4),
+          ffn_mult=int(getattr(config, 'NetDef_MoveTokenFFNMult', 2) or 2),
+          max_tokens=int(getattr(config, 'NetDef_MoveTokenMax', 128) or 128),
+          value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
+          value2=self.value2_loss_weight > 0)
+      _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
+      print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
+            f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
+            f'({_n_mt:,} params); policy = per-token 4-slot logits scattered to 1858 + per-move bias '
+            f'(MLP policy head bypassed; its params stay in the ckpt, unused); '
+            f'value inject {"on" if _mt_vi else "off"}; absent-move floor {-30.0}')
+
 
   def _rpe_genphase_biases(self, emb):
     """RPE-fromEmb architected graph (see __init__): per-layer QK-rpe score biases
@@ -2110,6 +2148,21 @@ class CeresNet(nn.Module):
       # Zeros keep every downstream additive term (plane decode, ray-context)
       # unchanged; the dead MLP branch is pruned from the export graph.
       policy_out = torch.zeros(fS_policy.shape[0], 1858, device=fS_policy.device, dtype=fS_policy.dtype)
+    elif getattr(self, 'use_move_tokens', False):
+      # MOVE TOKENS own the policy (see __init__ / move_tokens.py). `flow` is the
+      # post-trunk-norm [B,64,D] square state; the decoder builds its candidate
+      # set in-graph from the one-hot slice.
+      _mt_pol, _mt_pool, _mt_stats, _mt_sel, _mt_valid = self.move_tokens(
+          squares[:, :, 0:13].to(flow.dtype), flow)
+      policy_out = _mt_pol.to(fS_policy.dtype)
+      if self.move_tokens.value_inject_dim > 0:
+        _mvi = self.move_tokens.v_inject(_mt_pool)
+        _v_inject = _mvi if _v_inject is None else _v_inject + _mvi
+        if self.value2_loss_weight > 0:
+          _mvi2 = self.move_tokens.v2_inject(_mt_pool)
+          _v2_inject = _mvi2 if _v2_inject is None else _v2_inject + _mvi2
+      if self.training:
+        self._last_mt = (_mt_sel, _mt_valid, _mt_stats)
     else:
       policy_out = self.policy_head(fS_policy)
 
@@ -2630,6 +2683,25 @@ class CeresNet(nn.Module):
         oppp_loss = 0.0 * _oppp.float().sum()
         _oppp_participation_only = True
 
+    # MOVE-TOKEN diagnostics (training-only stash from forward): candidate count,
+    # truncation rate, and the number that matters — how often the target's
+    # argmax move has NO token (it would then sit at the -30 floor).
+    _mt_log = {}
+    _mt = getattr(self, '_last_mt', None)
+    if _mt is not None and not gradient_norm_logging_mode:
+      self._last_mt = None
+      _mt_sel, _mt_valid, _mt_stats = _mt
+      with torch.no_grad():
+        _tgt_pair = self.move_tokens.mv_pair_flat[policy_target.argmax(dim=1)]          # [B]
+        _hit = ((_mt_sel == _tgt_pair.unsqueeze(1)) & _mt_valid).any(dim=1).float()
+        _mt_log['mt_missing_target_rate'] = 1.0 - _hit.mean()
+        for _k, _v in _mt_stats.items():
+          _mt_log[_k] = _v
+        _mt_log['mt_pol_w_rms'] = self.move_tokens.pol.weight.float().pow(2).mean().sqrt()
+        _mt_log['mt_pol_bias_rms'] = self.move_tokens.mt_pol_bias.float().pow(2).mean().sqrt()
+        if self.move_tokens.value_inject_dim > 0:
+          _mt_log['mt_vinject_rms'] = self.move_tokens.v_inject.weight.float().pow(2).mean().sqrt()
+
     # EDGE-AUX (boelge 13 / P1): par-supervisjon paa planets kant-tilstand.
     # Two targets on the final [B,32,32,C] edge state, both restricted to
     # PIECE-PIECE slot pairs (the plane's competence; empty slots masked):
@@ -3137,6 +3209,8 @@ class CeresNet(nn.Module):
         self._log("opp_policy_loss" + stat_suffix, oppp_loss, step=num_pos)
       if not isinstance(actp_loss, int) and not _actp_participation_only:
         self._log("action_played_loss" + stat_suffix, actp_loss, step=num_pos)
+      for _k, _v in _mt_log.items():
+        self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(dpe_pi_loss, int):
         self._log("dp_edge_pi_loss" + stat_suffix, dpe_pi_loss, step=num_pos)
       if not isinstance(dpe_rel_loss, int):

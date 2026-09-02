@@ -578,6 +578,7 @@ def Train():
       if 'placement_value_head' in n or 'survival_head' in n or 'stvalue_head' in n or 'dp_surv_head' in n: return False  # single-Linear aux heads ARE final layers
       if 'dpe_w' in n or 'dpd_' in n or 'dpch_w' in n or 'dpc_score' in n: return False  # 1-row zero-init decode couplings: Newton-Schulz fixed-spectral-norm on rank-1 zero-init is the wrong class (review 2026-08-25b finding 9)
       if 'dp_eaux_' in n: return False           # edge-aux readout [T, C] (boelge 13): a training-only final layer, AdamW
+      if 'move_tokens.pol' in n: return False    # move-token policy readout [4, dm]: the final policy layer, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -1629,7 +1630,10 @@ def Train():
         'dpd_in.', 'dpd_out.', 'kdist_proj.', 'spe_proj.', 'cbk_',
         # Edge-aux readout (boelge 13): training-only head, never in the served
         # graph, so fresh-init on warm start changes nothing the base net does.
-        'dp_eaux_')
+        'dp_eaux_',
+        # Move-token decoder (design B): a new policy owner — warm-starting it
+        # from a base ckpt is a fresh init by construction.
+        'move_tokens.')
     # Graph-route heads + tactic refiner (2026-08 tactical program): the
     # refiner is top-level ('tactical_refiner.'), the route params live
     # nested per attention layer (transformer_layer.N.attention.graph_route_*).
