@@ -51,13 +51,12 @@ def main():
   legal_start = {(SQ[f + '2'], SQ[f + '3']) for f in 'abcdefgh'} | {(SQ[f + '2'], SQ[f + '4']) for f in 'abcdefgh'} \
       | {(SQ['b1'], SQ['a3']), (SQ['b1'], SQ['c3']), (SQ['g1'], SQ['f3']), (SQ['g1'], SQ['h3'])}
   assert legal_start <= P, f'start position missing {legal_start - P}'
-  assert (SQ['e1'], SQ['g1']) not in P, 'castling must be gated on empty f1/g1'
-  print(f'  start position: {len(P)} candidates (>= 20 legal, double pushes present)')
-  # castling gates
-  cand, _ = dec.candidates(board_from_pieces({'e1': 'K', 'h1': 'R', 'a1': 'R'}, {'e8': 'K'}))
-  P = pairs_of(cand); assert (4, 6) in P and (4, 2) in P, 'castling pairs missing'
-  cand, _ = dec.candidates(board_from_pieces({'e1': 'K', 'h1': 'R', 'b1': 'N', 'a1': 'R'}, {'e8': 'K'}))
-  P = pairs_of(cand); assert (4, 6) in P and (4, 2) not in P, 'queenside must be blocked by b1'
+  # castling = king-takes-rook in the TPG encoding (e1h1 / e1a1): both pairs present at start
+  assert (SQ['e1'], SQ['h1']) in P and (SQ['e1'], SQ['a1']) in P, 'king-takes-rook castling pairs missing'
+  print(f'  start position: {len(P)} candidates (>= 20 legal, double pushes + king-takes-rook present)')
+  # castling pairs follow the king's rank (FRC-compatible); rooks off the rank are not added
+  cand, _ = dec.candidates(board_from_pieces({'e1': 'K', 'h1': 'R', 'a1': 'R', 'a5': 'R'}, {'e8': 'K'}))
+  P = pairs_of(cand); assert (4, 7) in P and (4, 0) in P and (4, SQ['a5']) not in P, 'castling pairs'
   # promotion + en passant geometry (pawn on 7th: push and capture diagonals present)
   cand, _ = dec.candidates(board_from_pieces({'e1': 'K', 'b7': 'P'}, {'e8': 'K', 'a8': 'R', 'c8': 'B'}))
   P = pairs_of(cand); assert {(SQ['b7'], SQ['b8']), (SQ['b7'], SQ['a8']), (SQ['b7'], SQ['c8'])} <= P
@@ -86,6 +85,9 @@ def main():
       cand, _ = dec.candidates(board_from_pieces(own, opp)); P = pairs_of(cand); n_cnt.append(len(P))
       for mv in b.legal_moves:
         fr, to = mv.from_square, mv.to_square
+        if b.is_castling(mv):                   # TPG encodes castling as king-takes-rook
+          to = chess.H1 if chess.square_file(to) > chess.square_file(fr) else chess.A1
+          if b.turn == chess.BLACK: to = chess.square(chess.square_file(to), 7)
         if b.turn == chess.BLACK:
           fr = chess.square(chess.square_file(fr), 7 - chess.square_rank(fr))
           to = chess.square(chess.square_file(to), 7 - chess.square_rank(to))

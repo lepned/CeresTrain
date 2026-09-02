@@ -25,9 +25,9 @@ legal move is un-representable, a spurious one is masked by the loss/serving):
                                                                     own-target masked)
                 + double pawn push (from on rank 1, from+8 and from+16 empty)   <- reviewer
                   finding: `vis` deliberately omits it; 3.4 % of legal moves.
-                + castling pairs e1g1 / e1c1 gated on king@e1 + own rook@h1/a1 +
-                  empty between (castling RIGHTS are not in the input; a phantom
-                  pair is harmless).
+                + castling as KING-TAKES-ROOK pairs (the TPG/Ceres encoding: e1h1, e1a1;
+                  FRC-compatible): king square -> every own rook on the king's rank
+                  (castling RIGHTS are not in the input; a phantom pair is harmless).
   Selection: TopK over the 4096 pairs of  cand + tie/4096*0.5  (tie < the 0/1 gate
   by construction — the fp16 tie-break lesson from dual_plane.py), M = MoveTokenMax.
   The decoder is permutation-equivariant and the scatter uses gathered indices, so
@@ -133,12 +133,17 @@ class MoveTokenDecoder(nn.Module):
     # the 4096 tie levels collapse; fp32 ulp at 1.0 is 1.2e-7, so a 1e-4 step is
     # safe there). Max 0.5 < the 0/1 candidate gate.
     self.register_buffer('tie_rank', ar, persistent=False)
-    # Castling target one-hots (constant Mul+Add instead of an in-place slice
-    # assign, which lowers to ScatterND — review nit 3).
-    ks_oh = torch.zeros(4096); ks_oh[4 * 64 + 6] = 1.0
-    qs_oh = torch.zeros(4096); qs_oh[4 * 64 + 2] = 1.0
-    self.register_buffer('ks_onehot', ks_oh, persistent=False)
-    self.register_buffer('qs_onehot', qs_oh, persistent=False)
+    # CASTLING = KING-TAKES-ROOK in the TPG/Ceres move encoding (e1h1 / e1a1, FRC-
+    # style), NOT e1g1/e1c1 — measured on real T91 data 2026-09-02: 100 % of the
+    # 1.6 % missing-target cases were king(ch 6) -> own rook(ch 4). Candidate
+    # pairs: king square -> every own rook on the king's rank (superset; covers
+    # Chess960). Constant same-rank table, Mul+Add only.
+    sr = torch.zeros(64, 64)
+    for k in range(64):
+      for r in range(64):
+        if k // 8 == r // 8:
+          sr[k, r] = 1.0
+    self.register_buffer('same_rank', sr, persistent=False)
     # Double pawn push table: from on rank 1 (squares 8..15) -> from+16.
     dbl = torch.zeros(64, 64)
     for f in range(8, 16):
@@ -184,15 +189,11 @@ class MoveTokenDecoder(nn.Module):
     mid_empty = torch.gather(empty, 1, self.push_mid.unsqueeze(0).expand(empty.shape[0], -1))
     dbl_from = pawn * self.rank1.to(dt).unsqueeze(0) * mid_empty            # [B,64]
     cand = cand + dbl_from.unsqueeze(2) * self.dbl_push.to(dt).unsqueeze(0) * empty.unsqueeze(1)
-    # Castling: king@4, own rook@7 (kingside: 5,6 empty) / own rook@0 (queenside: 1,2,3 empty).
-    king_e1 = squares13[:, 4, 6].to(dt)
+    # Castling as king-takes-rook: cand[k, r] += king[k] * rook[r] * same_rank[k, r].
+    king = squares13[:, :, 6].to(dt)                                        # [B,64]
     rook = squares13[:, :, 4].to(dt)
-    ks = king_e1 * rook[:, 7] * empty[:, 5] * empty[:, 6]
-    qs = king_e1 * rook[:, 0] * empty[:, 1] * empty[:, 2] * empty[:, 3]
-    cand = cand.reshape(-1, 4096) \
-        + ks.unsqueeze(1) * self.ks_onehot.to(dt).unsqueeze(0) \
-        + qs.unsqueeze(1) * self.qs_onehot.to(dt).unsqueeze(0)
-    return cand.clamp(max=1.0), E
+    cand = cand + king.unsqueeze(2) * rook.unsqueeze(1) * self.same_rank.to(dt).unsqueeze(0)
+    return cand.reshape(-1, 4096).clamp(max=1.0), E
 
   def forward(self, squares13, flow):
     """flow [B,64,S] (post trunk norm). Returns (policy_add [B,1858], pooled [B,2dm],
