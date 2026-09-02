@@ -171,6 +171,9 @@ def save_model(NAME : str,
       print(f'INFO: MT_EXPORT_MAX={_mt_cap} — exported graphs use {_mt_cap} move tokens (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
     _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '')
+    # CERES_EXPORT_TAG=<txt>: extra filename tag for A/B exports of the same weights
+    # (e.g. graph-level variants); never overwrites the plain export.
+    _num_pos_tag += (os.environ.get('CERES_EXPORT_TAG', '') or '').strip()
 
 
     # AOT export. Works (generates .so file), but seemingly slower than ONNX export options.

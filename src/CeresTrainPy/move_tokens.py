@@ -45,6 +45,7 @@ Everything is topk / gather / scatter / matmul / softmax (TRT-static, fixed M).
 No per-sample weight matmuls (the dual_plane rel_gains 46x-slowdown class).
 """
 
+import os
 import torch
 from torch import nn
 from rms_norm import make_norm
@@ -98,12 +99,14 @@ class MoveTokenBlock(nn.Module):
     a = torch.softmax(s, dim=-1)
     return torch.matmul(a, v).transpose(1, 2).reshape(B, Tq, self.h * self.dk)
 
-  def forward(self, x, s_flow_n, key_bias):
+  def forward(self, x, s_flow_n, key_bias, kv=None):
     h = self.ln1(x)
     q, k, v = self.qkv(h).chunk(3, dim=-1)
     x = x + self.proj(self._attn(q, k, v, key_bias))
     h = self.ln2(x)
-    k2, v2 = self.xkv(s_flow_n).chunk(2, dim=-1)
+    # kv: precomputed [B,64,2dm] cross-attn keys|values (export-fused path, see
+    # MoveTokenDecoder.forward); otherwise this block norms + projects the squares itself.
+    k2, v2 = (self.xkv(s_flow_n) if kv is None else kv).chunk(2, dim=-1)
     x = x + self.xproj(self._attn(self.xq(h), k2, v2))
     h = self.ln3(x)
     g, u = self.ffn_in(h).chunk(2, dim=-1)
@@ -135,6 +138,14 @@ class MoveTokenDecoder(nn.Module):
     self.value_pool_detach = bool(value_pool_detach)
     self.rich_dim = 17 if self.rich_features else 0
     self.pool_dim = 3 * dm if value_pool == 'both' else 2 * dm
+    # EXPORT-FUSED eval path (2026-09-03, TRT profile: decoder is launch-bound, ~101
+    # kernels). Function-identical rewrites used when not training:
+    #  * ONE shared RMS normalisation of the 64 squares + ONE GEMM producing every
+    #    block's cross-attn K|V (each block's ln_s scale is folded into its xkv weight:
+    #    W_kv (n * s) == (W_kv * s^T) n), instead of L norms + L GEMMs;
+    #  * one gather for (from,to) and one gather for the two square embeddings.
+    # Only for RMSNorm blocks. CERES_MT_FUSED_EXPORT=0 disables (A/B timing).
+    self.export_fused = (os.environ.get('CERES_MT_FUSED_EXPORT', '1') or '1').strip() not in ('0', '')
     # Candidate source: private visibility module ('vis' family only). Its
     # construction runs a random probe -> fork_rng keeps the global stream
     # untouched (bit-pairing with the control; the edge-aux lesson).
@@ -146,6 +157,7 @@ class MoveTokenDecoder(nn.Module):
     ar = torch.arange(4096, dtype=torch.long)
     self.register_buffer('pair_from', ar // 64, persistent=False)   # [4096]
     self.register_buffer('pair_to', ar % 64, persistent=False)
+    self.register_buffer('pair_ft', torch.stack([ar // 64, ar % 64], dim=1), persistent=False)   # [4096,2]
     # Deterministic tie-break: kept as an INT buffer and turned into fp32 at use
     # time (review B3: a float buffer is downcast under BFloat16Pure and ~4000 of
     # the 4096 tie levels collapse; fp32 ulp at 1.0 is 1.2e-7, so a 1e-4 step is
@@ -200,6 +212,10 @@ class MoveTokenDecoder(nn.Module):
       if value2:
         self.v2_inject = nn.Linear(self.pool_dim, value_inject_dim, bias=False)
         nn.init.zeros_(self.v2_inject.weight)
+
+  def _fusable(self):
+    from rms_norm import RMSNorm
+    return all(isinstance(blk.ln_s, RMSNorm) for blk in self.blocks)
 
   def set_export_max(self, m: int):
     """EXPORT-TIME token cap. The decoder is permutation-equivariant with masking and
@@ -260,18 +276,33 @@ class MoveTokenDecoder(nn.Module):
     score = cand.float() + (self.tie_rank.float() * (0.5 / 4096.0)).unsqueeze(0)
     sel = torch.topk(score, self.M, dim=1).indices                          # [B,M]
     valid = torch.gather(cand, 1, sel) > 0.5                                 # [B,M]
-    fr = torch.gather(self.pair_from.unsqueeze(0).expand(B, -1), 1, sel)     # [B,M]
-    to = torch.gather(self.pair_to.unsqueeze(0).expand(B, -1), 1, sel)
-    f_from = torch.gather(flow, 1, fr.unsqueeze(-1).expand(-1, -1, S))
-    f_to = torch.gather(flow, 1, to.unsqueeze(-1).expand(-1, -1, S))
+    _fused = self.export_fused and not self.training and self._fusable()
+    if _fused:
+      ft = torch.gather(self.pair_ft.unsqueeze(0).expand(B, -1, -1), 1, sel.unsqueeze(-1).expand(-1, -1, 2))
+      fr, to = ft[..., 0], ft[..., 1]                                          # [B,M] each
+      f_both = torch.gather(flow, 1, torch.cat([fr, to], dim=1).unsqueeze(-1).expand(-1, -1, S))
+      f_from, f_to = f_both[:, :self.M], f_both[:, self.M:]
+    else:
+      fr = torch.gather(self.pair_from.unsqueeze(0).expand(B, -1), 1, sel)   # [B,M]
+      to = torch.gather(self.pair_to.unsqueeze(0).expand(B, -1), 1, sel)
+      f_from = torch.gather(flow, 1, fr.unsqueeze(-1).expand(-1, -1, S))
+      f_to = torch.gather(flow, 1, to.unsqueeze(-1).expand(-1, -1, S))
     e_pair = torch.gather(E.reshape(B, 4096, 4), 1, sel.unsqueeze(-1).expand(-1, -1, 4)).to(flow.dtype)
     parts = [f_from, f_to, e_pair]
     if self.rich_features:
       parts.append(self.rich(squares13, E, fr, to).to(flow.dtype))
     x = self.w_in(torch.cat(parts, dim=-1))                                  # [B,M,dm]
     key_bias = ((~valid).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M)
-    for blk in self.blocks:
-      x = blk(x, blk.ln_s(flow), key_bias)      # each block re-norms the squares under ITS norm (review B1)
+    if _fused:
+      eps = self.blocks[0].ln_s.eps
+      n = flow * torch.rsqrt(flow.pow(2).mean(-1, keepdim=True) + eps)         # shared, scale-free RMS
+      W = torch.cat([blk.xkv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks], dim=0)
+      kv_all = torch.nn.functional.linear(n, W.to(n.dtype))                     # [B,64,L*2dm]
+      for blk, kv in zip(self.blocks, kv_all.chunk(len(self.blocks), dim=-1)):
+        x = blk(x, None, key_bias, kv=kv)
+    else:
+      for blk in self.blocks:
+        x = blk(x, blk.ln_s(flow), key_bias)    # each block re-norms the squares under ITS norm (review B1)
     xo = self.out_ln(x)
     # Policy: 4 slot logits per token -> [B,4096,4] buffer at floor -> flat index_select.
     tok = self.pol(xo)                                                       # [B,M,4]

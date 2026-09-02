@@ -214,6 +214,20 @@ def main():
   except ImportError:
     print('  (onnx_ir not installed here: knob-variant export parity skipped)')
 
+  # --- 4d. export-fused eval path == unfused (shared square norm + single K/V GEMM, one-gather assembly)
+  net.eval()
+  with torch.no_grad():
+    for _i, _blk in enumerate(net.move_tokens.blocks):     # non-trivial norm scales so the fold is exercised
+      _blk.ln_s.scale.copy_(torch.rand(_blk.ln_s.scale.shape, generator=torch.Generator().manual_seed(11 + _i)) + 0.5)
+    net.move_tokens.export_fused = False
+    ref_u = net(sq, None)
+    net.move_tokens.export_fused = True
+    assert net.move_tokens._fusable()
+    out_f = net(sq, None)
+  dpol = float((out_f[0] - ref_u[0]).abs().max()); dval = float((out_f[1] - ref_u[1]).abs().max())
+  assert dpol < 1e-4 and dval < 1e-4, (dpol, dval)
+  print(f'  export-fused path OK: identical to unfused (policy max|d| {dpol:.1e}, value {dval:.1e})')
+
   # --- 4c. export-time token cap: equivariance => identical logits when all fit ---
   net.eval()
   with torch.no_grad():
