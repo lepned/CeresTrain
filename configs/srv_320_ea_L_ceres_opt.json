@@ -54,8 +54,8 @@
     "SurvivalLossBuckets": "2,4",
     "SurvivalCaptureWeight": 4,
     "TestValue": 0,
-    "TorchSeed": 778,
+    "TorchSeed": 777,
     "ShuffleSeed": 20260828,
-    "LossDualPlaneEdgePiMultiplier": 0.05,
-    "LossDualPlaneEdgeRelMultiplier": 2.0
+    "LossDualPlaneEdgePiMultiplier": 0,
+    "LossDualPlaneEdgeRelMultiplier": 0
 }
