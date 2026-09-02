@@ -1,7 +1,7 @@
 {
     "LoRARankDivisor": 0,
     "NumTrainingPositions": 100000000,
-    "BatchSizeForwardPass": 2048,
+    "BatchSizeForwardPass": 4096,
     "BatchSizeBackwardPass": 4096,
     "Optimizer": "Muon",
     "CheckpointFrequencyNumPositions": 50000000,
