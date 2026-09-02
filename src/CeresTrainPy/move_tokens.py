@@ -201,6 +201,20 @@ class MoveTokenDecoder(nn.Module):
         self.v2_inject = nn.Linear(self.pool_dim, value_inject_dim, bias=False)
         nn.init.zeros_(self.v2_inject.weight)
 
+  def set_export_max(self, m: int):
+    """EXPORT-TIME token cap. The decoder is permutation-equivariant with masking and
+    no buffer depends on M, so a net trained at M=128 can be exported at a smaller M
+    unchanged: identical outputs on every position whose candidate count fits, and
+    only truncation (rarest moves dropped, floor logits) beyond it. Observed maximum
+    over 100M T91 positions was 68 (mean 37). Apply to the EXPORT COPY only."""
+    m = int(m)
+    assert 1 <= m <= 4096, m
+    old = self.M
+    self.M = m
+    print(f'[move_tokens] export token cap: M {old} -> {m} (trained at {old}; equivariant, '
+          f'exact for positions with <= {m} candidates)')
+    return old
+
   def candidates(self, squares13):
     """squares13 [B,64,13] one-hot -> (cand [B,4096] in {0,1}, E [B,64,64,4])."""
     E = self.vis(squares13)                                   # [B,64,64,4]: stm_out, opp_out, stm_in, opp_in

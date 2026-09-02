@@ -156,6 +156,22 @@ def save_model(NAME : str,
       _strip_target.export_strip_action = True
       print('INFO: EXPORT_STRIP_ACTION enabled — action head omitted from exported graphs')
 
+    # Export-time MOVE-TOKEN cap (2026-09-02, X-program serving lever): the decoder is
+    # permutation-equivariant with masking and no buffer depends on M, so a net trained
+    # at MoveTokenMax=128 can be exported at a smaller static M (observed max candidate
+    # count 68 over 100M positions). CERES_MT_EXPORT_MAX=96 -> TopK/attention over 96
+    # tokens in the graph. Applied to a DEEPCOPY so the live training model keeps its M.
+    _mt_cap = int((os.environ.get('CERES_MT_EXPORT_MAX', '0') or '0').strip() or 0)
+    if _mt_cap > 0:
+      _cap_target = getattr(model_nocompile, 'core', model_nocompile)
+      if getattr(_cap_target, 'move_tokens', None) is None:
+        raise ValueError('CERES_MT_EXPORT_MAX is set but the model has no move-token decoder (silent no-op refused)')
+      model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+      getattr(model_nocompile, 'core', model_nocompile).move_tokens.set_export_max(_mt_cap)
+      print(f'INFO: MT_EXPORT_MAX={_mt_cap} — exported graphs use {_mt_cap} move tokens (training model untouched)')
+    # Distinct file tag so a capped re-export never overwrites the full-M net.
+    _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '')
+
 
     # AOT export. Works (generates .so file), but seemingly slower than ONNX export options.
     if False and CONVERT_ONLY:
@@ -229,7 +245,7 @@ def save_model(NAME : str,
       # TorchDynamo based export. Encountered warning/error on export.
       if False:
         try:
-          SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + "_dynamo.onnx")
+          SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + _num_pos_tag + "_dynamo.onnx")
           export_options = torch.onnx.ExportOptions(dynamic_shapes=True)
           onnx_model = torch.onnx.dynamo_export(model_nocompile, sample_inputs[0], sample_inputs[1], export_options=export_options)
           onnx_model.save(SAVE_FULL_NAME)
@@ -240,7 +256,7 @@ def save_model(NAME : str,
       # Legacy ONNX export.
       if True:
         try:
-          SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + num_pos + ".onnx")
+          SAVE_FULL_NAME = os.path.join(OUTPUTS_DIR, 'nets', NAME + "_" + _num_pos_tag + ".onnx")
           # Output tensor previously named 'prior_state', same as the input — which is
           # an invalid ONNX graph (tensor can't be both named input and named output).
           # Rename the output tensor to 'prior_state_out' so the model is loadable.

@@ -214,6 +214,22 @@ def main():
   except ImportError:
     print('  (onnx_ir not installed here: knob-variant export parity skipped)')
 
+  # --- 4c. export-time token cap: equivariance => identical logits when all fit ---
+  net.eval()
+  with torch.no_grad():
+    cnt = net.move_tokens.candidates(sq[:, :, 0:13])[0].sum(dim=1)
+    fit = cnt <= 56
+    assert int(fit.sum()) >= 2, f'need >= 2 boards within the cap: {cnt.tolist()}'
+    sq_fit = sq[fit]
+    ref_full = net(sq_fit, None)[0].clone()
+    old_M = net.move_tokens.set_export_max(56)
+    cap = net(sq_fit, None)[0]
+    net.move_tokens.M = old_M
+  dmax = float((cap - ref_full).abs().max())
+  assert dmax < 1e-4, f'export cap changed logits: {dmax}'
+  print(f'  export-time cap OK: M 64 -> 56 gives identical policy (max|d| {dmax:.1e}) on {int(fit.sum())} boards '
+        f'with <= 56 candidates (counts {cnt.tolist()})')
+
   # --- 5. guards ---------------------------------------------------------
   for name, over in (('with plane decode', {'UseMoveTokens': True}),
                      ('rich w/o move tokens', {'DualPlanePolicyDecode': False, 'MoveTokenRichFeatures': True}),
