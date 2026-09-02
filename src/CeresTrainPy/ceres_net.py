@@ -521,6 +521,18 @@ class CeresNet(nn.Module):
     if self.policy_margin_weight > 0:
       print(f'[ceres_net] POLICY MARGIN loss enabled: hinge m={self.policy_margin_value} mot top-4 rivaler, '
             f'konfidensvektet med target-top1, w={self.policy_margin_weight}')
+    # PLACKETT-LUCE policy ranking aux (Kovax, 2026-09-02): listwise ListMLE
+    # likelihood of the TARGET'S move ORDER over its top-K moves,
+    #   -log P(pi) = sum_{k<=K} [ logsumexp_{j>=k} s_(j) - s_(k) ]   (s ordered by target rank,
+    # suffix over ALL legal moves). Unlike CE it does not fit the target's
+    # sharpness; it only pushes the net's ORDERING toward the teacher's, so it can
+    # sit beside CE (which stays the anchor) without the confidently-wrong-
+    # sharpening failure mode. Config: PolicyPLWeight (0 = off), PolicyPLTopK.
+    self.policy_pl_weight = float(os.environ.get('CERES_POLICY_PL_WEIGHT', '0') or 0)
+    self.policy_pl_topk = int(os.environ.get('CERES_POLICY_PL_TOPK', '3') or 3)
+    if self.policy_pl_weight > 0:
+      print(f'[ceres_net] POLICY PLACKETT-LUCE ranking loss enabled: top-{self.policy_pl_topk} '
+            f'ListMLE over legal moves in target order, w={self.policy_pl_weight} (CE stays the anchor)')
     self.value_contrast_weight = float(os.environ.get('CERES_VALUE_CONTRAST_WEIGHT', '0') or 0)
     if self.value_contrast_weight > 0:
       self.vc_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 1858 * 3, 0)
@@ -2457,6 +2469,33 @@ class CeresNet(nn.Module):
       _pm_h = torch.relu(self.policy_margin_value - (_pm_best_logit.unsqueeze(1) - _pm_rivals)).mean(dim=1)
       policy_margin_loss = (_pm_conf.detach() * _pm_h).mean()
 
+    # Policy PLACKETT-LUCE ranking loss (see __init__): ListMLE over the target's
+    # top-K order. Legality proxy = target > 0 (same as policy_loss); illegal
+    # moves get -inf so they never enter a suffix. Positions with fewer than K
+    # legal moves contribute only their legal ranks. Ties inside the target's
+    # top-K are broken by argsort order (stable enough: visit counts rarely tie).
+    policy_pl_loss = 0
+    _pl_log = {}
+    if self.policy_pl_weight > 0 and policy_out is not None and not gradient_norm_logging_mode:
+      _pl_t = policy_target.float()
+      _pl_logits = policy_out.float().masked_fill(_pl_t <= 0, float('-inf'))
+      _pl_order = torch.argsort(_pl_t, dim=1, descending=True)                     # target rank order
+      _pl_s = torch.gather(_pl_logits, 1, _pl_order)                               # logits in target order
+      # suffix logsumexp: lse_{j>=k} = flip(logcumsumexp(flip(s)))
+      _pl_suf = torch.flip(torch.logcumsumexp(torch.flip(_pl_s, dims=[1]), dim=1), dims=[1])
+      _K = self.policy_pl_topk
+      _pl_terms = (_pl_suf[:, :_K] - _pl_s[:, :_K])                                # [B,K] >= 0
+      _pl_valid = torch.gather(_pl_t, 1, _pl_order)[:, :_K] > 0                    # rank k has target mass
+      _pl_terms = torch.where(_pl_valid, _pl_terms, torch.zeros_like(_pl_terms))
+      policy_pl_loss = _pl_terms.sum(dim=1).mean()
+      with torch.no_grad():
+        # ordering diagnostics: does the net's top-1 / top-K set match the target's?
+        _pl_pred = torch.topk(_pl_logits, _K, dim=1).indices
+        _pl_log['policy_pl_top1'] = (_pl_pred[:, 0] == _pl_order[:, 0]).float().mean()
+        _pl_tgt_set = _pl_order[:, :_K]
+        _pl_hits = (_pl_pred.unsqueeze(2) == _pl_tgt_set.unsqueeze(1)).any(dim=2).float().sum(dim=1)
+        _pl_log['policy_pl_topk_overlap'] = (_pl_hits / _K).mean()
+
     # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
     # the record's WDL, every other legal move is labeled LOSS-for-STM.
     # The loss-vector label (not a flip of the record WDL) is correct across
@@ -2897,6 +2936,7 @@ class CeresNet(nn.Module):
            if not isinstance(depth_probe_ploss, int) else 0)
         + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
         + (self.policy_margin_weight * policy_margin_loss if not isinstance(policy_margin_loss, int) else 0)
+        + (self.policy_pl_weight * policy_pl_loss if not isinstance(policy_pl_loss, int) else 0)
         + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
         + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
         + (self.opt_policy_weight * opt_loss if not isinstance(opt_loss, int) else 0)
@@ -2925,6 +2965,7 @@ class CeresNet(nn.Module):
     if getattr(self, '_gc_probe_now', False):
       self._gc_policy_loss = (self.policy_loss_weight * p_loss
           + (self.policy_margin_weight * policy_margin_loss if not isinstance(policy_margin_loss, int) else 0)
+          + (self.policy_pl_weight * policy_pl_loss if not isinstance(policy_pl_loss, int) else 0)
           + self.uncertainty_policy_weight * uncertainty_policy_loss
           + self.action_loss_weight * action_loss
           + self.action_uncertainty_loss_weight * action_uncertainty_loss
@@ -3060,6 +3101,10 @@ class CeresNet(nn.Module):
         self._log("value_rank_loss" + stat_suffix, value_rank_loss, step=num_pos)
       if not isinstance(policy_margin_loss, int):
         self._log("policy_margin_loss" + stat_suffix, policy_margin_loss, step=num_pos)
+      if not isinstance(policy_pl_loss, int):
+        self._log("policy_pl_loss" + stat_suffix, policy_pl_loss, step=num_pos)
+        for _k, _v in _pl_log.items():
+          self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(vc_loss, int):
         self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
       if not isinstance(hlg_loss, int):

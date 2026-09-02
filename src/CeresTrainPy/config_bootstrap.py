@@ -39,6 +39,9 @@ BOOTSTRAP_ENV_MAP = {
     # Policy-margin-tap (I4): vekt + hinge-margin.
     'PolicyMarginWeight': 'CERES_POLICY_MARGIN_WEIGHT',
     'PolicyMarginValue': 'CERES_POLICY_MARGIN_VALUE',
+    # Plackett-Luce policy ranking aux (Kovax, 2026-09-02): weight + top-K.
+    'PolicyPLWeight': 'CERES_POLICY_PL_WEIGHT',
+    'PolicyPLTopK': 'CERES_POLICY_PL_TOPK',
     # G1-gate paa SDPA-outputen (arXiv 2505.06708; allerede implementert env-gated i
     # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
     # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
