@@ -1,0 +1,23 @@
+{
+    "ID": "srv_320_ea_C778",
+    "DeviceType": "cuda",
+    "DeviceIDs": [
+        0
+    ],
+    "DataType": "BFloat16",
+    "UseFP8": false,
+    "UseHistory": true,
+    "RunInDocker": false,
+    "DropoutRate": 0,
+    "DropoutDuringInference": false,
+    "EngineType": "CSharpViaTorchscript",
+    "SaveNetwork1FileName": null,
+    "SaveNetwork2FileName": null,
+    "ActivationMonitorDumpSkipCount": 0,
+    "SupplementaryStat": "None",
+    "TrackFinalLayerIntrinsicDimensionality": false,
+    "MonitorActivationStats": false,
+    "ExportOnly": false,
+    "TestFlag": false,
+    "TestValue": 0
+}
