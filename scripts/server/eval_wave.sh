@@ -16,7 +16,7 @@ PREFIX="a4000-21bn11"
 SK=".claude/skills/eval-net/eval_net.py"
 for ID in "$@"; do
   # EVAL_RAW=1 reads the RAW net (the EMA auto-window at a 50M ckpt cadence averages
-  # across the whole decay window of a 100M run — raw is the honest read there).
+  # across the whole decay window of a 100M run - raw is the honest read there).
   if [ "${EVAL_RAW:-0}" = "1" ]; then NET="${PREFIX}_${ID}_${POS}.onnx"; TAGSUF="_raw"; else NET="${PREFIX}_${ID}_${POS}ema.onnx"; TAGSUF=""; fi
   if [ ! -s "$DST_WIN/$NET" ]; then
     wsl bash -c "scp -q -P 21031 admin@gate05.aime.info:/mnt/lepned/ceres_out/nets/$NET '$DST_WSL/'" \
