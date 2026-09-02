@@ -43,6 +43,9 @@ BOOTSTRAP_ENV_MAP = {
     # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
     # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
     'GatedAttentionOutput': 'CERES_GATED_ATTENTION_OUTPUT',
+    # Gate-bias-init (2026-09-02): 4.0 = naer-identitet (dagens default); 0.0 =
+    # Qwen-formen (gate starter paa 0.5, sparsitet/sink-fjerning kan oppstaa).
+    'GatedAttentionOutputBiasInit': 'CERES_GATED_ATTENTION_OUTPUT_BIAS',
     # Parameterfrie forward-matte-knotter (bugfunn 2026-08-28, runde 2): begge
     # leses fra env i __init__ og etterlater INGEN spor i state_dict — den
     # universelle noekkelsett-vakten i recover_export kan per konstruksjon ikke

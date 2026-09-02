@@ -328,13 +328,19 @@ class DotProductAttention(torch.nn.Module):
     # channels close only where gradients ask for it.
     self.use_gated_attn_out = int(os.environ.get('CERES_GATED_ATTENTION_OUTPUT', '0') or 0) > 0
     if self.use_gated_attn_out:
+      # Bias init (config GatedAttentionOutputBiasInit, bridged to env): 4.0 keeps
+      # the historical near-identity start; 0.0 is the Qwen/NeurIPS-25 form where
+      # the gate starts at 0.5 and query-dependent sparsity (sink removal) can
+      # emerge — the mechanism the paper credits for the gain and the higher-LR
+      # tolerance. Zero weight either way (input-independent at step 0).
+      _gate_bias = float(os.environ.get('CERES_GATED_ATTENTION_OUTPUT_BIAS', '4.0') or 4.0)
       self.attn_out_gate = torch.nn.Linear(self.d_model, self.d_model * self.attention_multiplier, bias=True)
       torch.nn.init.zeros_(self.attn_out_gate.weight)
-      torch.nn.init.constant_(self.attn_out_gate.bias, 4.0)
+      torch.nn.init.constant_(self.attn_out_gate.bias, _gate_bias)
       if not self.layer_num:  # print once (layer 0 or None), not per layer
         print(f'[dot_product_attention] GATED ATTENTION OUTPUT enabled: elementwise sigmoid '
               f'gate [{self.d_model} -> {self.d_model * self.attention_multiplier}] per layer, '
-              f'zero-init weight / bias 4.0 (gate~0.982 at step 0)')
+              f'zero-init weight / bias {_gate_bias} (gate~{1/(1+__import__("math").exp(-_gate_bias)):.3f} at step 0)')
 
     # Visibility edge-bias B/C content gates (Kovax visibility program,
     # VISIBILITY_PROGRAM.md sec. 4/16): per-layer, per-head LINEAR readout of
