@@ -19,7 +19,7 @@
     "Alpha": 5,
     "GradientClipLevel": 1.0,
     "QKClipTau": 30.0,
-    "EMAPeriodSteps": -1,
+    "EMAPeriodSteps": 100,
     "EMAMaxN": 10,
     "LossValueMultiplier": 1.0,
     "LossValue2Multiplier": 0.04,
