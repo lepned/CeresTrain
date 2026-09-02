@@ -165,8 +165,59 @@ def main():
   except ImportError:
     print('  (onnx_ir not installed here: export parity check skipped — run under the WSL env)')
 
+  # --- 4b. X-program knobs: rich features + policy-weighted pool + aux MLP CE ---
+  net2, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                   'MoveTokenRichFeatures': True, 'MoveTokenValuePool': 'both'},
+                  {'LossMoveTokenAuxMLPMultiplier': 0.3}, 'mt2')
+  assert net2.move_tokens.w_in.in_features == 2 * net2.EMBEDDING_DIM + 4 + 17
+  assert net2.move_tokens.v_inject.in_features == 3 * 64
+  # rich features on a known board: e2 pawn -> e4 is a pawn move, no capture, not promo
+  s1 = board_from_pieces({'e1': 'K', 'e2': 'P', 'd1': 'Q'}, {'e8': 'K', 'e5': 'R', 'd4': 'N'})
+  cand1, E1 = net2.move_tokens.candidates(s1)
+  fr1 = torch.tensor([[SQ['e2'], SQ['d1']]]); to1 = torch.tensor([[SQ['e4'], SQ['d4']]])
+  r1 = net2.move_tokens.rich(s1, E1, fr1, to1)
+  assert r1.shape == (1, 2, 17)
+  assert r1[0, 0, 0] == 1 and r1[0, 0, 1:6].sum() == 0, 'mover one-hot: pawn'
+  assert r1[0, 0, 6:12].sum() == 0, 'e2e4 is not a capture'
+  assert r1[0, 1, 4] == 1, 'mover one-hot: queen'
+  assert r1[0, 1, 6 + 1] == 1, 'd1xd4 captures a knight (opp one-hot index 1)'
+  assert r1[0, 0, 12] == 0, 'no promotion flag on e2e4'
+  assert float(r1[0, 0, 13]) * 4 == 1.0, 'e4 is attacked by the e5 rook (opp attackers of to = 1)'
+  net2.train(); net2.zero_grad(set_to_none=True)
+  loss2 = run_loss(net2, batch, sq); assert torch.isfinite(loss2); loss2.backward()
+  assert net2._last_mt is None and net2._last_mt_aux_out is None, 'stashes must be consumed'
+  dead2 = [n for n, p in net2.move_tokens.named_parameters() if p.grad is None]
+  assert not dead2, f'move_tokens params without gradient: {dead2}'
+  g_aux = net2.policy_head.fcFinal.weight.grad
+  assert g_aux is not None and g_aux.abs().sum() > 0, 'aux MLP policy CE must train the MLP head'
+  from wd_partition import partition_weight_decay as _pwd
+  _pwd(net2)
+  _, pooled2, st2, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
+  assert pooled2.shape[-1] == 3 * 64 and torch.isfinite(pooled2).all() and float(pooled2.abs().max()) < 1e3
+  assert 'mt_polpool_entropy' in st2
+  net2.eval()
+  with torch.no_grad(): out2 = net2(sq, None)
+  assert torch.isfinite(out2[0]).all() and torch.isfinite(out2[1]).all()
+  print(f'  X-program knobs OK: rich features (17, checked on a known board), value pool both (3dm), '
+        f'aux MLP CE trains the MLP head, loss {float(loss2.detach()):.4f}')
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path2 = os.path.join(tempfile.gettempdir(), 'mt_export_test2.onnx')
+    with torch.no_grad(): ref2 = net2(sq, None)
+    torch.onnx.export(net2, (sq, None), path2, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s2 = ort.InferenceSession(path2, providers=['CPUExecutionProvider'])
+    o2 = s2.run(None, {s2.get_inputs()[0].name: sq.numpy()})
+    pr2 = ref2[0].numpy(); po2 = [x for x in o2 if x.shape == pr2.shape][0]
+    d2 = float(np.abs(po2 - pr2).max()); assert d2 < 1e-3, d2
+    print(f'  ONNX export + ORT parity OK for the knob variant (policy max|d| {d2:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: knob-variant export parity skipped)')
+
   # --- 5. guards ---------------------------------------------------------
   for name, over in (('with plane decode', {'UseMoveTokens': True}),
+                     ('rich w/o move tokens', {'DualPlanePolicyDecode': False, 'MoveTokenRichFeatures': True}),
+                     ('bad pool name', {'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenValuePool': 'max'}),
                      ('with fromto', {'DualPlanePolicyDecode': False, 'UseMoveTokens': True})):
     try:
       if name == 'with fromto':

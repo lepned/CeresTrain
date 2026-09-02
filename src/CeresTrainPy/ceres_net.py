@@ -1541,6 +1541,8 @@ class CeresNet(nn.Module):
     # the eval-only serve blends that would reassign policy_out at export).
     self.use_move_tokens = bool(getattr(config, 'NetDef_UseMoveTokens', False))
     self._last_mt = None
+    self._last_mt_aux_out = None
+    self.mt_aux_mlp_w = float(getattr(config, 'Opt_LossMoveTokenAuxMLPMultiplier', 0) or 0) if self.use_move_tokens else 0.0
     if self.use_move_tokens:
       from move_tokens import MoveTokenDecoder
       if getattr(self, 'dp_policy_decode', False):
@@ -1557,6 +1559,11 @@ class CeresNet(nn.Module):
                          '(eval-only blend would leak MLP-head logits onto absent moves)')
       _mt_vi = bool(getattr(config, 'NetDef_MoveTokenValueInject', True))
       _mt_pb = bool(getattr(config, 'NetDef_MoveTokenPolBias', True))
+      _mt_rich = bool(getattr(config, 'NetDef_MoveTokenRichFeatures', False))
+      _mt_vpool = str(getattr(config, 'NetDef_MoveTokenValuePool', 'meanmax') or 'meanmax')
+      _mt_vpd = bool(getattr(config, 'NetDef_MoveTokenValuePoolDetach', True))
+      if _mt_vpool != 'meanmax' and not _mt_vi:
+        raise ValueError('MoveTokenValuePool != meanmax with MoveTokenValueInject off is a silent no-op (the pool feeds only the value inject)')
       self.move_tokens = MoveTokenDecoder(
           s_dim=self.EMBEDDING_DIM, norm_type=config.NetDef_NormType,
           dm=int(getattr(config, 'NetDef_MoveTokenDim', 160) or 160),
@@ -1565,14 +1572,17 @@ class CeresNet(nn.Module):
           ffn_mult=int(getattr(config, 'NetDef_MoveTokenFFNMult', 2) or 2),
           max_tokens=int(getattr(config, 'NetDef_MoveTokenMax', 128) or 128),
           value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
-          value2=self.value2_loss_weight > 0, pol_bias=_mt_pb)
+          value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
+          rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd)
       _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
       print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
             f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
             f'({_n_mt:,} params); policy = per-token 4-slot logits scattered to 1858 + per-move bias '
             f'(MLP policy head bypassed; its params stay in the ckpt, unused); '
             f'value inject {"on" if _mt_vi else "off"}; per-move bias {"on" if _mt_pb else "OFF (frozen zero)"}; '
-            f'absent-move floor {-30.0}')
+            f'rich features {"ON (+17)" if _mt_rich else "off"}; value pool {_mt_vpool}'
+            f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
+            f'aux MLP policy CE {self.mt_aux_mlp_w}; absent-move floor {-30.0}')
 
 
   def _rpe_genphase_biases(self, emb):
@@ -2165,6 +2175,9 @@ class CeresNet(nn.Module):
           _v2_inject = _mvi2 if _v2_inject is None else _v2_inject + _mvi2
       if self.training:
         self._last_mt = (_mt_sel, _mt_valid, _mt_stats)
+        if self.mt_aux_mlp_w > 0:
+          # Aux MLP policy head (X-program item 2): training-only stash, never exported.
+          self._last_mt_aux_out = self.policy_head(fS_policy)
     else:
       policy_out = self.policy_head(fS_policy)
 
@@ -2905,6 +2918,18 @@ class CeresNet(nn.Module):
       soft_policy_loss = loss_calc.ce_loss.forward(_sp_m.float(), _sp_t) \
           - (loss_calc.entropy(_sp_t) if SUBTRACT_ENTROPY else 0.0)
 
+    # Move-token aux MLP policy CE (see __init__): the bypassed MLP head trained on the
+    # same target with the same legality masking. Uses ce_loss directly (NOT
+    # loss_calc.policy_loss, which would fold into the logged policy number).
+    mt_aux_loss = 0
+    _mta = getattr(self, '_last_mt_aux_out', None)
+    if _mta is not None and not gradient_norm_logging_mode:
+      self._last_mt_aux_out = None
+      _mta_legal = policy_target > 0
+      _mta_m = torch.where(_mta_legal, _mta, torch.full_like(_mta, loss_calc.MASK_POLICY_VALUE))
+      mt_aux_loss = loss_calc.ce_loss.forward(_mta_m.float(), policy_target.float()) \
+          - (loss_calc.entropy(policy_target) if SUBTRACT_ENTROPY else 0.0)
+
     # Refiner deep-supervision policy CE (see __init__/forward): mean CE over
     # the intermediate refiner iterations against the SAME policy target, with
     # the standard legality masking. Same consume-and-clear + skip-on-gradnorm
@@ -3039,6 +3064,7 @@ class CeresNet(nn.Module):
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
+        + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
         + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
@@ -3069,6 +3095,7 @@ class CeresNet(nn.Module):
         + (self.opp_policy_weight * oppp_loss if not isinstance(oppp_loss, int) else 0)
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
+          + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
           # pi-edge is a policy-target CE (rel-aux is neither family: kept out).
           + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
@@ -3221,6 +3248,8 @@ class CeresNet(nn.Module):
         self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(soft_policy_loss, int):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
+      if not isinstance(mt_aux_loss, int):
+        self._log("mt_aux_mlp_policy_loss" + stat_suffix, mt_aux_loss, step=num_pos)
       if not isinstance(refiner_ploss, int):
         self._log("refiner_deepsup_policy_loss" + stat_suffix, refiner_ploss, step=num_pos)
       if not gradient_norm_logging_mode:

@@ -114,9 +114,27 @@ class MoveTokenBlock(nn.Module):
 class MoveTokenDecoder(nn.Module):
   def __init__(self, s_dim: int, norm_type: str, dm: int = 160, layers: int = 3,
                heads: int = 4, ffn_mult: int = 2, max_tokens: int = 128,
-               value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True):
+               value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True,
+               rich_features: bool = False, value_pool: str = 'meanmax',
+               value_pool_detach: bool = True):
     super().__init__()
     self.dm, self.M = dm, max_tokens
+    # 2026-09-02 evening knobs (X-program items 1 and 3):
+    #  rich_features: +17 per-token inputs derived in-graph from the board and the
+    #    visibility maps - mover one-hot (6), captured one-hot (6), promotion-rank flag
+    #    (1), and four attack/defence counts (to attacked by opp, to defended by own
+    #    excluding the mover, from attacked by opp, from defended by own), each /4.
+    #  value_pool: 'meanmax' (X form, [mean,max] = 2dm) | 'policy' ([mean, policy-
+    #    weighted pool] = 2dm, param-matched to X) | 'both' ([mean,max,polpool] = 3dm).
+    #    The policy-weighted pool = sum_i softmax(token score)_i * x_i - value looks at
+    #    'what my likely move does' (a one-ply proxy). Weights are DETACHED by default
+    #    so value cannot reshape the policy through them.
+    assert value_pool in ('meanmax', 'policy', 'both'), value_pool
+    self.rich_features = bool(rich_features)
+    self.value_pool = value_pool
+    self.value_pool_detach = bool(value_pool_detach)
+    self.rich_dim = 17 if self.rich_features else 0
+    self.pool_dim = 3 * dm if value_pool == 'both' else 2 * dm
     # Candidate source: private visibility module ('vis' family only). Its
     # construction runs a random probe -> fork_rng keeps the global stream
     # untouched (bit-pairing with the control; the edge-aux lesson).
@@ -156,7 +174,7 @@ class MoveTokenDecoder(nn.Module):
     self.register_buffer('castle_pair', torch.tensor([4 * 64 + 6, 4 * 64 + 2], dtype=torch.long),
                          persistent=False)
     # Token init: concat(flow[from], flow[to], 4 vis channels of the pair).
-    self.w_in = nn.Linear(2 * s_dim + 4, dm)
+    self.w_in = nn.Linear(2 * s_dim + 4 + self.rich_dim, dm)
     self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type)
                                  for _ in range(layers)])
     self.out_ln = make_norm(norm_type, dm)
@@ -177,10 +195,10 @@ class MoveTokenDecoder(nn.Module):
     # Value inject (zero-init, separate per head — the dp_value_inject pattern).
     self.value_inject_dim = value_inject_dim
     if value_inject_dim > 0:
-      self.v_inject = nn.Linear(2 * dm, value_inject_dim, bias=False)
+      self.v_inject = nn.Linear(self.pool_dim, value_inject_dim, bias=False)
       nn.init.zeros_(self.v_inject.weight)
       if value2:
-        self.v2_inject = nn.Linear(2 * dm, value_inject_dim, bias=False)
+        self.v2_inject = nn.Linear(self.pool_dim, value_inject_dim, bias=False)
         nn.init.zeros_(self.v2_inject.weight)
 
   def candidates(self, squares13):
@@ -200,6 +218,26 @@ class MoveTokenDecoder(nn.Module):
     cand = cand + king.unsqueeze(2) * rook.unsqueeze(1) * self.same_rank.to(dt).unsqueeze(0)
     return cand.reshape(-1, 4096).clamp(max=1.0), E
 
+  def rich(self, squares13, E, fr, to):
+    """[B,M,17] per-token features (see __init__). Gather/sum only (TRT-static)."""
+    B, M = fr.shape
+    dt = E.dtype
+    own_pc = squares13[:, :, 1:7].to(dt)                                    # [B,64,6]
+    opp_pc = squares13[:, :, 7:13].to(dt)
+    mover = torch.gather(own_pc, 1, fr.unsqueeze(-1).expand(-1, -1, 6))      # [B,M,6]
+    captured = torch.gather(opp_pc, 1, to.unsqueeze(-1).expand(-1, -1, 6))   # [B,M,6]
+    promo = mover[:, :, 0] * (fr >= 48).to(dt)                              # pawn on rank 7 -> promotion
+    own_out_cnt = E[..., 0].sum(dim=1)                                      # [B,64] own attackers of sq
+    opp_out_cnt = E[..., 1].sum(dim=1)                                      # [B,64] opp attackers of sq
+    att_to = torch.gather(opp_out_cnt, 1, to)
+    att_from = torch.gather(opp_out_cnt, 1, fr)
+    def_from = torch.gather(own_out_cnt, 1, fr)
+    # own defenders of `to` EXCLUDING the mover's own attack on it (the pair bit).
+    pair_own = torch.gather(E[..., 0].reshape(B, 4096), 1, fr * 64 + to)
+    def_to = torch.gather(own_out_cnt, 1, to) - pair_own
+    cnts = torch.stack([att_to, def_to, att_from, def_from], dim=-1) * 0.25   # [B,M,4]
+    return torch.cat([mover, captured, promo.unsqueeze(-1), cnts], dim=-1)
+
   def forward(self, squares13, flow):
     """flow [B,64,S] (post trunk norm). Returns (policy_add [B,1858], pooled [B,2dm],
     stats dict, sel [B,M], valid [B,M])."""
@@ -213,7 +251,10 @@ class MoveTokenDecoder(nn.Module):
     f_from = torch.gather(flow, 1, fr.unsqueeze(-1).expand(-1, -1, S))
     f_to = torch.gather(flow, 1, to.unsqueeze(-1).expand(-1, -1, S))
     e_pair = torch.gather(E.reshape(B, 4096, 4), 1, sel.unsqueeze(-1).expand(-1, -1, 4)).to(flow.dtype)
-    x = self.w_in(torch.cat([f_from, f_to, e_pair], dim=-1))                # [B,M,dm]
+    parts = [f_from, f_to, e_pair]
+    if self.rich_features:
+      parts.append(self.rich(squares13, E, fr, to).to(flow.dtype))
+    x = self.w_in(torch.cat(parts, dim=-1))                                  # [B,M,dm]
     key_bias = ((~valid).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M)
     for blk in self.blocks:
       x = blk(x, blk.ln_s(flow), key_bias)      # each block re-norms the squares under ITS norm (review B1)
@@ -231,8 +272,26 @@ class MoveTokenDecoder(nn.Module):
     # Max-pool guarded for the no-candidate case (mate/stalemate): without the
     # guard it would be ~-1e4 in every channel and feed the value head (review B2).
     max_pool = torch.where(n_valid > 0, (xo + (w - 1.0) * 1e4).amax(dim=1), torch.zeros_like(mean_pool))
-    pooled = torch.cat([mean_pool, max_pool], dim=-1)
     n_cand = cand.float().sum(dim=1)
     stats = {'mt_count_mean': n_cand.mean(), 'mt_count_max': n_cand.amax(),
              'mt_trunc_rate': (n_cand > self.M).float().mean()}
+    if self.value_pool == 'meanmax':
+      pooled = torch.cat([mean_pool, max_pool], dim=-1)
+    else:
+      # Policy-weighted pool: token score = logsumexp over the 4 slot logits (fp32),
+      # invalid tokens masked; softmax over the M tokens; zero on empty boards.
+      score = torch.logsumexp(tok.float(), dim=-1)                           # [B,M]
+      score = torch.where(valid, score, torch.full_like(score, -1e4))
+      w_pol = torch.softmax(score, dim=1)
+      if self.value_pool_detach:
+        w_pol = w_pol.detach()
+      w_pol = w_pol * (n_valid > 0).to(w_pol.dtype)
+      pol_pool = (xo * w_pol.unsqueeze(-1).to(xo.dtype)).sum(dim=1)
+      with torch.no_grad():
+        _wp = w_pol.float().clamp_min(1e-9)
+        stats['mt_polpool_entropy'] = (-(_wp * _wp.log()).sum(dim=1) * (n_valid.squeeze(1) > 0).float()).mean()
+      if self.value_pool == 'policy':
+        pooled = torch.cat([mean_pool, pol_pool], dim=-1)
+      else:
+        pooled = torch.cat([mean_pool, max_pool, pol_pool], dim=-1)
     return pol, pooled, stats, sel, valid

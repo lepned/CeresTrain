@@ -592,9 +592,15 @@ class Configuration:
     self.NetDef_MoveTokenMax = int(config_net_def.get('MoveTokenMax', 128) or 128)
     self.NetDef_MoveTokenValueInject = bool(config_net_def.get('MoveTokenValueInject', True))
     self.NetDef_MoveTokenPolBias = bool(config_net_def.get('MoveTokenPolBias', True))
+    self.NetDef_MoveTokenRichFeatures = bool(config_net_def.get('MoveTokenRichFeatures', False))
+    self.NetDef_MoveTokenValuePool = str(config_net_def.get('MoveTokenValuePool', 'meanmax') or 'meanmax')
+    self.NetDef_MoveTokenValuePoolDetach = bool(config_net_def.get('MoveTokenValuePoolDetach', True))
+    if self.NetDef_MoveTokenValuePool not in ('meanmax', 'policy', 'both'):
+      raise ValueError(f'MoveTokenValuePool must be meanmax|policy|both, got {self.NetDef_MoveTokenValuePool!r}')
     if not self.NetDef_UseMoveTokens:
       for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
-                 'MoveTokenValueInject', 'MoveTokenPolBias'):
+                 'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures',
+                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach'):
         if _k in config_net_def:
           raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
@@ -619,6 +625,12 @@ class Configuration:
     self.NetDef_DualPlaneEdgeAuxWithhold = str(config_net_def.get('DualPlaneEdgeAuxWithhold', '') or '')
     self.NetDef_DualPlaneEdgeAuxDetach = bool(config_net_def.get('DualPlaneEdgeAuxDetach', False))
     self.Opt_LossDualPlaneEdgePiMultiplier = float(config_opt.get('LossDualPlaneEdgePiMultiplier', 0) or 0)
+    # X-program item 2 (2026-09-02): auxiliary CE on the bypassed MLP policy head while
+    # move tokens own the served policy - the trunk gets the old dense policy gradient
+    # in addition to the token path. Training-only; zero serving cost.
+    self.Opt_LossMoveTokenAuxMLPMultiplier = float(config_opt.get('LossMoveTokenAuxMLPMultiplier', 0) or 0)
+    if self.Opt_LossMoveTokenAuxMLPMultiplier > 0 and not self.NetDef_UseMoveTokens:
+      raise ValueError('LossMoveTokenAuxMLPMultiplier > 0 but UseMoveTokens is off - the MLP head IS the policy there (silent no-op refused)')
     self.Opt_LossDualPlaneEdgeRelMultiplier = float(config_opt.get('LossDualPlaneEdgeRelMultiplier', 0) or 0)
     # DualPlaneBlockRepeat SLETTET 2026-08-29 (boelge 5): vektdelt dybde SKADET
     # den rike planen 2v2-seeds (mate-value 58/38 vs kzcaps 80/82) og var
