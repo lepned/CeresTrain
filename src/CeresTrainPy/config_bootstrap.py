@@ -49,6 +49,14 @@ BOOTSTRAP_ENV_MAP = {
     # Gate-bias-init (2026-09-02): 4.0 = naer-identitet (dagens default); 0.0 =
     # Qwen-formen (gate starter paa 0.5, sparsitet/sink-fjerning kan oppstaa).
     'GatedAttentionOutputBiasInit': 'CERES_GATED_ATTENTION_OUTPUT_BIAS',
+    # Sink logit (2026-09-02): +1 constant-0 logit per softmax row (heads may attend nowhere).
+    'AttentionSinkLogit': 'CERES_ATTENTION_SINK_LOGIT',
+    # Policy head form (2026-09-02): 'mlp' (default) or 'fromto' = the from-to bilinear
+    # (ray-context mode 1 machinery) as the PRIMARY head, MLP head bypassed. Ray-context
+    # knobs bridged too so the arm is reconstructable from config alone.
+    'PolicyHeadForm': 'CERES_POLICY_HEAD_FORM',
+    'RayContext': 'CERES_RAY_CONTEXT',
+    'RayContextDH': 'CERES_RAY_CONTEXT_DH',
     # Parameterfrie forward-matte-knotter (bugfunn 2026-08-28, runde 2): begge
     # leses fra env i __init__ og etterlater INGEN spor i state_dict — den
     # universelle noekkelsett-vakten i recover_export kan per konstruksjon ikke

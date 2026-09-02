@@ -436,6 +436,21 @@ class CeresNet(nn.Module):
     # non-collinear rays through from, since a move never vacates its own line).
     # Constant-index Gathers + matmuls only: TRT/INT8-clean, no attention change.
     self.ray_context_mode = int(os.environ.get('CERES_RAY_CONTEXT', '0') or 0)
+    # POLICY HEAD FORM (2026-09-02, config PolicyHeadForm): 'fromto' makes the
+    # from-to bilinear (Lc0/BT4-style attention policy head, ray-context mode 1
+    # machinery) the PRIMARY policy head and bypasses the 1858-way MLP head.
+    # Motivation: the dual-plane knockout showed the net moved its whole policy
+    # function into the mover-bilinear decode and let the MLP head decay to a
+    # fixed prior — it prefers the from-to form when offered one. rc_WT is then
+    # given a normal init (it is the head, not an add-on). Promotions share the
+    # from-to score and differ only through the per-move bias rc_btype.
+    self.policy_head_form = str(os.environ.get('CERES_POLICY_HEAD_FORM', 'mlp') or 'mlp').lower()
+    assert self.policy_head_form in ('mlp', 'fromto'), f'PolicyHeadForm: {self.policy_head_form!r}'
+    if self.policy_head_form == 'fromto' and self.ray_context_mode == 0:
+      self.ray_context_mode = 1
+    if self.policy_head_form == 'fromto':
+      print('[ceres_net] POLICY HEAD FORM = fromto: from-to bilinear IS the policy head '
+            f'(ray-context mode {self.ray_context_mode}); the MLP policy head is bypassed')
     if self.ray_context_mode > 0:
       self.rc_dh = int(os.environ.get('CERES_RAY_CONTEXT_DH', '64') or 64)
       # Memory-lean serving formulation (CERES_RAY_CONTEXT_CHUNKED=N, export-time
@@ -454,7 +469,8 @@ class CeresNet(nn.Module):
         self.register_buffer('rc_ft_flat', torch.tensor(_ft_flat, dtype=torch.long), persistent=False)
       self.rc_WF = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
       self.rc_WT = nn.Linear(self.EMBEDDING_DIM, self.rc_dh, bias=False)
-      nn.init.zeros_(self.rc_WT.weight)
+      if self.policy_head_form != 'fromto':
+        nn.init.zeros_(self.rc_WT.weight)     # add-on form: exact step-0 no-op
       self.rc_btype = nn.Parameter(torch.zeros(1858))
       if self.ray_context_mode >= 2:
         from chess_geometry import build_ray_context_tables
@@ -2089,7 +2105,13 @@ class CeresNet(nn.Module):
       self._last_oppp_out = self.oppp_head(fS_policy)
 
     # Heads. Policy reads fS_policy (== fS_others unless pda); value reads fS_value (with adapter).
-    policy_out = self.policy_head(fS_policy)
+    if getattr(self, 'policy_head_form', 'mlp') == 'fromto':
+      # MLP head bypassed (see __init__): the from-to bilinear below is the head.
+      # Zeros keep every downstream additive term (plane decode, ray-context)
+      # unchanged; the dead MLP branch is pruned from the export graph.
+      policy_out = torch.zeros(fS_policy.shape[0], 1858, device=fS_policy.device, dtype=fS_policy.dtype)
+    else:
+      policy_out = self.policy_head(fS_policy)
 
     # Dual-plane mover-bilinear decode (Stage A3, see __init__): pair scores
     # destination-square x piece-slot, mapped to from-squares via the slot

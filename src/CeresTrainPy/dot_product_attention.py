@@ -132,6 +132,16 @@ class ParameterWrapper:
     return self._parameter
 
 
+class SinkSoftmax(torch.nn.Module):
+  """Softmax over the last dim with one extra constant-0 logit appended and
+  dropped after normalisation ("softmax-off-by-one"). Rows sum to <= 1, so a
+  head can put its mass on nothing. Concat + slice only: TRT/ONNX-trivial."""
+
+  def forward(self, scores):
+    _z = torch.zeros_like(scores[..., :1])
+    return torch.softmax(torch.cat([scores, _z], dim=-1), dim=-1)[..., :-1]
+
+
 class DotProductAttention(torch.nn.Module):
   """
   Implements (scaled) Dot Product Attention.
@@ -182,7 +192,18 @@ class DotProductAttention(torch.nn.Module):
     self.d_model = num_attention_heads * kv_channels
     self.d_output = num_attention_heads * kv_channels
     self.d_k = kv_channels
-    self.softmax = torch.nn.Softmax(-1)
+    # SINK LOGIT (2026-09-02, config AttentionSinkLogit -> CERES_ATTENTION_SINK_LOGIT):
+    # every softmax row gets one extra constant-0 logit that is dropped after
+    # normalisation ("softmax-off-by-one"), so a head can attend NOWHERE for
+    # free. Motivation (Kovax anatomy): ~1/3 of each block's attention output
+    # is the same vector for all 64 squares and 8-16 head-slots per net act as
+    # pure pooling sinks. Zero parameters; rows no longer sum to 1. Applies to
+    # every softmax site in this module (standard + both diff-attention maps).
+    self.use_sink_logit = int(os.environ.get('CERES_ATTENTION_SINK_LOGIT', '0') or 0) > 0
+    self.softmax = SinkSoftmax() if self.use_sink_logit else torch.nn.Softmax(-1)
+    if self.use_sink_logit and not layer_num:
+      print('[dot_product_attention] ATTENTION SINK LOGIT enabled: +1 constant-0 logit per softmax row, '
+            'dropped after normalisation (rows sum <= 1); zero params')
     self.smolgen_head_divisor = smolgen_head_divisor
     self.test = test    
     self.use_qkv = use_qkv
