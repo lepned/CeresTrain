@@ -595,12 +595,15 @@ class Configuration:
     self.NetDef_MoveTokenRichFeatures = bool(config_net_def.get('MoveTokenRichFeatures', False))
     self.NetDef_MoveTokenValuePool = str(config_net_def.get('MoveTokenValuePool', 'meanmax') or 'meanmax')
     self.NetDef_MoveTokenValuePoolDetach = bool(config_net_def.get('MoveTokenValuePoolDetach', True))
+    # X-program items 3/4 (2026-09-03): post-move square attention per block; learned value query token.
+    self.NetDef_MoveTokenPostMove = bool(config_net_def.get('MoveTokenPostMove', False))
+    self.NetDef_MoveTokenValueQuery = bool(config_net_def.get('MoveTokenValueQuery', False))
     if self.NetDef_MoveTokenValuePool not in ('meanmax', 'policy', 'both'):
       raise ValueError(f'MoveTokenValuePool must be meanmax|policy|both, got {self.NetDef_MoveTokenValuePool!r}')
     if not self.NetDef_UseMoveTokens:
       for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
                  'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures',
-                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach'):
+                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach', 'MoveTokenPostMove', 'MoveTokenValueQuery'):
         if _k in config_net_def:
           raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)

@@ -214,6 +214,61 @@ def main():
   except ImportError:
     print('  (onnx_ir not installed here: knob-variant export parity skipped)')
 
+  # --- 4e. post-move attention + learned value query: grads, step-0 no-op, fused identity, ONNX parity
+  net4, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                   'MoveTokenPostMove': True, 'MoveTokenValueQuery': True}, {}, 'mt4')
+  assert net4.move_tokens.v_inject.in_features == 3 * 64, 'value query widens the pool by dm'
+  # step-0: pm_proj is zero => post-move attention is an exact no-op vs the same net without it
+  net4b, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                    'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                    'MoveTokenValueQuery': True}, {}, 'mt4b')
+  net4.eval(); net4b.eval()
+  with torch.no_grad():
+    sd4 = net4.state_dict()
+    net4b.load_state_dict({k: v for k, v in sd4.items() if k in net4b.state_dict()}, strict=True)
+    net4.move_tokens.export_fused = False; net4b.move_tokens.export_fused = False
+    o4 = net4(sq, None); o4b = net4b(sq, None)
+  d0 = float((o4[0] - o4b[0]).abs().max())
+  assert d0 < 1e-5, f'post-move attention must be a step-0 no-op (zero pm_proj): {d0}'
+  net4.train(); net4.zero_grad(set_to_none=True)
+  loss4 = run_loss(net4, batch, sq); assert torch.isfinite(loss4); loss4.backward()
+  dead4 = [n for n, p in net4.move_tokens.named_parameters() if p.grad is None]
+  assert not dead4, f'params without gradient: {dead4}'
+  # zero-init pm_proj => inner post-move params get zero grad at step 0 (the projection trains first,
+  # the v_inject pattern); what must hold is: grads EXIST (DDP) and pm_proj itself gets signal.
+  assert net4.move_tokens.blocks[0].pm_dk.grad is not None
+  assert net4.move_tokens.blocks[0].pm_proj.weight.grad.abs().sum() > 0, 'pm_proj must get gradient at step 0'
+  assert net4.move_tokens.vq_block.vq.grad is not None
+  from wd_partition import partition_weight_decay as _pwd4
+  _pwd4(net4)
+  net4.eval()
+  with torch.no_grad():
+    for _i, _blk in enumerate(net4.move_tokens.blocks):
+      _blk.ln_s.scale.copy_(torch.rand(_blk.ln_s.scale.shape, generator=torch.Generator().manual_seed(21 + _i)) + 0.5)
+      _blk.pm_proj.weight.normal_(0, 0.05, generator=torch.Generator().manual_seed(31 + _i))
+    net4.move_tokens.vq_block.ln_s.scale.copy_(torch.rand(net4.move_tokens.vq_block.ln_s.scale.shape, generator=torch.Generator().manual_seed(41)) + 0.5)
+    net4.move_tokens.export_fused = False; ref4 = net4(sq, None)
+    net4.move_tokens.export_fused = True; assert net4.move_tokens._fusable(); fus4 = net4(sq, None)
+  d4p = float((fus4[0] - ref4[0]).abs().max()); d4v = float((fus4[1] - ref4[1]).abs().max())
+  assert d4p < 1e-4 and d4v < 1e-4, (d4p, d4v)
+  _, pooled4, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
+  assert torch.isfinite(pooled4).all() and float(pooled4.abs().max()) < 1e3
+  print(f'  post-move + value-query OK: step-0 no-op (|d| {d0:.1e}), all params get grad, fused identity '
+        f'(policy {d4p:.1e}, value {d4v:.1e}), empty-board guard')
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path4 = os.path.join(tempfile.gettempdir(), 'mt_export_test4.onnx')
+    with torch.no_grad(): ref4o = net4(sq, None)
+    torch.onnx.export(net4, (sq, None), path4, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s4 = ort.InferenceSession(path4, providers=['CPUExecutionProvider'])
+    o4o = s4.run(None, {s4.get_inputs()[0].name: sq.numpy()})
+    pr4 = ref4o[0].numpy(); po4 = [x for x in o4o if x.shape == pr4.shape][0]
+    d4 = float(np.abs(po4 - pr4).max()); assert d4 < 1e-3, d4
+    print(f'  ONNX export + ORT parity OK for post-move + value-query (policy max|d| {d4:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: post-move/value-query export parity skipped)')
+
   # --- 4d. export-fused eval path == unfused (shared square norm + single K/V GEMM, one-gather assembly)
   net.eval()
   with torch.no_grad():

@@ -1562,6 +1562,10 @@ class CeresNet(nn.Module):
       _mt_rich = bool(getattr(config, 'NetDef_MoveTokenRichFeatures', False))
       _mt_vpool = str(getattr(config, 'NetDef_MoveTokenValuePool', 'meanmax') or 'meanmax')
       _mt_vpd = bool(getattr(config, 'NetDef_MoveTokenValuePoolDetach', True))
+      _mt_pm = bool(getattr(config, 'NetDef_MoveTokenPostMove', False))
+      _mt_vq = bool(getattr(config, 'NetDef_MoveTokenValueQuery', False))
+      if _mt_vq and not _mt_vi:
+        raise ValueError('MoveTokenValueQuery with MoveTokenValueInject off is a silent no-op (the query feeds only the value inject)')
       if _mt_vpool != 'meanmax' and not _mt_vi:
         raise ValueError('MoveTokenValuePool != meanmax with MoveTokenValueInject off is a silent no-op (the pool feeds only the value inject)')
       self.move_tokens = MoveTokenDecoder(
@@ -1573,7 +1577,8 @@ class CeresNet(nn.Module):
           max_tokens=int(getattr(config, 'NetDef_MoveTokenMax', 128) or 128),
           value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
-          rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd)
+          rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
+          post_move=_mt_pm, value_query=_mt_vq)
       _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
       print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
             f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
@@ -1582,7 +1587,8 @@ class CeresNet(nn.Module):
             f'value inject {"on" if _mt_vi else "off"}; per-move bias {"on" if _mt_pb else "OFF (frozen zero)"}; '
             f'rich features {"ON (+17)" if _mt_rich else "off"}; value pool {_mt_vpool}'
             f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
-            f'aux MLP policy CE {self.mt_aux_mlp_w}; absent-move floor {-30.0}')
+            f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {"ON" if _mt_pm else "off"}; '
+            f'value query {"ON" if _mt_vq else "off"}; absent-move floor {-30.0}')
 
 
   def _rpe_genphase_biases(self, emb):

@@ -71,10 +71,31 @@ class MoveTokenBlock(nn.Module):
   """Pre-norm block: masked self-attention among move tokens, cross-attention
   from moves to the 64 square states, SwiGLU FFN. Plain matmul/softmax."""
 
-  def __init__(self, dm: int, s_dim: int, heads: int, ffn_mult: int, norm_type: str):
+  def __init__(self, dm: int, s_dim: int, heads: int, ffn_mult: int, norm_type: str,
+               post_move: bool = False):
     super().__init__()
     assert dm % heads == 0
     self.h, self.dk = heads, dm // heads
+    # POST-MOVE square attention (2026-09-03, X-program item 3): a second cross-attention
+    # from each move token to the 64 squares in which the two squares the move touches
+    # are seen AFTER the move: the to-square's key/value get a learned per-piece delta
+    # for the mover, the from-square's the 'now empty' delta. Exact and cheap: the base
+    # scores/values are one shared matmul; the edits are two per-token rank-1 corrections
+    # applied through one-hot masks (no [B,M,64,d] tensor, no scatter). This is the only
+    # place in the net that can see a position one ply ahead.
+    self.post_move = bool(post_move)
+    if self.post_move:
+      self.ln_pm = make_norm(norm_type, dm)
+      self.pm_q = nn.Linear(dm, dm, bias=False)
+      self.pm_kv = nn.Linear(s_dim, 2 * dm, bias=False)
+      self.pm_proj = nn.Linear(dm, dm, bias=False)
+      nn.init.zeros_(self.pm_proj.weight)              # exact step-0 no-op for the block
+      # index 0 = 'empty' (the vacated from-square), 1..6 = mover piece type on the to-square
+      self.pm_dk = nn.Parameter(torch.zeros(7, dm))
+      self.pm_dv = nn.Parameter(torch.zeros(7, dm))
+      with torch.no_grad():
+        g = torch.Generator().manual_seed(0x0D0D)
+        self.pm_dk.normal_(0.0, 0.02, generator=g); self.pm_dv.normal_(0.0, 0.02, generator=g)
     self.ln1 = make_norm(norm_type, dm)
     self.qkv = nn.Linear(dm, 3 * dm, bias=False)
     self.proj = nn.Linear(dm, dm, bias=False)
@@ -99,7 +120,29 @@ class MoveTokenBlock(nn.Module):
     a = torch.softmax(s, dim=-1)
     return torch.matmul(a, v).transpose(1, 2).reshape(B, Tq, self.h * self.dk)
 
-  def forward(self, x, s_flow_n, key_bias, kv=None):
+  def _post_move_attn(self, h, k, v, oh_to, oh_from, mover):
+    """h [B,M,dm] normed tokens; k,v [B,64,dm]; oh_to/oh_from [B,M,64] one-hots; mover [B,M] in 1..6.
+    Scores s_tj = q_t.k_j + [j==to] q_t.dk[mover_t] + [j==from] q_t.dk[0]; values likewise."""
+    B, M = h.shape[0], h.shape[1]
+    q = self.pm_q(h).reshape(B, M, self.h, self.dk).transpose(1, 2)              # [B,h,M,dk]
+    kh = k.reshape(B, 64, self.h, self.dk).transpose(1, 2)                       # [B,h,64,dk]
+    vh = v.reshape(B, 64, self.h, self.dk).transpose(1, 2)
+    dk_to = self.pm_dk[mover].to(q.dtype).reshape(B, M, self.h, self.dk).transpose(1, 2)   # [B,h,M,dk]
+    dv_to = self.pm_dv[mover].to(q.dtype).reshape(B, M, self.h, self.dk).transpose(1, 2)
+    dk_fr = self.pm_dk[0].to(q.dtype).reshape(1, self.h, 1, self.dk)
+    dv_fr = self.pm_dv[0].to(q.dtype).reshape(1, self.h, 1, self.dk)
+    scale = self.dk ** -0.5
+    s = torch.matmul(q, kh.transpose(2, 3)) * scale                             # [B,h,M,64]
+    c_to = (q * dk_to).sum(-1, keepdim=True) * scale                             # [B,h,M,1]
+    c_fr = (q * dk_fr).sum(-1, keepdim=True) * scale
+    s = s + c_to * oh_to.unsqueeze(1).to(s.dtype) + c_fr * oh_from.unsqueeze(1).to(s.dtype)
+    a = torch.softmax(s, dim=-1)
+    a_to = (a * oh_to.unsqueeze(1).to(a.dtype)).sum(-1, keepdim=True)            # [B,h,M,1]
+    a_fr = (a * oh_from.unsqueeze(1).to(a.dtype)).sum(-1, keepdim=True)
+    o = torch.matmul(a, vh) + a_to * dv_to + a_fr * dv_fr                        # [B,h,M,dk]
+    return o.transpose(1, 2).reshape(B, M, self.h * self.dk)
+
+  def forward(self, x, s_flow_n, key_bias, kv=None, pm=None, pm_kv=None):
     h = self.ln1(x)
     q, k, v = self.qkv(h).chunk(3, dim=-1)
     x = x + self.proj(self._attn(q, k, v, key_bias))
@@ -108,10 +151,60 @@ class MoveTokenBlock(nn.Module):
     # MoveTokenDecoder.forward); otherwise this block norms + projects the squares itself.
     k2, v2 = (self.xkv(s_flow_n) if kv is None else kv).chunk(2, dim=-1)
     x = x + self.xproj(self._attn(self.xq(h), k2, v2))
+    if self.post_move:
+      oh_to, oh_from, mover = pm
+      k3, v3 = (self.pm_kv(s_flow_n) if pm_kv is None else pm_kv).chunk(2, dim=-1)
+      x = x + self.pm_proj(self._post_move_attn(self.ln_pm(x), k3, v3, oh_to, oh_from, mover))
     h = self.ln3(x)
     g, u = self.ffn_in(h).chunk(2, dim=-1)
     x = x + self.ffn_out(torch.nn.functional.silu(g) * u)
     return x
+
+
+class ValueQueryBlock(nn.Module):
+  """LEARNED VALUE QUERY (2026-09-03, X-program item 4): one learned token that cross-attends
+  to the (masked) move tokens and to the 64 squares, then an FFN. Its output joins the
+  pooled move state that feeds the zero-init value inject: attention pooling instead of
+  mean/max. Plain matmul/softmax; no per-sample weights."""
+
+  def __init__(self, dm: int, s_dim: int, heads: int, ffn_mult: int, norm_type: str):
+    super().__init__()
+    assert dm % heads == 0
+    self.h, self.dk, self.dm = heads, dm // heads, dm
+    self.vq = nn.Parameter(torch.zeros(1, 1, dm))
+    with torch.no_grad():
+      self.vq.normal_(0.0, 0.02, generator=torch.Generator().manual_seed(0x0A0A))
+    self.ln1 = make_norm(norm_type, dm); self.q1 = nn.Linear(dm, dm, bias=False)
+    self.kv1 = nn.Linear(dm, 2 * dm, bias=False); self.proj1 = nn.Linear(dm, dm, bias=False)
+    self.ln2 = make_norm(norm_type, dm); self.q2 = nn.Linear(dm, dm, bias=False)
+    self.ln_s = make_norm(norm_type, s_dim)
+    self.kv2 = nn.Linear(s_dim, 2 * dm, bias=False); self.proj2 = nn.Linear(dm, dm, bias=False)
+    self.ln3 = make_norm(norm_type, dm)
+    self.ffn_in = nn.Linear(dm, 2 * ffn_mult * dm, bias=False)
+    self.ffn_out = nn.Linear(ffn_mult * dm, dm, bias=False)
+
+  def _attn(self, q, k, v, key_bias=None):
+    B, Tk = k.shape[0], k.shape[1]
+    q = q.reshape(B, 1, self.h, self.dk).transpose(1, 2)
+    k = k.reshape(B, Tk, self.h, self.dk).transpose(1, 2)
+    v = v.reshape(B, Tk, self.h, self.dk).transpose(1, 2)
+    s = torch.matmul(q, k.transpose(2, 3)) * (self.dk ** -0.5)
+    if key_bias is not None:
+      s = s + key_bias.to(s.dtype)
+    a = torch.softmax(s, dim=-1)
+    return torch.matmul(a, v).transpose(1, 2).reshape(B, 1, self.h * self.dk)
+
+  def forward(self, xo, key_bias, s_flow_n=None, kv2=None):
+    """xo [B,M,dm] decoder output; key_bias [B,1,1,M]; squares via s_flow_n [B,64,S] or kv2 [B,64,2dm]."""
+    B = xo.shape[0]
+    x = self.vq.to(xo.dtype).expand(B, -1, -1)                                   # [B,1,dm]
+    h = self.ln1(x); k1, v1 = self.kv1(xo).chunk(2, dim=-1)
+    x = x + self.proj1(self._attn(self.q1(h), k1, v1, key_bias))
+    h = self.ln2(x); k2, v2 = (self.kv2(s_flow_n) if kv2 is None else kv2).chunk(2, dim=-1)
+    x = x + self.proj2(self._attn(self.q2(h), k2, v2))
+    h = self.ln3(x); g, u = self.ffn_in(h).chunk(2, dim=-1)
+    x = x + self.ffn_out(torch.nn.functional.silu(g) * u)
+    return x.squeeze(1)                                                          # [B,dm]
 
 
 class MoveTokenDecoder(nn.Module):
@@ -119,7 +212,8 @@ class MoveTokenDecoder(nn.Module):
                heads: int = 4, ffn_mult: int = 2, max_tokens: int = 128,
                value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True,
                rich_features: bool = False, value_pool: str = 'meanmax',
-               value_pool_detach: bool = True):
+               value_pool_detach: bool = True, post_move: bool = False,
+               value_query: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
     # 2026-09-02 evening knobs (X-program items 1 and 3):
@@ -137,7 +231,9 @@ class MoveTokenDecoder(nn.Module):
     self.value_pool = value_pool
     self.value_pool_detach = bool(value_pool_detach)
     self.rich_dim = 17 if self.rich_features else 0
-    self.pool_dim = 3 * dm if value_pool == 'both' else 2 * dm
+    self.post_move = bool(post_move)
+    self.value_query = bool(value_query)
+    self.pool_dim = (3 * dm if value_pool == 'both' else 2 * dm) + (dm if self.value_query else 0)
     # EXPORT-FUSED eval path (2026-09-03, TRT profile: decoder is launch-bound, ~101
     # kernels). Function-identical rewrites used when not training:
     #  * ONE shared RMS normalisation of the 64 squares + ONE GEMM producing every
@@ -187,9 +283,11 @@ class MoveTokenDecoder(nn.Module):
                          persistent=False)
     # Token init: concat(flow[from], flow[to], 4 vis channels of the pair).
     self.w_in = nn.Linear(2 * s_dim + 4 + self.rich_dim, dm)
-    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type)
+    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type, post_move=self.post_move)
                                  for _ in range(layers)])
     self.out_ln = make_norm(norm_type, dm)
+    if self.value_query:
+      self.vq_block = ValueQueryBlock(dm, s_dim, heads, ffn_mult, norm_type)
     # Policy read: 4 logits per token (promotion slots). SMALL fixed-key init,
     # not zero: with both readers (pol, value inject) at zero the decoder body
     # receives no gradient at all at step 0 — the product-rule cascade this
@@ -215,7 +313,10 @@ class MoveTokenDecoder(nn.Module):
 
   def _fusable(self):
     from rms_norm import RMSNorm
-    return all(isinstance(blk.ln_s, RMSNorm) for blk in self.blocks)
+    ok = all(isinstance(blk.ln_s, RMSNorm) for blk in self.blocks)
+    if self.value_query:
+      ok = ok and isinstance(self.vq_block.ln_s, RMSNorm)
+    return ok
 
   def set_export_max(self, m: int):
     """EXPORT-TIME token cap. The decoder is permutation-equivariant with masking and
@@ -293,16 +394,32 @@ class MoveTokenDecoder(nn.Module):
       parts.append(self.rich(squares13, E, fr, to).to(flow.dtype))
     x = self.w_in(torch.cat(parts, dim=-1))                                  # [B,M,dm]
     key_bias = ((~valid).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M)
+    pm = None
+    if self.post_move:
+      ar64 = torch.arange(64, device=flow.device)
+      oh_to = (ar64.reshape(1, 1, 64) == to.unsqueeze(-1)).to(flow.dtype)      # [B,M,64]
+      oh_from = (ar64.reshape(1, 1, 64) == fr.unsqueeze(-1)).to(flow.dtype)
+      own_pc = squares13[:, :, 1:7]
+      mover = torch.gather(own_pc, 1, fr.unsqueeze(-1).expand(-1, -1, 6)).argmax(dim=-1) + 1   # [B,M] in 1..6
+      pm = (oh_to, oh_from, mover)
     if _fused:
       eps = self.blocks[0].ln_s.eps
       n = flow * torch.rsqrt(flow.pow(2).mean(-1, keepdim=True) + eps)         # shared, scale-free RMS
-      W = torch.cat([blk.xkv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks], dim=0)
-      kv_all = torch.nn.functional.linear(n, W.to(n.dtype))                     # [B,64,L*2dm]
-      for blk, kv in zip(self.blocks, kv_all.chunk(len(self.blocks), dim=-1)):
-        x = blk(x, None, key_bias, kv=kv)
+      Ws = [blk.xkv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks]
+      if self.post_move:
+        Ws += [blk.pm_kv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks]
+      if self.value_query:
+        Ws.append(self.vq_block.kv2.weight * self.vq_block.ln_s.scale.unsqueeze(0))
+      kv_all = torch.nn.functional.linear(n, torch.cat(Ws, dim=0).to(n.dtype))  # [B,64,sum]
+      L = len(self.blocks)
+      kvs = list(kv_all.split([w.shape[0] for w in Ws], dim=-1))
+      for i, blk in enumerate(self.blocks):
+        x = blk(x, None, key_bias, kv=kvs[i], pm=pm, pm_kv=(kvs[L + i] if self.post_move else None))
+      vq_kv2 = kvs[-1] if self.value_query else None
     else:
       for blk in self.blocks:
-        x = blk(x, blk.ln_s(flow), key_bias)    # each block re-norms the squares under ITS norm (review B1)
+        x = blk(x, blk.ln_s(flow), key_bias, pm=pm)   # each block re-norms the squares under ITS norm (review B1)
+      vq_kv2 = None
     xo = self.out_ln(x)
     # Policy: 4 slot logits per token -> [B,4096,4] buffer at floor -> flat index_select.
     tok = self.pol(xo)                                                       # [B,M,4]
@@ -339,4 +456,9 @@ class MoveTokenDecoder(nn.Module):
         pooled = torch.cat([mean_pool, pol_pool], dim=-1)
       else:
         pooled = torch.cat([mean_pool, max_pool, pol_pool], dim=-1)
+    if self.value_query:
+      # Learned value query over tokens + squares; zero on empty boards (no valid token to attend to).
+      vq_out = self.vq_block(xo, key_bias, s_flow_n=(None if vq_kv2 is not None else self.vq_block.ln_s(flow)), kv2=vq_kv2)
+      vq_out = vq_out * (n_valid > 0).to(vq_out.dtype)
+      pooled = torch.cat([pooled, vq_out], dim=-1)
     return pol, pooled, stats, sel, valid
