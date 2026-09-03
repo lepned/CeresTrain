@@ -57,5 +57,7 @@
     "TorchSeed": 777,
     "ShuffleSeed": 20260828,
     "LossDualPlaneEdgePiMultiplier": 0,
-    "LossDualPlaneEdgeRelMultiplier": 0
+    "LossDualPlaneEdgeRelMultiplier": 0,
+    "PolicyPLWeight": 0.05,
+    "PolicyPLTopK": 5
 }
