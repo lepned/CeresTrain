@@ -1,6 +1,6 @@
 {
     "LoRARankDivisor": 0,
-    "NumTrainingPositions": 2000000000,
+    "NumTrainingPositions": 4000000000,
     "BatchSizeForwardPass": 4096,
     "BatchSizeBackwardPass": 4096,
     "Optimizer": "Muon",
@@ -9,7 +9,7 @@
     "PyTorchCompileMode": "default",
     "WeightDecay": 0.01,
     "LearningRateBase": 0.0005,
-    "LRBeginDecayAtFractionComplete": 0.8,
+    "LRBeginDecayAtFractionComplete": 0.6,
     "LRWarmupPhaseMultiplier": 0.03,
     "LRDecayShape": "cosine",
     "LRMinFactor": 0.1,
