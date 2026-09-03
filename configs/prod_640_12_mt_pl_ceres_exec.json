@@ -1,5 +1,5 @@
 {
-    "ID": "srv_256_fs_PROD640",
+    "ID": "prod_640_12_mt_pl",
     "DeviceType": "cuda",
     "DeviceIDs": [
         0,
