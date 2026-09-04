@@ -183,7 +183,12 @@ def save_model(NAME : str,
         raise ValueError(f'ExportFolds={_fold_s!r} but nothing was foldable in this model (silent no-op refused)')
       print(f'INFO: EXPORT_FOLD applied: {_fc} (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
-    _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '') + (('fld' if _fold_s == 'all' else 'fld' + _fold_s) if _fold else '')
+    # NB folds deliberately do NOT tag the filename: ExportFolds is a property of the RUN's
+    # config, so every export of that run is folded and there is nothing to disambiguate —
+    # while a tag would break every consumer that globs `<prefix>_<id>_<pos>.onnx`
+    # (scripts/server/eval_wave.sh, the monitor chain, EB defs). For an A/B re-export of the
+    # SAME weights with and without folds, set CERES_EXPORT_TAG=fldmt on the folded run.
+    _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '')
     # CERES_EXPORT_TAG=<txt>: extra filename tag for A/B exports of the same weights
     # (e.g. graph-level variants); never overwrites the plain export.
     _num_pos_tag += (os.environ.get('CERES_EXPORT_TAG', '') or '').strip()

@@ -52,9 +52,10 @@ Suggested pair order on 2-GPU pairs: (0,1) (0 must run first or in parallel), th
   exact rewrites. Measured on the 700M prod net in EngineBattle: `mt` (decoder attention-scale +
   pre-norm scale folds) **+6-8 % EPS** (1.08x / 1.06x both orders) -> `"ExportFolds": "mt"` is
   set in every wave-2 config (and worth adopting for prod exports); `ffn` (SwiGLU gate|up
-  fusion) 0.96-1.00x and `all` 0.91-0.96x -> A/B tools only. NOTE: with `ExportFolds` set,
-  every export of the run is named `<pos>fldmt.onnx` (also the `ema` files) — eval/def tooling
-  must glob that name, and a paired control must carry the same setting (it does).
+  fusion) 0.96-1.00x and `all` 0.91-0.96x -> A/B tools only. NOTE: exported filenames are
+  UNCHANGED by `ExportFolds` (the eval chain globs `<prefix>_<id>_<pos>.onnx`); the fold is
+  recorded in the log line `INFO: EXPORT_FOLD applied`. For an A/B re-export of the same
+  weights with and without folds, set `CERES_EXPORT_TAG=fldmt` on the folded one.
 
 ## Not in this wave (decided)
 
