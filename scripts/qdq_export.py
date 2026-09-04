@@ -306,6 +306,14 @@ def main():
                          'upcasting the whole graph to FP32 (which makes excluded MatMuls/norms FP32)')
     ap.add_argument('--exclude_regex', default=None,
                     help='full-match regex on MatMul/Gemm node names to keep in FP (sensitivity sweeps)')
+    ap.add_argument('--include_shapes', default=None,
+                    help='ALLOWLIST (robust, name-independent): quantize ONLY MatMul/Gemm whose '
+                         'weight shape KxN is in this comma list; everything else stays FP. Prefer '
+                         'this over --exclude_regex: dynamo node NAMES shift between exports of the '
+                         'same architecture (measured 2026-09-04: the decoder regex matched 41 nodes '
+                         'on one checkpoint and 39 on the next), so a name-based denylist silently '
+                         'leaks layers into INT8. Trunk-only for the 640x12 move-token net: '
+                         '640x1920,1920x640,640x640')
     ap.add_argument('--exclude_shapes', default=None,
                     help='comma list of weight shapes KxN (e.g. 640x32,256x2048) whose MatMuls stay FP')
     ap.add_argument('--exclude_index_range', default=None,
@@ -411,7 +419,8 @@ def main():
     nodes_to_exclude = []
     _m = onnx.load(quant_input) if (args.exclude_tail > 0 or args.exclude_act_matmuls
                                     or args.exclude_pattern or args.exclude_regex
-                                    or args.exclude_shapes or args.exclude_index_range) else None
+                                    or args.exclude_shapes or args.exclude_index_range
+                                    or args.include_shapes) else None
     if args.exclude_tail > 0:
         _mm = [n.name for n in _m.graph.node if n.op_type == 'MatMul']
         nodes_to_exclude = _mm[-args.exclude_tail:]
@@ -440,6 +449,18 @@ def main():
                   and (pat in n.name or any(pat in i for i in n.input))]
         nodes_to_exclude += [n for n in pat_mm if n not in nodes_to_exclude]
         print(f'[qdq] excluding {len(pat_mm)} MatMuls matching "{pat}" from quant')
+    if args.include_shapes:
+      _keep = set(args.include_shapes.split(','))
+      _dims = {t.name: 'x'.join(str(d) for d in t.dims) for t in _m.graph.initializer}
+      _sel = [n.name for n in _m.graph.node
+              if n.op_type in ('MatMul', 'Gemm')
+              and not (len(n.input) > 1 and _dims.get(n.input[1]) in _keep)]
+      _kept = sum(1 for n in _m.graph.node if n.op_type in ('MatMul', 'Gemm')) - len(_sel)
+      if _kept == 0:
+        raise ValueError(f'--include_shapes {args.include_shapes!r} matched no MatMul/Gemm weight shape')
+      nodes_to_exclude += [n for n in _sel if n not in nodes_to_exclude]
+      print(f'[qdq] include_shapes {sorted(_keep)}: quantizing {_kept} MatMul/Gemm, '
+            f'{len(_sel)} kept in FP (shape allowlist; name-independent)')
     if args.exclude_regex or args.exclude_shapes or args.exclude_index_range:
         import re as _re
         _dims = {t.name: 'x'.join(str(d) for d in t.dims) for t in _m.graph.initializer}
