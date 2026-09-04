@@ -215,12 +215,14 @@ class TPGReader(CalibrationDataReader):
         self.channels = channels
         self.byte_div = byte_div
 
+    in_dtype = np.float32
+
     def _fmt(self, b):
         if self.channels is not None:
             b = b[:, :, :self.channels]
         if self.byte_div > 0:
             return np.clip(np.rint(b.astype(np.float32) * self.byte_div), 0, 255).astype(np.uint8)
-        return b.astype(np.float32)
+        return b.astype(self.in_dtype)
 
     def get_next(self):
         if self.i >= self.n:
@@ -298,6 +300,16 @@ def main():
                          'GEMMs (nn.Linear), so quantizing these at export is '
                          'train/deploy skew; excluding them deploys exactly what QAT '
                          'trained against.')
+    ap.add_argument('--internal_fp16', action='store_true',
+                    help='quantize the FP16 graph directly (opset 19, fp16 Q/DQ scales) so every '
+                         'non-quantized op runs in FP16 in the strongly-typed engine, instead of '
+                         'upcasting the whole graph to FP32 (which makes excluded MatMuls/norms FP32)')
+    ap.add_argument('--exclude_regex', default=None,
+                    help='full-match regex on MatMul/Gemm node names to keep in FP (sensitivity sweeps)')
+    ap.add_argument('--exclude_shapes', default=None,
+                    help='comma list of weight shapes KxN (e.g. 640x32,256x2048) whose MatMuls stay FP')
+    ap.add_argument('--exclude_index_range', default=None,
+                    help='A-B: MatMuls whose graph node index is in [A,B] stay FP (e.g. one trunk layer)')
     ap.add_argument('--exclude_pattern', default=None,
                     help='exclude MatMuls whose node name or any input name contains '
                          'this substring (e.g. "vda" keeps the depth-attention value '
@@ -357,8 +369,21 @@ def main():
     pre_path = base + '.fp32.pre.onnx'
     qdq_path = base + '.' + tag + '.onnx'
 
-    # 1. lossless FP16 -> FP32
-    fp16_to_fp32(args.onnx, fp32_path)
+    # 1. lossless FP16 -> FP32 (default) or keep FP16 internals (--internal_fp16)
+    if args.internal_fp16:
+        from onnx import version_converter
+        _m16 = onnx.load(args.onnx)
+        _ops = {o.domain: o.version for o in _m16.opset_import}
+        if _ops.get('', 0) < 19:
+            _m16 = version_converter.convert_version(_m16, 19)
+        fp32_path = base + '.fp16op19.onnx'
+        onnx.save(_m16, fp32_path)
+        tag += '16'
+        qdq_path = base + '.' + tag + '.onnx'
+        TPGReader.in_dtype = np.float16
+        print(f'[internal_fp16] quantizing the FP16 graph directly (opset 19) -> {fp32_path}')
+    else:
+        fp16_to_fp32(args.onnx, fp32_path)
 
     # 2. shape inference / preprocessing for clean QDQ insertion.
     #    ORT symbolic shape inference asserts on this graph (an aux output type
@@ -385,7 +410,8 @@ def main():
     # Exclude the last N MatMuls (the value-feeding late trunk) from quantization.
     nodes_to_exclude = []
     _m = onnx.load(quant_input) if (args.exclude_tail > 0 or args.exclude_act_matmuls
-                                    or args.exclude_pattern) else None
+                                    or args.exclude_pattern or args.exclude_regex
+                                    or args.exclude_shapes or args.exclude_index_range) else None
     if args.exclude_tail > 0:
         _mm = [n.name for n in _m.graph.node if n.op_type == 'MatMul']
         nodes_to_exclude = _mm[-args.exclude_tail:]
@@ -414,6 +440,22 @@ def main():
                   and (pat in n.name or any(pat in i for i in n.input))]
         nodes_to_exclude += [n for n in pat_mm if n not in nodes_to_exclude]
         print(f'[qdq] excluding {len(pat_mm)} MatMuls matching "{pat}" from quant')
+    if args.exclude_regex or args.exclude_shapes or args.exclude_index_range:
+        import re as _re
+        _dims = {t.name: 'x'.join(str(d) for d in t.dims) for t in _m.graph.initializer}
+        _shapes = set(args.exclude_shapes.split(',')) if args.exclude_shapes else set()
+        _rx = _re.compile(args.exclude_regex) if args.exclude_regex else None
+        _lo, _hi = (int(v) for v in args.exclude_index_range.split('-')) if args.exclude_index_range else (-1, -1)
+        sel = []
+        for _i, n in enumerate(_m.graph.node):
+            if n.op_type not in ('MatMul', 'Gemm'):
+                continue
+            hit = (_rx is not None and _rx.fullmatch(n.name) is not None)                 or (len(n.input) > 1 and _dims.get(n.input[1]) in _shapes)                 or (_lo <= _i <= _hi)
+            if hit:
+                sel.append(n.name)
+        nodes_to_exclude += [n for n in sel if n not in nodes_to_exclude]
+        print(f'[qdq] excluding {len(sel)} MatMul/Gemm by regex/shape/index-range from quant: '
+              f'{sel[:4]}{" ..." if len(sel) > 4 else ""}')
     # FP8 in ORT requires Distribution calibration (histogram-based scale).
     if FP8:
         cmethod = CalibrationMethod.Distribution
@@ -507,8 +549,13 @@ def main():
 
     # Restore FP16 IO so the artifact is Ceres-TensorRTNative-deployable
     # (Ceres feeds/reads FP16). This is the deployable net.
-    qdq_deploy = args.out if args.out else (base + '.' + tag + '.fp16io.onnx')
-    restore_fp16_io(qdq_path, qdq_deploy)
+    if args.internal_fp16:
+        qdq_deploy = args.out if args.out else qdq_path
+        if qdq_deploy != qdq_path:
+            os.replace(qdq_path, qdq_deploy)
+    else:
+        qdq_deploy = args.out if args.out else (base + '.' + tag + '.fp16io.onnx')
+        restore_fp16_io(qdq_path, qdq_deploy)
     qdq_path = qdq_deploy
     print(f'[deploy] {qdq_deploy}')
 
