@@ -78,9 +78,10 @@ if fwd % nproc:
 if nproc > 1:
     if float(opt.get('MirrorConsistencyWeight', 0) or 0) > 0:
         errs.append('MirrorConsistencyWeight > 0 is single-GPU only (see DDP_MULTI_GPU.md)')
-    for k in ('SurvivalTargetWeight', 'PlacementValueWeight', 'StValueWeight'):
+    for k in ('SurvivalTargetWeight', 'PlacementValueWeight', 'StValueWeight',
+              'LossMoveTokenValueOrderMultiplier', 'LossMoveTokenAuxMLPMultiplier', 'HLGaussWeight'):
         if float(opt.get(k, 0) or 0) > 0:
-            warns.append(f'{k} > 0 needs CERES_DDP_STATIC_GRAPH=1 under DDP')
+            warns.append(f'{k} > 0 needs CERES_DDP_STATIC_GRAPH=1 under DDP (stash-only loss)')
     ema = int(opt.get('EMAPeriodSteps', 0) or 0)
     # KORRIGERT 2026-09-01: det gamle raadet 'del paa nproc' var MATEMATISK FEIL
     # (BatchSizeForwardPass er GLOBAL og deles paa ranks => ett optimizer-steg

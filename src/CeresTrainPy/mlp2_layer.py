@@ -126,6 +126,12 @@ class MLP2Layer(torch.nn.Module):
       # operate on the SAME original input x (post-global-concat). Save the
       # input before linear1 overwrites it.
       x_in = x
+      _l13 = getattr(self, 'linear13', None)
+      if _l13 is not None:
+        # export_folds.py: one (in -> 2*inner) GEMM for gate|up, then SiLU(g) * u.
+        g, u = _l13(x_in).chunk(2, dim=-1)
+        before_linear2 = self.activation_fn(g) * u
+        return before_linear2, self.linear2(before_linear2)
       x = self.linear1(x_in)
       if self.ffn_softcap is not None:
         # SiTU-GLU (see __init__): capped Swish gate x capped up branch.

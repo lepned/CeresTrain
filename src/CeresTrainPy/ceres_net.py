@@ -1564,6 +1564,20 @@ class CeresNet(nn.Module):
       _mt_vpd = bool(getattr(config, 'NetDef_MoveTokenValuePoolDetach', True))
       _mt_pm = bool(getattr(config, 'NetDef_MoveTokenPostMove', False))
       _mt_vq = bool(getattr(config, 'NetDef_MoveTokenValueQuery', False))
+      self.mt_vord_w = float(getattr(config, 'Opt_LossMoveTokenValueOrderMultiplier', 0) or 0)
+      self.mt_vord_topk = int(getattr(config, 'Opt_MoveTokenValueOrderTopK', 5) or 5)
+      _mt_opp = int(getattr(config, 'NetDef_MoveTokenOppMax', 0) or 0)
+      _mt_opp_pool = bool(getattr(config, 'NetDef_MoveTokenOppPool', False))
+      _mt_wb = bool(getattr(config, 'NetDef_MoveTokenWriteBack', False))
+      if self.use_gtab:
+        # Review 2026-09-04 finding 3: the decoder now runs BEFORE the GTAB adapter add, so a
+        # gtab + move-token net would not be bit-paired with the pre-change graph. Never used
+        # together; refuse rather than silently change behaviour.
+        raise ValueError('UseMoveTokens with GTAB is unsupported (the decoder runs before the adapter add)')
+      if _mt_wb and self.value_head_channels > 0:
+        raise ValueError('MoveTokenWriteBack needs the plain shared head front-end (ValueHeadChannels / private value front-end must be 0)')
+      if _mt_opp_pool and not _mt_vi:
+        raise ValueError('MoveTokenOppPool with MoveTokenValueInject off is a silent no-op (the pool feeds only the value inject)')
       if _mt_vq and not _mt_vi:
         raise ValueError('MoveTokenValueQuery with MoveTokenValueInject off is a silent no-op (the query feeds only the value inject)')
       if _mt_vpool != 'meanmax' and not _mt_vi:
@@ -1578,7 +1592,8 @@ class CeresNet(nn.Module):
           value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
-          post_move=_mt_pm, value_query=_mt_vq)
+          post_move=_mt_pm, value_query=_mt_vq, value_order=self.mt_vord_w > 0,
+          opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb)
       _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
       print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
             f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
@@ -1588,7 +1603,11 @@ class CeresNet(nn.Module):
             f'rich features {"ON (+17)" if _mt_rich else "off"}; value pool {_mt_vpool}'
             f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
             f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {"ON" if _mt_pm else "off"}; '
-            f'value query {"ON" if _mt_vq else "off"}; absent-move floor {-30.0}')
+            f'value query {"ON" if _mt_vq else "off"}; '
+            f'value-order head {("ON w=%g top-%d" % (self.mt_vord_w, self.mt_vord_topk)) if self.mt_vord_w > 0 else "off"}; '
+            f'opponent keys {("ON Mo=%d%s" % (_mt_opp, " +pool" if _mt_opp_pool else "")) if _mt_opp > 0 else "off"}; '
+            f'square write-back {"ON" if _mt_wb else "off"}; '
+            f'absent-move floor {-30.0}')
 
 
   def _rpe_genphase_biases(self, emb):
@@ -1911,6 +1930,13 @@ class CeresNet(nn.Module):
     #     value_head and value2_head; policy and other heads read orig body
     #     output. Two parallel passes through head front-end. Policy is
     #     bit-identical to orig (modulo head LoRA recalibration if any).
+    # MOVE TOKENS run here, BEFORE the head front-end, so the (optional) square write-back
+    # can add to `flow` ahead of headPremap; the policy/inject readout happens further down.
+    _mt_out = None
+    if getattr(self, 'use_move_tokens', False):
+      _mt_out = self.move_tokens(squares[:, :, 0:13].to(flow.dtype), flow)
+      if _mt_out[5] is not None:
+        flow = flow + _mt_out[5].to(flow.dtype)
     if self.use_gtab:
       flow_aux = self.tactical_adapter(flow_post_embed)   # [B, 64, dim]
       g_x      = self.tactical_gate(flow_post_embed)      # [B, 1, 1]
@@ -2170,8 +2196,7 @@ class CeresNet(nn.Module):
       # MOVE TOKENS own the policy (see __init__ / move_tokens.py). `flow` is the
       # post-trunk-norm [B,64,D] square state; the decoder builds its candidate
       # set in-graph from the one-hot slice.
-      _mt_pol, _mt_pool, _mt_stats, _mt_sel, _mt_valid = self.move_tokens(
-          squares[:, :, 0:13].to(flow.dtype), flow)
+      _mt_pol, _mt_pool, _mt_stats, _mt_sel, _mt_valid, _ = _mt_out
       policy_out = _mt_pol.to(fS_policy.dtype)
       if self.move_tokens.value_inject_dim > 0:
         _mvi = self.move_tokens.v_inject(_mt_pool)
@@ -2591,6 +2616,21 @@ class CeresNet(nn.Module):
         _pl_tgt_set = _pl_order[:, :_K]
         _pl_hits = (_pl_pred.unsqueeze(2) == _pl_tgt_set.unsqueeze(1)).any(dim=2).float().sum(dim=1)
         _pl_log['policy_pl_topk_overlap'] = (_pl_hits / _K).mean()
+
+    # Move-token VALUE-ORDER aux (see config Opt_LossMoveTokenValueOrderMultiplier):
+    # ListMLE over the tokens' training-only order scalar toward the target's top-K
+    # visit order. Reads the decoder's stash; `_last_mt` (sel, valid) is left for the
+    # diagnostics block below, which consumes it.
+    mt_vord_loss = 0
+    _vo_log = {}
+    if getattr(self, 'use_move_tokens', False) and getattr(self, 'mt_vord_w', 0) > 0 and not gradient_norm_logging_mode:
+      _vo_u = getattr(self.move_tokens, '_last_vord', None)
+      _vo_mt = getattr(self, '_last_mt', None)
+      if _vo_u is not None and _vo_mt is not None:
+        self.move_tokens._last_vord = None
+        from move_tokens import move_token_value_order_loss
+        mt_vord_loss, _vo_log = move_token_value_order_loss(
+            _vo_u, _vo_mt[0], _vo_mt[1], policy_target, self.move_tokens.mv_pair_flat, self.mt_vord_topk)
 
     # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
     # the record's WDL, every other legal move is labeled LOSS-for-STM.
@@ -3071,6 +3111,7 @@ class CeresNet(nn.Module):
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
         + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
+        + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
         + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
@@ -3102,6 +3143,7 @@ class CeresNet(nn.Module):
         + (self.action_played_weight * actp_loss if not isinstance(actp_loss, int) else 0)
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
           + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
+          + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
           # pi-edge is a policy-target CE (rel-aux is neither family: kept out).
           + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
@@ -3256,6 +3298,10 @@ class CeresNet(nn.Module):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not isinstance(mt_aux_loss, int):
         self._log("mt_aux_mlp_policy_loss" + stat_suffix, mt_aux_loss, step=num_pos)
+      if not isinstance(mt_vord_loss, int):
+        self._log("mt_vord_loss" + stat_suffix, mt_vord_loss, step=num_pos)
+        for _k, _v in _vo_log.items():
+          self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(refiner_ploss, int):
         self._log("refiner_deepsup_policy_loss" + stat_suffix, refiner_ploss, step=num_pos)
       if not gradient_norm_logging_mode:

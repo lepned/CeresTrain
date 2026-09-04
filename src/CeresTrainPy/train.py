@@ -579,6 +579,7 @@ def Train():
       if 'dpe_w' in n or 'dpd_' in n or 'dpch_w' in n or 'dpc_score' in n: return False  # 1-row zero-init decode couplings: Newton-Schulz fixed-spectral-norm on rank-1 zero-init is the wrong class (review 2026-08-25b finding 9)
       if 'dp_eaux_' in n: return False           # edge-aux readout [T, C] (boelge 13): a training-only final layer, AdamW
       if 'move_tokens.pol' in n: return False    # move-token policy readout [4, dm]: the final policy layer, AdamW
+      if 'move_tokens.vord' in n: return False   # value-order scalar [1, dm]: a training-only readout, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -597,11 +598,24 @@ def Train():
       # smolgen go to the internal AdamW group at base lr.
       return (_use_muon_all_non_trunk(n, p)
               and ('mlp.linear' in n or 'tactical_ffn' in n))
+    def _use_muon_all_non_trunk_decoder(n, p):
+      # 2026-09-04 ideation T1-1: the move-token decoder BODY joins Muon. Excluded on purpose:
+      # move_tokens.pol (final policy layer), v_inject/v2_inject and wb.wo (zero-init couplings:
+      # Newton-Schulz on a zero/rank-deficient matrix is the wrong class), vord (1-row), 1-D params.
+      if _use_muon_all_non_trunk(n, p):
+        return True
+      if '.pm_proj' in n or '.pm_dk' in n or '.pm_dv' in n:
+        return False   # post-move: zero-init proj + raw [7,dm] tables (review 2026-09-04 finding 5)
+      return (p.ndim == 2 and ('move_tokens.blocks.' in n or n.endswith('move_tokens.w_in.weight')
+                               or 'move_tokens.wb.wq' in n or 'move_tokens.wb.wkv' in n))
     _SCOPE_PREDS = {'final-only': _use_muon_final_only,
                     'all-non-trunk': _use_muon_all_non_trunk,
-                    'ffn-only': _use_muon_ffn_only}
+                    'ffn-only': _use_muon_ffn_only,
+                    'all-non-trunk+decoder': _use_muon_all_non_trunk_decoder}
     if _muon_scope not in _SCOPE_PREDS:
-      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only' or 'ffn-only')")
+      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only', 'ffn-only' or 'all-non-trunk+decoder')")
+    if _muon_scope == 'all-non-trunk+decoder' and getattr(model, 'move_tokens', None) is None:
+      raise ValueError("MuonAdamWScope 'all-non-trunk+decoder' but the model has no move-token decoder (silent no-op refused)")
     _use_muon = _SCOPE_PREDS[_muon_scope]
     muon_params  = [p for n, p in model.named_parameters() if p.requires_grad and _use_muon(n, p)]
     adamw_params = [p for n, p in model.named_parameters() if p.requires_grad and not _use_muon(n, p)]
@@ -679,11 +693,12 @@ def Train():
                         'dpv_a.', 'dpv_b.', 'dpe_w.', 'dpd_in.', 'dpd_out.')
     _heads_ratio = getattr(config, 'Opt_LearningRateHeadsRatio', None)
     _coup_ratio = getattr(config, 'Opt_LearningRateCouplingsRatio', None)
+    _dec_ratio = getattr(config, 'Opt_LearningRateDecoderRatio', None)   # 2026-09-04 T1-1: every move_tokens.* param
     assert not (_heads_ratio is not None and _heads_lr is not None), \
         'LearningRateHeadsRatio and LearningRateBaseHeads are mutually exclusive (different group semantics)'
     _lr_ratios = {}
-    if _heads_ratio is not None or _coup_ratio is not None:
-      _n_h = _n_c = 0
+    if _heads_ratio is not None or _coup_ratio is not None or _dec_ratio is not None:
+      _n_h = _n_c = _n_d = 0
       for _pn, _pp in model.named_parameters():
         if not _pp.requires_grad:
           continue  # frozen (e.g. LoRA base weights): a ratio on a frozen param is inert and inflates the match count (review finding 7)
@@ -691,14 +706,19 @@ def Train():
           _lr_ratios[_pp] = float(_heads_ratio); _n_h += 1
         elif _coup_ratio is not None and any(f in _pn for f in _COUPLING_FAMILY):
           _lr_ratios[_pp] = float(_coup_ratio); _n_c += 1
+        elif _dec_ratio is not None and 'move_tokens.' in _pn:
+          _lr_ratios[_pp] = float(_dec_ratio); _n_d += 1
       # Membership dump (phase-0 smoke contract): grep-able, one line per family.
       print(f'[train] FAMILY-LR: heads ratio={_heads_ratio} ({_n_h} params), '
-            f'couplings ratio={_coup_ratio} ({_n_c} params); '
+            f'couplings ratio={_coup_ratio} ({_n_c} params), '
+            f'decoder ratio={_dec_ratio} ({_n_d} params); '
             f'ratios ride the schedule multiplicatively', flush=True)
       if _heads_ratio is not None and _n_h == 0:
         raise ValueError('LearningRateHeadsRatio set but no head-family params matched')
       if _coup_ratio is not None and _n_c == 0:
         raise ValueError('LearningRateCouplingsRatio set but no coupling-family params matched (UseDualPlane off?)')
+      if _dec_ratio is not None and _n_d == 0:
+        raise ValueError('LearningRateDecoderRatio set but no move_tokens.* params matched')
     # THIRD LR GROUP (2026-08-24, dev-box finding): tensors the ACTIVE scope moved
     # OUT of Muon relative to the reference partition ('all-non-trunk') — under
     # 'ffn-only' the attention qkv/proj and smolgen matrices. Left alone they run
@@ -1371,11 +1391,14 @@ def Train():
       or getattr(core, 'hlg_weight', 0) > 0
       or getattr(core, 'value_contrast_weight', 0) > 0
       or getattr(core, 'use_value_depth_attention', False)
-      or getattr(core, 'refiner_deep_sup_weight', 0) > 0) and WORLD_SIZE > 1:
+      or getattr(core, 'refiner_deep_sup_weight', 0) > 0
+      # move-token stash-only losses (review 2026-09-04 finding 2): value-order head, aux MLP CE
+      or getattr(core, 'mt_vord_w', 0) > 0
+      or getattr(core, 'mt_aux_mlp_w', 0) > 0) and WORLD_SIZE > 1:
     if not _static_graph:
       raise NotImplementedError(
-        'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy aux heads '
-        'under DDP require static_graph: the stashed aux output is invisible to DDP\'s '
+        'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy/move-token-value-order '
+        'aux heads under DDP require static_graph: the stashed aux output is invisible to DDP\'s '
         'default reducer. Re-launch with CERES_DDP_STATIC_GRAPH=1.')
     print(f'[ddp] stash-only aux heads enabled under DDP via '
           f'static_graph; compute_loss emits zero-weighted participation terms so the '
@@ -1762,6 +1785,20 @@ def Train():
       # like-formede params forblir udetekterbar — dokumentert restrisiko.)
       _cur_params = [p for g in current_param_groups for p in g['params']]
       _st = loaded_optimizer_state.get('state', {})
+      # Review 2026-09-04 finding 4: a Muon partition change (new MuonAdamWScope) reorders the
+      # positional state and would trip the shape check below with a misleading message; detect
+      # it FIRST via the per-position use_muon flags and start the optimizer state fresh instead.
+      _muon_partition_changed = False
+      if config.Opt_Optimizer == 'Muon':
+        _cur_flags0 = [bool(optimizer.state[p]["use_muon"]) for p in _cur_params]
+        _muon_partition_changed = any(
+          (_st.get(i, {}).get("use_muon") is not None) and (bool(_st[i]["use_muon"]) != cur)
+          for i, cur in enumerate(_cur_flags0))
+        if _muon_partition_changed:
+          print("[checkpoint-resume] Muon partition differs from checkpoint (MuonAdamWScope change?) "
+                "— starting optimizer state fresh (positional state cannot be re-keyed)", flush=True)
+          loaded_optimizer_state["state"] = {}
+          _st = {}
       for _idx, _pp in enumerate(_cur_params):
         _ps = _st.get(_idx)
         if _ps is None: continue

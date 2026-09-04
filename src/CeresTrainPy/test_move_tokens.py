@@ -104,7 +104,7 @@ def main():
   sq = random_boards(B)
   flow = torch.randn(B, 64, 32)
   dec.pol.weight.data.normal_()                       # make token logits non-trivial
-  pol, pooled, stats, sel, valid = dec(sq[:, :, 0:13], flow)
+  pol, pooled, stats, sel, valid, _ = dec(sq[:, :, 0:13], flow)
   assert pol.shape == (B, 1858) and pooled.shape == (B, 64)
   # recompute reference: for each move index, token logit if its pair is selected+valid
   for b in range(B):
@@ -144,7 +144,7 @@ def main():
   # no-candidate board (lone kings, stm king boxed by own pawns): pooled must stay finite/zero
   s0 = board_from_pieces({'a1': 'K', 'a2': 'P', 'b2': 'P', 'b1': 'P'}, {'h8': 'K'})
   s0[0, SQ['b2'], 0] = 0
-  _, pooled0, st0, _, v0 = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
+  _, pooled0, st0, _, v0, _ = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
   assert torch.isfinite(pooled0).all() and float(pooled0.abs().max()) < 1e3, 'empty-candidate pool guard'
   net.eval()
   with torch.no_grad(): out = net(sq, None)
@@ -193,7 +193,7 @@ def main():
   assert g_aux is not None and g_aux.abs().sum() > 0, 'aux MLP policy CE must train the MLP head'
   from wd_partition import partition_weight_decay as _pwd
   _pwd(net2)
-  _, pooled2, st2, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
+  _, pooled2, st2, _, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
   assert pooled2.shape[-1] == 3 * 64 and torch.isfinite(pooled2).all() and float(pooled2.abs().max()) < 1e3
   assert 'mt_polpool_entropy' in st2
   net2.eval()
@@ -213,6 +213,148 @@ def main():
     print(f'  ONNX export + ORT parity OK for the knob variant (policy max|d| {d2:.2e})')
   except ImportError:
     print('  (onnx_ir not installed here: knob-variant export parity skipped)')
+
+  # --- 4c. value-order head (2026-09-04 ideation T1-4): training-only per-token scalar ---
+  net3, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64},
+                  {'LossMoveTokenValueOrderMultiplier': 0.5, 'MoveTokenValueOrderTopK': 3}, 'mt3')
+  assert net3.move_tokens.value_order and tuple(net3.move_tokens.vord.weight.shape) == (1, 64)
+  sd3 = net3.state_dict()
+  extra3 = set(sd3) - set(sd_n)
+  assert extra3 == {'move_tokens.vord.weight'}, extra3
+  for k in sd_n:
+    assert torch.equal(sd_n[k], sd3[k]), f'bit-pairing broken at {k}'
+  net3.train(); net3.zero_grad(set_to_none=True)
+  loss3 = run_loss(net3, batch, sq); assert torch.isfinite(loss3); loss3.backward()
+  assert net3.move_tokens._last_vord is None and net3._last_mt is None, 'stashes must be consumed'
+  g3 = net3.move_tokens.vord.weight.grad
+  assert g3 is not None and g3.abs().sum() > 0, 'value-order head must receive gradient'
+  dead3 = [n for n, p in net3.move_tokens.named_parameters() if p.grad is None]
+  assert not dead3, f'move_tokens params without gradient: {dead3}'
+  _pwd(net3)
+  # loss contract: tokens in the target's order score lower than the reversed order; no-target row = 0
+  from move_tokens import move_token_value_order_loss as _vol
+  mv = net3.move_tokens.mv_pair_flat
+  m_idx = [0, 1, 2]                                   # three 1858-moves with distinct from-to pairs
+  pairs = [int(mv[m]) for m in m_idx]
+  assert len(set(pairs)) == 3
+  other = next(pp for pp in range(4096) if pp not in pairs)
+  sel3 = torch.tensor([pairs + [other], pairs + [other]])
+  valid3 = torch.ones(2, 4, dtype=torch.bool)
+  tgt = torch.zeros(2, 1858); tgt[0, m_idx[0]] = 0.6; tgt[0, m_idx[1]] = 0.3; tgt[0, m_idx[2]] = 0.1
+  good = torch.tensor([[3., 2., 1., 0.], [0., 0., 0., 0.]])
+  bad = torch.tensor([[0., 1., 2., 3.], [0., 0., 0., 0.]])
+  lg, dg = _vol(good, sel3, valid3, tgt, mv, 3)
+  lb, db = _vol(bad, sel3, valid3, tgt, mv, 3)
+  assert torch.isfinite(lg) and torch.isfinite(lb) and float(lg) < float(lb), (float(lg), float(lb))
+  assert float(dg['mt_vord_top1']) == 1.0 and float(db['mt_vord_top1']) == 0.0
+  assert abs(float(dg['mt_vord_rows_with_target']) - 0.5) < 1e-6, 'row 2 has no target mass -> excluded'
+  net3.eval()
+  with torch.no_grad(): out3 = net3(sq, None)
+  assert net3.move_tokens._last_vord is None, 'no stash in eval (export path)'
+  assert torch.isfinite(out3[0]).all()
+  print(f'  value-order head OK: 1 new tensor, grads flow, ListMLE contract (good {float(lg):.3f} < bad {float(lb):.3f}), '
+        f'eval graph untouched')
+
+  # --- 4d. opponent-reply keys + square write-back (2026-09-04 ideation T1-2 / T1-3) ---
+  base_over = {'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+               'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64}
+  # (i) write-back alone is an exact step-0 no-op on every head (zero-init wo)
+  net_wb, _ = build(dict(base_over, MoveTokenWriteBack=True), {}, 'mtwb')
+  sd_wb = net_wb.state_dict()
+  extra_wb = set(sd_wb) - set(sd_n)
+  assert extra_wb == {'move_tokens.wb.ln_q.scale', 'move_tokens.wb.wq.weight', 'move_tokens.wb.wkv.weight',
+                      'move_tokens.wb.wo.weight'} or all(k.startswith('move_tokens.wb.') for k in extra_wb), extra_wb
+  for k in sd_n:
+    assert torch.equal(sd_n[k], sd_wb[k]), f'bit-pairing broken at {k}'
+  net.eval(); net_wb.eval()
+  with torch.no_grad():
+    o_ref = net(sq, None); o_wb = net_wb(sq, None)
+  for i, (a, b) in enumerate(zip(o_ref, o_wb)):
+    if a is not None and b is not None:
+      assert torch.equal(a, b), f'write-back must be an exact step-0 no-op (output {i})'
+  net_wb.train(); net_wb.zero_grad(set_to_none=True)
+  loss_wb = run_loss(net_wb, batch, sq); assert torch.isfinite(loss_wb); loss_wb.backward()
+  assert net_wb.move_tokens.wb.wo.weight.grad is not None and net_wb.move_tokens.wb.wo.weight.grad.abs().sum() > 0, \
+      'zero-init wo must still receive gradient (value heads read the write-back)'
+  dead_wb = [n for n, p in net_wb.move_tokens.named_parameters() if p.grad is None]
+  assert not dead_wb, f'move_tokens params without gradient: {dead_wb}'
+  _pwd(net_wb)
+  # empty-candidate board: write-back must be exactly zero
+  net_wb.eval()
+  with torch.no_grad():
+    *_, wb0 = net_wb.move_tokens(s0, torch.randn(1, 64, net_wb.EMBEDDING_DIM))
+  assert wb0 is not None and float(wb0.abs().max()) == 0.0, 'no-candidate board -> zero write-back'
+  print('  square write-back OK: exact step-0 no-op on all heads, grads flow into wo, zero on empty boards')
+  # (ii) opponent keys: candidate superset vs python-chess with the side to move flipped
+  net_o, _ = build(dict(base_over, MoveTokenOppMax=48, MoveTokenOppPool=True), {}, 'mto')
+  assert net_o.move_tokens.M_opp == 48 and net_o.move_tokens.v_inject.in_features == 4 * 64
+  try:
+    import chess, random
+    random.seed(5); tot = miss = 0
+    for _ in range(120):
+      b = chess.Board()
+      for _ in range(random.randint(0, 60)):
+        mv = list(b.legal_moves)
+        if not mv: break
+        b.push(random.choice(mv))
+      if b.is_game_over(): continue
+      own, opp = {}, {}
+      for sq_, pc in b.piece_map().items():
+        f, r = chess.square_file(sq_), chess.square_rank(sq_)
+        if b.turn == chess.BLACK: r = 7 - r
+        (own if pc.color == b.turn else opp)['abcdefgh'[f] + str(r + 1)] = pc.symbol().upper()
+      s13 = board_from_pieces(own, opp)
+      _, E = net_o.move_tokens.candidates(s13)
+      cand_o = net_o.move_tokens.candidates_opp(s13, E)[0]
+      b2 = b.copy(); b2.turn = not b.turn
+      for mv in b2.pseudo_legal_moves:
+        fr, to = mv.from_square, mv.to_square
+        if b2.is_castling(mv):                  # king-takes-rook on the OPPONENT's back rank
+          to = chess.square(7 if chess.square_file(to) > chess.square_file(fr) else 0,
+                            0 if b2.turn == chess.WHITE else 7)
+        if b.turn == chess.BLACK:
+          fr = chess.square(chess.square_file(fr), 7 - chess.square_rank(fr))
+          to = chess.square(chess.square_file(to), 7 - chess.square_rank(to))
+        tot += 1
+        if float(cand_o[fr * 64 + to]) < 0.5: miss += 1
+    print(f'  opponent candidates: {tot} pseudo-legal replies over random positions, missing {miss}')
+    assert miss == 0, 'opponent candidate set must be a superset of the opponent pseudo-legal replies'
+  except ImportError:
+    print('  (python-chess not installed: opponent superset check skipped)')
+  net_o.train(); net_o.zero_grad(set_to_none=True)
+  loss_o = run_loss(net_o, batch, sq); assert torch.isfinite(loss_o); loss_o.backward()
+  dead_o = [n for n, p in net_o.move_tokens.named_parameters() if p.grad is None]
+  assert not dead_o, f'move_tokens params without gradient: {dead_o}'
+  assert net_o.move_tokens.opp_side.grad is not None and net_o.move_tokens.opp_side.grad.abs().sum() > 0
+  _pwd(net_o)
+  net_o.eval()
+  with torch.no_grad():
+    _, pooled_o, st_o, _, _, _ = net_o.move_tokens(s0, torch.randn(1, 64, net_o.EMBEDDING_DIM))
+    out_o = net_o(sq, None)
+  assert pooled_o.shape[-1] == 4 * 64 and torch.isfinite(pooled_o).all() and float(pooled_o.abs().max()) < 1e3
+  assert 'mt_opp_count_mean' in st_o and torch.isfinite(out_o[0]).all() and torch.isfinite(out_o[1]).all()
+  # logit monitor: present in training stats, absent in eval
+  net_o.train()
+  _, _, st_tr, _, _, _ = net_o.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_o.EMBEDDING_DIM))
+  assert 'mt_qk_max_self' in st_tr and 'mt_qk_max_cross' in st_tr and torch.isfinite(st_tr['mt_qk_max_self'])
+  assert 'mt_qk_max_self' not in st_o
+  print(f'  opponent keys OK: {net_o.move_tokens.M_opp} opp tokens as extra K/V, pool 4dm, grads flow, empty-board guard, '
+        f'logit monitor self {float(st_tr["mt_qk_max_self"]):.2f} / cross {float(st_tr["mt_qk_max_cross"]):.2f}')
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    for tag, nn_ in (('wb', net_wb), ('opp', net_o)):
+      nn_.eval()
+      pth = os.path.join(tempfile.gettempdir(), f'mt_export_test_{tag}.onnx')
+      with torch.no_grad(): ref_ = nn_(sq, None)
+      torch.onnx.export(nn_, (sq, None), pth, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+      ss = ort.InferenceSession(pth, providers=['CPUExecutionProvider'])
+      oo = ss.run(None, {ss.get_inputs()[0].name: sq.numpy()})
+      pr_ = ref_[0].numpy(); po_ = [x for x in oo if x.shape == pr_.shape][0]
+      dd = float(np.abs(po_ - pr_).max()); assert dd < 1e-3, dd
+      print(f'  ONNX export + ORT parity OK for {tag} (policy max|d| {dd:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: opp/write-back export parity skipped)')
 
   # --- 4e. post-move attention + learned value query: grads, step-0 no-op, fused identity, ONNX parity
   net4, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
@@ -252,7 +394,7 @@ def main():
     net4.move_tokens.export_fused = True; assert net4.move_tokens._fusable(); fus4 = net4(sq, None)
   d4p = float((fus4[0] - ref4[0]).abs().max()); d4v = float((fus4[1] - ref4[1]).abs().max())
   assert d4p < 1e-4 and d4v < 1e-4, (d4p, d4v)
-  _, pooled4, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
+  _, pooled4, _, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
   assert torch.isfinite(pooled4).all() and float(pooled4.abs().max()) < 1e3
   print(f'  post-move + value-query OK: step-0 no-op (|d| {d0:.1e}), all params get grad, fused identity '
         f'(policy {d4p:.1e}, value {d4v:.1e}), empty-board guard')

@@ -169,8 +169,21 @@ def save_model(NAME : str,
       model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
       getattr(model_nocompile, 'core', model_nocompile).move_tokens.set_export_max(_mt_cap)
       print(f'INFO: MT_EXPORT_MAX={_mt_cap} — exported graphs use {_mt_cap} move tokens (training model untouched)')
+    # Export-time graph folds (export_folds.py): FFN gate|up fusion, decoder attention
+    # scale + pre-norm scale folds. NetDef "ExportFolds": none|mt|ffn|all (config-driven).
+    _fold_s = str(getattr(config, 'NetDef_ExportFolds', 'none') or 'none')   # config-driven (NetDef "ExportFolds")
+    _fold = _fold_s != 'none'
+    if _fold:
+      # 'all' = every fold; 'ffn' = FFN gate|up fusion only; 'mt' = decoder scale+norm folds only.
+      from export_folds import apply_export_folds
+      model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+      _fc = apply_export_folds(getattr(model_nocompile, 'core', model_nocompile),
+                               ffn=_fold_s in ('all', 'ffn'), mt_scale=_fold_s in ('all', 'mt'), mt_norms=_fold_s in ('all', 'mt'))
+      if not any(_fc.values()):
+        raise ValueError(f'ExportFolds={_fold_s!r} but nothing was foldable in this model (silent no-op refused)')
+      print(f'INFO: EXPORT_FOLD applied: {_fc} (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
-    _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '')
+    _num_pos_tag = num_pos + (f'm{_mt_cap}' if _mt_cap > 0 else '') + (('fld' if _fold_s == 'all' else 'fld' + _fold_s) if _fold else '')
     # CERES_EXPORT_TAG=<txt>: extra filename tag for A/B exports of the same weights
     # (e.g. graph-level variants); never overwrites the plain export.
     _num_pos_tag += (os.environ.get('CERES_EXPORT_TAG', '') or '').strip()

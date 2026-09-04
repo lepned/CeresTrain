@@ -183,7 +183,18 @@ class Configuration:
     #   'final-only' (dje-style): only final output layers (fcFinal / single-Linear
     #       aux heads), embeddings, LoRA adapters and 1-D params; head hidden
     #       matrices train under Muon like the trunk.
+    #   'all-non-trunk+decoder' (2026-09-04 ideation T1-1): as all-non-trunk PLUS the move-token
+    #       decoder body (block matrices, w_in, write-back q/kv) under Muon. Without it the
+    #       decoder trains under the internal AdamW group at the MUON peak rate (the 576-A/B trap).
     self.Opt_MuonAdamWScope = config_opt.get('MuonAdamWScope', 'all-non-trunk')
+    # LearningRateDecoderRatio (2026-09-04 ideation T1-1): per-param LR ratio for every
+    # `move_tokens.` parameter (both optimizer branches), riding the schedule. None = off.
+    _dr = config_opt.get('LearningRateDecoderRatio', None)
+    self.Opt_LearningRateDecoderRatio = None if _dr is None else float(_dr)
+    # (UseMoveTokens guard for this key lives in the NetDef section: the opt block is parsed first.)
+    if 'LRWarmupPhaseMultiplier' in config_opt:
+      # Present in older prod configs; read by NOTHING in train.py (warmup = min(100M, 5 %)).
+      print('[config] WARNING: LRWarmupPhaseMultiplier is not implemented and is IGNORED (warmup = num_warmup_positions())', flush=True)
     # Hard-position replay buffer (0 = off). An online ring buffer of the
     # highest-value-KL batch rows (measured by the LIVE net each step); a
     # fraction of every subsequent batch is replaced with buffered hard rows so
@@ -598,14 +609,40 @@ class Configuration:
     # X-program items 3/4 (2026-09-03): post-move square attention per block; learned value query token.
     self.NetDef_MoveTokenPostMove = bool(config_net_def.get('MoveTokenPostMove', False))
     self.NetDef_MoveTokenValueQuery = bool(config_net_def.get('MoveTokenValueQuery', False))
+    # 2026-09-04 ideation T1-2 / T1-3: opponent-reply keys in the decoder self-attention
+    # (MoveTokenOppMax = number of opponent candidate tokens, 0 = off; MoveTokenOppPool =
+    # also pool them into the value inject) and the move->square write-back before the heads.
+    self.NetDef_MoveTokenOppMax = int(config_net_def.get('MoveTokenOppMax', 0) or 0)
+    self.NetDef_MoveTokenOppPool = bool(config_net_def.get('MoveTokenOppPool', False))
+    self.NetDef_MoveTokenWriteBack = bool(config_net_def.get('MoveTokenWriteBack', False))
+    # EXPORT-TIME GRAPH FOLDS (export_folds.py; 2026-09-04): 'none' | 'mt' | 'ffn' | 'all'.
+    # 'mt' = decoder attention-scale + pre-norm scale folds: exact, measured +6-8 % EPS in EB
+    # on the 700M prod net. 'ffn' (SwiGLU gate|up fusion) measured EPS-neutral/negative; kept
+    # for A/B only. Applies to every export of the run (train-time and recover_export).
+    self.NetDef_ExportFolds = str(config_net_def.get('ExportFolds', 'none') or 'none')
+    if self.NetDef_ExportFolds not in ('none', 'mt', 'ffn', 'all'):
+      raise ValueError(f"ExportFolds must be none|mt|ffn|all, got {self.NetDef_ExportFolds!r}")
+    if self.NetDef_ExportFolds in ('mt', 'all') and not self.NetDef_UseMoveTokens:
+      raise ValueError(f"ExportFolds={self.NetDef_ExportFolds!r} but UseMoveTokens is off (nothing to fold there; use 'ffn' or 'none')")
+    if os.environ.get('CERES_EXPORT_FOLD'):
+      raise ValueError('CERES_EXPORT_FOLD is retired: set "ExportFolds" in the NetDef config (none|mt|ffn|all)')
+    if self.NetDef_MoveTokenOppPool and self.NetDef_MoveTokenOppMax <= 0:
+      raise ValueError('MoveTokenOppPool is set but MoveTokenOppMax is 0 (silent no-op refused)')
+    if self.NetDef_MoveTokenOppMax > 0 and self.NetDef_MoveTokenRichFeatures:
+      raise ValueError('MoveTokenOppMax with MoveTokenRichFeatures: rich features are own-move features (not defined for opponent tokens)')
     if self.NetDef_MoveTokenValuePool not in ('meanmax', 'policy', 'both'):
       raise ValueError(f'MoveTokenValuePool must be meanmax|policy|both, got {self.NetDef_MoveTokenValuePool!r}')
     if not self.NetDef_UseMoveTokens:
       for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
                  'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures',
-                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach', 'MoveTokenPostMove', 'MoveTokenValueQuery'):
+                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach', 'MoveTokenPostMove', 'MoveTokenValueQuery',
+                 'MoveTokenOppMax', 'MoveTokenOppPool', 'MoveTokenWriteBack'):
         if _k in config_net_def:
           raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
+      if getattr(self, 'Opt_LearningRateDecoderRatio', None) is not None:
+        raise ValueError('LearningRateDecoderRatio is set but UseMoveTokens is off (silent no-op refused)')
+      if getattr(self, 'Opt_MuonAdamWScope', None) == 'all-non-trunk+decoder':
+        raise ValueError("MuonAdamWScope 'all-non-trunk+decoder' but UseMoveTokens is off (silent no-op refused)")
     self.NetDef_DualPlaneEdgeToTrunk = config_net_def.get('DualPlaneEdgeToTrunk', False)
     # Boelge 6 (2026-08-29): laert kant-oppdatering i P-blokkene (EGT-halvdelen).
     self.NetDef_DualPlaneEdgeUpdate = config_net_def.get('DualPlaneEdgeUpdate', False)
@@ -634,6 +671,17 @@ class Configuration:
     self.Opt_LossMoveTokenAuxMLPMultiplier = float(config_opt.get('LossMoveTokenAuxMLPMultiplier', 0) or 0)
     if self.Opt_LossMoveTokenAuxMLPMultiplier > 0 and not self.NetDef_UseMoveTokens:
       raise ValueError('LossMoveTokenAuxMLPMultiplier > 0 but UseMoveTokens is off - the MLP head IS the policy there (silent no-op refused)')
+    # Value-ORDER head on the move tokens (2026-09-04 ideation T1-4): a training-only
+    # scalar per token trained with the Plackett-Luce/ListMLE order loss toward the
+    # target's top-K visit order. Routes the PXpl value gain around the policy
+    # softmax (PL 1.0 on the policy logits hurt CE calibration; this scalar is never
+    # served). 0 = off.
+    self.Opt_LossMoveTokenValueOrderMultiplier = float(config_opt.get('LossMoveTokenValueOrderMultiplier', 0) or 0)
+    self.Opt_MoveTokenValueOrderTopK = int(config_opt.get('MoveTokenValueOrderTopK', 5) or 5)
+    if self.Opt_LossMoveTokenValueOrderMultiplier > 0 and not self.NetDef_UseMoveTokens:
+      raise ValueError('LossMoveTokenValueOrderMultiplier > 0 but UseMoveTokens is off (silent no-op refused)')
+    if 'MoveTokenValueOrderTopK' in config_opt and self.Opt_LossMoveTokenValueOrderMultiplier <= 0:
+      raise ValueError('MoveTokenValueOrderTopK is set but LossMoveTokenValueOrderMultiplier is 0 (silent no-op refused)')
     self.Opt_LossDualPlaneEdgeRelMultiplier = float(config_opt.get('LossDualPlaneEdgeRelMultiplier', 0) or 0)
     # DualPlaneBlockRepeat SLETTET 2026-08-29 (boelge 5): vektdelt dybde SKADET
     # den rike planen 2v2-seeds (mate-value 58/38 vs kzcaps 80/82) og var
@@ -678,6 +726,11 @@ class Configuration:
     self.NetDef_NonLinearAttention = config_net_def.get('NonLinearAttention', False)
     self.NetDef_FFNMultiplier = config_net_def.get('FFNMultiplier', 1)
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
+    if getattr(self, 'NetDef_ExportFolds', 'none') in ('ffn', 'all'):
+      # export_folds.py only fuses plain SwiGLU FFNs; anything else would make the fold a no-op
+      # that save_model refuses at the FIRST checkpoint save (review 2026-09-04 finding 6).
+      if self.NetDef_FFNActivationType != 'SwiGLU' or (os.environ.get('CERES_FFN_SOFTCAP', '0') or '0') != '0':
+        raise ValueError(f"ExportFolds={self.NetDef_ExportFolds!r} needs a plain SwiGLU FFN (no CERES_FFN_SOFTCAP); use 'mt' or 'none'")
     self.NetDef_FFNUseGlobalEveryNLayers = config_net_def.get('FFNUseGlobalEveryNLayers', 0)
     self.NetDef_HeadsActivationType = config_net_def.get('HeadsActivationType', 'ReLU')
     # Runde-3: 'SwiGLU' i hodene var stille ren SiLU (ingen gate-linear i Head)

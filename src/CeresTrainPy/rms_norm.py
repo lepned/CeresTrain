@@ -37,6 +37,9 @@ class RMSNorm(torch.nn.Module):
     # every working production net (opset≤18, decomposed norms) behaves.
     var = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + self.eps)
+    if getattr(self, '_scale_folded', False):
+      # export_folds.py folded `scale` into the consumer Linear's input columns.
+      return x
     return x * self.scale
 
 

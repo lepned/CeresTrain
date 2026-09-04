@@ -1,0 +1,13 @@
+{
+ "SourceType": "DirectFromPositionGenerator",
+ "TPGFixedSet1": null,
+ "TPGFixedSet2": null,
+ "NumTPGFixedSet1BatchesReturnedForSet2": 0,
+ "TrainingFilesDirectory": "/mnt/d/T80_v2_sub",
+ "TrainingFilesDirectory2": null,
+ "RatioSet1ToSet2": 0,
+ "NumTPGFilesToSkip": 0,
+ "TARPositionSkipCount": 30,
+ "FractionQ": 1,
+ "WDLLabelSmoothing": 0
+}
