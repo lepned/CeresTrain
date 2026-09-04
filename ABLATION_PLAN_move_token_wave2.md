@@ -49,13 +49,15 @@ Suggested pair order on 2-GPU pairs: (0,1) (0 must run first or in parallel), th
 - Write-back: +~0.5 M params on 640, one extra attention block at serving (~-1 % EPS).
 - Value-order head: 0 serving cost (never exported).
 - Export folds (NetDef `ExportFolds: none|mt|ffn|all`, `export_folds.py` via `save_model.py`):
-  exact rewrites. Measured on the 700M prod net in EngineBattle: `mt` (decoder attention-scale +
-  pre-norm scale folds) **+6-8 % EPS** (1.08x / 1.06x both orders) -> `"ExportFolds": "mt"` is
-  set in every wave-2 config (and worth adopting for prod exports); `ffn` (SwiGLU gate|up
-  fusion) 0.96-1.00x and `all` 0.91-0.96x -> A/B tools only. NOTE: exported filenames are
-  UNCHANGED by `ExportFolds` (the eval chain globs `<prefix>_<id>_<pos>.onnx`); the fold is
-  recorded in the log line `INFO: EXPORT_FOLD applied`. For an A/B re-export of the same
-  weights with and without folds, set `CERES_EXPORT_TAG=fldmt` on the folded one.
+  a SERVING optimization, **off in every ablation config** (`none`). Reasons: the ablation
+  arms are judged on puzzles, not EPS, and the fold is mathematically exact but not bit-exact
+  in fp16 (~1e-5 policy KL, 99.8 % top-1 agreement, decoder weights 0.03 % -> 0.12-0.67 %
+  subnormal), so it is a needless confound in an A/B. Apply it at serving time by
+  re-exporting the checkpoint with `ExportFolds: "mt"`: measured +6-8 % EPS on the 700M net
+  in FP16 and +4-13 % on top of INT8. Exported filenames are UNCHANGED by the setting (the
+  eval chain globs `<prefix>_<id>_<pos>.onnx`); the fold is recorded in the log line
+  `INFO: EXPORT_FOLD applied`. For an A/B re-export of the same weights, disambiguate with
+  `CERES_EXPORT_TAG`.
 
 ## Not in this wave (decided)
 

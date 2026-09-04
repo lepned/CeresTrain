@@ -58,5 +58,5 @@
  "MoveTokenFFNMult": 2,
  "MoveTokenMax": 128,
  "MoveTokenWriteBack": true,
- "ExportFolds": "mt"
+ "ExportFolds": "none"
 }
