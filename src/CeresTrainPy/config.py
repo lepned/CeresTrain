@@ -94,6 +94,14 @@ class Configuration:
     self.Data_PositionGenerator = config_data.get('PositionGenerator', {})
     self.Data_TrainingFilesDirectory = config_data.get('TrainingFilesDirectory', None)
     self.Data_NumTPGFilesToSkip = config_data.get('NumTPGFilesToSkip', 0)
+    # NumTPGFilesToSkipAfterShuffle (2026-09-05): skip the first N shards of the SHUFFLED
+    # order (same ShuffleSeed) = continue a resumed run's data stream where the original
+    # left off, instead of replaying it from index 0 (reference_resume_data_stream_offset).
+    # N = shards the original run had consumed at the resume point (count the distinct
+    # 'PROCESSING TPG FILE' lines in its log). Pick N so that (num_shards - N) is divisible by
+    # world_size, or the rank partition drops the remainder. NumTPGFilesToSkip, by contrast,
+    # removes N shards BEFORE the shuffle (permanently, from the corpus).
+    self.Data_NumTPGFilesToSkipAfterShuffle = int(config_data.get('NumTPGFilesToSkipAfterShuffle', 0) or 0)
     self.Data_FractionQ = config_data.get('FractionQ', 0.0)
     self.Data_WDLLabelSmoothing = config_data.get('WDLLabelSmoothing', 0.0)
     # Optional secondary TPG dir for mixed-corpus training. When set, batches are

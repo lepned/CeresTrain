@@ -295,7 +295,8 @@ class TPGDataset(Dataset):
                square_bytes : int = None,
                sidecar_mode : str = None,
                v7x_mode : str = None,
-               file_mirror_prob : float = None):
+               file_mirror_prob : float = None,
+               num_files_to_skip_after_shuffle : int = 0):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
@@ -347,6 +348,8 @@ class TPGDataset(Dataset):
     self.rank = rank
     self.world_size = world_size
     self.num_files_to_skip = num_files_to_skip
+    # Applied AFTER try_shuffle (resume-continuation; see config Data_NumTPGFilesToSkipAfterShuffle).
+    self.num_files_to_skip_after_shuffle = int(num_files_to_skip_after_shuffle or 0)
 
     # Get initial list of files and select the rank-subset for this worker.
     self.files = self._discover_files(initial=True)
@@ -372,6 +375,21 @@ class TPGDataset(Dataset):
       assert len(all_files) >= self.num_files_to_skip + self.num_workers, f"Trying to skip more files than available: {len(all_files)} available, {self.num_files_to_skip} to skip, {self.num_workers} workers"
     all_files = all_files[self.num_files_to_skip:]
     all_files = try_shuffle(all_files)
+    if self.num_files_to_skip_after_shuffle > 0:
+      # Resume continuation: drop the first N shards of the seeded order (the ones the
+      # original run already consumed) so the stream continues instead of restarting.
+      if initial:
+        assert len(all_files) > self.num_files_to_skip_after_shuffle + self.world_size,             f'NumTPGFilesToSkipAfterShuffle={self.num_files_to_skip_after_shuffle} leaves too few of {len(all_files)} shards'
+        if self.rank == 0:
+          print(f'[tpg_dataset] resume-continuation: skipping the first {self.num_files_to_skip_after_shuffle} shards of the '
+                f'shuffled order (first kept: {all_files[self.num_files_to_skip_after_shuffle]})', flush=True)
+          _rem = (len(all_files) - self.num_files_to_skip_after_shuffle) % self.world_size
+          if _rem:
+            # the rank partition below is len // world_size per rank: a non-divisible count drops the tail
+            print(f'[tpg_dataset] WARNING: {len(all_files) - self.num_files_to_skip_after_shuffle} remaining shards are not '
+                  f'divisible by world_size={self.world_size}; {_rem} shard(s) will be dropped by the rank partition. '
+                  f'Pick N so that (num_shards - N) % world_size == 0.', flush=True)
+      all_files = all_files[self.num_files_to_skip_after_shuffle:]
     # Cross-rank ordering check: the rank slice below is only a PARTITION if
     # every rank shuffled into the same order (see _default_shuffle_seed). A
     # disagreement means silent duplicate/skipped shards, so verify rather than

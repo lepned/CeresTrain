@@ -947,6 +947,8 @@ def Train():
     assert float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) == 0, \
         'DirectFromV6 requires LossQDeviationMultiplier=0 (no q-deviation data in v6 records)'
     from v6_dataset import V6ChunkDataset
+    if getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0):
+      raise ValueError('NumTPGFilesToSkipAfterShuffle is only implemented for the TPG loader (silent no-op refused on V6)')
     primary_dataset = V6ChunkDataset(TPG_TRAIN_DIR, batch_size_forward // world_size,
                                      config.Data_WDLLabelSmoothing,
                                      rank, world_size, NUM_DATASET_WORKERS,
@@ -960,7 +962,8 @@ def Train():
     primary_dataset = TPGDataset(TPG_TRAIN_DIR, batch_size_forward // world_size, config.Data_WDLLabelSmoothing,
                                  rank, world_size, NUM_DATASET_WORKERS,
                                  BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
-                                 file_mirror_prob=_MIRROR_PRIMARY)
+                                 file_mirror_prob=_MIRROR_PRIMARY,
+                                 num_files_to_skip_after_shuffle=getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0))
 
   # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
   # Triggered when both Data_TrainingFilesDirectory2 is set AND Data_RatioSet1ToSet2 > 0.
