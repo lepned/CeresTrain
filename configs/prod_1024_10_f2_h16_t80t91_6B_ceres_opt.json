@@ -59,5 +59,8 @@
   "LossDualPlaneEdgePiMultiplier": 0,
   "LossDualPlaneEdgeRelMultiplier": 0,
   "PolicyPLWeight": 0.05,
-  "PolicyPLTopK": 5
+  "PolicyPLTopK": 5,
+  "LossMoveTokenValueOrderMultiplier": 0.05,
+  "MoveTokenValueOrderTopK": 5,
+  "MuonAdamWScope": "all-non-trunk+decoder"
 }
