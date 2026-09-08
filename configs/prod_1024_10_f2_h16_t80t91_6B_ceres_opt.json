@@ -62,5 +62,7 @@
   "PolicyPLTopK": 5,
   "LossMoveTokenValueOrderMultiplier": 0.05,
   "MoveTokenValueOrderTopK": 5,
-  "MuonAdamWScope": "all-non-trunk+decoder"
+  "MuonAdamWScope": "all-non-trunk+decoder",
+  "SquareBytes": 137,
+  "SquareBytes2": 141
 }
