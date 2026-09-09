@@ -296,7 +296,9 @@ class TPGDataset(Dataset):
                sidecar_mode : str = None,
                v7x_mode : str = None,
                file_mirror_prob : float = None,
-               num_files_to_skip_after_shuffle : int = 0):
+               num_files_to_skip_after_shuffle : int = 0,
+               exclude_files = None,
+               start_offsets = None):
 
     self.root_dir = root_dir
     self.batch_size = batch_size
@@ -350,6 +352,20 @@ class TPGDataset(Dataset):
     self.num_files_to_skip = num_files_to_skip
     # Applied AFTER try_shuffle (resume-continuation; see config Data_NumTPGFilesToSkipAfterShuffle).
     self.num_files_to_skip_after_shuffle = int(num_files_to_skip_after_shuffle or 0)
+    # DATA-STREAM RESUME (2026-09-09): exact continuation of a corpus after a checkpoint.
+    #  exclude_files: shard names already fully consumed by the run being resumed (dropped
+    #    from the shuffled list BEFORE the rank partition, so the remaining set is exactly
+    #    the unconsumed one regardless of how ranks/workers re-partition it);
+    #  start_offsets: {shard name: positions already consumed} for shards that were
+    #    in progress at the checkpoint (the reader fast-forwards that many records,
+    #    sidecars in lockstep). Both come from <ckpt>.datastream.json (train.py).
+    # Replaces the global NumTPGFilesToSkipAfterShuffle for the multi-rank case, where the
+    # CHUNKED rank partition (rank r = a contiguous block of the shuffled list) means the
+    # consumed shards are the first k of EACH block, never the first N of the list.
+    self.exclude_files = set(exclude_files or ())
+    self.start_offsets = {str(k): int(v) for k, v in (start_offsets or {}).items()}
+    assert not (self.exclude_files and self.num_files_to_skip_after_shuffle > 0), \
+        'exclude_files (data-stream resume) and num_files_to_skip_after_shuffle are mutually exclusive'
 
     # Get initial list of files and select the rank-subset for this worker.
     self.files = self._discover_files(initial=True)
@@ -390,6 +406,14 @@ class TPGDataset(Dataset):
                   f'divisible by world_size={self.world_size}; {_rem} shard(s) will be dropped by the rank partition. '
                   f'Pick N so that (num_shards - N) % world_size == 0.', flush=True)
       all_files = all_files[self.num_files_to_skip_after_shuffle:]
+    if self.exclude_files:
+      _n_before = len(all_files)
+      all_files = [f for f in all_files if f not in self.exclude_files]
+      if initial and self.rank == 0:
+        _missing = self.exclude_files - set(all_files) - set(fnmatch.filter(os.listdir(self.root_dir), '*.zst'))
+        print(f'[tpg_dataset] resume-continuation ({self.root_dir}): excluding {_n_before - len(all_files)} '
+              f'already-consumed shard(s) of {_n_before}; {len(all_files)} remain'
+              + (f'; {len(_missing)} listed shard(s) no longer exist' if _missing else ''), flush=True)
     # Cross-rank ordering check: the rank slice below is only a PARTITION if
     # every rank shuffled into the same order (see _default_shuffle_seed). A
     # disagreement means silent duplicate/skipped shards, so verify rather than
@@ -562,8 +586,27 @@ class TPGDataset(Dataset):
         with open(os.path.join(self.root_dir, file_name),'rb') as file:
           dctx = zstandard.ZstdDecompressor()
           stream_reader = dctx.stream_reader(file)
-
           leftover = b''
+          # Positions of this shard already emitted as batches (+ any resume fast-forward).
+          # Tagged onto every batch so the trainer can record exactly where each worker is.
+          _file_pos = 0
+          _skip_pos = self.start_offsets.get(file_name, 0)
+          if _skip_pos > 0:
+            _skip_bytes = _skip_pos * BYTES_PER_POS
+            _rem = _skip_bytes
+            while _rem > 0:
+              _c = stream_reader.read(min(_rem, BYTES_PER_BLOCK))
+              if not _c:
+                break
+              _rem -= len(_c)
+            _skipped = (_skip_bytes - _rem) // BYTES_PER_POS
+            if surv_reader is not None and _skipped > 0:
+              _read_exact(surv_reader, _skipped * 64)
+            if v7x_reader is not None and _skipped > 0:
+              _read_exact(v7x_reader, _skipped * _V7X_ROW_BYTES)
+            _file_pos = _skipped
+            print(f'DATASET WORKER {self.worker_id} resume-continuation: fast-forwarded {_skipped} of '
+                  f'{_skip_pos} requested positions in {file_name}', flush=True)
           while True:
             chunk = stream_reader.read(BYTES_PER_BLOCK)
             if not chunk:
@@ -805,7 +848,9 @@ class TPGDataset(Dataset):
 
               yield  ((policies_indices, policies_values, wdl_deblundered, wdl_q, mlh, uncertainty,
                        wdl_nondeblundered, q_deviation_lower, q_deviation_upper, squares,policy_index_in_parent, played_q_suboptimality,
-                       uncertainty_policy, survival, v7x))
+                       uncertainty_policy, survival, v7x,
+                       (file_name, _file_pos, _file_pos + BATCH_SIZE)))   # data-stream tag: shard + record span
+              _file_pos += BATCH_SIZE
 
         if surv_file is not None:
           surv_reader.close()
@@ -832,6 +877,7 @@ class TPGDataset(Dataset):
     uncertainty_policy = batch[12]
     survival = batch[13] if len(batch) > 13 else None
     v7x = batch[14] if len(batch) > 14 else None
+    _stream_tag = batch[15] if len(batch) > 15 else None
     
     _nb = policies_indices.shape[0]   # actual row count (may be < batch_size after decisive draw-filtering)
     policies_indices = torch.tensor(policies_indices, dtype=torch.int64).reshape(_nb, MAX_MOVES)
@@ -864,6 +910,13 @@ class TPGDataset(Dataset):
           'played_q_suboptimality': filter_tensor(torch.tensor(played_q_suboptimality), mod_value),
           'uncertainty_policy': filter_tensor(torch.tensor(uncertainty_policy), mod_value)
       }
+      if _stream_tag is not None:
+        # Data-stream bookkeeping (train.py pops these before the batch reaches any loss):
+        filtered_dict['tpg_root'] = self.root_dir
+        filtered_dict['tpg_file'] = _stream_tag[0]
+        filtered_dict['tpg_file_pos'] = int(_stream_tag[1])
+        filtered_dict['tpg_file_pos_end'] = int(_stream_tag[2])
+        filtered_dict['tpg_worker'] = int(self.worker_id if self.worker_id is not None else 0)
       if survival is not None:
         filtered_dict['survival'] = filter_tensor(torch.tensor(np.ascontiguousarray(survival), dtype=torch.uint8), mod_value)
       if v7x is not None:

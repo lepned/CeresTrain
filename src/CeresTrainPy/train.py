@@ -96,6 +96,87 @@ def _move_batch_to_device(batch, device):
         return batch.to(device, non_blocking=True)
     return batch
 
+
+# ---------------------------------------------------------------------------------
+# DATA-STREAM RESUME bookkeeping (2026-09-09). Every batch carries the shard it came
+# from and the record span inside it (tpg_dataset tags). Per corpus root we track, per
+# (rank, worker), the shard currently being read and how far, and the set of shards a
+# worker has moved on from (= fully consumed). At checkpoint time every rank gathers
+# its view, rank 0 merges and writes <ckpt>.datastream.json; a resume reads that file
+# and hands each corpus its consumed set + in-progress offsets (see tpg_dataset).
+# ---------------------------------------------------------------------------------
+_DS_PROGRESS = {}   # root -> {'current': {(rank, worker): (file, pos_end)}, 'done': set()}
+_DS_TAG_KEYS = ('tpg_root', 'tpg_file', 'tpg_file_pos', 'tpg_file_pos_end', 'tpg_worker')
+
+def _pop_stream_tags(batch):
+    """Remove the data-stream tags from every board dict of a batch (dict or list/tuple of
+    dicts) and return the first one as (root, file, pos, pos_end, worker), or None."""
+    dicts = [batch] if isinstance(batch, dict) else [b for b in batch if isinstance(b, dict)]
+    tag = None
+    for d in dicts:
+        if 'tpg_file' in d:
+            t = tuple(d.get(k) for k in _DS_TAG_KEYS)
+            if tag is None:
+                tag = t
+            for k in _DS_TAG_KEYS:
+                d.pop(k, None)
+    return tag
+
+def _ds_track(tag, rank):
+    root, fname, pos, pos_end, worker = tag
+    st = _DS_PROGRESS.setdefault(root, {'current': {}, 'done': set()})
+    key = (int(rank), int(worker))
+    prev = st['current'].get(key)
+    if prev is not None and prev[0] != fname:
+        st['done'].add(prev[0])          # this worker moved on: previous shard fully consumed
+    st['current'][key] = (fname, int(pos_end))
+
+def _ds_local_state():
+    out = {}
+    for root, st in _DS_PROGRESS.items():
+        out[root] = {'done': sorted(st['done']),
+                     'in_progress': {f: int(pe) for (f, pe) in st['current'].values()}}
+    return out
+
+def _ds_write_state(ckpt_path, world_size, is_master):
+    """ALL ranks must call this (collective). Rank 0 writes <ckpt_path>.datastream.json."""
+    local = _ds_local_state()
+    if world_size > 1:
+        import torch.distributed as _d
+        gathered = [None] * world_size
+        _d.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+    if not is_master:
+        return
+    merged = {}
+    for part in gathered:
+        for root, st in (part or {}).items():
+            m = merged.setdefault(root, {'done': set(), 'in_progress': {}})
+            m['done'].update(st['done'])
+            for f, pe in st['in_progress'].items():
+                m['in_progress'][f] = max(int(pe), m['in_progress'].get(f, 0))
+    for root, m in merged.items():
+        for f in list(m['in_progress']):
+            if f in m['done']:
+                del m['in_progress'][f]      # finished on one rank's view already
+        m['done'] = sorted(m['done'])
+    from tpg_dataset import _RUN_SHUFFLE_SEED
+    import json
+    state = {'shuffle_seed': int(_RUN_SHUFFLE_SEED), 'world_size': int(world_size), 'corpora': merged}
+    with open(ckpt_path + '.datastream.json', 'w', encoding='utf-8') as fh:
+        json.dump(state, fh, indent=1)
+    _n_done = sum(len(m['done']) for m in merged.values()); _n_ip = sum(len(m['in_progress']) for m in merged.values())
+    print(f'INFO: DATASTREAM_STATE {ckpt_path}.datastream.json ({_n_done} consumed shard(s), {_n_ip} in progress across {len(merged)} corpus/corpora)', flush=True)
+
+def _ds_load_state(ckpt_path):
+    import json
+    fn = (ckpt_path or '') + '.datastream.json'
+    if not ckpt_path or not os.path.exists(fn):
+        return None
+    with open(fn, 'r', encoding='utf-8') as fh:
+        return json.load(fh)
+
 print(torch.__version__)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(False)
@@ -686,7 +767,14 @@ def Train():
     #   LearningRateCouplingsRatio — dual-plane zero-init couplings (plan H2)
     _HEAD_FAMILY = ('policy_head.', 'value_head.', 'value2_head.', 'unc_head.',
                     'mlh_head.', 'qdev_upper.', 'qdev_lower.', 'headPremap.',
-                    'headSharedLinear.', 'unc_policy.')
+                    'headSharedLinear.', 'unc_policy.',
+                    # 2026-09-09 (policy-training review): on a move-token net the POLICY readout is
+                    # the decoder's 4-slot linear + per-move bias, not `policy_head` (bypassed, unused),
+                    # and value reads the decoder through the injects. Without these the ratio would
+                    # slow every head EXCEPT the real policy readout. Decoder BODY stays out (that is
+                    # LearningRateDecoderRatio, which starved the value inject at 25M when applied whole).
+                    'move_tokens.pol.', 'move_tokens.mt_pol_bias', 'move_tokens.v_inject.',
+                    'move_tokens.v2_inject.', 'move_tokens.vord.', 'move_tokens.ev_head.', 'mt_ev_dir')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
@@ -709,6 +797,10 @@ def Train():
         elif _dec_ratio is not None and 'move_tokens.' in _pn:
           _lr_ratios[_pp] = float(_dec_ratio); _n_d += 1
       # Membership dump (phase-0 smoke contract): grep-able, one line per family.
+      if _heads_ratio is not None and getattr(model, 'move_tokens', None) is not None:
+        _mt_h = [n for n, p in model.named_parameters() if p.requires_grad and p in _lr_ratios and n.startswith('move_tokens.')]
+        print(f'[train] FAMILY-LR: move-token readouts under the heads ratio: {len(_mt_h)} '
+              f'({", ".join(n.split(".", 1)[1] for n in _mt_h)})', flush=True)
       print(f'[train] FAMILY-LR: heads ratio={_heads_ratio} ({_n_h} params), '
             f'couplings ratio={_coup_ratio} ({_n_c} params), '
             f'decoder ratio={_dec_ratio} ({_n_d} params); '
@@ -937,6 +1029,36 @@ def Train():
   _MIRROR_PRIMARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_PRIMARY')
   _MIRROR_SECONDARY = _opt_env_float0('CERES_FILE_MIRROR_AUG_SECONDARY')
 
+  # DATA-STREAM RESUME (see helpers above): exact continuation of every corpus.
+  _ds_resume = None
+  _resume_ckpt = getattr(config, 'Opt_CheckpointResumeFromFileName', None)
+  if _resume_ckpt and bool(getattr(config, 'Data_ResumeDataStream', True)):
+    _ds_resume = _ds_load_state(_resume_ckpt)
+    if _ds_resume is None:
+      print(f'[datastream] WARNING: no {_resume_ckpt}.datastream.json next to the checkpoint (written by trainers from '
+            f'2026-09-09 on) -> the shard streams RESTART at index 0 (legacy behaviour; set NumTPGFilesToSkipAfterShuffle '
+            f'manually, single-rank only)', flush=True)
+    else:
+      from tpg_dataset import _RUN_SHUFFLE_SEED as _seed_now
+      if int(_ds_resume.get('shuffle_seed', -1)) != int(_seed_now):
+        raise ValueError(f'ResumeDataStream: the checkpoint was written under ShuffleSeed {_ds_resume.get("shuffle_seed")} but this run '
+                         f'uses {_seed_now}; the consumed-shard set only means something under the same seed. Set the same '
+                         f'ShuffleSeed, or ResumeDataStream: false to restart the stream deliberately.')
+      if int(getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0) or 0) > 0:
+        raise ValueError('ResumeDataStream (automatic, from the checkpoint) and NumTPGFilesToSkipAfterShuffle (manual) are mutually exclusive')
+      if IS_MASTER:
+        for _r, _m in _ds_resume['corpora'].items():
+          print(f'[datastream] resume {_r}: {len(_m["done"])} shard(s) consumed, {len(_m["in_progress"])} in progress -> '
+                f'excluded / fast-forwarded', flush=True)
+  def _ds_args(root):
+    if not _ds_resume:
+      return {}
+    _m = _ds_resume['corpora'].get(root)
+    if _m is None:
+      if IS_MASTER:
+        print(f'[datastream] WARNING: corpus {root} has no state in the checkpoint (new corpus?) -> starts at shard 0', flush=True)
+      return {}
+    return {'exclude_files': set(_m['done']), 'start_offsets': dict(_m['in_progress'])}
   # Primary source: TPG shards (default) or direct LC0 v6 .gz chunks
   # (Data config "SourceType": "DirectFromV6" — zero-storage path for
   # training straight from pre-rescored LC0 data; see v6_dataset.py).
@@ -963,7 +1085,8 @@ def Train():
                                  rank, world_size, NUM_DATASET_WORKERS,
                                  BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
                                  file_mirror_prob=_MIRROR_PRIMARY,
-                                 num_files_to_skip_after_shuffle=getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0))
+                                 num_files_to_skip_after_shuffle=getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0),
+                                 **_ds_args(TPG_TRAIN_DIR))
 
   # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
   # Triggered when both Data_TrainingFilesDirectory2 is set AND Data_RatioSet1ToSet2 > 0.
@@ -993,7 +1116,8 @@ def Train():
                                    # 'required' er en paastand om PRIMAEREN; en sidecar-loes
                                    # puzzle-sekundaer skal ikke drepe kjoeringen.
                                    v7x_mode='auto' if os.environ.get('CERES_TPG_V7X_SIDECAR', '0') in ('1', 'required') else None,
-                                   file_mirror_prob=_MIRROR_SECONDARY)
+                                   file_mirror_prob=_MIRROR_SECONDARY,
+                                   **_ds_args(config.Data_TrainingFilesDirectory2))
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')
     print(f'[mixed-dataset] ratio = {config.Data_RatioSet1ToSet2}:1 (primary:secondary batches)')
@@ -2035,6 +2159,9 @@ def Train():
     # Move the freshly-fetched batch to GPU. Replaces Lightning's recursive
     # auto-move; with pin_memory=True these are true async DMA transfers.
     batch = _move_batch_to_device(batch, device)
+    _stream_tag = _pop_stream_tags(batch)
+    if _stream_tag is not None:
+      _ds_track(_stream_tag, RANK)
 
     fraction_complete = num_pos / MAX_POSITIONS
     model.train()
@@ -2755,6 +2882,7 @@ def Train():
       # weights, so rank 0's copy is authoritative; letting every rank write the same
       # paths would corrupt the files. last_save_model_pos is still advanced on every
       # rank so the cadence stays in lockstep.
+      _ds_write_state(os.path.join(OUTPUTS_DIR, 'nets', 'ckpt_' + NAME + '_' + str(num_pos)), WORLD_SIZE, IS_MASTER)   # all ranks
       if IS_MASTER:
         save_checkpoint(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos))
         save_model(NAME, OUTPUTS_DIR, config, model_nocompile, state, str(num_pos), True)
@@ -2862,6 +2990,7 @@ def Train():
   # Skipped when the interval save already wrote this exact position count
   # (checkpoint frequency == run length) — the redundant re-save is wasted work
   # and, pre-2026-07-22, overwrote the .lora bin with an empty one post-merge.
+  _ds_write_state(os.path.join(OUTPUTS_DIR, 'nets', 'ckpt_' + NAME + '_' + str(num_pos)), WORLD_SIZE, IS_MASTER)   # all ranks
   if IS_MASTER:
     if config.Opt_CheckpointFrequencyNumPositions > 0 and last_save_model_pos == num_pos:
       print(f"INFO: final save skipped (checkpoint already written at {num_pos})")
