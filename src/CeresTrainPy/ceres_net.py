@@ -546,9 +546,20 @@ class CeresNet(nn.Module):
     # sharpening failure mode. Config: PolicyPLWeight (0 = off), PolicyPLTopK.
     self.policy_pl_weight = float(os.environ.get('CERES_POLICY_PL_WEIGHT', '0') or 0)
     self.policy_pl_topk = int(os.environ.get('CERES_POLICY_PL_TOPK', '3') or 3)
+    # RANK-TARGET MASS FLOOR (2026-09-09 policy-loss review, finding 1): the TPG writer gives
+    # every legal move a floor probability (~0.0005) so `target > 0` doubles as the legality
+    # mask. The RANKING losses (Plackett-Luce over the target's top-K, and the move-token
+    # value-order ListMLE) must not treat those floor moves as ranked targets: in a position
+    # where search visited only 2 moves, ranks 3..K would be unvisited moves in arbitrary
+    # argsort order and the loss would demand an arbitrary ordering among them. A rank
+    # counts only if its target mass exceeds this threshold (1e-3 > floor, < one visit at
+    # 800 nodes = 1.25e-3). Legality masks are unchanged (floor moves stay in the suffix
+    # denominators as the alternatives to rank below). Config key PolicyRankMinTargetMass.
+    self.policy_rank_min_mass = float(os.environ.get('CERES_POLICY_RANK_MIN_MASS', '1e-3') or 1e-3)
     if self.policy_pl_weight > 0:
       print(f'[ceres_net] POLICY PLACKETT-LUCE ranking loss enabled: top-{self.policy_pl_topk} '
-            f'ListMLE over legal moves in target order, w={self.policy_pl_weight} (CE stays the anchor)')
+            f'ListMLE over legal moves in target order, w={self.policy_pl_weight} (CE stays the anchor); '
+            f'ranks count only above target mass {self.policy_rank_min_mass:g}')
     self.value_contrast_weight = float(os.environ.get('CERES_VALUE_CONTRAST_WEIGHT', '0') or 0)
     if self.value_contrast_weight > 0:
       self.vc_head = Head(self.Activation, self.HEAD_IN_SIZE, 64 * HEAD_MULT, 1858 * 3, 0)
@@ -1569,6 +1580,11 @@ class CeresNet(nn.Module):
       _mt_opp = int(getattr(config, 'NetDef_MoveTokenOppMax', 0) or 0)
       _mt_opp_pool = bool(getattr(config, 'NetDef_MoveTokenOppPool', False))
       _mt_wb = bool(getattr(config, 'NetDef_MoveTokenWriteBack', False))
+      _mt_ev = bool(getattr(config, 'NetDef_MoveTokenExpectedValue', False))
+      _mt_su = bool(getattr(config, 'NetDef_MoveTokenSquareUpdate', False))
+      self.mt_expected_value = _mt_ev
+      if _mt_su and self.value_head_channels > 0:
+        raise ValueError('MoveTokenSquareUpdate needs the plain shared head front-end (ValueHeadChannels must be 0)')
       if self.use_gtab:
         # Review 2026-09-04 finding 3: the decoder now runs BEFORE the GTAB adapter add, so a
         # gtab + move-token net would not be bit-paired with the pre-change graph. Never used
@@ -1593,7 +1609,12 @@ class CeresNet(nn.Module):
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
           post_move=_mt_pm, value_query=_mt_vq, value_order=self.mt_vord_w > 0,
-          opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb)
+          opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
+          expected_value=_mt_ev, square_update=_mt_su)
+      if _mt_ev:
+        # ev [B] -> WDL logits through a zero-init 3-vector: exact step-0 no-op; the value
+        # target then teaches both the direction and (through w_ev) the per-token scalars.
+        self.mt_ev_dir = nn.Parameter(torch.zeros(3))
       _n_mt = sum(p.numel() for p in self.move_tokens.parameters())
       print(f'[ceres_net] MOVE TOKENS enabled: M={self.move_tokens.M} candidate from-to tokens, '
             f'dm={self.move_tokens.dm}, {len(self.move_tokens.blocks)} decoder blocks '
@@ -1607,6 +1628,7 @@ class CeresNet(nn.Module):
             f'value-order head {("ON w=%g top-%d" % (self.mt_vord_w, self.mt_vord_topk)) if self.mt_vord_w > 0 else "off"}; '
             f'opponent keys {("ON Mo=%d%s" % (_mt_opp, " +pool" if _mt_opp_pool else "")) if _mt_opp > 0 else "off"}; '
             f'square write-back {"ON" if _mt_wb else "off"}; '
+            f'expected-value readout {"ON" if _mt_ev else "off"}; per-block square update {"ON" if _mt_su else "off"}; '
             f'absent-move floor {-30.0}')
 
 
@@ -2196,7 +2218,7 @@ class CeresNet(nn.Module):
       # MOVE TOKENS own the policy (see __init__ / move_tokens.py). `flow` is the
       # post-trunk-norm [B,64,D] square state; the decoder builds its candidate
       # set in-graph from the one-hot slice.
-      _mt_pol, _mt_pool, _mt_stats, _mt_sel, _mt_valid, _ = _mt_out
+      _mt_pol, _mt_pool, _mt_stats, _mt_sel, _mt_valid, _, _mt_ev = _mt_out
       policy_out = _mt_pol.to(fS_policy.dtype)
       if self.move_tokens.value_inject_dim > 0:
         _mvi = self.move_tokens.v_inject(_mt_pool)
@@ -2440,6 +2462,8 @@ class CeresNet(nn.Module):
         _cvi2 = self.dpcv_out2(_csum).to(fS_value.dtype)
         _v2_inject = _cvi2 if _v2_inject is None else _v2_inject + _cvi2
     value_out = self.value_head(fS_value_v, _v_inject)
+    if _mt_out is not None and getattr(self, 'mt_expected_value', False) and _mt_out[6] is not None:
+      value_out = value_out + (_mt_out[6].to(torch.float32).unsqueeze(-1) * self.mt_ev_dir.to(torch.float32)).to(value_out.dtype)
     value2_out = self.value2_head(torch.cat((fS_value_v, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
@@ -2606,7 +2630,7 @@ class CeresNet(nn.Module):
       _pl_suf = torch.flip(torch.logcumsumexp(torch.flip(_pl_s, dims=[1]), dim=1), dims=[1])
       _K = self.policy_pl_topk
       _pl_terms = (_pl_suf[:, :_K] - _pl_s[:, :_K])                                # [B,K] >= 0
-      _pl_valid = torch.gather(_pl_t, 1, _pl_order)[:, :_K] > 0                    # rank k has target mass
+      _pl_valid = torch.gather(_pl_t, 1, _pl_order)[:, :_K] > self.policy_rank_min_mass   # rank k has REAL target mass (not the legal-move floor)
       _pl_terms = torch.where(_pl_valid, _pl_terms, torch.zeros_like(_pl_terms))
       policy_pl_loss = _pl_terms.sum(dim=1).mean()
       with torch.no_grad():
@@ -2630,7 +2654,8 @@ class CeresNet(nn.Module):
         self.move_tokens._last_vord = None
         from move_tokens import move_token_value_order_loss
         mt_vord_loss, _vo_log = move_token_value_order_loss(
-            _vo_u, _vo_mt[0], _vo_mt[1], policy_target, self.move_tokens.mv_pair_flat, self.mt_vord_topk)
+            _vo_u, _vo_mt[0], _vo_mt[1], policy_target, self.move_tokens.mv_pair_flat, self.mt_vord_topk,
+            min_mass=self.policy_rank_min_mass)
 
     # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
     # the record's WDL, every other legal move is labeled LOSS-for-STM.

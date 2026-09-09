@@ -83,6 +83,11 @@ def partition_weight_decay(model):
               # convention (cbk_*, smol_*_bank). Hits B and C identically.
               # NB inert under Muon anyway (group wd) — completeness is the point.
               no_decay.add(fpn)
+          elif fpn.endswith("mt_ev_dir"):
+              # 2026-09-08 expected-value readout: zero-init 3-vector mapping the decoder's
+              # expected value onto the WDL logits. A raw direction/gain, not a weight matrix
+              # -> no_decay (inert under Muon anyway; keeps it out of orthogonalization).
+              no_decay.add(fpn)
           elif "smol_basis_bank" in fpn or "smol_static_bank" in fpn:
               # Smolbasis/smbstatic-tabellbankene: raa logit-tabeller, ikke
               # projeksjonsvekter — embedding-konvensjonen (no decay). NB

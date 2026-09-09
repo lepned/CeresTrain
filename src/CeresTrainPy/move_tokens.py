@@ -257,6 +257,38 @@ class WriteBackBlock(nn.Module):
     return self.wo(o) * any_valid.to(o.dtype).reshape(B, 1, 1)
 
 
+class SquareUpdateBlock(nn.Module):
+  """PER-BLOCK SQUARE UPDATE (2026-09-08, 'value in the decoder' arm 2). After each decoder
+  block the 64 square states are the queries and the (masked, normed) move tokens are
+  keys/values; the ZERO-INIT output projection is added to the square stream, and the NEXT
+  block's cross-attention (and finally the value pool / head front-end) reads the updated
+  squares. Write-back at every stage instead of once at the end: value gets the decoder's
+  rounds of move-level reasoning, not only the pooled bag. Exact step-0 no-op."""
+  def __init__(self, dm: int, s_dim: int, heads: int, norm_type: str):
+    super().__init__()
+    assert dm % heads == 0
+    self.h, self.dk = heads, dm // heads
+    self.ln_q = make_norm(norm_type, s_dim)
+    self.ln_kv = make_norm(norm_type, dm)
+    self.wq = nn.Linear(s_dim, dm, bias=False)
+    self.wkv = nn.Linear(dm, 2 * dm, bias=False)
+    self.wo = nn.Linear(dm, s_dim, bias=False)
+    nn.init.zeros_(self.wo.weight)
+
+  def forward(self, flow, x, key_bias, any_valid):
+    B = flow.shape[0]
+    q = self.wq(self.ln_q(flow))                                             # [B,64,dm]
+    k, v = self.wkv(self.ln_kv(x)).chunk(2, dim=-1)                          # [B,M,dm] each
+    M = k.shape[1]
+    q = q.reshape(B, 64, self.h, self.dk).transpose(1, 2)
+    k = k.reshape(B, M, self.h, self.dk).transpose(1, 2)
+    v = v.reshape(B, M, self.h, self.dk).transpose(1, 2)
+    s = torch.matmul(q, k.transpose(2, 3)) * (self.dk ** -0.5) + key_bias.to(q.dtype)
+    a = torch.softmax(s, dim=-1)
+    o = torch.matmul(a, v).transpose(1, 2).reshape(B, 64, self.h * self.dk)
+    return self.wo(o) * any_valid.to(o.dtype).reshape(B, 1, 1)
+
+
 class MoveTokenDecoder(nn.Module):
   def __init__(self, s_dim: int, norm_type: str, dm: int = 160, layers: int = 3,
                heads: int = 4, ffn_mult: int = 2, max_tokens: int = 128,
@@ -264,9 +296,20 @@ class MoveTokenDecoder(nn.Module):
                rich_features: bool = False, value_pool: str = 'meanmax',
                value_pool_detach: bool = True, post_move: bool = False,
                value_query: bool = False, value_order: bool = False,
-               opp_max: int = 0, opp_pool: bool = False, write_back: bool = False):
+               opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
+               expected_value: bool = False, square_update: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
+    # 2026-09-08 'value in the decoder' arms:
+    #  expected_value: position value gets an additive term ev = sum_i softmax(policy)_i * u_i
+    #    over the tokens (u = the per-token scalar; shared with the value-order head when that
+    #    is on, else its own linear). Exported (matmul/softmax); the direction vector that maps
+    #    ev onto the WDL logits lives in ceres_net (zero-init => exact step-0 no-op).
+    #  square_update: SquareUpdateBlock after every decoder block (see class doc). Forces the
+    #    per-block (unfused) square path since each block's cross-attn reads updated squares.
+    self.expected_value = bool(expected_value)
+    self.square_update = bool(square_update)
+    assert not (self.square_update and write_back), 'MoveTokenSquareUpdate already writes back at every block; MoveTokenWriteBack is redundant'
     # opp_max: number of OPPONENT candidate tokens offered as extra keys/values to the
     #   own-token self-attention (0 = off). opp_pool: also mean|max-pool them into the
     #   value inject (+2dm). write_back: WriteBackBlock (see class doc).
@@ -368,6 +411,8 @@ class MoveTokenDecoder(nn.Module):
         self.opp_ln = make_norm(norm_type, dm)
     if self.write_back:
       self.wb = WriteBackBlock(dm, s_dim, heads, norm_type)
+    if self.square_update:
+      self.sq_upd = nn.ModuleList([SquareUpdateBlock(dm, s_dim, heads, norm_type) for _ in range(layers)])
     # Policy read: 4 logits per token (promotion slots). SMALL fixed-key init,
     # not zero: with both readers (pol, value inject) at zero the decoder body
     # receives no gradient at all at step 0 — the product-rule cascade this
@@ -380,6 +425,10 @@ class MoveTokenDecoder(nn.Module):
       self.vord = nn.Linear(dm, 1, bias=False)
       with torch.no_grad():
         self.vord.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0C))
+    if self.expected_value and not self.value_order:
+      self.ev_head = nn.Linear(dm, 1, bias=False)
+      with torch.no_grad():
+        self.ev_head.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0D))
     # Per-move bias table (1858). pol_bias=False keeps it as a frozen zero BUFFER so the
     # graph/diagnostics are unchanged and the token features must carry the whole logit.
     if pol_bias:
@@ -397,6 +446,8 @@ class MoveTokenDecoder(nn.Module):
 
   def _fusable(self):
     from rms_norm import RMSNorm
+    if getattr(self, 'square_update', False):
+      return False   # each block reads UPDATED squares: no shared K|V precompute
     ok = all(isinstance(blk.ln_s, RMSNorm) for blk in self.blocks)
     if self.value_query:
       ok = ok and isinstance(self.vq_block.ln_s, RMSNorm)
@@ -472,7 +523,7 @@ class MoveTokenDecoder(nn.Module):
 
   def forward(self, squares13, flow):
     """flow [B,64,S] (post trunk norm). Returns (policy_add [B,1858], pooled [B,pool_dim],
-    stats dict, sel [B,M], valid [B,M], write_back [B,64,S] or None)."""
+    stats dict, sel [B,M], valid [B,M], write_back [B,64,S] or None, ev [B] or None)."""
     B, S = flow.shape[0], flow.shape[2]
     cand, E = self.candidates(squares13)
     score = cand.float() + (self.tie_rank.float() * (0.5 / 4096.0)).unsqueeze(0)
@@ -532,8 +583,12 @@ class MoveTokenDecoder(nn.Module):
                 x_opp=x_opp, opp_bias=opp_bias)
       vq_kv2 = kvs[-1] if self.value_query else None
     else:
-      for blk in self.blocks:
-        x = blk(x, blk.ln_s(flow), key_bias, pm=pm, x_opp=x_opp, opp_bias=opp_bias)   # each block re-norms the squares under ITS norm (review B1)
+      flow_cur = flow
+      any_valid_early = valid.any(dim=1)                                      # [B]
+      for i, blk in enumerate(self.blocks):
+        x = blk(x, blk.ln_s(flow_cur), key_bias, pm=pm, x_opp=x_opp, opp_bias=opp_bias)   # each block re-norms the squares under ITS norm (review B1)
+        if self.square_update:
+          flow_cur = flow_cur + self.sq_upd[i](flow_cur, x, key_bias, any_valid_early)
       vq_kv2 = None
     xo = self.out_ln(x)
     if self.value_order and self.training:
@@ -601,15 +656,30 @@ class MoveTokenDecoder(nn.Module):
     wb = None
     if self.write_back:
       wb = self.wb(flow, xo, key_bias, n_valid.squeeze(1) > 0)               # [B,64,S], zero-init proj
-    return pol, pooled, stats, sel, valid, wb
+    elif self.square_update:
+      wb = flow_cur - flow                                                   # total per-block delta (zero at init)
+    ev = None
+    if self.expected_value:
+      # Expected value under the (detached) policy over the tokens: one-ply lookahead readout.
+      u = (self.vord(xo) if self.value_order else self.ev_head(xo)).squeeze(-1).float()   # [B,M]
+      sc = torch.logsumexp(tok.float(), dim=-1)
+      sc = torch.where(valid, sc, torch.full_like(sc, -1e4))
+      w_ev = torch.softmax(sc, dim=1).detach() * (n_valid > 0).to(sc.dtype)
+      ev = (w_ev * u).sum(dim=1)                                             # [B] fp32
+      if self.training:
+        stats['mt_ev_mean'] = ev.detach().mean()
+        stats['mt_ev_absmean'] = ev.detach().abs().mean()
+    return pol, pooled, stats, sel, valid, wb, ev
 
 
-def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk: int):
+def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk: int, min_mass: float = 0.0):
   """ListMLE (Plackett-Luce top-K) over the move TOKENS' order scalars `u` [B,M],
   toward the policy target's visit order. Target mass per token = the target's mass on
   the token's from-to pair (promotion slots summed). Tokens without target mass are
   excluded (-inf), mirroring the policy PL loss in ceres_net; rows whose target moves
-  have no token contribute 0. Returns (loss, diagnostics dict)."""
+  have no token contribute 0. `min_mass`: a rank counts as a target only if its mass
+  exceeds this (the TPG legal-move floor ~0.0005 must not produce ranked targets; see
+  ceres_net.policy_rank_min_mass). Returns (loss, diagnostics dict)."""
   B = u.shape[0]
   t = policy_target.float()
   pair_mass = torch.zeros(B, 4096, device=t.device, dtype=t.dtype).index_add_(1, mv_pair_flat, t)   # [B,4096]
@@ -620,7 +690,7 @@ def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk
   suf = torch.flip(torch.logcumsumexp(torch.flip(s, dims=[1]), dim=1), dims=[1])
   K = min(int(topk), s.shape[1])
   s_k, suf_k = s[:, :K], suf[:, :K]
-  ok = (torch.gather(tok_t, 1, order)[:, :K] > 0) & torch.isfinite(s_k)
+  ok = (torch.gather(tok_t, 1, order)[:, :K] > float(min_mass)) & torch.isfinite(s_k)
   terms = torch.where(ok, suf_k - s_k, torch.zeros_like(s_k))
   loss = terms.sum(dim=1).mean()
   with torch.no_grad():

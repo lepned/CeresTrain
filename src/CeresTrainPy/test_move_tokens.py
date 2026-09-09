@@ -104,7 +104,7 @@ def main():
   sq = random_boards(B)
   flow = torch.randn(B, 64, 32)
   dec.pol.weight.data.normal_()                       # make token logits non-trivial
-  pol, pooled, stats, sel, valid, _ = dec(sq[:, :, 0:13], flow)
+  pol, pooled, stats, sel, valid, _, _ = dec(sq[:, :, 0:13], flow)
   assert pol.shape == (B, 1858) and pooled.shape == (B, 64)
   # recompute reference: for each move index, token logit if its pair is selected+valid
   for b in range(B):
@@ -144,7 +144,7 @@ def main():
   # no-candidate board (lone kings, stm king boxed by own pawns): pooled must stay finite/zero
   s0 = board_from_pieces({'a1': 'K', 'a2': 'P', 'b2': 'P', 'b1': 'P'}, {'h8': 'K'})
   s0[0, SQ['b2'], 0] = 0
-  _, pooled0, st0, _, v0, _ = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
+  _, pooled0, st0, _, v0, _, _ = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
   assert torch.isfinite(pooled0).all() and float(pooled0.abs().max()) < 1e3, 'empty-candidate pool guard'
   net.eval()
   with torch.no_grad(): out = net(sq, None)
@@ -193,7 +193,7 @@ def main():
   assert g_aux is not None and g_aux.abs().sum() > 0, 'aux MLP policy CE must train the MLP head'
   from wd_partition import partition_weight_decay as _pwd
   _pwd(net2)
-  _, pooled2, st2, _, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
+  _, pooled2, st2, _, _, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
   assert pooled2.shape[-1] == 3 * 64 and torch.isfinite(pooled2).all() and float(pooled2.abs().max()) < 1e3
   assert 'mt_polpool_entropy' in st2
   net2.eval()
@@ -249,6 +249,18 @@ def main():
   assert torch.isfinite(lg) and torch.isfinite(lb) and float(lg) < float(lb), (float(lg), float(lb))
   assert float(dg['mt_vord_top1']) == 1.0 and float(db['mt_vord_top1']) == 0.0
   assert abs(float(dg['mt_vord_rows_with_target']) - 0.5) < 1e-6, 'row 2 has no target mass -> excluded'
+  # legal-move FLOOR contract (2026-09-09 review): floor-mass moves are legal alternatives but NOT ranked targets
+  tgtf = torch.zeros(2, 1858); tgtf[0, m_idx[0]] = 0.7; tgtf[0, m_idx[1]] = 0.2995; tgtf[0, m_idx[2]] = 0.0005   # third = writer floor
+  tgtf[1, m_idx[0]] = 0.0005; tgtf[1, m_idx[1]] = 0.0005                                                          # row of ONLY floor mass
+  l_floor0, d_floor0 = _vol(good, sel3, valid3, tgtf, mv, 3, min_mass=0.0)
+  l_floor1, d_floor1 = _vol(good, sel3, valid3, tgtf, mv, 3, min_mass=1e-3)
+  assert torch.isfinite(l_floor0) and torch.isfinite(l_floor1)
+  assert float(l_floor1) < float(l_floor0), 'with the mass floor the third (floor) rank and the floor-only row must drop out'
+  assert abs(float(d_floor0['mt_vord_rows_with_target']) - 1.0) < 1e-6 and abs(float(d_floor1['mt_vord_rows_with_target']) - 0.5) < 1e-6, \
+      'floor-only row counts as a target row without the threshold, not with it'
+  # with the threshold, the floor row contributes exactly 0: loss == the K=2 loss on the same row
+  l_k2, _ = _vol(good[:1], sel3[:1], valid3[:1], tgtf[:1], mv, 2, min_mass=0.0)
+  assert abs(float(l_floor1) - float(l_k2) / 2.0) < 1e-6, (float(l_floor1), float(l_k2))
   net3.eval()
   with torch.no_grad(): out3 = net3(sq, None)
   assert net3.move_tokens._last_vord is None, 'no stash in eval (export path)'
@@ -283,7 +295,7 @@ def main():
   # empty-candidate board: write-back must be exactly zero
   net_wb.eval()
   with torch.no_grad():
-    *_, wb0 = net_wb.move_tokens(s0, torch.randn(1, 64, net_wb.EMBEDDING_DIM))
+    *_, wb0, _ = net_wb.move_tokens(s0, torch.randn(1, 64, net_wb.EMBEDDING_DIM))
   assert wb0 is not None and float(wb0.abs().max()) == 0.0, 'no-candidate board -> zero write-back'
   print('  square write-back OK: exact step-0 no-op on all heads, grads flow into wo, zero on empty boards')
   # (ii) opponent keys: candidate superset vs python-chess with the side to move flipped
@@ -330,13 +342,13 @@ def main():
   _pwd(net_o)
   net_o.eval()
   with torch.no_grad():
-    _, pooled_o, st_o, _, _, _ = net_o.move_tokens(s0, torch.randn(1, 64, net_o.EMBEDDING_DIM))
+    _, pooled_o, st_o, _, _, _, _ = net_o.move_tokens(s0, torch.randn(1, 64, net_o.EMBEDDING_DIM))
     out_o = net_o(sq, None)
   assert pooled_o.shape[-1] == 4 * 64 and torch.isfinite(pooled_o).all() and float(pooled_o.abs().max()) < 1e3
   assert 'mt_opp_count_mean' in st_o and torch.isfinite(out_o[0]).all() and torch.isfinite(out_o[1]).all()
   # logit monitor: present in training stats, absent in eval
   net_o.train()
-  _, _, st_tr, _, _, _ = net_o.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_o.EMBEDDING_DIM))
+  _, _, st_tr, _, _, _, _ = net_o.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_o.EMBEDDING_DIM))
   assert 'mt_qk_max_self' in st_tr and 'mt_qk_max_cross' in st_tr and torch.isfinite(st_tr['mt_qk_max_self'])
   assert 'mt_qk_max_self' not in st_o
   print(f'  opponent keys OK: {net_o.move_tokens.M_opp} opp tokens as extra K/V, pool 4dm, grads flow, empty-board guard, '
@@ -394,7 +406,7 @@ def main():
     net4.move_tokens.export_fused = True; assert net4.move_tokens._fusable(); fus4 = net4(sq, None)
   d4p = float((fus4[0] - ref4[0]).abs().max()); d4v = float((fus4[1] - ref4[1]).abs().max())
   assert d4p < 1e-4 and d4v < 1e-4, (d4p, d4v)
-  _, pooled4, _, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
+  _, pooled4, _, _, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
   assert torch.isfinite(pooled4).all() and float(pooled4.abs().max()) < 1e3
   print(f'  post-move + value-query OK: step-0 no-op (|d| {d0:.1e}), all params get grad, fused identity '
         f'(policy {d4p:.1e}, value {d4v:.1e}), empty-board guard')
@@ -440,6 +452,104 @@ def main():
   assert dmax < 1e-4, f'export cap changed logits: {dmax}'
   print(f'  export-time cap OK: M 64 -> 56 gives identical policy (max|d| {dmax:.1e}) on {int(fit.sum())} boards '
         f'with <= 56 candidates (counts {cnt.tolist()})')
+
+  # --- 6. 'value in the decoder' arms (2026-09-08) -------------------------
+  # (i) expected-value readout: ev = sum softmax(policy)*u over tokens -> WDL logits via a
+  #     zero-init direction. Exact step-0 no-op on every head; the direction gets gradient
+  #     from the value loss; ev is zero on empty boards; exported graph matches ORT.
+  net_ev, _ = build(dict(base_over, MoveTokenExpectedValue=True), {}, 'mtev')
+  assert net_ev.move_tokens.expected_value and hasattr(net_ev, 'mt_ev_dir') and float(net_ev.mt_ev_dir.abs().sum()) == 0.0
+  net_c, _ = build(base_over, {}, 'mtc')     # FRESH control: `net` was mutated by 4d (random ln_s scales)
+  net_ev.eval(); net_c.eval()
+  with torch.no_grad():
+    o_ref = net_c(sq, None); o_ev = net_ev(sq, None)
+  for i, (a, b) in enumerate(zip(o_ref, o_ev)):
+    if a is not None and b is not None:
+      assert torch.equal(a, b), f'expected-value readout must be an exact step-0 no-op (output {i})'
+  s_none = board_from_pieces({}, {'h8': 'K'})   # no own pieces => zero candidates by construction (s0 still has pawn pushes)
+  assert float(net_ev.move_tokens.candidates(s_none)[0].sum()) == 0.0
+  with torch.no_grad():
+    *_, ev_b = net_ev.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_ev.EMBEDDING_DIM))
+    *_, ev_0 = net_ev.move_tokens(s_none, torch.randn(1, 64, net_ev.EMBEDDING_DIM))
+  assert ev_b is not None and ev_b.shape == (sq.shape[0],) and torch.isfinite(ev_b).all()
+  assert float(ev_b.abs().max()) > 0.0, 'ev must be non-zero at init (per-token scalar has a small fixed-key init)'
+  assert ev_0 is not None and float(ev_0.abs().max()) == 0.0, 'no-candidate board -> ev exactly zero'
+  net_ev.train(); net_ev.zero_grad(set_to_none=True)
+  loss_ev = run_loss(net_ev, batch, sq); assert torch.isfinite(loss_ev); loss_ev.backward()
+  assert net_ev.mt_ev_dir.grad is not None and float(net_ev.mt_ev_dir.grad.abs().sum()) > 0, \
+      'zero-init ev direction must receive gradient from the value loss (ev != 0)'
+  _pwd(net_ev)
+  # one step of the direction => the per-token scalar now gets gradient (no dead cascade)
+  with torch.no_grad():
+    net_ev.mt_ev_dir.copy_(torch.tensor([0.1, -0.05, -0.05]))
+  net_ev.zero_grad(set_to_none=True)
+  loss_ev2 = run_loss(net_ev, batch, sq); loss_ev2.backward()
+  _u = net_ev.move_tokens.vord if net_ev.move_tokens.value_order else net_ev.move_tokens.ev_head
+  assert _u.weight.grad is not None and float(_u.weight.grad.abs().sum()) > 0, 'per-token value scalar must train once the direction is non-zero'
+  net_ev.eval()
+  with torch.no_grad():
+    o_ev2 = net_ev(sq, None)
+  assert not torch.equal(o_ev2[1], o_ref[1]) and torch.equal(o_ev2[0], o_ref[0]), 'ev must move VALUE only (policy untouched)'
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path_ev = os.path.join(tempfile.gettempdir(), 'mt_export_test_ev.onnx')
+    with torch.no_grad(): ref_evo = net_ev(sq, None)
+    torch.onnx.export(net_ev, (sq, None), path_ev, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s_ev = ort.InferenceSession(path_ev, providers=['CPUExecutionProvider'])
+    o_evo = s_ev.run(None, {s_ev.get_inputs()[0].name: sq.numpy()})
+    prv = ref_evo[1].numpy(); pov = [x for x in o_evo if x.shape == prv.shape][0]
+    d_ev = float(np.abs(pov - prv).max()); assert d_ev < 1e-3, d_ev
+    print(f'  ONNX export + ORT parity OK for expected-value readout (value max|d| {d_ev:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: expected-value export parity skipped)')
+  print('  expected-value readout OK: exact step-0 no-op, dir then scalar receive gradient, value-only, zero on empty boards')
+  # (ii) per-block square update: zero-init wo => exact step-0 no-op; grads reach every sq_upd;
+  #      unfused path forced; zero on empty boards; wb non-zero once wo is perturbed.
+  net_su, _ = build(dict(base_over, MoveTokenSquareUpdate=True), {}, 'mtsu')
+  assert net_su.move_tokens.square_update and len(net_su.move_tokens.sq_upd) == len(net_su.move_tokens.blocks)
+  assert not net_su.move_tokens._fusable(), 'square update must force the per-block (unfused) square path'
+  net_su.eval()
+  with torch.no_grad():
+    o_su = net_su(sq, None)
+    *_, wb_su, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
+  assert wb_su is not None and float(wb_su.abs().max()) == 0.0, 'square update must be an exact zero at init'
+  # step-0 no-op on the heads is only checkable when the extra params did not shift the RNG stream
+  # of later layers; assert on the wb tensor instead (above) and on finite outputs here.
+  assert all(torch.isfinite(o).all() for o in o_su if o is not None)
+  net_su.train(); net_su.zero_grad(set_to_none=True)
+  loss_su = run_loss(net_su, batch, sq); assert torch.isfinite(loss_su); loss_su.backward()
+  for i, blk in enumerate(net_su.move_tokens.sq_upd):
+    assert blk.wo.weight.grad is not None and float(blk.wo.weight.grad.abs().sum()) > 0, f'sq_upd[{i}].wo must receive gradient'
+  dead_su = [n for n, p in net_su.move_tokens.named_parameters() if p.grad is None]
+  assert not dead_su, f'move_tokens params without gradient: {dead_su}'
+  _pwd(net_su)
+  with torch.no_grad():
+    for blk in net_su.move_tokens.sq_upd:
+      blk.wo.weight.normal_(0.0, 0.05)
+  net_su.eval()
+  with torch.no_grad():
+    *_, wb_su2, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
+    *_, wb_su0, _ = net_su.move_tokens(s_none, torch.randn(1, 64, net_su.EMBEDDING_DIM))
+  assert float(wb_su2.abs().max()) > 0.0, 'perturbed wo must produce a non-zero square update'
+  assert float(wb_su0.abs().max()) == 0.0, 'no-candidate board -> zero square update'
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path_su = os.path.join(tempfile.gettempdir(), 'mt_export_test_su.onnx')
+    with torch.no_grad(): ref_suo = net_su(sq, None)
+    torch.onnx.export(net_su, (sq, None), path_su, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s_su = ort.InferenceSession(path_su, providers=['CPUExecutionProvider'])
+    o_suo = s_su.run(None, {s_su.get_inputs()[0].name: sq.numpy()})
+    prp = ref_suo[0].numpy(); pop = [x for x in o_suo if x.shape == prp.shape][0]
+    d_su = float(np.abs(pop - prp).max()); assert d_su < 1e-3, d_su
+    print(f'  ONNX export + ORT parity OK for per-block square update (policy max|d| {d_su:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: square-update export parity skipped)')
+  print('  per-block square update OK: zero at init, grads reach every block, unfused path, zero on empty boards')
+  # (iii) guard: square update + write-back refused
+  try:
+    build(dict(base_over, MoveTokenSquareUpdate=True, MoveTokenWriteBack=True), {}, 'rej_su'); raise SystemExit('FAIL: su+wb not rejected')
+  except ValueError as e:
+    print(f'  rejection OK (square update + write-back): {str(e)[:60]}')
 
   # --- 5. guards ---------------------------------------------------------
   for name, over in (('with plane decode', {'UseMoveTokens': True}),

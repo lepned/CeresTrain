@@ -109,6 +109,11 @@ class Configuration:
     # batches per 1 secondary). Default: None / 0 = single-source (legacy behaviour).
     self.Data_TrainingFilesDirectory2 = config_data.get('TrainingFilesDirectory2', None)
     self.Data_RatioSet1ToSet2 = int(config_data.get('RatioSet1ToSet2', 0))
+    # 2026-09-09: on CheckpointResumeFromFileName, continue every corpus's shard stream
+    # exactly where the checkpoint left it (reads <ckpt>.datastream.json written next to
+    # each checkpoint; consumed shards excluded, in-progress shards fast-forwarded).
+    # Default on; set false to get the old behaviour (stream restarts at shard 0).
+    self.Data_ResumeDataStream = bool(config_data.get('ResumeDataStream', True))
     # DirectFromV6 knobs (v6_dataset.py); None = fall back to env/default.
     # These live in the DATA config (review finding 15: the opt-config
     # bootstrap bridge alone made the recipe's data-config examples no-ops).
@@ -623,6 +628,13 @@ class Configuration:
     self.NetDef_MoveTokenOppMax = int(config_net_def.get('MoveTokenOppMax', 0) or 0)
     self.NetDef_MoveTokenOppPool = bool(config_net_def.get('MoveTokenOppPool', False))
     self.NetDef_MoveTokenWriteBack = bool(config_net_def.get('MoveTokenWriteBack', False))
+    # 2026-09-08 'value in the decoder' arms (see move_tokens.py): expected value under the
+    # policy over the tokens added to the WDL logits (zero-init direction), and per-block
+    # square update (write-back after every decoder block, next block reads updated squares).
+    self.NetDef_MoveTokenExpectedValue = bool(config_net_def.get('MoveTokenExpectedValue', False))
+    self.NetDef_MoveTokenSquareUpdate = bool(config_net_def.get('MoveTokenSquareUpdate', False))
+    if self.NetDef_MoveTokenSquareUpdate and self.NetDef_MoveTokenWriteBack:
+      raise ValueError('MoveTokenSquareUpdate writes back at every block; MoveTokenWriteBack is redundant (refused)')
     # EXPORT-TIME GRAPH FOLDS (export_folds.py; 2026-09-04): 'none' | 'mt' | 'ffn' | 'all'.
     # 'mt' = decoder attention-scale + pre-norm scale folds: exact, measured +6-8 % EPS in EB
     # on the 700M prod net. 'ffn' (SwiGLU gate|up fusion) measured EPS-neutral/negative; kept
@@ -642,7 +654,7 @@ class Configuration:
       raise ValueError(f'MoveTokenValuePool must be meanmax|policy|both, got {self.NetDef_MoveTokenValuePool!r}')
     if not self.NetDef_UseMoveTokens:
       for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
-                 'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures',
+                 'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures', 'MoveTokenExpectedValue', 'MoveTokenSquareUpdate',
                  'MoveTokenValuePool', 'MoveTokenValuePoolDetach', 'MoveTokenPostMove', 'MoveTokenValueQuery',
                  'MoveTokenOppMax', 'MoveTokenOppPool', 'MoveTokenWriteBack'):
         if _k in config_net_def:

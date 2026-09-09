@@ -42,6 +42,7 @@ BOOTSTRAP_ENV_MAP = {
     # Plackett-Luce policy ranking aux (Kovax, 2026-09-02): weight + top-K.
     'PolicyPLWeight': 'CERES_POLICY_PL_WEIGHT',
     'PolicyPLTopK': 'CERES_POLICY_PL_TOPK',
+    'PolicyRankMinTargetMass': 'CERES_POLICY_RANK_MIN_MASS',
     # G1-gate paa SDPA-outputen (arXiv 2505.06708; allerede implementert env-gated i
     # dot_product_attention.py:263). Config-broen gjor at BAADE train og recover_export
     # ser flagget fra opt-configen — env-only var eksport-fellen (review-klasse 2).
