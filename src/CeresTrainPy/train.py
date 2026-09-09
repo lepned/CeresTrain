@@ -798,9 +798,9 @@ def Train():
           _lr_ratios[_pp] = float(_dec_ratio); _n_d += 1
       # Membership dump (phase-0 smoke contract): grep-able, one line per family.
       if _heads_ratio is not None and getattr(model, 'move_tokens', None) is not None:
-        _mt_h = [n for n, p in model.named_parameters() if p.requires_grad and p in _lr_ratios and n.startswith('move_tokens.')]
+        _mt_h = [n for n, p in model.named_parameters() if p.requires_grad and p in _lr_ratios and ('move_tokens.' in n or n.endswith('mt_ev_dir'))]   # names may carry a compile/DDP prefix
         print(f'[train] FAMILY-LR: move-token readouts under the heads ratio: {len(_mt_h)} '
-              f'({", ".join(n.split(".", 1)[1] for n in _mt_h)})', flush=True)
+              f'({", ".join(n.split("move_tokens.", 1)[-1] for n in _mt_h)})', flush=True)
       print(f'[train] FAMILY-LR: heads ratio={_heads_ratio} ({_n_h} params), '
             f'couplings ratio={_coup_ratio} ({_n_c} params), '
             f'decoder ratio={_dec_ratio} ({_n_d} params); '
