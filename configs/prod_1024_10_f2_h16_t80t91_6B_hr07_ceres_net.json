@@ -56,5 +56,5 @@
   "MoveTokenLayers": 4,
   "MoveTokenHeads": 8,
   "MoveTokenFFNMult": 2,
-  "MoveTokenMax": 128
+  "MoveTokenMax": 96
 }
