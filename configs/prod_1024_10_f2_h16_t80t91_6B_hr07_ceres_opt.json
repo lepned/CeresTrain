@@ -65,5 +65,5 @@
   "MuonAdamWScope": "all-non-trunk+decoder",
   "SquareBytes": 137,
   "SquareBytes2": 141,
-  "LearningRateHeadsRatio": 0.7
+  "LearningRateHeadsRatio": 0.5
 }
