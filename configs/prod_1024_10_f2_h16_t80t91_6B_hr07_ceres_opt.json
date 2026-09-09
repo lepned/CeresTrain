@@ -8,7 +8,7 @@
   "CheckpointResumeFromFileName": "/mnt/lepned/ceres_out/nets/ckpt_a4000-21bn11_prod_1024_10_f2_h16_t80t91_6B_500019200",
   "PyTorchCompileMode": "default",
   "WeightDecay": 0.01,
-  "LearningRateBase": 0.0006,
+  "LearningRateBase": 0.0008,
   "LRBeginDecayAtFractionComplete": 0.6,
   "LRWarmupPhaseMultiplier": 0.03,
   "LRDecayShape": "cosine",
