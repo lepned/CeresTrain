@@ -15,7 +15,7 @@
   "LRDecayShape": "cosine",
   "LRMinFactor": 0.05,
   "Beta1": 0.9,
-  "MuonMomentum": 0.95,
+  "MuonMomentum": 0.9,
   "Beta2": 0.95,
   "Beta3": 0.9999,
   "Alpha": 5,
