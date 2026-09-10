@@ -108,6 +108,8 @@ class Muon(torch.optim.Optimizer):
         head_split_specs=None,
         lr_ratios=None,
         wd_scales=None,
+        hyperball_params=None,
+        hyperball_lr_ratio=1.0,
     ):
         # adamw_lr: separate learning rate for the internal-AdamW group (heads, embeddings,
         # norms, biases). The docstring always advertised it but it was never implemented -
@@ -126,6 +128,7 @@ class Muon(torch.optim.Optimizer):
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
             adamw_lr_ratio=adamw_lr_ratio,
+            hyperball_lr_ratio=hyperball_lr_ratio,
         )
 
         params = list(muon_params)
@@ -181,6 +184,22 @@ class Muon(torch.optim.Optimizer):
         self._wd_scales = dict(wd_scales) if wd_scales else {}
         for p, r in self._wd_scales.items():
             assert r >= 0, f"wd scale must be non-negative, got {r}"
+        # Hyperball (Wen, Dang, Lyu, Ma, Liang 2026, arXiv 2606.16899; 2026-09-10): for the
+        # matrices in `hyperball_params` the update replaces weight decay by two norm
+        # constraints. With u = the Muon update (NS output, its shape scaling absorbed):
+        #     u_hat  = u / ||u||_F
+        #     W~     = W - eta * R * u_hat          eta = group lr * hyperball_lr_ratio * lr_ratios[p]
+        #     W_new  = R * W~ / ||W~||_F
+        # R is the matrix's Frobenius norm at its FIRST Hyperball step and is kept in the
+        # optimizer state (state["hb_radius"]): from scratch that is the init norm, exactly the
+        # paper; at a resume it is the norm the weights carry at the switch, so the switch is
+        # function-preserving. `eta` is a RELATIVE step per optimizer step (the paper's
+        # learning rate), scheduled through the group lr like everything else. Hyperball
+        # params get NO weight decay (the projection is the decay). Embeddings, norm gains,
+        # biases and the embedding-like 2-D params are excluded by the caller, as in the paper.
+        self._hyperball = {id(p) for p in hyperball_params} if hyperball_params else set()
+        for p in (hyperball_params or []):
+            assert self.state[p].get("use_muon", False), "Hyperball only applies to Muon params"
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -258,6 +277,18 @@ class Muon(torch.optim.Optimizer):
                     # scale update
                     adjusted_lr = self.adjust_lr_for_muon(lr_p, p.shape)
 
+                if id(p) in self._hyperball:
+                    # Hyperball step: fixed update norm, then projection back onto the sphere
+                    # of radius R. fp32 math; the model keeps fp32 master weights (bf16-mixed).
+                    if "hb_radius" not in state:
+                        state["hb_radius"] = p.data.float().norm().item()
+                    R = state["hb_radius"]
+                    u32 = u.float()
+                    eta = lr_p * group.get("hyperball_lr_ratio", 1.0)
+                    w = p.data.float().add_(u32, alpha=-(eta * R / (u32.norm() + 1e-12)))
+                    w.mul_(R / (w.norm() + 1e-12))
+                    p.data.copy_(w)
+                    continue
                 # apply weight decay (family-scaled lr => decay stays
                 # proportional to the actual step size, matching AdamW branch)
                 p.data.mul_(1 - lr_p * wd * self._wd_scales.get(p, 1.0))

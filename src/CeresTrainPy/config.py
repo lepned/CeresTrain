@@ -196,6 +196,20 @@ class Configuration:
     # decays every parameter; both 640x12 prod runs and hr07 up to 1.1B trained so).
     _hnd = config_opt.get('MuonHonorNoDecay')
     self.Opt_MuonHonorNoDecay = False if _hnd is None else bool(_hnd)
+    # MuonHyperball (Muon only, 2026-09-10, arXiv 2606.16899): the Muon-partition matrices
+    # (minus the no_decay/embedding-like set) train on a fixed-Frobenius-norm sphere with a
+    # fixed relative update norm instead of weight decay. HyperballRelativeLR = the paper's
+    # learning rate = relative step per optimizer step at peak (scheduled like LearningRateBase).
+    # Reference for our recipe: the hr07 1.0B ckpt runs at a median relative Muon step of
+    # 0.0014 (p10 0.0012, p90 0.0023) under lr 8e-4 / wd 0.01; a from-scratch 256x10 at lr 8e-4
+    # starts at ~0.003. Required (no default) when enabled.
+    _hb = config_opt.get('MuonHyperball')
+    self.Opt_MuonHyperball = False if _hb is None else bool(_hb)
+    _hbl = config_opt.get('HyperballRelativeLR')
+    self.Opt_HyperballRelativeLR = None if _hbl is None else float(_hbl)
+    if self.Opt_MuonHyperball:
+      assert self.Opt_HyperballRelativeLR is not None and self.Opt_HyperballRelativeLR > 0, \
+        'MuonHyperball requires HyperballRelativeLR (relative step per optimizer step at peak, e.g. 0.0014)'
     # Muon partition scope (Muon only): which params the internal AdamW gets.
     #   'all-non-trunk' (legacy default): everything outside transformer_layer —
     #       whole heads (incl. hidden 2-D fc), embeddings, norms, biases.

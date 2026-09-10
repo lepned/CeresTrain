@@ -861,7 +861,16 @@ def Train():
       _n_all = sum(1 for _p in model.parameters() if _p.requires_grad)
       print(f"[train] Muon honors no_decay: {len(_wd_scales)} of {_n_all} params at wd 0 "
             f"(norm gains/biases/zero-init couplings); decay set at wd {WEIGHT_DECAY}", flush=True)
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None, wd_scales=_wd_scales)
+    # MuonHyperball: the Muon matrices minus the no_decay (embedding-like) set.
+    _hb_params = None; _hb_ratio = 1.0
+    if getattr(config, 'Opt_MuonHyperball', False):
+      _nd_ids = {id(param_dict[pn]) for pn in no_decay if pn in param_dict}
+      _hb_params = [p for p in muon_params if id(p) not in _nd_ids]
+      _hb_ratio = float(config.Opt_HyperballRelativeLR) / LR
+      print(f"[train] Muon HYPERBALL: {len(_hb_params)} of {len(muon_params)} Muon matrices on fixed-norm spheres, "
+            f"relative step {config.Opt_HyperballRelativeLR} at peak (ratio {_hb_ratio:.4g} to LearningRateBase {LR}); "
+            f"no weight decay on them (R = norm at first Hyperball step, kept in optimizer state)", flush=True)
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None, wd_scales=_wd_scales, hyperball_params=_hb_params, hyperball_lr_ratio=_hb_ratio)
     if getattr(config, 'Opt_MuonMomentum', None) is not None or getattr(config, 'Opt_MuonAdamWEps', None) is not None:
       print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':
@@ -2017,6 +2026,7 @@ def Train():
       _new_ratio = (float(_hl) / LR) if _hl is not None else 1.0
       _muon_hparams = {
         'adamw_lr_ratio': _new_ratio,
+        'hyperball_lr_ratio': _hb_ratio,
         'momentum': _muon_mom,
         'adamw_betas': (config.Opt_Beta1, config.Opt_Beta2),
         'adamw_eps': _muon_aeps,
