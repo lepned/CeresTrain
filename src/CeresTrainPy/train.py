@@ -853,7 +853,15 @@ def Train():
     # beta1 (see config.py) — reference combo is momentum 0.95 / adam beta1 0.9.
     _muon_mom = config.Opt_MuonMomentum if getattr(config, 'Opt_MuonMomentum', None) is not None else config.Opt_Beta1
     _muon_aeps = config.Opt_MuonAdamWEps if getattr(config, 'Opt_MuonAdamWEps', None) is not None else 1e-8
-    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None)
+    # MuonHonorNoDecay: the no_decay set from wd_partition.py gets wd scale 0 in
+    # both Muon branches (it was INERT under Muon: the group wd hit every param).
+    _wd_scales = None
+    if getattr(config, 'Opt_MuonHonorNoDecay', False):
+      _wd_scales = {param_dict[pn]: 0.0 for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad}
+      _n_all = sum(1 for _p in model.parameters() if _p.requires_grad)
+      print(f"[train] Muon honors no_decay: {len(_wd_scales)} of {_n_all} params at wd 0 "
+            f"(norm gains/biases/zero-init couplings); decay set at wd {WEIGHT_DECAY}", flush=True)
+    optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None, wd_scales=_wd_scales)
     if getattr(config, 'Opt_MuonMomentum', None) is not None or getattr(config, 'Opt_MuonAdamWEps', None) is not None:
       print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':

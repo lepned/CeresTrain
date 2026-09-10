@@ -190,6 +190,12 @@ class Configuration:
     self.Opt_MuonMomentum = None if _mm is None else float(_mm)
     _mae = config_opt.get('MuonAdamWEps')
     self.Opt_MuonAdamWEps = None if _mae is None else float(_mae)
+    # MuonHonorNoDecay (Muon only, 2026-09-10): apply weight decay only to the
+    # decay partition of wd_partition.py (2-D weights); norm gains, biases and the
+    # zero-init couplings get wd 0 as under AdamW. Legacy/absent = False (Muon
+    # decays every parameter; both 640x12 prod runs and hr07 up to 1.1B trained so).
+    _hnd = config_opt.get('MuonHonorNoDecay')
+    self.Opt_MuonHonorNoDecay = False if _hnd is None else bool(_hnd)
     # Muon partition scope (Muon only): which params the internal AdamW gets.
     #   'all-non-trunk' (legacy default): everything outside transformer_layer —
     #       whole heads (incl. hidden 2-D fc), embeddings, norms, biases.

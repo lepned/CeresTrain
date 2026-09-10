@@ -107,6 +107,7 @@ class Muon(torch.optim.Optimizer):
         adamw_lr=None,
         head_split_specs=None,
         lr_ratios=None,
+        wd_scales=None,
     ):
         # adamw_lr: separate learning rate for the internal-AdamW group (heads, embeddings,
         # norms, biases). The docstring always advertised it but it was never implemented -
@@ -173,6 +174,13 @@ class Muon(torch.optim.Optimizer):
         self._lr_ratios = dict(lr_ratios) if lr_ratios else {}
         for p, r in self._lr_ratios.items():
             assert r > 0, f"lr ratio must be positive, got {r}"
+        # Per-PARAM weight-decay scales (MuonHonorNoDecay, 2026-09-10): {param: scale},
+        # multiplied onto the group wd in BOTH branches. 0.0 = the AdamW-style no_decay
+        # set (norm gains, biases, zero-init couplings); absent = 1.0. Construction-time
+        # like lr_ratios, so a checkpoint can never resurrect a stale partition.
+        self._wd_scales = dict(wd_scales) if wd_scales else {}
+        for p, r in self._wd_scales.items():
+            assert r >= 0, f"wd scale must be non-negative, got {r}"
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -252,7 +260,7 @@ class Muon(torch.optim.Optimizer):
 
                 # apply weight decay (family-scaled lr => decay stays
                 # proportional to the actual step size, matching AdamW branch)
-                p.data.mul_(1 - lr_p * wd)
+                p.data.mul_(1 - lr_p * wd * self._wd_scales.get(p, 1.0))
 
                 # apply update
                 p.data.add_(u, alpha=-adjusted_lr)
@@ -291,7 +299,7 @@ class Muon(torch.optim.Optimizer):
                 bias_correction2 = 1 - beta2**step
                 scale = bias_correction1 / bias_correction2**0.5
                 lr_p = lr * self._lr_ratios.get(p, 1.0)
-                p.data.mul_(1 - lr_p * weight_decay)
+                p.data.mul_(1 - lr_p * weight_decay * self._wd_scales.get(p, 1.0))
                 p.data.add_(g, alpha=-lr_p / scale)
 
         return loss
