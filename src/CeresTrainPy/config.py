@@ -13,6 +13,7 @@ If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import json
+from lr_schedule import validate_knots as _validate_lr_knots   # pure module, no torch
 
 """
 Global constants.
@@ -486,6 +487,13 @@ class Configuration:
     # phase, resume its checkpoint uncompiled for a few million positions with this on.
     self.Opt_GradConflictProbeSteps = int(config_opt.get('GradConflictProbeSteps', 0) or 0)
     self.Opt_LRBeginDecayAtFractionComplete = config_opt.get('LRBeginDecayAtFractionComplete', 0.25)
+    # LRKnots (2026-09-11, optional): [[fraction_complete, factor], ...] = piecewise-
+    # linear LR between the hold and the final decay (see lr_schedule.py). The last
+    # knot's fraction must equal LRBeginDecayAtFractionComplete; the final decay
+    # (LRDecayShape) then runs from the last knot's factor to LRMinFactor. Absent =
+    # legacy hold-then-decay. CONFIG-ONLY.
+    self.Opt_LRKnots = _validate_lr_knots(config_opt.get('LRKnots'), self.Opt_LRBeginDecayAtFractionComplete,
+                                          self.Opt_LRMinFactor, self.Opt_NumTrainingPositions)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)
     self.Opt_Beta3 = config_opt.get('Beta3', 0.9999)

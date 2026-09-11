@@ -411,7 +411,6 @@ def on_before_optimizer_step(writer, model, optimizer, pos_num):
 
 def Train():
   global num_pos
-  global fraction_complete
 
   print("**** STARTING ", NAME)
 
@@ -628,9 +627,11 @@ def Train():
 
 
   def num_warmup_positions():
-    # Warmup is 5% of positions (but not more than 100mm).
+    # Warmup is 5% of positions (but not more than 100mm) — lr_schedule.warmup_positions,
+    # shared with the config-load knot validation so the two can never disagree.
     # Note that some sources (e.g. the SOAP paper) suggest long warmups (up to 25% of training data) are beneficial.
-    return int(min(100_000_000, 0.05 * config.Opt_NumTrainingPositions))
+    from lr_schedule import warmup_positions
+    return warmup_positions(config.Opt_NumTrainingPositions)
 
 
   STEPS_AdEMAMix_WARMUP = (num_warmup_positions() // 2) // config.Opt_BatchSizeBackwardPass
@@ -885,39 +886,27 @@ def Train():
   else:
     raise ValueError("Unsupported optimizer: ", config.Opt_Optimizer)
 
-  fraction_complete = 0
 
 
  
   """
   Lambda which determines current learning rate (as a fraction of the maximum).
   """
-  def lr_lambda(epoch : int):
-    global fraction_complete
-    global num_pos
-   
-    # After warmup phase, the LR is held constant until some fraction of training is complete
-    # and thereafter ramps down using a truncated consine decay, terminating around 0.10
-    FRAC_START_DECAY = config.Opt_LRBeginDecayAtFractionComplete
-    _mlr = getattr(config, 'Opt_LRMinFactor', None)
-    MIN_LR = 0.05 if _mlr is None else float(_mlr)  # runde-4: 'or' slukte eksplisitt 0 (full anneal til null)
-    WARMUP_POS = num_warmup_positions()
+  # Shape lives in lr_schedule.py (pure function of position, unit-tested):
+  # inverse-sqrt warmup -> hold at 1.0 -> optional piecewise-linear LRKnots ->
+  # final linear/cosine decay to LRMinFactor from LRBeginDecayAtFractionComplete.
+  # All knot invariants (incl. warmup/floor) are enforced at config load (config.py).
+  from lr_schedule import lr_factor as _lr_factor, describe as _lr_describe
+  MIN_LR = config.Opt_LRMinFactor      # validated + cast in config.py (0 = full anneal to zero)
+  _LR_SHAPE = config.Opt_LRDecayShape
+  _LR_KNOTS = config.Opt_LRKnots
+  print(_lr_describe(LR, config.Opt_NumTrainingPositions, num_warmup_positions(), config.Opt_LRBeginDecayAtFractionComplete,
+                     MIN_LR, _LR_SHAPE, _LR_KNOTS), flush=True)
 
-    if num_pos < WARMUP_POS:
-      return (float(num_pos) / float(WARMUP_POS))**0.5 # inverse square root warmup
-    elif fraction_complete < FRAC_START_DECAY:
-      return 1.0
-    elif fraction_complete > 1:
-      return MIN_LR # shouldn't happen
-    elif getattr(config, 'Opt_LRDecayShape', 'linear') == 'cosine':
-      # half-cosine decay to MIN_LR (reference no-plateau shape when
-      # FRAC_START_DECAY == 0: warmup then cosine over the entire run)
-      _prog = (fraction_complete - FRAC_START_DECAY) / (1.0 - FRAC_START_DECAY)
-      return MIN_LR + (1.0 - MIN_LR) * 0.5 * (1.0 + math.cos(math.pi * _prog))
-    else:
-      # linear deacay to MIN_LR
-      slope = (MIN_LR - 1.0) / (1.0 - FRAC_START_DECAY)
-      return 1.0 + slope * (fraction_complete - FRAC_START_DECAY)
+  def lr_lambda(epoch : int):
+    global num_pos
+    return _lr_factor(num_pos, config.Opt_NumTrainingPositions, num_warmup_positions(),
+                      config.Opt_LRBeginDecayAtFractionComplete, MIN_LR, _LR_SHAPE, _LR_KNOTS)
 
   scheduler = LambdaLR(optimizer, lr_lambda)
 
@@ -2189,7 +2178,6 @@ def Train():
     if _stream_tag is not None:
       _ds_track(_stream_tag, RANK)
 
-    fraction_complete = num_pos / MAX_POSITIONS
     model.train()
 
     # QAT: observe activation ranges for the first CERES_QAT_CALIB_POS positions,
@@ -2279,7 +2267,7 @@ def Train():
         # Start delay: the hard set turns over early, so focusing before the net
         # has matured spends the budget on rows ordinary training resolves anyway
         # (see config.py for the measured turnover).
-        _hr_on = (HARD_REPLAY_SIZE > 0 and fraction_complete >= HARD_REPLAY_START_FRAC)
+        _hr_on = (HARD_REPLAY_SIZE > 0 and num_pos / MAX_POSITIONS >= HARD_REPLAY_START_FRAC)
         # Inject-EMA oppdateres FØR buffer-guarden: ellers fryser den på sin
         # siste verdi når bufferet tømmes, og de to diagnosene som skal avsløre
         # sult rapporterer helse nøyaktig ved sult.
@@ -2876,7 +2864,7 @@ def Train():
     # (forward batch was split batch_size_forward // world_size), so multiply by
     # WORLD_SIZE to count positions across all ranks. WORLD_SIZE==1 single-GPU, so
     # this is unchanged there. Counting globally keeps MAX_POSITIONS, checkpoint
-    # cadence and the LR-decay schedule (fraction_complete) on the same footing as
+    # cadence and the LR schedule (lr_schedule.lr_factor(num_pos, ...)) on the same footing as
     # a single-GPU run rather than running world_size× too long.
     # num_pos counts GROSS positions, replayed rows included — deliberately.
     # Subtracting injected rows was tried (2026-08-19) and reverted the same
