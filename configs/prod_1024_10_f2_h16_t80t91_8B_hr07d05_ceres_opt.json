@@ -11,6 +11,7 @@
   "MuonHonorNoDecay": true,
   "LearningRateBase": 0.0008,
   "LRBeginDecayAtFractionComplete": 0.5,
+  "LRKnots": [[0.25, 1.0], [0.5, 0.75]],
   "LRWarmupPhaseMultiplier": 0.03,
   "LRDecayShape": "cosine",
   "LRMinFactor": 0.05,
