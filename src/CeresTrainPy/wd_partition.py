@@ -17,20 +17,47 @@ computed the loss but never touched this partition. Any new raw nn.Parameter
 and `assert_partition_complete` is what the tests call to prove it has one.
 
 Based on the minGPT recipe (https://github.com/karpathy/minGPT).
-NB: under Muon the no_decay set is INERT (muon.py applies the group weight decay
-to everything it owns); the partition still has to be complete or the assert fires.
+NB: under Muon the no_decay set is INERT unless Opt_MuonHonorNoDecay is on (muon.py
+applies the group weight decay to everything it owns; HonorNoDecay passes per-param
+wd scale 0 for this set); the partition still has to be complete or the assert fires.
+
+2026-09-11 fix: norm-module parameters (RMSNorm.scale, LayerNorm.weight, DyT/Derf
+alpha/gamma/beta) are resolved FIRST, by ownership, wherever they live. Before this
+the `"transformer_layer" in fpn` catch-all sent every trunk norm gain to `decay`
+(the isinstance(BLACKLIST) rule sat below it and never saw them), so HonorNoDecay
+freed biases/embeddings/decoder norms but kept decaying the trunk gains — the
+asymmetric half-measure diagnosed on the 8B run's seg2 (09-10/11).
+NB this is NOT Muon-only: the AdamW-family optimizers build their two param groups
+from these sets, so from this fix on they also stop decaying trunk norm gains
+(the minGPT convention the BLACKLIST always intended). Consequences: (1) post-fix
+AdamW runs differ from pre-fix ones in that respect — train.py logs the count;
+(2) resuming a PRE-fix AdamW-family checkpoint changes the per-group sizes, which
+train.py's resume path treats as a group mismatch => optimizer state starts fresh
+(it says so). Muon is unaffected (single group; wd scales fixed at construction).
 """
 
 import torch
 
-from rms_norm import RMSNorm
-from derf_norm import DerfNorm
-from dyt_norm import DyTNorm
+from rms_norm import NORM_MODULE_TYPES
 from soft_moe_batched_dual import SoftMoEBatchedDual
 from multi_expert import MultiExpertLayer
 
 WHITELIST_WEIGHT_MODULES = (torch.nn.Linear, SoftMoEBatchedDual, MultiExpertLayer)
-BLACKLIST_WEIGHT_MODULES = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm, DerfNorm, DyTNorm)
+# Embedding only: norm types are claimed by ownership (norm_owned_param_names)
+# before any name rule, so listing them here would be dead code.
+BLACKLIST_WEIGHT_MODULES = (torch.nn.Embedding,)
+
+
+def norm_owned_param_names(model):
+  """Full names of every parameter owned DIRECTLY by a norm module
+  (NORM_MODULE_TYPES; recurse=False so a container that merely contains a norm
+  does not match). These are gains/offsets, never weight matrices."""
+  names = set()
+  for mn, m in model.named_modules():
+      if isinstance(m, NORM_MODULE_TYPES):
+          for pn, _ in m.named_parameters(recurse=False):
+              names.add('%s.%s' % (mn, pn) if mn else pn)
+  return names
 
 
 def partition_weight_decay(model):
@@ -39,10 +66,15 @@ def partition_weight_decay(model):
   decay = set()
   no_decay = set()
 
+  # Norm gains are resolved by OWNERSHIP before any name-based rule, so trunk
+  # norms ("transformer_layer.N.ln*") are not swept into `decay` by the catch-all
+  # below. Keep this the first branch: anything inserted above it re-opens the bug.
+  norm_owned = norm_owned_param_names(model)
+
   for mn, m in model.named_modules():
       for pn, p in m.named_parameters():
           fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-          if pn.endswith('bias'):
+          if pn.endswith('bias') or fpn in norm_owned:
               no_decay.add(fpn)
           elif "rpe" in fpn:
               decay.add(fpn)
@@ -125,3 +157,13 @@ def assert_partition_complete(model, decay, no_decay):
   assert len(inter_params) == 0, "parameters %s appear in both decay/no_decay sets" % (str(inter_params), )
   assert len(param_dict.keys() - union_params) == 0, "parameters %s were not fully partitioned into decay/no_decay sets" \
                                               % (str(param_dict.keys() - union_params), )
+  # Owner-based invariant (2026-09-11): every param directly owned by a norm or
+  # embedding module must be in no_decay, wherever it lives in the tree. This is
+  # the check the tests inherit; it is independent of the rule order above.
+  owned_nodecay = set(norm_owned_param_names(model))
+  for mn, m in model.named_modules():
+      if isinstance(m, BLACKLIST_WEIGHT_MODULES):
+          for pn, _ in m.named_parameters(recurse=False):
+              owned_nodecay.add('%s.%s' % (mn, pn) if mn else pn)
+  leaked = owned_nodecay & decay
+  assert not leaked, "norm/embedding-owned parameters landed in the decay set: %s" % (sorted(leaked),)

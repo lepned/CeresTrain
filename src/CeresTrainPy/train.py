@@ -607,9 +607,13 @@ def Train():
   # wd_partition.py (2026-09-02) so tests can run it: the edge-aux raw
   # nn.Parameters (ea4fe1a) died HERE on the bench before step 0 while the
   # smoke test, which never built the optimizer, passed.
-  from wd_partition import partition_weight_decay
+  from wd_partition import partition_weight_decay, norm_owned_param_names
   decay, no_decay = partition_weight_decay(model)
   param_dict = {pn: p for pn, p in model.named_parameters()}
+  _norm_gains = sorted(norm_owned_param_names(model))
+  print(f"[train] wd partition: decay {len(decay)} / no_decay {len(no_decay)} params; "
+        f"{len(_norm_gains)} norm gains ({sum(param_dict[n].numel() for n in _norm_gains):,} elements) in no_decay "
+        f"(incl. trunk norms since 2026-09-11; effective for AdamW-family groups, and for Muon only with MuonHonorNoDecay)", flush=True)
 
   optim_groups = [
       {"params": [param_dict[pn] for pn in sorted(list(decay))  if "rpe_factor" not in pn], "weight_decay": WEIGHT_DECAY},
@@ -1952,9 +1956,13 @@ def Train():
                 f'Optimizer-resume: state[{_idx}][{_k}] shape {tuple(_v.shape)} != param shape '
                 f'{tuple(_pp.shape)} — count-preserving reorder detected; refusing silent moment re-keying')
     if not groups_match:
+      _cur_sizes = [len(g["params"]) for g in current_param_groups]
+      _ld_sizes = [len(g.get("params", [])) for g in loaded_param_groups]
       print(f"[checkpoint-resume] optimizer param_groups mismatch "
-            f"(current={len(current_param_groups)} vs loaded={len(loaded_param_groups)}) — "
-            f"substituting current groups, starting optimizer state fresh")
+            f"(current {len(current_param_groups)} groups, sizes {_cur_sizes}; loaded {len(loaded_param_groups)} groups, "
+            f"sizes {_ld_sizes}) — substituting current groups, starting optimizer state FRESH (moments/preconditioners "
+            f"discarded). Same group count with different sizes = the decay/no_decay partition changed, e.g. a "
+            f"checkpoint from before the 2026-09-11 wd_partition fix (trunk norm gains moved to no_decay).", flush=True)
       loaded_optimizer_state["param_groups"] = current_param_groups
       loaded_optimizer_state["state"] = {}
     if config.Opt_Optimizer == 'Muon' and groups_match:

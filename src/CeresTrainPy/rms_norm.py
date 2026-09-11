@@ -68,3 +68,16 @@ def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Modul
     return DyTNorm(d_model, eps=eps)
   raise ValueError(f"Unknown norm_type: {norm_type!r} (expected one of "
                    "'LayerNorm', 'RMSNorm', 'Derf', 'DyT')")
+
+
+# Every module class whose parameters are NORM GAINS (scale/gamma/alpha/beta).
+# wd_partition.py routes params owned by these to no_decay by ownership, so a
+# norm type added to make_norm above MUST be added here too (review 2026-09-11:
+# the list used to live only in wd_partition.py and a new type would have been
+# swept into `decay` by the trunk catch-all with no assert firing).
+# L2NormScaled = SoftMoE normPhi (dormant: SMOE_USE_NORMALIZATION is hard-off),
+# included so that path is right the day it is armed.
+from derf_norm import DerfNorm
+from dyt_norm import DyTNorm
+from l2norm_scaled import L2NormScaled
+NORM_MODULE_TYPES = (torch.nn.LayerNorm, RMSNorm, DerfNorm, DyTNorm, L2NormScaled)
