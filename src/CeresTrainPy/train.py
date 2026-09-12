@@ -863,9 +863,18 @@ def Train():
     _wd_scales = None
     if getattr(config, 'Opt_MuonHonorNoDecay', False):
       _hnd_scope = getattr(config, 'Opt_MuonHonorNoDecayScope', 'all')
-      # 'trunk' = honour no_decay everywhere EXCEPT the policy path (move-token
-      # decoder + head family), so the trunk keeps the freeing while the decoder
-      # biases / mt_pol_bias / head 1-D params go back under the group wd.
+      # 'trunk' = honour no_decay everywhere EXCEPT the move-token decoder, so the
+      # trunk keeps the freeing while the decoder's 1-D params (its norm gains,
+      # biases and mt_pol_bias) go back under the group wd.
+      #
+      # The classic head family is NOT excluded (2026-09-12, second pass). On a
+      # move-token net the decoder IS the primary policy head and the 1858-way MLP
+      # head is bypassed (ceres_net.py), so headPremap/headSharedLinear feed only
+      # the value/unc/mlh family and policy_head is unused: decaying them cannot
+      # help policy and only costs value. The first version excluded them purely as
+      # a side effect of defining the scope as "not trunk"; measured 1.9B -> 2.0B,
+      # they shrank 3-7 % while value gave back 10 puzzle points.
+      #
       # SUBSTRING matching, like every other family matcher in this function:
       # under torch.compile (and DDP) `model`'s parameter names carry an
       # `_orig_mod.` / `module.` prefix, so a startswith() test on bare
@@ -873,7 +882,7 @@ def Train():
       # "nothing freed" (review 2026-09-12; the CPU check missed it because it
       # built the net uncompiled). The zero-match guards below are the backstop.
       def _hnd_policy_path(pn):
-        return 'move_tokens.' in pn or any(f in pn for f in _HEAD_FAMILY)
+        return 'move_tokens.' in pn
       _in_scope = (lambda pn: True) if _hnd_scope == 'all' else (lambda pn: not _hnd_policy_path(pn))
       _honored = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and _in_scope(pn))
       _kept = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and not _in_scope(pn))
