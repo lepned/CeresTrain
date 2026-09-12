@@ -207,6 +207,9 @@ class Configuration:
     # plausible value source) and re-regularises the policy path. CONFIG-ONLY.
     _hnds = (config_opt.get('MuonHonorNoDecayScope', 'all') or 'all').strip().lower()
     assert _hnds in ('all', 'trunk'), f"MuonHonorNoDecayScope must be 'all' or 'trunk', got {_hnds!r}"
+    if _hnds != 'all' and not self.Opt_MuonHonorNoDecay:
+      print(f"[config] WARNING: MuonHonorNoDecayScope={_hnds!r} is INERT because MuonHonorNoDecay is false "
+            f"(nothing is exempted from weight decay)", flush=True)
     self.Opt_MuonHonorNoDecayScope = _hnds
     # MuonHyperball (Muon only, 2026-09-10, arXiv 2606.16899): the Muon-partition matrices
     # (minus the no_decay/embedding-like set) train on a fixed-Frobenius-norm sphere with a

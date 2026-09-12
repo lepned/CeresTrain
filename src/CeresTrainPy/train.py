@@ -863,8 +863,18 @@ def Train():
     _wd_scales = None
     if getattr(config, 'Opt_MuonHonorNoDecay', False):
       _hnd_scope = getattr(config, 'Opt_MuonHonorNoDecayScope', 'all')
-      _TRUNK_PREFIXES = ('transformer_layer.', 'embedding_layer.')
-      _in_scope = (lambda pn: True) if _hnd_scope == 'all' else (lambda pn: pn.startswith(_TRUNK_PREFIXES))
+      # 'trunk' = honour no_decay everywhere EXCEPT the policy path (move-token
+      # decoder + head family), so the trunk keeps the freeing while the decoder
+      # biases / mt_pol_bias / head 1-D params go back under the group wd.
+      # SUBSTRING matching, like every other family matcher in this function:
+      # under torch.compile (and DDP) `model`'s parameter names carry an
+      # `_orig_mod.` / `module.` prefix, so a startswith() test on bare
+      # 'transformer_layer.' matches NOTHING and the flag degrades silently to
+      # "nothing freed" (review 2026-09-12; the CPU check missed it because it
+      # built the net uncompiled). The zero-match guards below are the backstop.
+      def _hnd_policy_path(pn):
+        return 'move_tokens.' in pn or any(f in pn for f in _HEAD_FAMILY)
+      _in_scope = (lambda pn: True) if _hnd_scope == 'all' else (lambda pn: not _hnd_policy_path(pn))
       _honored = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and _in_scope(pn))
       _kept = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and not _in_scope(pn))
       _wd_scales = {param_dict[pn]: 0.0 for pn in _honored}
@@ -873,6 +883,13 @@ def Train():
             f"({sum(param_dict[pn].numel() for pn in _honored):,} elements); "
             f"{len(_kept)} no_decay params KEPT at wd {WEIGHT_DECAY} ({sum(param_dict[pn].numel() for pn in _kept):,} elements"
             f"{'; e.g. ' + ', '.join(_kept[:4]) if _kept else ''}); decay set at wd {WEIGHT_DECAY}", flush=True)
+      # Refuse silent no-ops, as every other directive in this block does.
+      if not _honored:
+        raise ValueError(f"MuonHonorNoDecay is on but scope {_hnd_scope!r} matched NO no_decay params "
+                         f"(of {len(no_decay)}) — a name-matching bug would otherwise train as if the flag were off")
+      if _hnd_scope != 'all' and not _kept:
+        raise ValueError(f"MuonHonorNoDecayScope {_hnd_scope!r} kept NO params under the group wd "
+                         f"— it is indistinguishable from 'all'; check the policy-path matcher")
     # MuonHyperball: the Muon matrices minus the no_decay (embedding-like) set.
     _hb_params = None; _hb_ratio = 1.0
     if getattr(config, 'Opt_MuonHyperball', False):
