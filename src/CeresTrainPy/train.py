@@ -1841,6 +1841,13 @@ def Train():
       _dropped = [k for k in _ckpt_placement_keys if k not in _model_aux_keys]
       if _dropped:
         print(f"INFO: AUX_HEAD checkpoint keys dropped (env var not set this run): {_dropped}")
+        # 2026-09-11 review: a config-gated zero-init module that was TRAINED in the checkpoint and is now
+        # switched off changes the served net silently. Say so loudly.
+        _dropped_live = [k for k in _dropped if torch.is_tensor(_ckpt_model_sd[k]) and _ckpt_model_sd[k].is_floating_point()
+                         and float(_ckpt_model_sd[k].detach().abs().max()) > 0]
+        if _dropped_live:
+          print(f"WARNING: {len(_dropped_live)} dropped checkpoint tensors are NON-ZERO (trained): disabling their module "
+                f"changes the net's function on resume: {_dropped_live}", flush=True)
         _ckpt_model_sd = {k: v for k, v in _ckpt_model_sd.items() if k not in _dropped}
       _fresh = [k for k in _model_aux_keys if k not in _ckpt_model_sd]
       if _fresh:
@@ -1975,7 +1982,8 @@ def Train():
             f"(current {len(current_param_groups)} groups, sizes {_cur_sizes}; loaded {len(loaded_param_groups)} groups, "
             f"sizes {_ld_sizes}) — substituting current groups, starting optimizer state FRESH (moments/preconditioners "
             f"discarded). Same group count with different sizes = the decay/no_decay partition changed, e.g. a "
-            f"checkpoint from before the 2026-09-11 wd_partition fix (trunk norm gains moved to no_decay).", flush=True)
+            f"checkpoint from before the 2026-09-11 wd_partition fix (trunk norm gains moved to no_decay), or a "
+            f"config-gated zero-init module newly enabled/disabled this run (its params join/leave a group).", flush=True)
       loaded_optimizer_state["param_groups"] = current_param_groups
       loaded_optimizer_state["state"] = {}
     if config.Opt_Optimizer == 'Muon' and groups_match:

@@ -2783,10 +2783,11 @@ class CeresNet(nn.Module):
         _mt_log['mt_missing_target_rate'] = 1.0 - _hit.mean()
         for _k, _v in _mt_stats.items():
           _mt_log[_k] = _v
-        _mt_log['mt_pol_w_rms'] = self.move_tokens.pol.weight.float().pow(2).mean().sqrt()
-        _mt_log['mt_pol_bias_rms'] = self.move_tokens.mt_pol_bias.float().pow(2).mean().sqrt()
-        if self.move_tokens.value_inject_dim > 0:
-          _mt_log['mt_vinject_rms'] = self.move_tokens.v_inject.weight.float().pow(2).mean().sqrt()
+        if log_stats:   # parameter-only diagnostics: no reason to reduce them on the ~99.9 % of steps that never log
+          _mt_log['mt_pol_w_rms'] = self.move_tokens.pol.weight.float().pow(2).mean().sqrt()
+          _mt_log['mt_pol_bias_rms'] = self.move_tokens.mt_pol_bias.float().pow(2).mean().sqrt()
+          if self.move_tokens.value_inject_dim > 0:
+            _mt_log['mt_vinject_rms'] = self.move_tokens.v_inject.weight.float().pow(2).mean().sqrt()
 
     # EDGE-AUX (boelge 13 / P1): par-supervisjon paa planets kant-tilstand.
     # Two targets on the final [B,32,32,C] edge state, both restricted to

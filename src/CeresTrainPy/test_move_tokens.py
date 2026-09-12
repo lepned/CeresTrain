@@ -423,7 +423,7 @@ def main():
   except ImportError:
     print('  (onnx_ir not installed here: post-move/value-query export parity skipped)')
 
-  # --- 4d. export-fused eval path == unfused (shared square norm + single K/V GEMM, one-gather assembly)
+  # --- 4f. export-fused eval path == unfused (shared square norm + single K/V GEMM, one-gather assembly)
   net.eval()
   with torch.no_grad():
     for _i, _blk in enumerate(net.move_tokens.blocks):     # non-trivial norm scales so the fold is exercised
@@ -437,7 +437,7 @@ def main():
   assert dpol < 1e-4 and dval < 1e-4, (dpol, dval)
   print(f'  export-fused path OK: identical to unfused (policy max|d| {dpol:.1e}, value {dval:.1e})')
 
-  # --- 4c. export-time token cap: equivariance => identical logits when all fit ---
+  # --- 4g. export-time token cap: equivariance => identical logits when all fit ---
   net.eval()
   with torch.no_grad():
     cnt = net.move_tokens.candidates(sq[:, :, 0:13])[0].sum(dim=1)

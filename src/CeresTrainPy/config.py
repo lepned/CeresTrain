@@ -695,12 +695,11 @@ class Configuration:
     if self.NetDef_MoveTokenValuePool not in ('meanmax', 'policy', 'both'):
       raise ValueError(f'MoveTokenValuePool must be meanmax|policy|both, got {self.NetDef_MoveTokenValuePool!r}')
     if not self.NetDef_UseMoveTokens:
-      for _k in ('MoveTokenDim', 'MoveTokenLayers', 'MoveTokenHeads', 'MoveTokenFFNMult', 'MoveTokenMax',
-                 'MoveTokenValueInject', 'MoveTokenPolBias', 'MoveTokenRichFeatures', 'MoveTokenExpectedValue', 'MoveTokenSquareUpdate',
-                 'MoveTokenValuePool', 'MoveTokenValuePoolDetach', 'MoveTokenPostMove', 'MoveTokenValueQuery',
-                 'MoveTokenOppMax', 'MoveTokenOppPool', 'MoveTokenWriteBack'):
-        if _k in config_net_def:
-          raise ValueError(f'{_k} is set but UseMoveTokens is off — silent no-op refused')
+      # Prefix rule (2026-09-11 review): every NetDef MoveToken* key is a decoder knob, so a hand-kept
+      # tuple only drifts; this also catches misspelt MoveToken* keys.
+      _stray = sorted(k for k in config_net_def if k.startswith('MoveToken'))
+      if _stray:
+        raise ValueError(f'{", ".join(_stray)} is set but UseMoveTokens is off — silent no-op refused')
       if getattr(self, 'Opt_LearningRateDecoderRatio', None) is not None:
         raise ValueError('LearningRateDecoderRatio is set but UseMoveTokens is off (silent no-op refused)')
       if getattr(self, 'Opt_MuonAdamWScope', None) == 'all-non-trunk+decoder':
