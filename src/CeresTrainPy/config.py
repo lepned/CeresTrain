@@ -197,6 +197,17 @@ class Configuration:
     # decays every parameter; both 640x12 prod runs and hr07 up to 1.1B trained so).
     _hnd = config_opt.get('MuonHonorNoDecay')
     self.Opt_MuonHonorNoDecay = False if _hnd is None else bool(_hnd)
+    # MuonHonorNoDecayScope (2026-09-12): which part of the no_decay set the flag
+    # honours. 'all' (default) = every no_decay param at wd 0. 'trunk' = only the
+    # trunk family (transformer_layer.* and embedding_layer.*) at wd 0; everything
+    # under move_tokens.* and the heads keeps the group wd. Motivation: on the 8B
+    # run 'all' freed the decoder's biases/norms and the per-move policy bias
+    # (mt_pol_bias RMS +48 % in 400M) and policy regressed both on puzzles and
+    # in-distribution while value gained; 'trunk' keeps the trunk freeing (the
+    # plausible value source) and re-regularises the policy path. CONFIG-ONLY.
+    _hnds = (config_opt.get('MuonHonorNoDecayScope', 'all') or 'all').strip().lower()
+    assert _hnds in ('all', 'trunk'), f"MuonHonorNoDecayScope must be 'all' or 'trunk', got {_hnds!r}"
+    self.Opt_MuonHonorNoDecayScope = _hnds
     # MuonHyperball (Muon only, 2026-09-10, arXiv 2606.16899): the Muon-partition matrices
     # (minus the no_decay/embedding-like set) train on a fixed-Frobenius-norm sphere with a
     # fixed relative update norm instead of weight decay. HyperballRelativeLR = the paper's

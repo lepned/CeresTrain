@@ -862,10 +862,17 @@ def Train():
     # both Muon branches (it was INERT under Muon: the group wd hit every param).
     _wd_scales = None
     if getattr(config, 'Opt_MuonHonorNoDecay', False):
-      _wd_scales = {param_dict[pn]: 0.0 for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad}
+      _hnd_scope = getattr(config, 'Opt_MuonHonorNoDecayScope', 'all')
+      _TRUNK_PREFIXES = ('transformer_layer.', 'embedding_layer.')
+      _in_scope = (lambda pn: True) if _hnd_scope == 'all' else (lambda pn: pn.startswith(_TRUNK_PREFIXES))
+      _honored = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and _in_scope(pn))
+      _kept = sorted(pn for pn in no_decay if pn in param_dict and param_dict[pn].requires_grad and not _in_scope(pn))
+      _wd_scales = {param_dict[pn]: 0.0 for pn in _honored}
       _n_all = sum(1 for _p in model.parameters() if _p.requires_grad)
-      print(f"[train] Muon honors no_decay: {len(_wd_scales)} of {_n_all} params at wd 0 "
-            f"(norm gains/biases/zero-init couplings); decay set at wd {WEIGHT_DECAY}", flush=True)
+      print(f"[train] Muon honors no_decay (scope {_hnd_scope!r}): {len(_honored)} of {_n_all} params at wd 0 "
+            f"({sum(param_dict[pn].numel() for pn in _honored):,} elements); "
+            f"{len(_kept)} no_decay params KEPT at wd {WEIGHT_DECAY} ({sum(param_dict[pn].numel() for pn in _kept):,} elements"
+            f"{'; e.g. ' + ', '.join(_kept[:4]) if _kept else ''}); decay set at wd {WEIGHT_DECAY}", flush=True)
     # MuonHyperball: the Muon matrices minus the no_decay (embedding-like) set.
     _hb_params = None; _hb_ratio = 1.0
     if getattr(config, 'Opt_MuonHyperball', False):
