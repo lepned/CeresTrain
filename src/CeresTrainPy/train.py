@@ -267,7 +267,19 @@ def _setup_distributed():
   rank = int(os.environ.get('RANK', '0') or 0)
   local_rank = int(os.environ.get('LOCAL_RANK', '0') or 0)
   backend = os.environ.get('CERES_DDP_BACKEND', 'nccl')
-  dist.init_process_group(backend=backend, init_method='env://')
+  # Collective timeout. The NCCL default is 10 min, which the DATA-STREAM RESUME can
+  # legitimately exceed: each worker fast-forwards its in-progress shards by decompressing
+  # them, and a single T91 shard can hold ~56-94M positions. On the 2026-09-12 2.0B resume
+  # rank 0 was still inside its loader when ranks 2/3 hit the 600 s watchdog on a BROADCAST,
+  # and the watchdog took the whole job down (SIGABRT) after one training step. The cost of
+  # a longer timeout is only how late a genuine hang is reported; the cost of too short a
+  # one is a dead 4-GPU run. Override with CERES_DDP_TIMEOUT_MIN.
+  _ddp_timeout_min = float(os.environ.get('CERES_DDP_TIMEOUT_MIN', '60') or 60)
+  dist.init_process_group(backend=backend, init_method='env://',
+                          timeout=datetime.timedelta(minutes=_ddp_timeout_min))
+  if int(os.environ.get('RANK', '0') or 0) == 0:
+    print(f'[ddp] collective timeout {_ddp_timeout_min:g} min (CERES_DDP_TIMEOUT_MIN); '
+          f'covers long data-stream fast-forwards on resume', flush=True)
   if torch.cuda.is_available():
     gpu = local_rank if local_rank < torch.cuda.device_count() else 0
     torch.cuda.set_device(gpu)
