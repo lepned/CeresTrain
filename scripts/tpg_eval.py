@@ -32,6 +32,14 @@ computed per record; --aux overrides it for configs predating that key.
 # Until it is rewritten to decode shards through TPGDataset instead of its own
 # offsets, use the EngineBattle puzzle gates (run_v5_gate.ps1) for any
 # comparison that informs a decision.
+#
+# For MODEL-FREE questions about the data itself (target sharpness, drawishness,
+# deblunder rate, corpus-vs-corpus comparison) use scripts/tpg_peek.py instead.
+# It decodes the same records but states the layout once and cross-checks it
+# three ways (byte-accounting at both square widths, constants read out of
+# tpg_dataset.py, and a runtime probability-vector check that makes a misaligned
+# stride raise instead of returning plausible numbers). See test_tpg_peek.py.
+# It does NOT run the model, so it does not replace the gates above.
 
 import argparse, os, sys, time
 import numpy as np
