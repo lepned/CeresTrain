@@ -48,6 +48,7 @@ No per-sample weight matmuls (the dual_plane rel_gains 46x-slowdown class).
 import os
 import torch
 from torch import nn
+import torch.nn.functional as F
 from rms_norm import make_norm
 from chess_geometry import VisibilityChannels
 from lc0_moves_1858 import MOVES_1858, FROM_1858, TO_1858
@@ -346,7 +347,13 @@ class MoveTokenDecoder(nn.Module):
     #  * ONE shared RMS normalisation of the 64 squares + ONE GEMM producing every
     #    block's cross-attn K|V (each block's ln_s scale is folded into its xkv weight:
     #    W_kv (n * s) == (W_kv * s^T) n), instead of L norms + L GEMMs;
-    #  * one gather for (from,to) and one gather for the two square embeddings.
+    #  * one gather for (from,to) and one gather for the two square embeddings;
+    #  * PROJECT-THEN-GATHER for w_in: the 64 squares are projected through w_in's
+    #    from/to column blocks ONCE and the gather then moves dm-wide rows instead of
+    #    s_dim-wide ones (4x less traffic at 1024->256; the [B,M,2*s_dim] token tensor
+    #    never exists), with the projection shared by the opponent branch. Exact, not
+    #    an approximation -- see _w_in_squares. Motivated by the 2026-09-13 TRT
+    #    profile: token assembly was the single costliest decoder-region layer.
     # Only for RMSNorm blocks. CERES_MT_FUSED_EXPORT=0 disables (A/B timing).
     self.export_fused = (os.environ.get('CERES_MT_FUSED_EXPORT', '1') or '1').strip() not in ('0', '')
     # Candidate source: private visibility module ('vis' family only). Its
@@ -453,6 +460,42 @@ class MoveTokenDecoder(nn.Module):
       ok = ok and isinstance(self.vq_block.ln_s, RMSNorm)
     return ok
 
+  def _w_in_squares(self, flow):
+    """PROJECT-THEN-GATHER, half 1 of 2: push the 64 squares through w_in's from/to
+    column blocks once, so the gather moves dm-wide rows instead of s_dim-wide ones.
+
+    w_in is a Linear over concat(flow[from], flow[to], rest), and a linear map over a
+    concatenation is the sum of its column blocks:
+
+        w_in(cat(a, b, r)) == a @ W_from^T + b @ W_to^T + r @ W_rest^T + bias
+
+    so projecting first and gathering second is the SAME function, not an
+    approximation — no weight migration, no retrain, exact in real arithmetic (FP16
+    differs only in accumulation order; verify with scripts/verify_serving_parity.py).
+
+    The win is traffic, and it is why this is worth doing at all: the gathered/
+    materialised token tensor drops from [B, M, 2*s_dim] to [B, M, dm] (1024 -> 256
+    per half here, 4x), and the projection now runs over 64 squares once instead of
+    over M move tokens — and is REUSED by the opponent branch, which gathers against
+    the same squares. Returns [B, 128, dm]: rows 0..63 = from-projection, 64..127 =
+    to-projection, stacked so one gather still serves both (see _w_in_fused).
+    """
+    S = flow.shape[2]
+    W = self.w_in.weight
+    return torch.cat([F.linear(flow, W[:, :S]), F.linear(flow, W[:, S:2 * S])], dim=1)
+
+  def _w_in_fused(self, P, fr, to, rest, S):
+    """PROJECT-THEN-GATHER, half 2 of 2: one gather over the stacked projection.
+
+    `to + 64` indexes into the to-half of P, so the single gather of the existing
+    fused path is preserved (same kernel count) while moving 4x fewer bytes.
+    """
+    dm = P.shape[-1]
+    idx = torch.cat([fr, to + 64], dim=1)                                    # [B,2M]
+    g = torch.gather(P, 1, idx.unsqueeze(-1).expand(-1, -1, dm))             # [B,2M,dm]
+    m = fr.shape[1]
+    return g[:, :m] + g[:, m:] + F.linear(rest, self.w_in.weight[:, 2 * S:], self.w_in.bias)
+
   def set_export_max(self, m: int):
     """EXPORT-TIME token cap. The decoder is permutation-equivariant with masking and
     no buffer depends on M, so a net trained at M=128 can be exported at a smaller M
@@ -530,21 +573,25 @@ class MoveTokenDecoder(nn.Module):
     sel = torch.topk(score, self.M, dim=1).indices                          # [B,M]
     valid = torch.gather(cand, 1, sel) > 0.5                                 # [B,M]
     _fused = self.export_fused and not self.training and self._fusable()
+    P = None
     if _fused:
       ft = torch.gather(self.pair_ft.unsqueeze(0).expand(B, -1, -1), 1, sel.unsqueeze(-1).expand(-1, -1, 2))
       fr, to = ft[..., 0], ft[..., 1]                                          # [B,M] each
-      f_both = torch.gather(flow, 1, torch.cat([fr, to], dim=1).unsqueeze(-1).expand(-1, -1, S))
-      f_from, f_to = f_both[:, :self.M], f_both[:, self.M:]
+      P = self._w_in_squares(flow)                                             # [B,128,dm]
     else:
       fr = torch.gather(self.pair_from.unsqueeze(0).expand(B, -1), 1, sel)   # [B,M]
       to = torch.gather(self.pair_to.unsqueeze(0).expand(B, -1), 1, sel)
       f_from = torch.gather(flow, 1, fr.unsqueeze(-1).expand(-1, -1, S))
       f_to = torch.gather(flow, 1, to.unsqueeze(-1).expand(-1, -1, S))
     e_pair = torch.gather(E.reshape(B, 4096, 4), 1, sel.unsqueeze(-1).expand(-1, -1, 4)).to(flow.dtype)
-    parts = [f_from, f_to, e_pair]
+    rest = [e_pair]
     if self.rich_features:
-      parts.append(self.rich(squares13, E, fr, to).to(flow.dtype))
-    x = self.w_in(torch.cat(parts, dim=-1))                                  # [B,M,dm]
+      rest.append(self.rich(squares13, E, fr, to).to(flow.dtype))
+    rest = torch.cat(rest, dim=-1) if len(rest) > 1 else rest[0]
+    if _fused:
+      x = self._w_in_fused(P, fr, to, rest, S)                               # [B,M,dm]
+    else:
+      x = self.w_in(torch.cat([f_from, f_to, rest], dim=-1))                 # [B,M,dm]
     key_bias = ((~valid).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M)
     x_opp = opp_bias = None
     valid_o = None
@@ -554,10 +601,17 @@ class MoveTokenDecoder(nn.Module):
       sel_o = torch.topk(score_o, self.M_opp, dim=1).indices                 # [B,Mo]
       valid_o = torch.gather(cand_o, 1, sel_o) > 0.5
       fto = torch.gather(self.pair_ft.unsqueeze(0).expand(B, -1, -1), 1, sel_o.unsqueeze(-1).expand(-1, -1, 2))
-      f_both_o = torch.gather(flow, 1, torch.cat([fto[..., 0], fto[..., 1]], dim=1).unsqueeze(-1).expand(-1, -1, S))
       e_pair_o = torch.gather(E.reshape(B, 4096, 4), 1, sel_o.unsqueeze(-1).expand(-1, -1, 4)).to(flow.dtype)
-      x_opp = self.w_in(torch.cat([f_both_o[:, :self.M_opp], f_both_o[:, self.M_opp:], e_pair_o], dim=-1)) \
-              + self.opp_side.to(flow.dtype)
+      if _fused:
+        # Reuses the SAME square projection as the own-move branch (P): the opponent
+        # tokens gather against the same 64 squares, so this branch costs one gather
+        # and no extra GEMM. (rich_features is asserted off whenever M_opp > 0, so
+        # w_in's rest-block here is exactly the 4 e_pair columns.)
+        x_opp = self._w_in_fused(P, fto[..., 0], fto[..., 1], e_pair_o, S)
+      else:
+        f_both_o = torch.gather(flow, 1, torch.cat([fto[..., 0], fto[..., 1]], dim=1).unsqueeze(-1).expand(-1, -1, S))
+        x_opp = self.w_in(torch.cat([f_both_o[:, :self.M_opp], f_both_o[:, self.M_opp:], e_pair_o], dim=-1))
+      x_opp = x_opp + self.opp_side.to(flow.dtype)
       opp_bias = ((~valid_o).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M_opp)
     pm = None
     if self.post_move:

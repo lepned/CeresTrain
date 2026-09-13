@@ -39,6 +39,53 @@ def pairs_of(cand):
   return {(int(i) // 64, int(i) % 64) for i in torch.nonzero(cand[0] > 0.5).reshape(-1)}
 
 
+def check_w_in_project_then_gather():
+  """w_in project-then-gather (export-fused) must be the SAME FUNCTION, not an approximation.
+
+  The fused path projects the 64 squares through w_in's from/to column blocks once and
+  gathers dm-wide rows; the unfused path gathers s_dim-wide squares and applies w_in to
+  the concatenation. Linearity says these agree exactly, so in float64 the only
+  difference allowed is reassociation noise. Covers the rest-block variants that change
+  w_in's column layout (plain / rich_features) and the opponent branch, which reuses the
+  own-move projection.
+  """
+  start_own = {**{f + '2': 'P' for f in 'abcdefgh'}, 'a1': 'R', 'h1': 'R', 'b1': 'N', 'g1': 'N',
+               'c1': 'B', 'f1': 'B', 'd1': 'Q', 'e1': 'K'}
+  start_opp = {**{f + '7': 'P' for f in 'abcdefgh'}, 'a8': 'R', 'h8': 'R', 'b8': 'N', 'g8': 'N',
+               'c8': 'B', 'f8': 'B', 'd8': 'Q', 'e8': 'K'}
+  squares = board_from_pieces(start_own, start_opp).repeat(2, 1, 1)
+
+  cases = [('plain', {}),
+           ('rich_features', {'rich_features': True}),
+           ('opp tokens', {'opp_max': 16, 'opp_pool': True})]
+  for label, kwargs in cases:
+    torch.manual_seed(0)
+    dec = MoveTokenDecoder(s_dim=32, norm_type='RMSNorm', dm=32, layers=1, heads=2,
+                           max_tokens=64, **kwargs).double().eval()
+    assert dec._fusable(), f'{label}: fused path not eligible, test would be vacuous'
+    torch.manual_seed(1)
+    flow = torch.randn(2, 64, 32, dtype=torch.float64)
+    sq = squares.double()
+
+    with torch.no_grad():
+      dec.export_fused = True
+      fused = dec(sq, flow)
+      dec.export_fused = False
+      plain = dec(sq, flow)
+
+    worst = 0.0
+    for i, (a, b) in enumerate(zip(fused, plain)):
+      if not (torch.is_tensor(a) and torch.is_tensor(b)):
+        continue
+      assert a.shape == b.shape, f'{label}: output {i} shape {a.shape} vs {b.shape}'
+      if a.dtype.is_floating_point:
+        worst = max(worst, float((a - b).abs().max()))
+      else:
+        assert torch.equal(a, b), f'{label}: integer/bool output {i} differs'
+    assert worst < 1e-9, f'{label}: fused vs unfused differ by {worst:.3e} in float64 -- not exact'
+    print(f'  w_in project-then-gather [{label}]: max |fused - unfused| = {worst:.2e} (float64)')
+
+
 def main():
   dec = MoveTokenDecoder(s_dim=32, norm_type='RMSNorm', dm=32, layers=1, heads=2, max_tokens=64)
   # --- 1. candidate superset ---------------------------------------------
@@ -564,6 +611,7 @@ def main():
       print(f'  rejection OK ({name}): {str(e)[:60]}')
     finally:
       os.environ.pop('CERES_POLICY_HEAD_FORM', None)
+  check_w_in_project_then_gather()
   print('ALL OK')
 
 
