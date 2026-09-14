@@ -1849,7 +1849,9 @@ def Train():
     # zero-init — fresh-initializing on warm start reproduces the base net.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_pool_inject.', 'value2_pool_inject.')
     def _is_aux_key(k):
-      return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k
+      # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
+      # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.
+      return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
 
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # Placement value head etc. are config/env-gated, so their params can
@@ -1885,6 +1887,13 @@ def Train():
           _vh_sd = model_nocompile.value_head.state_dict()
           model_nocompile.vda_aux_head.load_state_dict(_vh_sd)
           print("INFO: VDA mode-4 warm start — vda_aux_head inherited value_head weights", flush=True)
+        # Gated attention output switched on at resume (2026-09-14): fold 1/sigmoid(bias) into every
+        # layer's loaded W_h so the switched net is function-identical to the checkpoint (gate_fold.py).
+        if any('.attn_out_gate.' in k for k in _fresh):
+          from gate_fold import fold_gate_on_warm_start
+          _n_fold, _g0 = fold_gate_on_warm_start(model_nocompile)
+          print(f"INFO: GATED ATTENTION OUTPUT enabled on resume: W_h scaled by 1/sigmoid(bias) = 1/{_g0:.4f} in {_n_fold} layers "
+                f"=> function-identical to the checkpoint at the switch (optimizer state restarts: group sizes changed)", flush=True)
       else:
         # load checkpoint parameters, expect all to match (strict = True)
         model_nocompile.load_state_dict(_ckpt_model_sd, strict = True)
