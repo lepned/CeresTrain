@@ -52,23 +52,29 @@ say "checkpoint ready: $CK"
 cd $REPO || exit 1
 git fetch origin && git reset --hard origin/main || exit 1
 say "repo at $(git rev-parse --short HEAD)"
-CHANGED=0
+# The invariant is per-LINE, not per-file: every differing line, in every config, must
+# name a KEY field. The old check also demanded exactly ONE differing FILE — a proxy that
+# breaks as soon as an intended change spans net + opt (e.g. an architecture key in the
+# net config alongside opt-config knobs), while allowing several unrelated keys inside one
+# file. Per-line is both stricter and more expressive.
+CHANGED=0; OTHER=0; MATCHED=0
 for f in data exec monitoring net opt; do
   n=${ID}_ceres_$f.json
-  if ! diff -q <(tr -d '\r' < $REPO/configs/$n) <(tr -d '\r' < $OUT/configs/$n) >/dev/null 2>&1; then
+  if ! diff -q <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) >/dev/null 2>&1; then
     say "differs: $f"
-    diff <(tr -d '\r' < $REPO/configs/$n) <(tr -d '\r' < $OUT/configs/$n) | sed 's/^/    /'
+    diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | sed 's/^/    /'
     CHANGED=$((CHANGED+1))
-    OTHER=$(diff <(tr -d '\r' < $REPO/configs/$n) <(tr -d '\r' < $OUT/configs/$n) \
-            | grep -E '^[<>]' | grep -vEc "$KEY")
+    _lines=$(diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | grep -cE '^[<>]')
+    _ok=$(diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | grep -E '^[<>]' | grep -cE "$KEY")
+    OTHER=$((OTHER + _lines - _ok)); MATCHED=$((MATCHED + _ok))
   fi
 done
-if [ "$CHANGED" -ne 1 ] || [ "${OTHER:-1}" -ne 0 ]; then
-  say "ABORT: expected exactly ONE file differing, on $KEY lines only"
-  say "       (files differing: $CHANGED, non-$KEY diff lines: ${OTHER:-n/a})"
+if [ "$CHANGED" -eq 0 ] || [ "$OTHER" -ne 0 ] || [ "$MATCHED" -eq 0 ]; then
+  say "ABORT: every differing config line must name /$KEY/"
+  say "       (files differing: $CHANGED, matching lines: $MATCHED, NON-matching: $OTHER)"
   exit 1
 fi
-say "pre-flight OK: single-knob change on $KEY confirmed"
+say "pre-flight OK: $MATCHED differing line(s) across $CHANGED file(s), all naming /$KEY/"
 
 # ---- 3. install configs, point the resume at the real checkpoint ----
 cp $REPO/configs/${ID}_ceres_*.json $OUT/configs/ || exit 1
