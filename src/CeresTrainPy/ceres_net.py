@@ -1551,11 +1551,13 @@ class CeresNet(nn.Module):
     # owner is refused loudly (the plane's decode, fromto form, ray-context, and
     # the eval-only serve blends that would reassign policy_out at export).
     self.use_move_tokens = bool(getattr(config, 'NetDef_UseMoveTokens', False))
+    self.mt_mix_layers = []   # trunk-layer-mix sources (see MoveTokenTrunkMix); empty = off
     self._last_mt = None
     self._last_mt_aux_out = None
     self.mt_aux_mlp_w = float(getattr(config, 'Opt_LossMoveTokenAuxMLPMultiplier', 0) or 0) if self.use_move_tokens else 0.0
     if self.use_move_tokens:
-      from move_tokens import MoveTokenDecoder
+      from move_tokens import MoveTokenDecoder, REL_NAMES, NREL
+      self._mt_rel_names, self._mt_nrel = REL_NAMES, NREL
       if getattr(self, 'dp_policy_decode', False):
         raise ValueError('UseMoveTokens owns the policy: DualPlanePolicyDecode (and its candidate/'
                          'victim/edge/degree/check-chain decodes) must be off')
@@ -1582,6 +1584,10 @@ class CeresNet(nn.Module):
       _mt_wb = bool(getattr(config, 'NetDef_MoveTokenWriteBack', False))
       _mt_ev = bool(getattr(config, 'NetDef_MoveTokenExpectedValue', False))
       _mt_su = bool(getattr(config, 'NetDef_MoveTokenSquareUpdate', False))
+      _mt_rel = bool(getattr(config, 'NetDef_MoveTokenRelBias', False))   # 2026-09-11 relational self-attn bias
+      # 2026-09-11 trunk layer mix (config-validated list of effective layer indices, 0 = post-embedding).
+      _mt_mix = [int(k) for k in (getattr(config, 'NetDef_MoveTokenTrunkMix', None) or [])]
+      self.mt_mix_layers = _mt_mix
       self.mt_expected_value = _mt_ev
       if _mt_su and self.value_head_channels > 0:
         raise ValueError('MoveTokenSquareUpdate needs the plain shared head front-end (ValueHeadChannels must be 0)')
@@ -1610,7 +1616,7 @@ class CeresNet(nn.Module):
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
           post_move=_mt_pm, value_query=_mt_vq, value_order=self.mt_vord_w > 0,
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
-          expected_value=_mt_ev, square_update=_mt_su)
+          expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel)
       if _mt_ev:
         # ev [B] -> WDL logits through a zero-init 3-vector: exact step-0 no-op; the value
         # target then teaches both the direction and (through w_ev) the per-token scalars.
@@ -1629,6 +1635,8 @@ class CeresNet(nn.Module):
             f'opponent keys {("ON Mo=%d%s" % (_mt_opp, " +pool" if _mt_opp_pool else "")) if _mt_opp > 0 else "off"}; '
             f'square write-back {"ON" if _mt_wb else "off"}; '
             f'expected-value readout {"ON" if _mt_ev else "off"}; per-block square update {"ON" if _mt_su else "off"}; '
+            f'trunk layer mix {("ON (zero-init gains on states %s)" % _mt_mix) if _mt_mix else "off"}; '
+            f'relational self-attn bias {"ON (zero-init, %d relations)" % NREL if _mt_rel else "off"}; '
             f'absent-move floor {-30.0}')
 
 
@@ -1864,7 +1872,11 @@ class CeresNet(nn.Module):
     # Depth-attention state collection: RAW references for ALL modes (deferred
     # pooling — zero ops in the trunk, all compute at the tail; activations are
     # alive for backward anyway so collection is free).
-    if self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training):
+    # The move-token trunk-layer mix (MoveTokenTrunkMix) reads the same list: vda_states[k] is the
+    # state after effective layer k (0 = post-embedding), for every LoopCount.
+    _collect_states = (self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training)
+                       or bool(self.mt_mix_layers))
+    if _collect_states:
       vda_states = [flow]  # post-embedding state
     rpe_src_tensor = flow if (self.rpe_from_embedding and not self.rpe_genphase) else None  # post-embedding, pre-layer-1
     rpe_gen_biases = self._rpe_genphase_biases(flow) if (self.rpe_from_embedding and self.rpe_genphase) else None
@@ -1896,7 +1908,7 @@ class CeresNet(nn.Module):
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
-        if self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training):
+        if _collect_states:
           vda_states.append(flow)  # post-layer (post-DWA if denseformer)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
@@ -1956,7 +1968,8 @@ class CeresNet(nn.Module):
     # can add to `flow` ahead of headPremap; the policy/inject readout happens further down.
     _mt_out = None
     if getattr(self, 'use_move_tokens', False):
-      _mt_out = self.move_tokens(squares[:, :, 0:13].to(flow.dtype), flow)
+      _mt_out = self.move_tokens(squares[:, :, 0:13].to(flow.dtype), flow,
+                                 mix_states=[vda_states[k] for k in self.mt_mix_layers] if self.mt_mix_layers else None)
       if _mt_out[5] is not None:
         flow = flow + _mt_out[5].to(flow.dtype)
     if self.use_gtab:
@@ -2788,6 +2801,12 @@ class CeresNet(nn.Module):
           _mt_log['mt_pol_bias_rms'] = self.move_tokens.mt_pol_bias.float().pow(2).mean().sqrt()
           if self.move_tokens.value_inject_dim > 0:
             _mt_log['mt_vinject_rms'] = self.move_tokens.v_inject.weight.float().pow(2).mean().sqrt()
+          for _j, _g in enumerate(getattr(self.move_tokens, 'mix_gain', [])):   # trunk-layer-mix gains: which layers the decoder reads
+            _mt_log[f'mt_mix_gain_rms_{_j}'] = _g.float().pow(2).mean().sqrt()
+          if self.move_tokens.rel_bias:   # relational bias: which relations the decoder uses (RMS over blocks x heads)
+            _rw = torch.stack([b.rel_w.float().reshape(self._mt_nrel, b.h) for b in self.move_tokens.blocks])   # [L,NREL,H]
+            for _rn, _v in zip(self._mt_rel_names, _rw.pow(2).mean(dim=(0, 2)).sqrt().tolist()):   # one reduction, one sync
+              _mt_log[f'mt_rel_{_rn}_rms'] = _v
 
     # EDGE-AUX (boelge 13 / P1): par-supervisjon paa planets kant-tilstand.
     # Two targets on the final [B,32,32,C] edge state, both restricted to

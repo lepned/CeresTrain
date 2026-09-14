@@ -791,7 +791,10 @@ def Train():
                     # slow every head EXCEPT the real policy readout. Decoder BODY stays out (that is
                     # LearningRateDecoderRatio, which starved the value inject at 25M when applied whole).
                     'move_tokens.pol.', 'move_tokens.mt_pol_bias', 'move_tokens.v_inject.',
-                    'move_tokens.v2_inject.', 'move_tokens.vord.', 'move_tokens.ev_head.', 'mt_ev_dir')
+                    'move_tokens.v2_inject.', 'move_tokens.vord.', 'move_tokens.ev_head.', 'mt_ev_dir',
+                    # 2026-09-11 review: the trunk-layer-mix gains are zero-init couplings of the same class as
+                    # the injects (readers, not decoder body) -> same family, so a heads ratio treats them alike.
+                    'move_tokens.mix_gain.')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
@@ -1864,8 +1867,8 @@ def Train():
       _dropped = [k for k in _ckpt_placement_keys if k not in _model_aux_keys]
       if _dropped:
         print(f"INFO: AUX_HEAD checkpoint keys dropped (env var not set this run): {_dropped}")
-        # 2026-09-11 review: a config-gated zero-init module that was TRAINED in the checkpoint and is now
-        # switched off changes the served net silently. Say so loudly.
+        # 2026-09-11 review: a config-gated zero-init module (e.g. MoveTokenTrunkMix) that was TRAINED in the
+        # checkpoint and is now switched off changes the served net silently. Say so loudly.
         _dropped_live = [k for k in _dropped if torch.is_tensor(_ckpt_model_sd[k]) and _ckpt_model_sd[k].is_floating_point()
                          and float(_ckpt_model_sd[k].detach().abs().max()) > 0]
         if _dropped_live:
@@ -2013,7 +2016,7 @@ def Train():
             f"sizes {_ld_sizes}) — substituting current groups, starting optimizer state FRESH (moments/preconditioners "
             f"discarded). Same group count with different sizes = the decay/no_decay partition changed, e.g. a "
             f"checkpoint from before the 2026-09-11 wd_partition fix (trunk norm gains moved to no_decay), or a "
-            f"config-gated zero-init module newly enabled/disabled this run (its params join/leave a group).", flush=True)
+            f"config-gated zero-init module newly enabled/disabled this run (e.g. MoveTokenTrunkMix / MoveTokenRelBias add 1-D no_decay params).", flush=True)
       loaded_optimizer_state["param_groups"] = current_param_groups
       loaded_optimizer_state["state"] = {}
     if config.Opt_Optimizer == 'Muon' and groups_match:

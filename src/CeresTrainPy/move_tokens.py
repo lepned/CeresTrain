@@ -55,6 +55,19 @@ from lc0_moves_1858 import MOVES_1858, FROM_1858, TO_1858
 
 MT_FLOOR = -30.0
 
+# RELATIONAL BIAS among move tokens (2026-09-11 smoke) — CLOSED ARM: null on loss and TRT gate at 25M on the 256
+# chassis (KLD worse, 0.91x EPS) despite large learned weights; kept for reuse of the relation plumbing, most likely
+# will not move the needle (config.py prints the verdict when enabled). The decoder self-attention gets a learned
+# per-head additive score bias over a few static pairwise MOVE relations (own moves A -> B):
+REL_NAMES = ('same_from',        # same mover (alternatives of one piece)
+             'same_to',          # same target square (two pieces can go there)
+             'to_adj_to',        # destinations adjacent (king-distance 1)
+             'to_align_to',      # destinations on one rank/file/diagonal, distance >= 2
+             'to_adj_from',      # A lands next to B's piece
+             'to_align_from',    # A lands on a line with B's piece
+             'from_adj_from')    # the two movers are adjacent
+NREL = len(REL_NAMES)
+
 
 def _build_move_tables():
   """Constant tables: flat from*64+to per policy index, promotion slot per index
@@ -73,10 +86,17 @@ class MoveTokenBlock(nn.Module):
   from moves to the 64 square states, SwiGLU FFN. Plain matmul/softmax."""
 
   def __init__(self, dm: int, s_dim: int, heads: int, ffn_mult: int, norm_type: str,
-               post_move: bool = False):
+               post_move: bool = False, rel_bias: bool = False):
     super().__init__()
     assert dm % heads == 0
     self.h, self.dk = heads, dm // heads
+    # Relational self-attention bias (see REL_NAMES): [NREL*H] zero-init weights, kept 1-D so
+    # every Muon scope routes them to AdamW; bias-like -> no_decay. Exact step-0 no-op.
+    # LR family: decoder BODY (like the per-block pm_dk/pm_dv deltas), not the heads/readout
+    # family the injects and mix gains sit in — it shapes attention inside the body.
+    self.rel_bias = bool(rel_bias)
+    if self.rel_bias:
+      self.rel_w = nn.Parameter(torch.zeros(NREL * heads))
     # POST-MOVE square attention (2026-09-03, X-program item 3): a second cross-attention
     # from each move token to the 64 squares in which the two squares the move touches
     # are seen AFTER the move: the to-square's key/value get a learned per-piece delta
@@ -109,7 +129,7 @@ class MoveTokenBlock(nn.Module):
     self.ffn_in = nn.Linear(dm, 2 * ffn_mult * dm, bias=False)     # SwiGLU: gate | up
     self.ffn_out = nn.Linear(ffn_mult * dm, dm, bias=False)
 
-  def _attn(self, q, k, v, key_bias=None, tag=None):
+  def _attn(self, q, k, v, key_bias=None, tag=None, score_bias=None):
     B, Tq = q.shape[0], q.shape[1]
     Tk = k.shape[1]
     q = q.reshape(B, Tq, self.h, self.dk).transpose(1, 2)
@@ -125,6 +145,10 @@ class MoveTokenBlock(nn.Module):
       # trunk's clip tallies say nothing about it. Max pre-softmax score over the batch
       # (padded keys sit at -1e4 and never win). Read by MoveTokenDecoder.forward -> stats.
       setattr(self, '_amax_' + tag, s.detach().float().amax())
+    if score_bias is not None:
+      # [B,H,Tq,Tk] relational bias (self-attn only). Added AFTER the monitor so mt_qk_max_self
+      # keeps measuring the QK score alone (rel_w magnitudes are logged separately).
+      s = s + score_bias.to(s.dtype)
     a = torch.softmax(s, dim=-1)
     return torch.matmul(a, v).transpose(1, 2).reshape(B, Tq, self.h * self.dk)
 
@@ -150,8 +174,13 @@ class MoveTokenBlock(nn.Module):
     o = torch.matmul(a, vh) + a_to * dv_to + a_fr * dv_fr                        # [B,h,M,dk]
     return o.transpose(1, 2).reshape(B, M, self.h * self.dk)
 
-  def forward(self, x, s_flow_n, key_bias, kv=None, pm=None, pm_kv=None, x_opp=None, opp_bias=None):
+  def forward(self, x, s_flow_n, key_bias, kv=None, pm=None, pm_kv=None, x_opp=None, opp_bias=None, rel=None):
     h = self.ln1(x)
+    sb = None
+    if self.rel_bias:
+      assert rel is not None and x_opp is None, 'relational bias needs the [B,M,M,NREL] relation tensor and own-move keys only'
+      # [B,M,M,NREL] x [NREL,H] -> [B,M,M,H] -> [B,H,M,M]
+      sb = torch.matmul(rel, self.rel_w.reshape(NREL, self.h).to(rel.dtype)).permute(0, 3, 1, 2)
     q, k, v = self.qkv(h).chunk(3, dim=-1)
     if x_opp is not None:
       # OPPONENT-REPLY KEYS (2026-09-04 ideation T1-2): the opponent's candidate moves are
@@ -164,7 +193,7 @@ class MoveTokenBlock(nn.Module):
       kb = torch.cat([key_bias, opp_bias], dim=-1)
     else:
       kb = key_bias
-    x = x + self.proj(self._attn(q, k, v, kb, tag='self'))
+    x = x + self.proj(self._attn(q, k, v, kb, tag='self', score_bias=sb))
     h = self.ln2(x)
     # kv: precomputed [B,64,2dm] cross-attn keys|values (export-fused path, see
     # MoveTokenDecoder.forward); otherwise this block norms + projects the squares itself.
@@ -298,9 +327,31 @@ class MoveTokenDecoder(nn.Module):
                value_pool_detach: bool = True, post_move: bool = False,
                value_query: bool = False, value_order: bool = False,
                opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
-               expected_value: bool = False, square_update: bool = False):
+               expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
+               rel_bias: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
+    # Relational self-attention bias (REL_NAMES): static square-pair tables (from the visibility
+    # module, registered below once self.vis exists), gathered per token pair.
+    self.rel_bias = bool(rel_bias)
+    assert not (self.rel_bias and int(opp_max) > 0), 'MoveTokenRelBias with opponent keys: the bias covers own-move keys only'
+    # 2026-09-11 TRUNK LAYER MIX — CLOSED ARM: null on loss and TRT gate at 25M on the 256 chassis (KLD worse,
+    # 0.91x EPS); the gains grew (shallow layers most) but changed nothing => the decoder is not input-starved.
+    # Kept for plumbing reuse; most likely will not move the needle (config.py prints the verdict when enabled).
+    # Mechanism: the decoder reads `flow + sum_j g_j * rms(state_j)` where
+    # state_j are intermediate trunk states (post-embedding and/or after chosen layers) and
+    # g_j are per-channel gains, ZERO-INIT => bit-identical to the plain decoder at step 0
+    # (a single zero factor: the gains get gradient from step 0, no product-rule canary).
+    # Scale-free RMS per source (a post-norm trunk leaves intermediate layers at different
+    # scales). Cost: one norm + one FMA per source over 64 tokens; no new projections or
+    # keys, so the export-fused K|V path is untouched. ceres_net collects the states
+    # (references only, alive for backward anyway) and passes them as `mix_states`.
+    # The mix term is DECODER-INTERNAL: with square_update / write_back the returned delta is
+    # (flow_cur - mixed flow), so the head front-end reads base flow + delta, never the mix.
+    # Gain magnitudes are logged from ceres_net.compute_loss (mt_mix_gain_rms_<j>, log steps only).
+    self.trunk_mix = int(trunk_mix)
+    if self.trunk_mix > 0:
+      self.mix_gain = nn.ParameterList([nn.Parameter(torch.zeros(s_dim)) for _ in range(self.trunk_mix)])
     # 2026-09-08 'value in the decoder' arms:
     #  expected_value: position value gets an additive term ev = sum_i softmax(policy)_i * u_i
     #    over the tokens (u = the per-token scalar; shared with the value-order head when that
@@ -361,6 +412,14 @@ class MoveTokenDecoder(nn.Module):
     # untouched (bit-pairing with the control; the edge-aux lesson).
     with torch.random.fork_rng(devices=[]):
       self.vis = VisibilityChannels(families=('vis',))
+    if self.rel_bias:
+      # ADJ = king adjacency (chebyshev 1); ALIGN = rook|bishop line minus adjacency (distance >= 2).
+      # One [4096, 2] table => one gather per square pair in relations().
+      _k = self.vis.vc_king.float()
+      _al = (self.vis.vc_rook_line.float() + self.vis.vc_bish_line.float()).clamp(max=1.0) * (1.0 - _k)
+      self.register_buffer('rel_adj', _k.reshape(-1).clone(), persistent=False)
+      self.register_buffer('rel_align', _al.reshape(-1).clone(), persistent=False)
+      self.register_buffer('rel_tab', torch.stack([_k.reshape(-1), _al.reshape(-1)], dim=1).contiguous(), persistent=False)
     pf, sl, pfs = _build_move_tables()
     self.register_buffer('mv_pair_flat', pf, persistent=False)      # [1858] from*64+to
     self.register_buffer('mv_pair_slot', pfs, persistent=False)     # [1858] (from*64+to)*4+slot
@@ -404,7 +463,8 @@ class MoveTokenDecoder(nn.Module):
                          persistent=False)
     # Token init: concat(flow[from], flow[to], 4 vis channels of the pair).
     self.w_in = nn.Linear(2 * s_dim + 4 + self.rich_dim, dm)
-    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type, post_move=self.post_move)
+    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type, post_move=self.post_move,
+                                                rel_bias=self.rel_bias)
                                  for _ in range(layers)])
     self.out_ln = make_norm(norm_type, dm)
     if self.value_query:
@@ -510,6 +570,24 @@ class MoveTokenDecoder(nn.Module):
           f'exact for positions with <= {m} candidates)')
     return old
 
+  def relations(self, fr, to, dtype=torch.float32):
+    """fr, to [B,M] long -> [B,M,M,NREL] pairwise move relations in `dtype` (static geometry, no
+    parameters; the whole diagonal is zero so 'self' is not a relation). Three gathers on the
+    [4096,2] (adj|align) table: (to,to), (to,from), (from,from)."""
+    B, M = fr.shape
+    fa, fb = fr.unsqueeze(2), fr.unsqueeze(1)                                # [B,M,1], [B,1,M]
+    ta, tb = to.unsqueeze(2), to.unsqueeze(1)
+    same_from, same_to = (fa == fb), (ta == tb)
+    def tab2(a, b):
+      return torch.index_select(self.rel_tab, 0, (a * 64 + b).reshape(-1)).reshape(B, M, M, 2).to(dtype)
+    tt, tf, ff = tab2(ta, tb), tab2(ta, fb), tab2(fa, fb)
+    feats = [same_from.to(dtype), same_to.to(dtype), tt[..., 0], tt[..., 1], tf[..., 0], tf[..., 1], ff[..., 0]]
+    # Whole diagonal masked: a move's own from/to are always adjacent or aligned (non-knight),
+    # which would otherwise hand every token a meaningless 'self' relation. Tokens are unique
+    # (from,to) pairs (topk positions), so 'same from AND same to' is exactly the diagonal.
+    noself = ~(same_from & same_to)
+    return torch.stack(feats, dim=-1) * noself.unsqueeze(-1).to(dtype)
+
   def candidates(self, squares13):
     """squares13 [B,64,13] one-hot -> (cand [B,4096] in {0,1}, E [B,64,64,4])."""
     E = self.vis(squares13)                                   # [B,64,64,4]: stm_out, opp_out, stm_in, opp_in
@@ -564,10 +642,18 @@ class MoveTokenDecoder(nn.Module):
     cnts = torch.stack([att_to, def_to, att_from, def_from], dim=-1) * 0.25   # [B,M,4]
     return torch.cat([mover, captured, promo.unsqueeze(-1), cnts], dim=-1)
 
-  def forward(self, squares13, flow):
+  def forward(self, squares13, flow, mix_states=None):
     """flow [B,64,S] (post trunk norm). Returns (policy_add [B,1858], pooled [B,pool_dim],
-    stats dict, sel [B,M], valid [B,M], write_back [B,64,S] or None, ev [B] or None)."""
+    stats dict, sel [B,M], valid [B,M], write_back [B,64,S] or None, ev [B] or None).
+    mix_states: list of [B,64,S] intermediate trunk states (trunk_mix of them) or None."""
     B, S = flow.shape[0], flow.shape[2]
+    if self.trunk_mix > 0:
+      assert mix_states is not None and len(mix_states) == self.trunk_mix, \
+          f'MoveTokenTrunkMix: expected {self.trunk_mix} trunk states, got {None if mix_states is None else len(mix_states)}'
+      for st, g in zip(mix_states, self.mix_gain):
+        st = st.to(flow.dtype)
+        _r = torch.rsqrt(st.float().pow(2).mean(-1, keepdim=True) + 1e-6).to(flow.dtype)
+        flow = flow + (st * _r) * g.to(flow.dtype)
     cand, E = self.candidates(squares13)
     score = cand.float() + (self.tie_rank.float() * (0.5 / 4096.0)).unsqueeze(0)
     sel = torch.topk(score, self.M, dim=1).indices                          # [B,M]
@@ -592,6 +678,9 @@ class MoveTokenDecoder(nn.Module):
       x = self._w_in_fused(P, fr, to, rest, S)                               # [B,M,dm]
     else:
       x = self.w_in(torch.cat([f_from, f_to, rest], dim=-1))                 # [B,M,dm]
+    # Relations in the TOKEN-STREAM dtype (bf16 under autocast, not the fp32 residual dtype of
+    # `flow`): one tensor shared by every block's bias matmul, no per-block autocast copies.
+    rel = self.relations(fr, to, x.dtype) if self.rel_bias else None        # [B,M,M,NREL], computed once
     key_bias = ((~valid).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M)
     x_opp = opp_bias = None
     valid_o = None
@@ -634,13 +723,13 @@ class MoveTokenDecoder(nn.Module):
       kvs = list(kv_all.split([w.shape[0] for w in Ws], dim=-1))
       for i, blk in enumerate(self.blocks):
         x = blk(x, None, key_bias, kv=kvs[i], pm=pm, pm_kv=(kvs[L + i] if self.post_move else None),
-                x_opp=x_opp, opp_bias=opp_bias)
+                x_opp=x_opp, opp_bias=opp_bias, rel=rel)
       vq_kv2 = kvs[-1] if self.value_query else None
     else:
       flow_cur = flow
       any_valid_early = valid.any(dim=1)                                      # [B]
       for i, blk in enumerate(self.blocks):
-        x = blk(x, blk.ln_s(flow_cur), key_bias, pm=pm, x_opp=x_opp, opp_bias=opp_bias)   # each block re-norms the squares under ITS norm (review B1)
+        x = blk(x, blk.ln_s(flow_cur), key_bias, pm=pm, x_opp=x_opp, opp_bias=opp_bias, rel=rel)   # each block re-norms the squares under ITS norm (review B1)
         if self.square_update:
           flow_cur = flow_cur + self.sq_upd[i](flow_cur, x, key_bias, any_valid_early)
       vq_kv2 = None

@@ -100,8 +100,12 @@ def partition_weight_decay(model):
           elif "dual_plane" in fpn and "log_tau" in fpn:
               # P-plane soft-min temperatures: bias-like 1-D log params.
               no_decay.add(fpn)
+          elif "move_tokens.mix_gain" in fpn:
+              # 2026-09-11 trunk-layer-mix gains: zero-init per-channel gains on RMS-normalised
+              # trunk states = the norm-gain class -> no_decay (1-D, so AdamW under every Muon scope).
+              no_decay.add(fpn)
           elif "move_tokens." in fpn and (fpn.endswith(".pm_dk") or fpn.endswith(".pm_dv") or fpn.endswith("vq_block.vq")
-                                           or fpn.endswith(".opp_side")):
+                                           or fpn.endswith(".opp_side") or fpn.endswith(".rel_w")):
               # Move-token post-move deltas (per-piece key/value edits) and the learned value
               # query token (2026-09-03): raw nn.Parameters, embedding-like -> no_decay.
               no_decay.add(fpn)

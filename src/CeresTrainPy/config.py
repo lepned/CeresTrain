@@ -675,6 +675,38 @@ class Configuration:
     # square update (write-back after every decoder block, next block reads updated squares).
     self.NetDef_MoveTokenExpectedValue = bool(config_net_def.get('MoveTokenExpectedValue', False))
     self.NetDef_MoveTokenSquareUpdate = bool(config_net_def.get('MoveTokenSquareUpdate', False))
+    # 2026-09-11 RELATIONAL BIAS (move_tokens.REL_NAMES) — CLOSED ARM, null at 25M/256, kept for plumbing reuse (boot WARNING
+    # states the verdict). Learned per-head additive score bias in the
+    # decoder self-attention over static pairwise move relations (same mover / same target / adjacency /
+    # alignment of the squares involved). Zero-init, TRT-static, a few dozen params per block.
+    self.NetDef_MoveTokenRelBias = bool(config_net_def.get('MoveTokenRelBias', False))
+    if self.NetDef_MoveTokenRelBias:
+      print('[config] WARNING: MoveTokenRelBias is a ' + 'CLOSED ARM (2026-09-11, 256x10 + dm256x4 @25M vs bit-paired control): NULL on training loss and on the TensorRT puzzle gate (policy/pT3 |z| < 2, mate value z -2.0), rg2700 KLD worse (+0.04), 0.91x EPS, although the relation weights grow large (same_to/same_from RMS ~0.8). The decoder is not relation-starved. Kept for reuse of the relation plumbing only; enabling it most likely will NOT move the needle.', flush=True)
+    if self.NetDef_MoveTokenRelBias and self.NetDef_MoveTokenOppMax > 0:
+      raise ValueError('MoveTokenRelBias with MoveTokenOppMax > 0: the bias covers own-move keys only (refused)')
+    # 2026-09-11 TRUNK LAYER MIX (see move_tokens.py) — CLOSED ARM, null at 25M/256, kept for plumbing reuse (boot WARNING
+    # states the verdict). The decoder reads the final trunk state plus
+    # zero-init per-channel-gained, RMS-normalised intermediate states. 'all' = post-embedding +
+    # after every layer except the last; or a list of effective layer indices k (0 = post-
+    # embedding, k = after layer k, 1 <= k < NumLayers; the final layer is the base). Absent = off.
+    _mix_raw = config_net_def.get('MoveTokenTrunkMix', None)
+    _n_layers = int(self.NetDef_NumLayers)   # effective depth (LoopCount-expanded), parsed above with its default
+    if _mix_raw in (None, False, 0, '', [], 'none', 'off'):
+      self.NetDef_MoveTokenTrunkMix = []
+    elif _mix_raw == 'all':
+      if _n_layers < 2:
+        raise ValueError(f"MoveTokenTrunkMix 'all' needs NumLayers >= 2 (got {_n_layers}): no intermediate state to mix")
+      self.NetDef_MoveTokenTrunkMix = list(range(0, _n_layers))
+    elif isinstance(_mix_raw, (list, tuple)):
+      _ks = [int(k) for k in _mix_raw]
+      if len(set(_ks)) != len(_ks) or any(k < 0 or k >= _n_layers for k in _ks):
+        raise ValueError(f'MoveTokenTrunkMix must be unique layer indices in [0, NumLayers) (0 = post-embedding; '
+                         f'the final layer is the base), got {_mix_raw!r} with NumLayers {_n_layers}')
+      self.NetDef_MoveTokenTrunkMix = sorted(_ks)
+    else:
+      raise ValueError(f"MoveTokenTrunkMix must be 'all' or a list of layer indices, got {_mix_raw!r}")
+    if self.NetDef_MoveTokenTrunkMix:
+      print('[config] WARNING: MoveTokenTrunkMix is a ' + 'CLOSED ARM (2026-09-11, 256x10 + dm256x4 @25M vs bit-paired control): NULL on training loss and on the TensorRT puzzle gate (policy/pT3 |z| < 2), rg2700 KLD worse (+0.04), 0.91x EPS. The decoder is not input-starved. Kept for reuse of the plumbing only; enabling it most likely will NOT move the needle.', flush=True)
     if self.NetDef_MoveTokenSquareUpdate and self.NetDef_MoveTokenWriteBack:
       raise ValueError('MoveTokenSquareUpdate writes back at every block; MoveTokenWriteBack is redundant (refused)')
     # EXPORT-TIME GRAPH FOLDS (export_folds.py; 2026-09-04): 'none' | 'mt' | 'ffn' | 'all'.

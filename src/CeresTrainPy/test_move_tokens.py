@@ -11,6 +11,11 @@
    no gradient, eval forward finite, stash consumed by compute_loss and diagnostics logged.
 4. Bit-pairing: with UseMoveTokens on, every pre-existing parameter is identical to the
    control built with the same TorchSeed.
+4h. Trunk layer mix (MoveTokenTrunkMix): exact step-0 no-op, gains get gradient, no_decay,
+   live when non-zero, ONNX parity.
+4i. Relational bias (MoveTokenRelBias): relation tables on known squares, full 7-vectors on
+   symmetric/asymmetric/same-mover pairs, brute-force cross-check on a real board, exact step-0
+   no-op, exact extra keys, gradient, no_decay, live when non-zero, opp-keys refused, ONNX parity.
 5. Guards: UseMoveTokens with DualPlanePolicyDecode / PolicyHeadForm=fromto refused.
 """
 import os, sys
@@ -260,6 +265,153 @@ def main():
     print(f'  ONNX export + ORT parity OK for the knob variant (policy max|d| {d2:.2e})')
   except ImportError:
     print('  (onnx_ir not installed here: knob-variant export parity skipped)')
+
+  # --- 4h. trunk layer mix (2026-09-11) ---------------------------------------
+  net3, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                   'MoveTokenTrunkMix': 'all'}, {}, 'mt3')
+  assert len(net3.move_tokens.mix_gain) == 2 and net3.mt_mix_layers == [0, 1], net3.mt_mix_layers
+  sd3 = net3.state_dict()
+  for k, v in net.state_dict().items():
+    assert k in sd3 and torch.equal(v, sd3[k]), f'bit-pairing broken at {k}'
+  _extra3 = set(sd3) - set(net.state_dict())
+  assert _extra3 == {'move_tokens.mix_gain.0', 'move_tokens.mix_gain.1'}, _extra3
+  net.eval(); net3.eval()
+  with torch.no_grad():
+    o_ref = net(sq, None); o_mix = net3(sq, None)
+  assert torch.equal(o_ref[0], o_mix[0]) and torch.equal(o_ref[1], o_mix[1]), 'zero-init mix must be an exact step-0 no-op'
+  net3.train(); net3.zero_grad(set_to_none=True)
+  loss3 = run_loss(net3, batch, sq); assert torch.isfinite(loss3); loss3.backward()
+  assert net3._last_mt is None
+  for j, g in enumerate(net3.move_tokens.mix_gain):
+    assert g.grad is not None and g.grad.abs().sum() > 0, f'mix gain {j} gets no gradient at step 0'
+  dead3 = [n for n, p in net3.move_tokens.named_parameters() if p.grad is None]
+  assert not dead3, f'move_tokens params without gradient: {dead3}'
+  _dec3, _nd3 = _pwd(net3)
+  assert all(f'move_tokens.mix_gain.{j}' in _nd3 for j in range(2)), 'mix gains must be no_decay'
+  with torch.no_grad(): net3.move_tokens.mix_gain[1].fill_(0.5)
+  net3.eval()
+  with torch.no_grad(): o_mix2 = net3(sq, None)
+  assert not torch.equal(o_ref[0], o_mix2[0]), 'a non-zero gain must change the policy'
+  # both sources live and the value path perturbed before the export check below
+  with torch.no_grad():
+    net3.move_tokens.mix_gain[0].fill_(0.25); net3.move_tokens.v_inject.weight.normal_(0.0, 0.02)
+  # LoopCount > 1: sources are EFFECTIVE layer states (2 effective layers from 1 distinct module)
+  net3l, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                    'MoveTokenLayers': 1, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                    'NumLayers': 2, 'LoopCount': 2, 'MoveTokenTrunkMix': [0, 1]}, {}, 'mt3l')
+  assert len(net3l.transformer_layer) == 1 and len(net3l.move_tokens.mix_gain) == 2
+  net3l.eval()
+  with torch.no_grad():
+    net3l.move_tokens.mix_gain[1].fill_(0.5); o_l = net3l(sq, None)
+  assert torch.isfinite(o_l[0]).all() and torch.isfinite(o_l[1]).all()
+  try:
+    build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenTrunkMix': [0, 2]}, {}, 'mt3bad')
+    raise AssertionError('MoveTokenTrunkMix index == NumLayers must be refused')
+  except ValueError:
+    pass
+  print(f'  trunk layer mix OK: step-0 exact no-op, exact extra keys, gains get gradient, no_decay, live when non-zero, '
+        f'LoopCount=2 effective-index build, out-of-range index refused (loss {float(loss3.detach()):.4f})')
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path3 = os.path.join(tempfile.gettempdir(), 'mt_export_test3.onnx')
+    with torch.no_grad(): ref3 = net3(sq, None)
+    torch.onnx.export(net3, (sq, None), path3, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s3 = ort.InferenceSession(path3, providers=['CPUExecutionProvider'])
+    o3 = s3.run(None, {s3.get_inputs()[0].name: sq.numpy()})
+    pr3 = ref3[0].numpy(); po3 = [x for x in o3 if x.shape == pr3.shape][0]
+    d3 = float(np.abs(po3 - pr3).max()); assert d3 < 1e-3, d3
+    vr3 = ref3[1].numpy(); dv3 = min(float(np.abs(x - vr3).max()) for x in o3 if x.shape == vr3.shape)
+    assert dv3 < 1e-3, dv3
+    print(f'  ONNX export + ORT parity OK for the trunk-mix variant (policy max|d| {d3:.2e}, value {dv3:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: trunk-mix export parity skipped)')
+
+  # --- 4i. relational self-attention bias (2026-09-11) -----------------------
+  from move_tokens import REL_NAMES, NREL
+  with torch.no_grad(): o_ref = net(sq, None)   # own reference (net is in eval): no dependence on 4f
+  net4, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                   'MoveTokenRelBias': True}, {}, 'mt4')
+  # relation tables on known squares: a1-b2 adjacent, a1-h8 aligned, a1-b3 neither, a1-a1 neither
+  _A, _L = net4.move_tokens.rel_adj, net4.move_tokens.rel_align
+  assert _A[SQ['a1'] * 64 + SQ['b2']] == 1 and _L[SQ['a1'] * 64 + SQ['b2']] == 0
+  assert _L[SQ['a1'] * 64 + SQ['h8']] == 1 and _A[SQ['a1'] * 64 + SQ['h8']] == 0
+  assert _A[SQ['a1'] * 64 + SQ['b3']] == 0 and _L[SQ['a1'] * 64 + SQ['b3']] == 0
+  assert _A[SQ['a1'] * 64 + SQ['a1']] == 0 and _L[SQ['a1'] * 64 + SQ['a1']] == 0
+  # relations on two tokens: e2e4 and d2d4 -> same_from 0, same_to 0, to_adj_to 1 (e4-d4), from_adj_from 1 (e2-d2)
+  def _vec(R, i, j):
+    return [int(R[0, i, j, r]) for r in range(NREL)]
+  # tokens: 0 e2e4, 1 d2d4 (symmetric pair), 2 a1d4, 3 d5h8 (asymmetric: a1d4 lands next to d5), 4 e2e3 (same mover as 0)
+  _fr = torch.tensor([[SQ['e2'], SQ['d2'], SQ['a1'], SQ['d5'], SQ['e2']]])
+  _to = torch.tensor([[SQ['e4'], SQ['d4'], SQ['d4'], SQ['h8'], SQ['e3']]])
+  _R = net4.move_tokens.relations(_fr, _to)
+  assert _R.shape == (1, 5, 5, NREL)
+  #                       same_from same_to to_adj_to to_align_to to_adj_from to_align_from from_adj_from
+  assert _vec(_R, 0, 1) == [0, 0, 1, 0, 0, 0, 1], _vec(_R, 0, 1)   # e4-d4 adjacent, e2-d2 adjacent
+  assert _vec(_R, 1, 0) == [0, 0, 1, 0, 0, 0, 1], _vec(_R, 1, 0)
+  assert _vec(_R, 2, 3) == [0, 0, 0, 1, 1, 0, 0], _vec(_R, 2, 3)   # d4-h8 diagonal; d4 adjacent to d5 (B's piece)
+  assert _vec(_R, 3, 2) == [0, 0, 0, 1, 0, 1, 0], _vec(_R, 3, 2)   # asymmetric: h8 on a1's long diagonal (align), not adjacent
+  assert _vec(_R, 0, 4) == [1, 0, 1, 0, 0, 1, 0], _vec(_R, 0, 4)   # same mover; e4-e3 adjacent; e4 aligned with e2
+  assert _vec(_R, 1, 2) == [0, 1, 0, 0, 0, 1, 0], _vec(_R, 1, 2)   # d2d4 vs a1d4: same target; d4 on a1's diagonal
+  for i in range(5):
+    assert float(_R[0, i, i].sum()) == 0, 'the diagonal must carry no relation'
+  # brute-force cross-check of the gather implementation on a real board's candidate set
+  def _adj(a, b): return a != b and max(abs(a // 8 - b // 8), abs(a % 8 - b % 8)) == 1
+  def _ali(a, b):
+    dr, df = abs(a // 8 - b // 8), abs(a % 8 - b % 8)
+    return a != b and not _adj(a, b) and (dr == 0 or df == 0 or dr == df)
+  _cand, _ = net4.move_tokens.candidates(board_from_pieces(start_own, start_opp))
+  _sel = torch.topk(_cand.float() + net4.move_tokens.tie_rank.float().unsqueeze(0) * (0.5 / 4096.0), 64, dim=1).indices
+  _bf, _bt = _sel // 64, _sel % 64
+  _Rb = net4.move_tokens.relations(_bf, _bt)
+  for i in range(64):
+    for j in range(64):
+      fa, ta, fb, tb = int(_bf[0, i]), int(_bt[0, i]), int(_bf[0, j]), int(_bt[0, j])
+      exp = [0] * NREL if i == j else [int(fa == fb), int(ta == tb), int(_adj(ta, tb)), int(_ali(ta, tb)),
+                                        int(_adj(ta, fb)), int(_ali(ta, fb)), int(_adj(fa, fb))]
+      assert _vec(_Rb, i, j) == exp, (i, j, _vec(_Rb, i, j), exp)
+  sd4 = net4.state_dict()
+  for k, v in net.state_dict().items():
+    assert k in sd4 and torch.equal(v, sd4[k]), f'bit-pairing broken at {k}'
+  _extra4 = set(sd4) - set(net.state_dict())
+  assert _extra4 == {'move_tokens.blocks.0.rel_w', 'move_tokens.blocks.1.rel_w'}, _extra4
+  net4.eval()
+  with torch.no_grad(): o_rel = net4(sq, None)
+  assert torch.equal(o_ref[0], o_rel[0]) and torch.equal(o_ref[1], o_rel[1]), 'zero-init relational bias must be an exact step-0 no-op'
+  net4.train(); net4.zero_grad(set_to_none=True)
+  loss4 = run_loss(net4, batch, sq); assert torch.isfinite(loss4); loss4.backward()
+  assert net4._last_mt is None
+  for b in net4.move_tokens.blocks:
+    assert b.rel_w.grad is not None and b.rel_w.grad.abs().sum() > 0, 'rel_w gets no gradient at step 0'
+  dead4 = [n for n, p in net4.move_tokens.named_parameters() if p.grad is None]
+  assert not dead4, f'move_tokens params without gradient: {dead4}'
+  _dec4, _nd4 = _pwd(net4)
+  assert all(f'move_tokens.blocks.{j}.rel_w' in _nd4 for j in range(2)), 'rel_w must be no_decay'
+  with torch.no_grad():
+    for b in net4.move_tokens.blocks: b.rel_w.normal_(0.0, 0.5)
+  net4.eval()
+  with torch.no_grad(): o_rel2 = net4(sq, None)
+  assert not torch.equal(o_ref[0], o_rel2[0]), 'a non-zero relational bias must change the policy'
+  try:
+    build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenRelBias': True, 'MoveTokenOppMax': 8}, {}, 'mt4bad')
+    raise AssertionError('MoveTokenRelBias with opponent keys must be refused')
+  except ValueError:
+    pass
+  print(f'  relational bias OK: tables + full relation vectors on 5 known moves + brute-force 64x64 cross-check, step-0 exact no-op, exact extra keys, gradient, '
+        f'no_decay, live when non-zero, opp-keys refused (loss {float(loss4.detach()):.4f})')
+  try:
+    import onnx_ir, onnxruntime as ort, numpy as np, tempfile
+    path4 = os.path.join(tempfile.gettempdir(), 'mt_export_test4.onnx')
+    with torch.no_grad(): ref4 = net4(sq, None)
+    torch.onnx.export(net4, (sq, None), path4, dynamo=True, opset_version=18, input_names=['squares', 'prior'])
+    s4 = ort.InferenceSession(path4, providers=['CPUExecutionProvider'])
+    o4 = s4.run(None, {s4.get_inputs()[0].name: sq.numpy()})
+    pr4 = ref4[0].numpy(); po4 = [x for x in o4 if x.shape == pr4.shape][0]
+    d4 = float(np.abs(po4 - pr4).max()); assert d4 < 1e-3, d4
+    print(f'  ONNX export + ORT parity OK for the relational-bias variant (policy max|d| {d4:.2e})')
+  except ImportError:
+    print('  (onnx_ir not installed here: relational-bias export parity skipped)')
 
   # --- 4c. value-order head (2026-09-04 ideation T1-4): training-only per-token scalar ---
   net3, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
