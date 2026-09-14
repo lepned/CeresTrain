@@ -49,7 +49,7 @@
   "MirrorConsistencyWeight": 0,
   "ValueHeadChannels": 0,
   "UncSelfError": 0,
-  "ValueFocalGamma": 0,
+  "ValueFocalGamma": 0.25,
   "TPGV3": 0,
   "AuxFeaturesPerSquare": 0,
   "TargetSidecar": "auto",
