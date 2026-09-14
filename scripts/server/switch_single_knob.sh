@@ -52,29 +52,41 @@ say "checkpoint ready: $CK"
 cd $REPO || exit 1
 git fetch origin && git reset --hard origin/main || exit 1
 say "repo at $(git rev-parse --short HEAD)"
-# The invariant is per-LINE, not per-file: every differing line, in every config, must
-# name a KEY field. The old check also demanded exactly ONE differing FILE — a proxy that
-# breaks as soon as an intended change spans net + opt (e.g. an architecture key in the
-# net config alongside opt-config knobs), while allowing several unrelated keys inside one
-# file. Per-line is both stricter and more expressive.
-CHANGED=0; OTHER=0; MATCHED=0
-for f in data exec monitoring net opt; do
-  n=${ID}_ceres_$f.json
-  if ! diff -q <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) >/dev/null 2>&1; then
-    say "differs: $f"
-    diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | sed 's/^/    /'
-    CHANGED=$((CHANGED+1))
-    _lines=$(diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | grep -cE '^[<>]')
-    _ok=$(diff <(tr -d '' < $REPO/configs/$n) <(tr -d '' < $OUT/configs/$n) | grep -E '^[<>]' | grep -cE "$KEY")
-    OTHER=$((OTHER + _lines - _ok)); MATCHED=$((MATCHED + _ok))
-  fi
-done
-if [ "$CHANGED" -eq 0 ] || [ "$OTHER" -ne 0 ] || [ "$MATCHED" -eq 0 ]; then
-  say "ABORT: every differing config line must name /$KEY/"
-  say "       (files differing: $CHANGED, matching lines: $MATCHED, NON-matching: $OTHER)"
+# Compare configs as JSON, KEY BY KEY -- not as text. A text diff reports formatting as
+# a change (adding a key puts a comma on the previous line) and cannot exempt a field, so
+# it flagged CheckpointResumeFromFileName, which this script rewrites itself a few lines
+# below and which is therefore ALWAYS stale in the repo once a switch has run. Both bit a
+# real launch on 2026-09-15. Key-wise comparison is exact: every key whose VALUE differs
+# must name a KEY field, and at least one must.
+python3 - "$REPO/configs" "$OUT/configs" "$ID" "$KEY" <<'PYGUARD'
+import json, os, re, sys
+repo, out, rid, keyre = sys.argv[1:5]
+pat = re.compile(keyre)
+IGNORE = {"CheckpointResumeFromFileName"}   # rewritten below, never a real knob
+matched, other = [], []
+for f in ("data", "exec", "monitoring", "net", "opt"):
+    n = f"{rid}_ceres_{f}.json"
+    a = json.load(open(os.path.join(repo, n), encoding="utf-8"))
+    b = json.load(open(os.path.join(out, n), encoding="utf-8"))
+    for k in sorted(set(a) | set(b)):
+        if k in IGNORE:
+            continue
+        va, vb = a.get(k, "<absent>"), b.get(k, "<absent>")
+        if va != vb:
+            (matched if pat.search(k) else other).append(f"{f}.{k}: {vb!r} -> {va!r}")
+for m in matched:
+    print("    CHANGE  " + m)
+for o in other:
+    print("    UNEXPECTED  " + o)
+if other or not matched:
+    print(f"ABORT: {len(matched)} intended change(s), {len(other)} unexpected")
+    sys.exit(1)
+print(f"pre-flight OK: {len(matched)} change(s), all naming /{keyre}/")
+PYGUARD
+if [ $? -ne 0 ]; then
+  say "ABORT: config pre-flight failed (see above)"
   exit 1
 fi
-say "pre-flight OK: $MATCHED differing line(s) across $CHANGED file(s), all naming /$KEY/"
 
 # ---- 3. install configs, point the resume at the real checkpoint ----
 cp $REPO/configs/${ID}_ceres_*.json $OUT/configs/ || exit 1
