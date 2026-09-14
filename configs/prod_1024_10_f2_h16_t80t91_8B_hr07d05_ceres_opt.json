@@ -22,7 +22,7 @@
   "Beta3": 0.9999,
   "Alpha": 5,
   "GradientClipLevel": 1.0,
-  "QKClipTau": 30.0,
+  "QKClipTau": 60.0,
   "EMAPeriodSteps": -1,
   "EMAMaxN": 10,
   "LossValueMultiplier": 1.0,
