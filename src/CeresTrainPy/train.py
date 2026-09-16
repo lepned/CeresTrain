@@ -1616,9 +1616,9 @@ def Train():
   if (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip() and _IS_V6_SOURCE:
     # DirectFromV6 supplies v7x IN-BAND from v7 records (no sidecar files);
     # verify via the corpus diagnosis instead of listing .v7x.zst files.
-    if 7 not in getattr(primary_dataset, '_diag_versions', set()):
-      raise ValueError('CERES_VALUE_PROV_WEIGHTS set but the DirectFromV6 corpus is not '
-                       'v7 (no z_provenance available in v6 records)')
+    if not getattr(primary_dataset, '_diag_has_v7_tail', False):
+      raise ValueError('CERES_VALUE_PROV_WEIGHTS set but the DirectFromV6 corpus lacks the '
+                       'ExtraV7 tail (no z_provenance in v6 records; v7 and v8 have it)')
   elif (os.environ.get('CERES_VALUE_PROV_WEIGHTS', '') or '').strip():
     _v7x_mode_pw = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
     if _v7x_mode_pw in ('0', ''):
@@ -1634,9 +1634,9 @@ def Train():
 
   # Short-term value head requires V7-extras sidecar targets (censored q_st/d_st).
   if getattr(core, 'stvalue_weight', 0) > 0 and _IS_V6_SOURCE:
-    if 7 not in getattr(primary_dataset, '_diag_versions', set()):
-      raise ValueError('CERES_STVALUE_WEIGHT > 0 but the DirectFromV6 corpus is not v7 '
-                       '(no censored q_st/d_st in v6 records)')
+    if not getattr(primary_dataset, '_diag_has_v7_tail', False):
+      raise ValueError('CERES_STVALUE_WEIGHT > 0 but the DirectFromV6 corpus lacks the '
+                       'ExtraV7 tail (no censored q_st/d_st in v6 records; v7 and v8 have it)')
   elif getattr(core, 'stvalue_weight', 0) > 0:
     _v7x_mode = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
     if _v7x_mode in ('0', ''):
@@ -1662,11 +1662,11 @@ def Train():
       (getattr(core, 'action_played_weight', 0), 'LossActionPlayedMultiplier', '_diag_action_populated')):
     if _aux_w > 0:
       if not _IS_V6_SOURCE:
-        raise ValueError(f'{_aux_name} > 0 requires SourceType DirectFromV6 with a v7 corpus '
+        raise ValueError(f'{_aux_name} > 0 requires SourceType DirectFromV6 with a v7/v8 corpus '
                          f'(TPG records/sidecars carry no opp/action targets)')
-      if 7 not in getattr(primary_dataset, '_diag_versions', set()):
-        raise ValueError(f'{_aux_name} > 0 but the DirectFromV6 corpus is not v7 '
-                         f'(no OppPlayedIndex/QAfterPlayedMove in v6 records)')
+      if not getattr(primary_dataset, '_diag_has_v7_tail', False):
+        raise ValueError(f'{_aux_name} > 0 but the DirectFromV6 corpus lacks the ExtraV7 tail '
+                         f'(no OppPlayedIndex/QAfterPlayedMove in v6 records; v7 and v8 have it)')
       if BOARDS_PER_BATCH != 1:
         # 4-board mode calls compute_loss four times against the SAME batch
         # dict, so board N's aux output would be scored against board 1's

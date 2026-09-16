@@ -104,6 +104,44 @@ V7_DTYPE = np.dtype(V6_DTYPE.descr + [
 ])
 assert V7_DTYPE.itemsize == V7_RECORD_BYTES, V7_DTYPE.itemsize
 
+# LC0 v8 = v7 + a 2,640-byte block: a 16-byte header, a 128-slot struct-of-arrays
+# child table, 7 recipe constants and 36 reserved bytes. The first 8,396 bytes are
+# byte-identical to v7, so every existing decode path works on a v8 record unchanged
+# once the STRIDE is right -- and getting the stride wrong is the trap this format
+# sets: a v6/v7 reader decodes record 0 correctly and then silently reads garbage,
+# 2,680 (resp. 2,640) bytes out of phase per record. Always dispatch on the version
+# word at offset 0, never on a fixed stride.
+#
+# The child table is what v8 is FOR (per-move q/d/m, raw and de-forced visit counts,
+# the net's temperature-free prior, and the expected reply). Stage 1 only reads and
+# validates it; nothing downstream consumes it yet.
+V8_RECORD_BYTES = 11036
+V8_SLOTS = 128
+V8_DTYPE = np.dtype(V7_DTYPE.descr + [
+    ('v8_layout_version', '<u2'), ('recipe_id', '<u2'), ('provenance_flags', '<u2'),
+    ('n_legal', 'u1'), ('n_stored', 'u1'),
+    ('plies_until_progress', '<u2'), ('block_flags', '<u2'),
+    ('fe_visits', '<u2'), ('cpuct_x1000', '<u2'),
+    ('slot_idx', '<u2', (V8_SLOTS,)), ('slot_prior', '<u2', (V8_SLOTS,)),
+    ('slot_q', '<i2', (V8_SLOTS,)), ('slot_d', '<i2', (V8_SLOTS,)),
+    ('slot_m', '<u2', (V8_SLOTS,)),
+    ('slot_n_raw', '<u2', (V8_SLOTS,)), ('slot_n_deforced', '<u2', (V8_SLOTS,)),
+    ('slot_reply_idx', '<u2', (V8_SLOTS,)), ('slot_reply_q', '<i2', (V8_SLOTS,)),
+    ('slot_reply_n', '<u2', (V8_SLOTS,)),
+    ('recipe', '<f4', (7,)), ('reserved_v8', 'u1', (36,)),
+])
+assert V8_DTYPE.itemsize == V8_RECORD_BYTES, V8_DTYPE.itemsize
+
+# Version -> (stride, dtype). Single source of truth for every dispatch below.
+_BY_VERSION = {6: (V6_RECORD_BYTES, V6_DTYPE),
+               7: (V7_RECORD_BYTES, V7_DTYPE),
+               8: (V8_RECORD_BYTES, V8_DTYPE)}
+
+# Versions carrying the 40-byte ExtraV7 tail. Consumers must test THIS, not `7 in
+# versions`: v8 carries the tail byte-for-byte, and gating on the version number
+# silently refuses a v8 corpus that in fact has every field the aux heads need.
+_HAS_V7_TAIL = frozenset({7, 8})
+
 
 def _wdl_from_qd(q, d):
   """(q, d) -> [w, d, l] rows, clipped to valid simplex."""
@@ -220,6 +258,7 @@ class V6ChunkDataset(TPGDataset):
     self._skipped_other_version = 0
     self._skipped_formats = 0
     self._read_errors = 0
+    self._ragged_chunks = 0          # chunk length not a multiple of the record stride
     self._zfiltered = 0
     if self.max_resultq_delta > 0:
       print(f'[v6_dataset] z-integrity filter ON: drop |best_q - result_q| > {self.max_resultq_delta}')
@@ -257,16 +296,14 @@ class V6ChunkDataset(TPGDataset):
       ver = int(np.frombuffer(data[:4], dtype='<u4')[0])
       versions.add(ver)
       version_roots.setdefault(ver, set()).add(_root)
-      if ver == 6:
-        recs = np.frombuffer(data, dtype=V6_DTYPE, count=len(data) // V6_RECORD_BYTES)
-      elif ver == 7:
-        recs = np.frombuffer(data, dtype=V7_DTYPE, count=len(data) // V7_RECORD_BYTES)
-      else:
+      if ver not in _BY_VERSION:
         continue
+      _rb, _dt = _BY_VERSION[ver]
+      recs = np.frombuffer(data, dtype=_dt, count=len(data) // _rb)
       rq = np.nan_to_num(recs['result_q'])
       rq_nonint += int((np.abs(rq - np.round(rq)) > 1e-6).sum())
       rq_n += len(rq)
-      if ver == 7:
+      if ver >= 7:
         provs.update(np.unique(np.nan_to_num(recs['z_provenance']).astype(np.uint8)).tolist())
         opp_pop += int((recs['opp_played_idx'] < 1858).sum())
         act_pop += int(((recs['played_idx'] < 1858)
@@ -278,6 +315,8 @@ class V6ChunkDataset(TPGDataset):
       fh.close()
     self._tar_handles = {}
     self._diag_versions = versions            # consumed by train.py sidecar preflights
+    # v7-tail capability, not version identity — see _HAS_V7_TAIL.
+    self._diag_has_v7_tail = bool(versions & _HAS_V7_TAIL)
     # Aux-target population fractions over the v7 sample (finding 7: a corpus
     # whose writer zero-filled the ExtraV7 tail would otherwise train the
     # opp/action heads on 100% 'valid' garbage with plausible loss curves).
@@ -288,17 +327,17 @@ class V6ChunkDataset(TPGDataset):
     # pinning is first-decoded-chunk-wins PER FORKED WORKER, so a mixed union
     # would pin differently per worker/rank — rank-divergent batch keys (NCCL
     # hang under static_graph) and ~half the corpus silently dropped.
-    if len(versions & {6, 7}) > 1:
+    if len(versions & set(_BY_VERSION)) > 1:
       _vr = {v: sorted(version_roots.get(v, set())) for v in sorted(versions)}
       raise ValueError(f'DirectFromV6: mixed record versions across TrainingFilesDirectory '
                        f'roots ({_vr}) — all roots must hold the SAME version '
-                       f'(v6 and v7 cannot be combined in one source)')
+                       f'(v6/v7/v8 cannot be combined in one source)')
     deblundered = (rq_nonint > 0) or bool(provs & {2, 3})
     rescored = bool(provs & {1, 4})
     parts = [f'versions={sorted(versions)}']
     parts.append('deblundered=YES' if deblundered else
                  'deblundered=NO (z-integrity filter recommended: V6MaxResultQDelta)')
-    parts.append(('rescored=YES' if rescored else 'rescored=unknown/no') if 7 in versions
+    parts.append(('rescored=YES' if rescored else 'rescored=unknown/no') if versions & _HAS_V7_TAIL
                  else 'rescored=undetectable (v6)')
     if provs:
       parts.append(f'provenance={sorted(provs)}')
@@ -375,15 +414,19 @@ class V6ChunkDataset(TPGDataset):
     if data is None or len(data) < 8:
       return None
     ver = int(np.frombuffer(data[:4], dtype='<u4')[0])
-    if ver not in (6, 7):
+    if ver not in _BY_VERSION:
       return None
     if self._version is None:
       self._version = ver                          # pin corpus version (finding 9)
     elif ver != self._version:
       self._skipped_other_version += 1
       return None
-    rec_bytes, dtype = ((V6_RECORD_BYTES, V6_DTYPE) if ver == 6
-                        else (V7_RECORD_BYTES, V7_DTYPE))
+    rec_bytes, dtype = _BY_VERSION[ver]
+    if len(data) % rec_bytes:
+      # Spec guarantees an exact multiple; a remainder means the version word and the
+      # body disagree. Count it rather than decoding a truncated tail.
+      self._ragged_chunks += 1
+      return None
     n = len(data) // rec_bytes
     if n == 0:
       return None
@@ -631,6 +674,8 @@ class V6ChunkDataset(TPGDataset):
         diags.append(f'non-format-1 records {self._skipped_formats}')
       if self._read_errors:
         diags.append(f'read errors {self._read_errors}')
+      if self._ragged_chunks:
+        diags.append(f'RAGGED chunks {self._ragged_chunks} (length not a multiple of the stride)')
       if self._zfiltered:
         diags.append(f'z-filtered {self._zfiltered}')
       if diags:
