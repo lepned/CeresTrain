@@ -53,7 +53,7 @@
   "UseDualPlane": false,
   "UseMoveTokens": true,
   "MoveTokenDim": 256,
-  "MoveTokenLayers": 4,
+  "MoveTokenLayers": 6,
   "MoveTokenHeads": 8,
   "MoveTokenFFNMult": 2,
   "MoveTokenMax": 96,

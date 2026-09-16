@@ -7,6 +7,9 @@
 #   KEY=HLGaussWeight VAL=0 MINPOS=3100000000 SEG=seg8_hlgauss_off \
 #     setsid nohup bash ~/scan/switch_single_knob.sh > /tmp/switch.log 2>&1 &
 #
+#   ID=<id>_ng KEY=MoveTokenLayers MINPOS=3900000000 SEG=seg10_dec6 \
+#     setsid nohup bash ~/scan/switch_single_knob.sh > /tmp/switch.log 2>&1 &
+#
 # THE GUARD IS THE POINT: it aborts unless exactly one config file differs from the
 # running one and the only differing lines mention KEY. Two knobs at once makes the
 # readout uninterpretable whichever way the metric moves -- the failure that made the
@@ -18,7 +21,8 @@
 
 set -u
 OUT=/mnt/lepned/ceres_out
-ID=prod_1024_10_f2_h16_t80t91_8B_hr07d05
+# ID is overridable: arm B (the live run since 3.3B) is the "_ng" training id.
+ID=${ID:-prod_1024_10_f2_h16_t80t91_8B_hr07d05}
 REPO=~/repos/CeresTrain
 LOG=$OUT/logs/${ID}_launch.log
 KEY=${KEY:?set KEY: one field name, or a regex alternation for a deliberate
@@ -115,7 +119,7 @@ sleep 210
 
 # ---- 6. verify the boot lines that matter ----
 say "boot check:"
-grep -E "LOAD_CHECKPOINT|HL-GAUSS|FOCAL hardness|dropped checkpoint tensors|Muon honors|wd partition|lr-schedule|datastream. resume|collective timeout|static_graph" \
-     $LOG | tail -14 | sed 's/^/    /'
+grep -E "LOAD_CHECKPOINT|DECODER GROWN|post-move attn|MT_EXPORT_MAX|HL-GAUSS|FOCAL hardness|dropped checkpoint tensors|Muon honors|wd partition|lr-schedule|datastream. resume|collective timeout|static_graph" \
+     $LOG | tail -16 | sed 's/^/    /'
 say "procs: $(pgrep -fc "train.py $ID")  tracebacks: $(grep -c 'Traceback\|Watchdog caught' $LOG)"
 say "pos: $(grep '^TRAIN: ' $LOG | tail -1 | cut -d, -f1)"
