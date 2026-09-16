@@ -324,7 +324,7 @@ class MoveTokenDecoder(nn.Module):
                heads: int = 4, ffn_mult: int = 2, max_tokens: int = 128,
                value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True,
                rich_features: bool = False, value_pool: str = 'meanmax',
-               value_pool_detach: bool = True, post_move: bool = False,
+               value_pool_detach: bool = True, post_move: bool = False, post_move_blocks=None,
                value_query: bool = False, value_order: bool = False,
                opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
                expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
@@ -389,8 +389,18 @@ class MoveTokenDecoder(nn.Module):
     self.value_pool = value_pool
     self.value_pool_detach = bool(value_pool_detach)
     self.rich_dim = 17 if self.rich_features else 0
-    self.post_move = bool(post_move)
     self.value_query = bool(value_query)
+    # 2026-09-15 POST-MOVE BLOCK SUBSET: post_move_blocks = iterable of block indices that get the post-move
+    # cross-attention (None = every block when post_move is on). Full form measured 12.5 % EPS on 256x10
+    # (all 4 blocks); the last-block-only form is the cheap candidate. Blocks outside the set are plain.
+    if post_move and post_move_blocks is None:
+      self.pm_blocks = set(range(layers))
+    elif post_move:
+      self.pm_blocks = set(int(i) for i in post_move_blocks)
+      assert self.pm_blocks and all(0 <= i < layers for i in self.pm_blocks), f'post_move_blocks {sorted(self.pm_blocks)} out of range for {layers} blocks'
+    else:
+      self.pm_blocks = set()
+    self.post_move = len(self.pm_blocks) > 0
     self.pool_dim = (3 * dm if value_pool == 'both' else 2 * dm) + (dm if self.value_query else 0) \
                     + (2 * dm if self.opp_pool else 0)
     # EXPORT-FUSED eval path (2026-09-03, TRT profile: decoder is launch-bound, ~101
@@ -463,9 +473,9 @@ class MoveTokenDecoder(nn.Module):
                          persistent=False)
     # Token init: concat(flow[from], flow[to], 4 vis channels of the pair).
     self.w_in = nn.Linear(2 * s_dim + 4 + self.rich_dim, dm)
-    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type, post_move=self.post_move,
+    self.blocks = nn.ModuleList([MoveTokenBlock(dm, s_dim, heads, ffn_mult, norm_type, post_move=(i in self.pm_blocks),
                                                 rel_bias=self.rel_bias)
-                                 for _ in range(layers)])
+                                 for i in range(layers)])
     self.out_ln = make_norm(norm_type, dm)
     if self.value_query:
       self.vq_block = ValueQueryBlock(dm, s_dim, heads, ffn_mult, norm_type)
@@ -714,15 +724,16 @@ class MoveTokenDecoder(nn.Module):
       eps = self.blocks[0].ln_s.eps
       n = flow * torch.rsqrt(flow.pow(2).mean(-1, keepdim=True) + eps)         # shared, scale-free RMS
       Ws = [blk.xkv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks]
-      if self.post_move:
-        Ws += [blk.pm_kv.weight * blk.ln_s.scale.unsqueeze(0) for blk in self.blocks]
+      _pm_idx = {}
+      for blk_i, blk in enumerate(self.blocks):
+        if blk.post_move:
+          _pm_idx[blk_i] = len(Ws); Ws.append(blk.pm_kv.weight * blk.ln_s.scale.unsqueeze(0))
       if self.value_query:
         Ws.append(self.vq_block.kv2.weight * self.vq_block.ln_s.scale.unsqueeze(0))
       kv_all = torch.nn.functional.linear(n, torch.cat(Ws, dim=0).to(n.dtype))  # [B,64,sum]
-      L = len(self.blocks)
       kvs = list(kv_all.split([w.shape[0] for w in Ws], dim=-1))
       for i, blk in enumerate(self.blocks):
-        x = blk(x, None, key_bias, kv=kvs[i], pm=pm, pm_kv=(kvs[L + i] if self.post_move else None),
+        x = blk(x, None, key_bias, kv=kvs[i], pm=pm, pm_kv=(kvs[_pm_idx[i]] if blk.post_move else None),
                 x_opp=x_opp, opp_bias=opp_bias, rel=rel)
       vq_kv2 = kvs[-1] if self.value_query else None
     else:

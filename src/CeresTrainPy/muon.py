@@ -282,6 +282,12 @@ class Muon(torch.optim.Optimizer):
                     # of radius R. fp32 math; the model keeps fp32 master weights (bf16-mixed).
                     if "hb_radius" not in state:
                         state["hb_radius"] = p.data.float().norm().item()
+                        if state["hb_radius"] == 0.0:
+                            print('[muon] Hyperball: a parameter has ZERO norm at its first Hyperball step (zero-init warm-start '
+                                  'module, e.g. a grown decoder block) — the sphere projection would pin it at 0 forever; '
+                                  'taking plain Muon steps for it instead (R stays 0 => excluded)', flush=True)
+                    R = state["hb_radius"]
+                if id(p) in self._hyperball and state.get("hb_radius", 0.0) > 0.0:
                     R = state["hb_radius"]
                     u32 = u.float()
                     eta = lr_p * group.get("hyperball_lr_ratio", 1.0)

@@ -663,6 +663,21 @@ class Configuration:
     self.NetDef_MoveTokenValuePoolDetach = bool(config_net_def.get('MoveTokenValuePoolDetach', True))
     # X-program items 3/4 (2026-09-03): post-move square attention per block; learned value query token.
     self.NetDef_MoveTokenPostMove = bool(config_net_def.get('MoveTokenPostMove', False))
+    # 2026-09-15: MoveTokenPostMoveBlocks = list of decoder block indices that get post-move ('all'/absent = every
+    # block). Last-block-only ([MoveTokenLayers-1]) is the cheap serving form (full form: 12.5 % EPS on 256x10).
+    _pmb = config_net_def.get('MoveTokenPostMoveBlocks', None)
+    if _pmb in (None, 'all', ''):
+      self.NetDef_MoveTokenPostMoveBlocks = None
+    else:
+      if not self.NetDef_MoveTokenPostMove:
+        raise ValueError('MoveTokenPostMoveBlocks is set but MoveTokenPostMove is off (silent no-op refused)')
+      if not isinstance(_pmb, (list, tuple)):
+        raise ValueError(f"MoveTokenPostMoveBlocks must be 'all' or a list of block indices, got {_pmb!r}")
+      _pmb = [int(i) for i in _pmb]
+      _nl = int(self.NetDef_MoveTokenLayers)
+      if not _pmb or len(set(_pmb)) != len(_pmb) or any(i < 0 or i >= _nl for i in _pmb):
+        raise ValueError(f'MoveTokenPostMoveBlocks must be unique block indices in [0, MoveTokenLayers={_nl}), got {_pmb!r}')
+      self.NetDef_MoveTokenPostMoveBlocks = sorted(_pmb)
     self.NetDef_MoveTokenValueQuery = bool(config_net_def.get('MoveTokenValueQuery', False))
     # 2026-09-04 ideation T1-2 / T1-3: opponent-reply keys in the decoder self-attention
     # (MoveTokenOppMax = number of opponent candidate tokens, 0 = off; MoveTokenOppPool =

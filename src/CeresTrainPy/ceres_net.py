@@ -1614,7 +1614,8 @@ class CeresNet(nn.Module):
           value_inject_dim=(64 * HEAD_MULT) if _mt_vi else 0,
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
-          post_move=_mt_pm, value_query=_mt_vq, value_order=self.mt_vord_w > 0,
+          post_move=_mt_pm, post_move_blocks=getattr(config, 'NetDef_MoveTokenPostMoveBlocks', None),
+          value_query=_mt_vq, value_order=self.mt_vord_w > 0,
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
           expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel)
       if _mt_ev:
@@ -1629,7 +1630,7 @@ class CeresNet(nn.Module):
             f'value inject {"on" if _mt_vi else "off"}; per-move bias {"on" if _mt_pb else "OFF (frozen zero)"}; '
             f'rich features {"ON (+17)" if _mt_rich else "off"}; value pool {_mt_vpool}'
             f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
-            f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {"ON" if _mt_pm else "off"}; '
+            f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {("ON blocks %s" % sorted(self.move_tokens.pm_blocks)) if _mt_pm else "off"}; '
             f'value query {"ON" if _mt_vq else "off"}; '
             f'value-order head {("ON w=%g top-%d" % (self.mt_vord_w, self.mt_vord_topk)) if self.mt_vord_w > 0 else "off"}; '
             f'opponent keys {("ON Mo=%d%s" % (_mt_opp, " +pool" if _mt_opp_pool else "")) if _mt_opp > 0 else "off"}; '

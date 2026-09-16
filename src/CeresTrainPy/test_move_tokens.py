@@ -398,6 +398,36 @@ def main():
     raise AssertionError('MoveTokenRelBias with opponent keys must be refused')
   except ValueError:
     pass
+  # --- 4k. post-move on a block SUBSET (2026-09-15): only listed blocks carry it; fused == unfused; refusal ---
+  net5, _ = build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenDim': 64,
+                   'MoveTokenLayers': 2, 'MoveTokenHeads': 2, 'MoveTokenMax': 64,
+                   'MoveTokenPostMove': True, 'MoveTokenPostMoveBlocks': [1]}, {}, 'mt5')
+  assert net5.move_tokens.pm_blocks == {1} and not net5.move_tokens.blocks[0].post_move and net5.move_tokens.blocks[1].post_move
+  assert not hasattr(net5.move_tokens.blocks[0], 'pm_kv') and hasattr(net5.move_tokens.blocks[1], 'pm_kv')
+  net5.train(); net5.zero_grad(set_to_none=True)
+  loss5 = run_loss(net5, batch, sq); assert torch.isfinite(loss5); loss5.backward()
+  dead5 = [n for n, p in net5.move_tokens.named_parameters() if p.grad is None]
+  assert not dead5, f'move_tokens params without gradient: {dead5}'
+  with torch.no_grad():
+    net5.move_tokens.blocks[1].pm_proj.weight.normal_(0.0, 0.05)   # make the post-move path live
+  net5.eval()
+  with torch.no_grad(): o_f = net5(sq, None)
+  net5.move_tokens.export_fused = False
+  with torch.no_grad(): o_u = net5(sq, None)
+  net5.move_tokens.export_fused = True
+  d5 = float((o_f[0] - o_u[0]).abs().max()); assert d5 < 1e-4, d5
+  try:
+    build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenLayers': 2, 'MoveTokenPostMove': True, 'MoveTokenPostMoveBlocks': [2]}, {}, 'mt5bad')
+    raise AssertionError('out-of-range post-move block must be refused')
+  except ValueError:
+    pass
+  try:
+    build({'DualPlanePolicyDecode': False, 'UseMoveTokens': True, 'MoveTokenPostMoveBlocks': [0]}, {}, 'mt5bad2')
+    raise AssertionError('MoveTokenPostMoveBlocks without MoveTokenPostMove must be refused')
+  except ValueError:
+    pass
+  print(f'  post-move block subset OK: only block 1 carries it, grads flow, fused == unfused (max|d| {d5:.2e}), refusals OK')
+
   print(f'  relational bias OK: tables + full relation vectors on 5 known moves + brute-force 64x64 cross-check, step-0 exact no-op, exact extra keys, gradient, '
         f'no_decay, live when non-zero, opp-keys refused (loss {float(loss4.detach()):.4f})')
   try:

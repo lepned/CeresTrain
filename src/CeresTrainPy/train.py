@@ -1876,6 +1876,9 @@ def Train():
                 f"changes the net's function on resume: {_dropped_live}", flush=True)
         _ckpt_model_sd = {k: v for k, v in _ckpt_model_sd.items() if k not in _dropped}
       _fresh = [k for k in _model_aux_keys if k not in _ckpt_model_sd]
+      _dropped_live = locals().get('_dropped_live', [])
+      _ident = ('function-identical to the checkpoint at the switch' if not _dropped_live
+                else 'NOT function-identical: trained tensors were dropped in this resume (see WARNING above)')
       if _fresh:
         print(f"INFO: AUX_HEAD newly enabled on resume; params start fresh-initialized: {sorted(_fresh)}")
         _pl_res = model_nocompile.load_state_dict(_ckpt_model_sd, strict=False)
@@ -1895,8 +1898,17 @@ def Train():
         if any('.attn_out_gate.' in k for k in _fresh):
           from gate_fold import fold_gate_on_warm_start
           _n_fold, _g0 = fold_gate_on_warm_start(model_nocompile)
-          print(f"INFO: GATED ATTENTION OUTPUT enabled on resume: W_h scaled by 1/sigmoid(bias) = 1/{_g0:.4f} in {_n_fold} layers "
-                f"=> function-identical to the checkpoint at the switch (optimizer state restarts: group sizes changed)", flush=True)
+          if IS_MASTER:
+            print(f"INFO: GATED ATTENTION OUTPUT enabled on resume: W_h scaled by 1/sigmoid(bias) = 1/{_g0:.4f} in {_n_fold} layers "
+                  f"=> {_ident} (optimizer state restarts: group sizes changed)", flush=True)
+        # Decoder GROWN at resume (2026-09-16, e.g. MoveTokenLayers 4 -> 6): every block whose parameters are all
+        # fresh gets its three output projections zeroed so it is an exact identity at the switch (decoder_grow.py).
+        if any(k.startswith('move_tokens.blocks.') for k in _fresh) and getattr(model_nocompile, 'move_tokens', None) is not None:
+          from decoder_grow import zero_init_fresh_decoder_blocks
+          _grown = zero_init_fresh_decoder_blocks(model_nocompile, _fresh)
+          if _grown and IS_MASTER:
+            print(f"INFO: MOVE-TOKEN DECODER GROWN on resume: blocks {_grown} are new -> proj/xproj/ffn_out zeroed "
+                  f"=> {_ident} (optimizer state restarts: group sizes changed)", flush=True)
       else:
         # load checkpoint parameters, expect all to match (strict = True)
         model_nocompile.load_state_dict(_ckpt_model_sd, strict = True)
@@ -1959,11 +1971,12 @@ def Train():
 
 
     # Check all layers for zero parameters
-    if config.Opt_CheckpointResumeFromFileName is not None:
+    if config.Opt_CheckpointResumeFromFileName is not None and IS_MASTER:
       for name, param in model.named_parameters():
         if param.requires_grad:  # Check only trainable parameters
           if torch.all(param == 0):  # Check if all elements in the tensor are zero
-            print(f"Note: layer {name} has all zero values. This is expected only for LoRA layers.")
+            print(f"Note: layer {name} has all zero values. Expected for LoRA layers and for zero-init warm-start modules "
+                  f"(grown decoder blocks, injects, gates); otherwise investigate.")
 
     # Unified optimizer-resume path:
     #   - If the loaded optimizer dict's param_groups match the current optimizer, a
