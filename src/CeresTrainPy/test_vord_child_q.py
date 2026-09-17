@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault('CERES_AUX_FEATURES_PER_SQUARE', '0')
-from move_tokens import move_token_value_order_loss
+from move_tokens import move_token_value_order_loss, _children_to_tokens
 
 M, SCRATCH = 8, 4096
 
@@ -95,14 +95,32 @@ def promotion_tiebreak():
   _, diag = move_token_value_order_loss(u, sel, valid, torch.zeros(B, 1858), mv_pair_flat,
                                         topk=1, child=(ci, cq, cn))
   assert diag['mt_vord_targets_per_row'] == 1.0
-  # Reach the scattered value through the public path: rank two tokens on the same pair.
-  sel2 = torch.zeros(B, 2, dtype=torch.int64)
+  # Assert the VALUE that survives the tiebreak, not just that the loss is finite. The
+  # earlier version only checked finiteness, so it passed for any winner -- including the
+  # arbitrary ones the old CUDA scatter could produce. Two pairs, each over-subscribed,
+  # with the correct answer different from both the lowest-q and the highest-q child.
+  mv2 = torch.zeros(1858, dtype=torch.int64)
+  mv2[20], mv2[21] = 1, 1                        # moves 20, 21 -> pair 1
+  ci2 = torch.full((B, S), -1, dtype=torch.int64)
+  cq2 = torch.zeros(B, S)
+  cn2 = torch.zeros(B, S, dtype=torch.int64)
+  ci2[:, 0], cn2[:, 0], cq2[:, 0] = 10, 90, 0.75   # pair 0 winner
+  ci2[:, 1], cn2[:, 1], cq2[:, 1] = 11, 40, -0.60
+  ci2[:, 2], cn2[:, 2], cq2[:, 2] = 12, 5, 0.99    # highest q, nearly unvisited -> must lose
+  ci2[:, 3], cn2[:, 3], cq2[:, 3] = 21, 70, -0.25  # pair 1 winner (NOT the lowest slot of the two)
+  ci2[:, 4], cn2[:, 4], cq2[:, 4] = 20, 30, 0.40
+  sel2 = torch.tensor([[0, 1]] * B)
   valid2 = torch.ones(B, 2, dtype=torch.bool)
-  u2 = torch.tensor([[5.0, -5.0]] * B)
-  l_hi, _ = move_token_value_order_loss(u2, sel2, valid2, torch.zeros(B, 1858), mv_pair_flat,
-                                        topk=1, child=(ci, cq, cn))
-  assert torch.isfinite(l_hi), 'tiebreak path produced a non-finite loss'
-  print('  promotion tiebreak OK: most-visited move on the pair supplies q (slot order respected)')
+  tok_n, tok_q = _children_to_tokens(sel2, valid2, mv2, ci2, cn2, cq2)
+  assert torch.allclose(tok_n, torch.tensor([[90.0, 70.0]] * B)), tok_n
+  assert torch.allclose(tok_q, torch.tensor([[0.75, -0.25]] * B)), tok_q
+
+  # A token whose pair has no child at all must come back dead, not borrow a neighbour's.
+  sel3 = torch.tensor([[0, 7]] * B)
+  n3, q3 = _children_to_tokens(sel3, valid2, mv2, ci2, cn2, cq2)
+  assert torch.allclose(n3[:, 1], torch.zeros(B)), n3
+  print('  promotion tiebreak OK: most-visited child wins per pair '
+        '(q 0.75/-0.25, n 90/70), empty pair stays dead')
 
 
 def unvisited_excluded():

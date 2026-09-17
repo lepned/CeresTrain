@@ -805,30 +805,19 @@ class Configuration:
     self.Opt_MoveTokenValueOrderMinVisits = float(config_opt.get('MoveTokenValueOrderMinVisits', 0) or 0)
     if self.Opt_MoveTokenValueOrderMinVisits > 0 and not self.Opt_MoveTokenValueOrderUseChildQ:
       raise ValueError('MoveTokenValueOrderMinVisits needs MoveTokenValueOrderUseChildQ (silent no-op refused)')
+    # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
+    # logit (architecture, not an aux readout). NetDef because it changes the graph.
+    self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))
+    self.Opt_LossMoveTokenMinimaxMultiplier = float(config_opt.get('LossMoveTokenMinimaxMultiplier', 0) or 0)
+    if self.NetDef_MoveTokenMinimax and not self.NetDef_UseMoveTokens:
+      raise ValueError('MoveTokenMinimax needs UseMoveTokens (silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and not self.NetDef_MoveTokenMinimax:
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but MoveTokenMinimax is off '
+                       '(nothing to supervise; silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 requires DirectFromV6 with a v8 corpus')
     # Regress the per-token scalar onto child q instead of ranking it. Mutually exclusive
     # with the ranking target: one scalar, one loss.
-    # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
-    # logit (architecture, not an aux readout). NetDef because it changes the graph.
-    self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))
-    self.Opt_LossMoveTokenMinimaxMultiplier = float(config_opt.get('LossMoveTokenMinimaxMultiplier', 0) or 0)
-    if self.NetDef_MoveTokenMinimax and not self.NetDef_UseMoveTokens:
-      raise ValueError('MoveTokenMinimax needs UseMoveTokens (silent no-op refused)')
-    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and not self.NetDef_MoveTokenMinimax:
-      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but MoveTokenMinimax is off '
-                       '(nothing to supervise; silent no-op refused)')
-    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
-      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 requires DirectFromV6 with a v8 corpus')
-    # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
-    # logit (architecture, not an aux readout). NetDef because it changes the graph.
-    self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))
-    self.Opt_LossMoveTokenMinimaxMultiplier = float(config_opt.get('LossMoveTokenMinimaxMultiplier', 0) or 0)
-    if self.NetDef_MoveTokenMinimax and not self.NetDef_UseMoveTokens:
-      raise ValueError('MoveTokenMinimax needs UseMoveTokens (silent no-op refused)')
-    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and not self.NetDef_MoveTokenMinimax:
-      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but MoveTokenMinimax is off '
-                       '(nothing to supervise; silent no-op refused)')
-    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
-      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 requires DirectFromV6 with a v8 corpus')
     self.Opt_LossMoveTokenQRegressionMultiplier = float(config_opt.get('LossMoveTokenQRegressionMultiplier', 0) or 0)
     if self.Opt_LossMoveTokenQRegressionMultiplier > 0:
       if self.Opt_LossMoveTokenValueOrderMultiplier > 0:

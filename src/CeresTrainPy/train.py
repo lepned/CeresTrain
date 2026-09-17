@@ -678,6 +678,7 @@ def Train():
       if 'dp_eaux_' in n: return False           # edge-aux readout [T, C] (boelge 13): a training-only final layer, AdamW
       if 'move_tokens.pol' in n: return False    # move-token policy readout [4, dm]: the final policy layer, AdamW
       if 'move_tokens.vord' in n: return False   # value-order scalar [1, dm]: a training-only readout, AdamW
+      if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -794,7 +795,12 @@ def Train():
                     'move_tokens.v2_inject.', 'move_tokens.vord.', 'move_tokens.ev_head.', 'mt_ev_dir',
                     # 2026-09-11 review: the trunk-layer-mix gains are zero-init couplings of the same class as
                     # the injects (readers, not decoder body) -> same family, so a heads ratio treats them alike.
-                    'move_tokens.mix_gain.')
+                    'move_tokens.mix_gain.',
+                    # 2026-09-17 review: the minimax readouts (mm_v, mm_r and their zero-init alphas)
+                    # are ADDED to the `pol` logits, so they are part of the policy readout. Without
+                    # this they would train at the base/decoder rate while the readout they feed
+                    # trains at half that -- an unintended 2x on one side of the same sum.
+                    'move_tokens.mm_')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her

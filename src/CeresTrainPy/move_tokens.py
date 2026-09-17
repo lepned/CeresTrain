@@ -855,6 +855,39 @@ class MoveTokenDecoder(nn.Module):
     return pol, pooled, stats, sel, valid, wb, ev
 
 
+def _children_to_tokens(sel, valid, mv_pair_flat, child_idx, child_n, *child_vals):
+  """Per-token view of the child table: for each move token, the values of the
+  MOST-VISITED child on that token's from-to pair.
+
+  Returns (tok_n, tok_val0, tok_val1, ...) all [B, M]. tok_n == 0 marks a token with no
+  usable child, and every returned value is meaningless there.
+
+  Why a gather and not a scatter. A from-to pair can carry several moves (promotions), so
+  several children write to the same pair. The obvious `scatter_` with the slots reversed
+  relies on "last write wins", which holds on CPU but is DOCUMENTED AS ARBITRARY for
+  duplicate indices on CUDA -- and training runs on CUDA. Worse, separate scatters for q,
+  n and reply_q race independently, so a token could receive the queen promotion's value
+  with the knight promotion's visit weight. Found in review 2026-09-17; the earlier
+  minimax/q-regression measurements were taken with that defect.
+
+  `argmax` documents first-occurrence on ties, and the writer emits slots n_raw-descending
+  (prior-descending on ties), so the winner is exactly the tiebreak the format intends.
+  Costs a [B, M, S] boolean -- ~6 M elements at B=512, M=96, S=128.
+  """
+  live = child_idx >= 0
+  SCRATCH = 4096
+  pair_of = torch.where(live, mv_pair_flat[child_idx.clamp_min(0)],
+                        torch.full_like(child_idx, SCRATCH))                  # [B,S]
+  match = sel.unsqueeze(2) == pair_of.unsqueeze(1)                            # [B,M,S]
+  key = child_n.float().unsqueeze(1) * match                                  # 0 where no match
+  best = key.argmax(dim=2)                                                    # [B,M]
+  tok_n = key.gather(2, best.unsqueeze(2)).squeeze(2) * valid.to(key.dtype)
+  out = [tok_n]
+  for v in child_vals:
+    out.append(torch.gather(v.float(), 1, best))
+  return tuple(out)
+
+
 def move_token_minimax_loss(v_tok, r_tok, sel, valid, mv_pair_flat, child,
                             huber_delta: float = 0.2):
   """Supervise the decoder's per-move VALUE and value-AFTER-REPLY heads.
@@ -866,23 +899,8 @@ def move_token_minimax_loss(v_tok, r_tok, sel, valid, mv_pair_flat, child,
   the loader marks those -2 (outside q's range). Training the reply head toward a zeroed
   sentinel would teach it that unrecorded replies are dead draws.
   """
-  B = v_tok.shape[0]
   ci, cq, cn, crq = child
-  S = ci.shape[1]
-  SCRATCH = 4096
-  live_c = ci >= 0
-  pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)], torch.full_like(ci, SCRATCH))
-  rev = torch.arange(S - 1, -1, -1, device=ci.device)
-  pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-  pr = torch.full((B, SCRATCH + 1), -2.0, device=ci.device, dtype=torch.float32)
-  pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-  pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
-  pr.scatter_(1, pair_of[:, rev], crq.float()[:, rev])
-  pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
-
-  t_v = torch.gather(pq[:, :SCRATCH], 1, sel)
-  t_r = torch.gather(pr[:, :SCRATCH], 1, sel)
-  w = torch.gather(pn[:, :SCRATCH], 1, sel) * valid.to(torch.float32)
+  w, t_v, t_r = _children_to_tokens(sel, valid, mv_pair_flat, ci, cn, cq, crq)
   w_r = w * (t_r > -1.5).to(torch.float32)          # reply recorded
 
   def huber(pred, tgt, wt):
@@ -919,20 +937,8 @@ def move_token_q_regression_loss(u, sel, valid, mv_pair_flat, child, huber_delta
   Huber rather than MSE: q is bounded in [-1, 1] but tablebase and mate scores sit exactly
   at the ends, and squared error on those swamps the ordinary positions.
   """
-  B = u.shape[0]
   ci, cq, cn = child
-  S = ci.shape[1]
-  SCRATCH = 4096
-  live_c = ci >= 0
-  pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)], torch.full_like(ci, SCRATCH))
-  rev = torch.arange(S - 1, -1, -1, device=ci.device)
-  pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-  pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-  pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
-  pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
-
-  tgt = torch.gather(pq[:, :SCRATCH], 1, sel)                                          # [B,M]
-  w = torch.gather(pn[:, :SCRATCH], 1, sel) * valid.to(torch.float32)                  # [B,M]
+  w, tgt = _children_to_tokens(sel, valid, mv_pair_flat, ci, cn, cq)                   # [B,M]
   wsum = w.sum(dim=1, keepdim=True)
   rows = (wsum.squeeze(1) > 0)
   err = u.float() - tgt
@@ -988,20 +994,7 @@ def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk
     tok_key = tok_t
   else:
     ci, cq, cn = child                                                                # [B,S]
-    S = ci.shape[1]
-    live_c = ci >= 0
-    # Masked children go to a scratch column so they cannot overwrite a real pair.
-    SCRATCH = 4096
-    pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)],
-                          torch.full_like(ci, SCRATCH))                               # [B,S]
-    rev = torch.arange(S - 1, -1, -1, device=ci.device)
-    dt = u.dtype if u.is_floating_point() else torch.float32
-    pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-    pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
-    pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
-    pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
-    tok_key = torch.gather(pq[:, :SCRATCH], 1, sel)                                   # [B,M]
-    tok_n = torch.gather(pn[:, :SCRATCH], 1, sel)                                     # [B,M]
+    tok_n, tok_key = _children_to_tokens(sel, valid, mv_pair_flat, ci, cn, cq)        # [B,M]
     tok_live = valid & (tok_n > 0)
     # min_visits: q from a child with 2-3 visits is nearly noise, and under a VALUE
     # ordering such a child can land in the supervised top-K above a well-searched move
