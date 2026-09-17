@@ -102,6 +102,19 @@ V7Extras = namedtuple('V7Extras',
                       ['cens_q', 'cens_d', 'prov', 'opp_idx', 'act_idx', 'act_q', 'act_d'],
                       defaults=(None, None, None, None))  # last 4 optional
 
+# LC0 v8 CHILD TABLE (cv4 corpora; v6_dataset.py builds it, nothing else can supply it).
+# Per position, up to V8_SLOTS candidate moves the search actually explored:
+#   child_idx [B,S] int16   1858-space move index, -1 = slot unused OR unvisited
+#   child_q   [B,S] float32 the search's value for that move, THIS record's frame, [-1,1]
+#   child_n   [B,S] int32   raw root visits of that child
+# The mask lives in child_idx (-1), so consumers never need the sentinels: q is only
+# meaningful where n_raw > 0, and that is already folded in.
+# This is the first per-MOVE value target we have had; the TPG/v6 path supervises a
+# single move per position (see train.py's action two-position trick).
+V8Extras = namedtuple('V8Extras',
+                      ['child_idx', 'child_q', 'child_n',
+                       'child_d', 'child_rq', 'child_ndef'])
+
 # SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
 # re-reading the env here. This guarantees the data width (how many aux channels
 # we keep per square) always matches the model width (config.py's embedding sizing).
@@ -878,6 +891,7 @@ class TPGDataset(Dataset):
     survival = batch[13] if len(batch) > 13 else None
     v7x = batch[14] if len(batch) > 14 else None
     _stream_tag = batch[15] if len(batch) > 15 else None
+    v8x = batch[16] if len(batch) > 16 else None      # v8 child table, DirectFromV6 only
     
     _nb = policies_indices.shape[0]   # actual row count (may be < batch_size after decisive draw-filtering)
     policies_indices = torch.tensor(policies_indices, dtype=torch.int64).reshape(_nb, MAX_MOVES)
@@ -936,6 +950,15 @@ class TPGDataset(Dataset):
           filtered_dict['action_played_idx'] = filter_tensor(torch.tensor(v7x.act_idx, dtype=torch.int64), mod_value)
           filtered_dict['action_q_after'] = filter_tensor(torch.tensor(v7x.act_q, dtype=torch.float32), mod_value)
           filtered_dict['action_d_after'] = filter_tensor(torch.tensor(v7x.act_d, dtype=torch.float32), mod_value)
+      if v8x is not None:
+        # Per-move search values. int64 for the index so it can gather directly; the
+        # -1 rows are the mask and every consumer must honour them.
+        filtered_dict['child_idx'] = filter_tensor(torch.tensor(v8x.child_idx, dtype=torch.int64), mod_value)
+        filtered_dict['child_q'] = filter_tensor(torch.tensor(v8x.child_q, dtype=torch.float32), mod_value)
+        filtered_dict['child_n'] = filter_tensor(torch.tensor(v8x.child_n, dtype=torch.int64), mod_value)
+        filtered_dict['child_d'] = filter_tensor(torch.tensor(v8x.child_d, dtype=torch.float32), mod_value)
+        filtered_dict['child_rq'] = filter_tensor(torch.tensor(v8x.child_rq, dtype=torch.float32), mod_value)
+        filtered_dict['child_ndef'] = filter_tensor(torch.tensor(v8x.child_ndef, dtype=torch.int64), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

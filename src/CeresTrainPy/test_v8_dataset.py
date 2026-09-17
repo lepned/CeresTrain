@@ -238,9 +238,64 @@ def loader(path):
   print('  ragged tripwire OK: a short-tailed chunk is refused and counted')
 
 
+def child_table(path):
+  """The v8 child table as the trainer will see it, checked against the raw records.
+
+  The masking rule is the part worth testing: a slot is usable only inside n_stored AND
+  visited (n_raw > 0). q carries the -32768 sentinel wherever n_raw == 0, so a consumer
+  that trusted n_stored alone would train on -1.0 values for moves the search never
+  looked at.
+  """
+  raw = next(iter(_games_from(path, 1)))[1]
+  nrec = min(len(raw) // V8_RECORD_BYTES, 64)
+  d = _bare()
+  recs = d._decode_chunk(raw[:nrec * V8_RECORD_BYTES])
+  out = d._records_to_arrays(recs)
+  v8x = out[14]
+  assert v8x is not None, 'v8 records must produce a child table'
+  ci, cq, cn = v8x.child_idx, v8x.child_q, v8x.child_n
+  assert ci.shape == cq.shape == cn.shape == (len(recs), V8_SLOTS), (ci.shape, len(recs))
+
+  live = ci >= 0
+  # The mask must agree exactly with the raw record, computed independently here.
+  ns = recs['n_stored'].astype(np.int64)[:, None]
+  k = np.arange(V8_SLOTS, dtype=np.int64)[None, :]
+  want = (k < ns) & (recs['slot_n_raw'].astype(np.int64) > 0) & (recs['slot_idx'].astype(np.int64) < 1858)
+  assert np.array_equal(live, want), 'mask disagrees with the raw record'
+
+  assert (ci[live] < 1858).all() and (ci[~live] == -1).all()
+  assert (np.abs(cq[live]) <= 1.0).all(), 'q outside [-1, 1]'
+  assert (cq[~live] == 0).all(), 'masked q must be zeroed, not left at the sentinel'
+  assert (cn[live] > 0).all() and (cn[~live] == 0).all()
+  # Dequantisation: q must match the raw i16 divided by 32767 exactly where live.
+  assert np.allclose(cq[live], recs['slot_q'].astype(np.float32)[live] / 32767.0, atol=0)
+  # Visit accounting survives the masking: zeroing unvisited slots removes nothing.
+  assert (cn.sum(1) == recs['visits'].astype(np.int64) - 1).all(), 'visit sum broken by masking'
+
+  # SIGN AND FRAME. Slots are sorted by n_raw descending, so slot 0 IS the most-visited
+  # child -- which is exactly what best_q is defined as. They must agree. A flipped sign
+  # or a frame error would pass every assertion above and silently train a ranking head
+  # backwards, so this is the one check that pins the semantics rather than the layout.
+  s0 = live[:, 0]
+  if s0.any():
+    dq = np.abs(cq[s0, 0] - np.nan_to_num(recs['best_q'])[s0])
+    assert dq.max() < 2e-4, f'slot 0 q vs best_q: max |diff| {dq.max():.2e} (sign/frame?)'
+    # And the negated version must NOT match, or the test would pass under a sign flip.
+    dq_flip = np.abs(-cq[s0, 0] - np.nan_to_num(recs['best_q'])[s0])
+    assert dq_flip.max() > 1e-3, 'negated q also matches — check cannot detect a sign flip'
+    print(f'    sign/frame OK: slot 0 q == best_q to {dq.max():.1e} on {int(s0.sum())} records')
+
+  nlive = int(live.sum())
+  print(f'  child table OK: {len(recs)} records, {nlive:,} live children '
+        f'({nlive / len(recs):.1f} per position, max {int(live.sum(1).max())}), '
+        f'q in [{cq[live].min():+.3f}, {cq[live].max():+.3f}], mask matches raw, '
+        f'sum(n_raw) preserved')
+
+
 if __name__ == '__main__':
   synthetic()
   if len(sys.argv) >= 2:
     real(sys.argv[1], sys.argv[2] if len(sys.argv) >= 3 else None)
     loader(sys.argv[1])
+    child_table(sys.argv[1])
   print('ALL OK')

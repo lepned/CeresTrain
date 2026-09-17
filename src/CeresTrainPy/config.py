@@ -790,6 +790,55 @@ class Configuration:
       raise ValueError('LossMoveTokenValueOrderMultiplier > 0 but UseMoveTokens is off (silent no-op refused)')
     if 'MoveTokenValueOrderTopK' in config_opt and self.Opt_LossMoveTokenValueOrderMultiplier <= 0:
       raise ValueError('MoveTokenValueOrderTopK is set but LossMoveTokenValueOrderMultiplier is 0 (silent no-op refused)')
+    # 2026-09-16: rank the move tokens toward the search's per-move VALUE (v8 child
+    # table) instead of its visit mass. Needs a v8 corpus via DirectFromV6 — nothing
+    # else can supply child_q. Verified at the call site, not here, because only the
+    # dataset knows what it actually produced.
+    self.Opt_MoveTokenValueOrderUseChildQ = bool(config_opt.get('MoveTokenValueOrderUseChildQ', False))
+    if self.Opt_MoveTokenValueOrderUseChildQ and self.Opt_LossMoveTokenValueOrderMultiplier <= 0:
+      raise ValueError('MoveTokenValueOrderUseChildQ is set but LossMoveTokenValueOrderMultiplier is 0 (silent no-op refused)')
+    if self.Opt_MoveTokenValueOrderUseChildQ and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError(f'MoveTokenValueOrderUseChildQ requires SourceType DirectFromV6 with a v8 corpus '
+                       f'(got {self.Data_SourceType!r}; TPG records carry no per-move q)')
+    # Relative visit floor for a slot to be a RANKED target (child-q ordering only).
+    # 0.05 = the child must have at least 5 % of the best-searched child's visits.
+    self.Opt_MoveTokenValueOrderMinVisits = float(config_opt.get('MoveTokenValueOrderMinVisits', 0) or 0)
+    if self.Opt_MoveTokenValueOrderMinVisits > 0 and not self.Opt_MoveTokenValueOrderUseChildQ:
+      raise ValueError('MoveTokenValueOrderMinVisits needs MoveTokenValueOrderUseChildQ (silent no-op refused)')
+    # Regress the per-token scalar onto child q instead of ranking it. Mutually exclusive
+    # with the ranking target: one scalar, one loss.
+    # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
+    # logit (architecture, not an aux readout). NetDef because it changes the graph.
+    self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))
+    self.Opt_LossMoveTokenMinimaxMultiplier = float(config_opt.get('LossMoveTokenMinimaxMultiplier', 0) or 0)
+    if self.NetDef_MoveTokenMinimax and not self.NetDef_UseMoveTokens:
+      raise ValueError('MoveTokenMinimax needs UseMoveTokens (silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and not self.NetDef_MoveTokenMinimax:
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but MoveTokenMinimax is off '
+                       '(nothing to supervise; silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 requires DirectFromV6 with a v8 corpus')
+    # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
+    # logit (architecture, not an aux readout). NetDef because it changes the graph.
+    self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))
+    self.Opt_LossMoveTokenMinimaxMultiplier = float(config_opt.get('LossMoveTokenMinimaxMultiplier', 0) or 0)
+    if self.NetDef_MoveTokenMinimax and not self.NetDef_UseMoveTokens:
+      raise ValueError('MoveTokenMinimax needs UseMoveTokens (silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and not self.NetDef_MoveTokenMinimax:
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but MoveTokenMinimax is off '
+                       '(nothing to supervise; silent no-op refused)')
+    if self.Opt_LossMoveTokenMinimaxMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError('LossMoveTokenMinimaxMultiplier > 0 requires DirectFromV6 with a v8 corpus')
+    self.Opt_LossMoveTokenQRegressionMultiplier = float(config_opt.get('LossMoveTokenQRegressionMultiplier', 0) or 0)
+    if self.Opt_LossMoveTokenQRegressionMultiplier > 0:
+      if self.Opt_LossMoveTokenValueOrderMultiplier > 0:
+        raise ValueError('LossMoveTokenQRegressionMultiplier and LossMoveTokenValueOrderMultiplier both > 0 '
+                         '(one scalar per token cannot serve both a ranking and a regression loss)')
+      if not self.NetDef_UseMoveTokens:
+        raise ValueError('LossMoveTokenQRegressionMultiplier > 0 but UseMoveTokens is off (silent no-op refused)')
+      if self.Data_SourceType != 'DirectFromV6':
+        raise ValueError(f'LossMoveTokenQRegressionMultiplier > 0 requires SourceType DirectFromV6 with a v8 '
+                         f'corpus (got {self.Data_SourceType!r})')
     self.Opt_LossDualPlaneEdgeRelMultiplier = float(config_opt.get('LossDualPlaneEdgeRelMultiplier', 0) or 0)
     # DualPlaneBlockRepeat SLETTET 2026-08-29 (boelge 5): vektdelt dybde SKADET
     # den rike planen 2v2-seeds (mate-value 58/38 vs kzcaps 80/82) og var

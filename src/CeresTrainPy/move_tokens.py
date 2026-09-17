@@ -328,6 +328,7 @@ class MoveTokenDecoder(nn.Module):
                value_query: bool = False, value_order: bool = False,
                opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
                expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
+               minimax: bool = False,
                rel_bias: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
@@ -361,6 +362,7 @@ class MoveTokenDecoder(nn.Module):
     #    per-block (unfused) square path since each block's cross-attn reads updated squares.
     self.expected_value = bool(expected_value)
     self.square_update = bool(square_update)
+    self.minimax = bool(minimax)
     assert not (self.square_update and write_back), 'MoveTokenSquareUpdate already writes back at every block; MoveTokenWriteBack is redundant'
     # opp_max: number of OPPONENT candidate tokens offered as extra keys/values to the
     #   own-token self-attention (0 = off). opp_pool: also mean|max-pool them into the
@@ -477,6 +479,17 @@ class MoveTokenDecoder(nn.Module):
                                                 rel_bias=self.rel_bias)
                                  for i in range(layers)])
     self.out_ln = make_norm(norm_type, dm)
+    if self.minimax:
+      self.mm_v = nn.Linear(dm, 1, bias=False)
+      self.mm_r = nn.Linear(dm, 1, bias=False)
+      nn.init.uniform_(self.mm_v.weight, -0.02, 0.02)
+      nn.init.uniform_(self.mm_r.weight, -0.02, 0.02)
+      # Scalars, not vectors: one global mixing weight each, so what the arm tests is
+      # whether an estimated minimax helps at all -- not a per-channel gate that could
+      # absorb the effect into ordinary capacity.
+      self.mm_alpha_v = nn.Parameter(torch.zeros(()))
+      self.mm_alpha_r = nn.Parameter(torch.zeros(()))
+      self._last_minimax = None
     if self.value_query:
       self.vq_block = ValueQueryBlock(dm, s_dim, heads, ffn_mult, norm_type)
     if self.M_opp > 0:
@@ -495,6 +508,12 @@ class MoveTokenDecoder(nn.Module):
     # receives no gradient at all at step 0 — the product-rule cascade this
     # campaign diagnosed (caught by test_move_tokens.py). The magnitude
     # trajectory of pol.weight remains the does-the-net-want-this diagnostic.
+    # MINIMAX READOUT (2026-09-16). The decoder used to rank moves by one free score.
+    # These give each move token an explicit VALUE and an explicit value-AFTER-THE-REPLY,
+    # and fold both into the policy logit, so ranking is a function of an estimated
+    # one-ply minimax rather than an unstructured preference. Both alphas are zero-init,
+    # so the net is function-identical at the switch and the heads grow in.
+    # Supervised by the v8 child table (q and reply_q); predicted, never given, at serving.
     self.pol = nn.Linear(dm, 4, bias=False)
     with torch.no_grad():
       self.pol.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0B))
@@ -749,7 +768,17 @@ class MoveTokenDecoder(nn.Module):
       # Stash the per-token order scalar for the loss (consumed in ceres_net). Not traced at export.
       self._last_vord = self.vord(xo).squeeze(-1)                           # [B,M]
     # Policy: 4 slot logits per token -> [B,4096,4] buffer at floor -> flat index_select.
+    if self.minimax:
+      # [B,M] each. Kept OUTSIDE the 4-slot promotion structure: a promotion's value
+      # belongs to the move, but the value estimate is a property of the from-to token.
+      v_tok = self.mm_v(xo).squeeze(-1)
+      r_tok = self.mm_r(xo).squeeze(-1)
+      if self.training:
+        self._last_minimax = (v_tok, r_tok)
     tok = self.pol(xo)                                                       # [B,M,4]
+    if self.minimax:
+      # alpha zero-init => identity at the switch; the readout earns its weight.
+      tok = tok + (self.mm_alpha_v * v_tok + self.mm_alpha_r * r_tok).unsqueeze(-1)
     tok = torch.where(valid.unsqueeze(-1), tok, torch.full_like(tok, MT_FLOOR))
     buf = torch.full((B, 4096, 4), MT_FLOOR, device=tok.device, dtype=tok.dtype)
     buf = buf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, 4), tok)
@@ -826,30 +855,181 @@ class MoveTokenDecoder(nn.Module):
     return pol, pooled, stats, sel, valid, wb, ev
 
 
-def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk: int, min_mass: float = 0.0):
-  """ListMLE (Plackett-Luce top-K) over the move TOKENS' order scalars `u` [B,M],
-  toward the policy target's visit order. Target mass per token = the target's mass on
-  the token's from-to pair (promotion slots summed). Tokens without target mass are
-  excluded (-inf), mirroring the policy PL loss in ceres_net; rows whose target moves
-  have no token contribute 0. `min_mass`: a rank counts as a target only if its mass
-  exceeds this (the TPG legal-move floor ~0.0005 must not produce ranked targets; see
-  ceres_net.policy_rank_min_mass). Returns (loss, diagnostics dict)."""
+def move_token_minimax_loss(v_tok, r_tok, sel, valid, mv_pair_flat, child,
+                            huber_delta: float = 0.2):
+  """Supervise the decoder's per-move VALUE and value-AFTER-REPLY heads.
+
+  These two scalars feed the policy logit (see MoveTokenMinimax), so this is not an
+  auxiliary readout -- it is the training signal for a term the ranking actually uses.
+
+  reply_q carries its own validity: a visited child need not have a recorded reply, and
+  the loader marks those -2 (outside q's range). Training the reply head toward a zeroed
+  sentinel would teach it that unrecorded replies are dead draws.
+  """
+  B = v_tok.shape[0]
+  ci, cq, cn, crq = child
+  S = ci.shape[1]
+  SCRATCH = 4096
+  live_c = ci >= 0
+  pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)], torch.full_like(ci, SCRATCH))
+  rev = torch.arange(S - 1, -1, -1, device=ci.device)
+  pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+  pr = torch.full((B, SCRATCH + 1), -2.0, device=ci.device, dtype=torch.float32)
+  pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+  pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
+  pr.scatter_(1, pair_of[:, rev], crq.float()[:, rev])
+  pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
+
+  t_v = torch.gather(pq[:, :SCRATCH], 1, sel)
+  t_r = torch.gather(pr[:, :SCRATCH], 1, sel)
+  w = torch.gather(pn[:, :SCRATCH], 1, sel) * valid.to(torch.float32)
+  w_r = w * (t_r > -1.5).to(torch.float32)          # reply recorded
+
+  def huber(pred, tgt, wt):
+    e = pred.float() - tgt
+    a = e.abs()
+    h = torch.where(a <= huber_delta, 0.5 * e * e, huber_delta * (a - 0.5 * huber_delta))
+    ws = wt.sum(dim=1)
+    rows = ws > 0
+    per = (wt * h).sum(dim=1) / ws.clamp_min(1e-6)
+    return (per[rows].mean() if rows.any() else pred.sum() * 0.0), rows.float().mean(),            ((wt * a).sum(dim=1) / ws.clamp_min(1e-6))[rows].mean() if rows.any() else torch.zeros((), device=pred.device)
+
+  l_v, rows_v, mae_v = huber(v_tok, t_v, w)
+  l_r, rows_r, mae_r = huber(r_tok, t_r, w_r)
+  with torch.no_grad():
+    diag = {'mt_mm_mae_v': mae_v, 'mt_mm_mae_r': mae_r,
+            'mt_mm_rows_v': rows_v, 'mt_mm_rows_r': rows_r,
+            'mt_mm_targets_per_row': (w > 0).float().sum(dim=1).mean()}
+  return l_v + l_r, diag
+
+
+def move_token_q_regression_loss(u, sel, valid, mv_pair_flat, child, huber_delta: float = 0.2):
+  """Regress the per-token scalar `u` onto the search's value for that move.
+
+  Same head as the ranking loss, different question. ListMLE only ever learns ORDER and is
+  invariant to any monotone transform of the target, so the token representation need only
+  encode "which is bigger". Regression forces it to carry HOW MUCH better a move is -- and
+  the policy logits read from that same representation.
+
+  Weighted by visits. q from a 400-visit child is a real estimate; from a 3-visit child it
+  is nearly noise, and weighting by n_raw is the natural way to say so in a regression
+  (the ranking loss has to exclude such children instead). Weights are normalised per row
+  so a position with a big visit budget does not dominate the batch.
+
+  Huber rather than MSE: q is bounded in [-1, 1] but tablebase and mate scores sit exactly
+  at the ends, and squared error on those swamps the ordinary positions.
+  """
   B = u.shape[0]
-  t = policy_target.float()
-  pair_mass = torch.zeros(B, 4096, device=t.device, dtype=t.dtype).index_add_(1, mv_pair_flat, t)   # [B,4096]
-  tok_t = torch.gather(pair_mass, 1, sel) * valid.to(t.dtype)                                     # [B,M]
-  s_all = u.float().masked_fill(~valid | (tok_t <= 0), float('-inf'))
-  order = torch.argsort(tok_t, dim=1, descending=True)
+  ci, cq, cn = child
+  S = ci.shape[1]
+  SCRATCH = 4096
+  live_c = ci >= 0
+  pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)], torch.full_like(ci, SCRATCH))
+  rev = torch.arange(S - 1, -1, -1, device=ci.device)
+  pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+  pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+  pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
+  pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
+
+  tgt = torch.gather(pq[:, :SCRATCH], 1, sel)                                          # [B,M]
+  w = torch.gather(pn[:, :SCRATCH], 1, sel) * valid.to(torch.float32)                  # [B,M]
+  wsum = w.sum(dim=1, keepdim=True)
+  rows = (wsum.squeeze(1) > 0)
+  err = u.float() - tgt
+  a = err.abs()
+  hub = torch.where(a <= huber_delta, 0.5 * err * err, huber_delta * (a - 0.5 * huber_delta))
+  per_row = (w * hub).sum(dim=1) / wsum.squeeze(1).clamp_min(1e-6)
+  loss = per_row[rows].mean() if rows.any() else u.sum() * 0.0
+  with torch.no_grad():
+    n_t = (w > 0).float().sum(dim=1)
+    mae = ((w * a).sum(dim=1) / wsum.squeeze(1).clamp_min(1e-6))[rows]
+    diag = {'mt_qreg_mae': mae.mean() if rows.any() else torch.zeros((), device=u.device),
+            'mt_qreg_targets_per_row': n_t.mean(),
+            'mt_qreg_rows_with_target': rows.float().mean()}
+  return loss, diag
+
+
+def move_token_value_order_loss(u, sel, valid, policy_target, mv_pair_flat, topk: int,
+                                min_mass: float = 0.0, child=None, min_visits: float = 0.0):
+  """ListMLE (Plackett-Luce top-K) over the move TOKENS' order scalars `u` [B,M].
+
+  TWO TARGETS, one tail. Which one is the whole experiment, so everything after the
+  target is shared: same ranking loss, same masking structure, same diagnostics.
+
+  `child is None` (today): rank toward the POLICY target's visit mass. Target mass per
+    token = the target's mass on the token's from-to pair, promotion slots summed.
+    Despite the head's name this is a VISIT order, not a value order.
+
+  `child = (idx, q, n)` (v8 corpora): rank toward the search's actual per-move VALUE.
+    Visits are the search's ESTIMATE of q, shaped by prior, cpuct and forced
+    exploration — so this is an independent signal, not a relabelling.
+
+  Two decisions the v8 path makes deliberately:
+    * A from-to pair can carry up to 4 promotion moves. Policy mass SUMS over them;
+      values cannot be summed. We take q of the MOST-VISITED move on the pair. Slots
+      arrive n_raw-descending (the writer's contract), so scattering them in reverse
+      leaves that move's value standing.
+    * q is meaningful only where the search visited the move, so the mask becomes
+      "visited" rather than "has target mass" — a DIFFERENT subset. The difference is
+      exactly the moves the search looked at and rejected, which carry a real value and
+      no policy mass.
+
+  `min_mass`: a rank counts as a target only if its mass exceeds this (the TPG legal-move
+  floor ~0.0005 must not produce ranked targets; see ceres_net.policy_rank_min_mass).
+  Applies to the policy target only — a visited child is a legitimate target at any q.
+  Returns (loss, diagnostics dict)."""
+  B, M = u.shape[0], u.shape[1]
+  if child is None:
+    t = policy_target.float()
+    pair_mass = torch.zeros(B, 4096, device=t.device, dtype=t.dtype).index_add_(1, mv_pair_flat, t)
+    tok_t = torch.gather(pair_mass, 1, sel) * valid.to(t.dtype)                       # [B,M]
+    tok_live = valid & (tok_t > 0)                    # participates in the ranking
+    tok_rank = tok_t > float(min_mass)                # counts as a ranked target
+    tok_key = tok_t
+  else:
+    ci, cq, cn = child                                                                # [B,S]
+    S = ci.shape[1]
+    live_c = ci >= 0
+    # Masked children go to a scratch column so they cannot overwrite a real pair.
+    SCRATCH = 4096
+    pair_of = torch.where(live_c, mv_pair_flat[ci.clamp_min(0)],
+                          torch.full_like(ci, SCRATCH))                               # [B,S]
+    rev = torch.arange(S - 1, -1, -1, device=ci.device)
+    dt = u.dtype if u.is_floating_point() else torch.float32
+    pq = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+    pn = torch.zeros(B, SCRATCH + 1, device=ci.device, dtype=torch.float32)
+    pq.scatter_(1, pair_of[:, rev], cq.float()[:, rev])
+    pn.scatter_(1, pair_of[:, rev], cn.float()[:, rev])
+    tok_key = torch.gather(pq[:, :SCRATCH], 1, sel)                                   # [B,M]
+    tok_n = torch.gather(pn[:, :SCRATCH], 1, sel)                                     # [B,M]
+    tok_live = valid & (tok_n > 0)
+    # min_visits: q from a child with 2-3 visits is nearly noise, and under a VALUE
+    # ordering such a child can land in the supervised top-K above a well-searched move
+    # -- something a visit ordering cannot do by construction. The floor is relative to
+    # the best-searched child in the row, so it scales with the position's visit budget.
+    if min_visits > 0:
+      floor = min_visits * tok_n.max(dim=1, keepdim=True).values
+      tok_rank = tok_live & (tok_n >= floor)
+    else:
+      tok_rank = tok_live
+    tok_t = tok_key
+
+  s_all = u.float().masked_fill(~tok_live, float('-inf'))
+  # Dead tokens must sort LAST. For the policy target 0 already does that; for q, 0 is a
+  # legitimate value (a drawn move), so the key has to be masked explicitly.
+  order = torch.argsort(tok_key.float().masked_fill(~tok_live, float('-inf')),
+                        dim=1, descending=True)
   s = torch.gather(s_all, 1, order)
   suf = torch.flip(torch.logcumsumexp(torch.flip(s, dims=[1]), dim=1), dims=[1])
   K = min(int(topk), s.shape[1])
   s_k, suf_k = s[:, :K], suf[:, :K]
-  ok = (torch.gather(tok_t, 1, order)[:, :K] > float(min_mass)) & torch.isfinite(s_k)
+  ok = torch.gather(tok_rank, 1, order)[:, :K] & torch.isfinite(s_k)
   terms = torch.where(ok, suf_k - s_k, torch.zeros_like(s_k))
   loss = terms.sum(dim=1).mean()
   with torch.no_grad():
     pred_top1 = s_all.argmax(dim=1)
     has = ok[:, 0]
     top1 = ((pred_top1 == order[:, 0]) & has).float().sum() / has.float().sum().clamp_min(1.0)
-    diag = {'mt_vord_top1': top1, 'mt_vord_rows_with_target': has.float().mean()}
+    diag = {'mt_vord_top1': top1, 'mt_vord_rows_with_target': has.float().mean(),
+            'mt_vord_targets_per_row': tok_rank.float().sum(dim=1).mean()}
   return loss, diag

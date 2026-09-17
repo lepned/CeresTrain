@@ -119,6 +119,15 @@ def partition_weight_decay(model):
               # convention (cbk_*, smol_*_bank). Hits B and C identically.
               # NB inert under Muon anyway (group wd) — completeness is the point.
               no_decay.add(fpn)
+          elif fpn.endswith("mm_alpha_v") or fpn.endswith("mm_alpha_r"):
+              # 2026-09-16 minimax readout: two zero-init SCALARS mixing the per-move value
+              # and value-after-reply estimates into the policy logit. Scalars are not
+              # weight matrices -- decaying them would pull the readout back toward "ignore
+              # the value estimate" for free, which is exactly the hypothesis under test.
+              # (Inert under Muon's group wd, but the partition must be complete: a bare
+              # nn.Parameter belongs to no module class and is otherwise MISSED, which
+              # aborted both minimax arms at startup.)
+              no_decay.add(fpn)
           elif fpn.endswith("mt_ev_dir"):
               # 2026-09-08 expected-value readout: zero-init 3-vector mapping the decoder's
               # expected value onto the WDL logits. A raw direction/gain, not a weight matrix

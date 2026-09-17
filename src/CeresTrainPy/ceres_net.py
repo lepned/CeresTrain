@@ -1579,6 +1579,11 @@ class CeresNet(nn.Module):
       _mt_vq = bool(getattr(config, 'NetDef_MoveTokenValueQuery', False))
       self.mt_vord_w = float(getattr(config, 'Opt_LossMoveTokenValueOrderMultiplier', 0) or 0)
       self.mt_vord_topk = int(getattr(config, 'Opt_MoveTokenValueOrderTopK', 5) or 5)
+      self.mt_vord_child_q = bool(getattr(config, 'Opt_MoveTokenValueOrderUseChildQ', False))
+      self.mt_vord_min_visits = float(getattr(config, 'Opt_MoveTokenValueOrderMinVisits', 0) or 0)
+      self.mt_qreg_w = float(getattr(config, 'Opt_LossMoveTokenQRegressionMultiplier', 0) or 0)
+      self.mt_minimax = bool(getattr(config, 'NetDef_MoveTokenMinimax', False))
+      self.mt_mm_w = float(getattr(config, 'Opt_LossMoveTokenMinimaxMultiplier', 0) or 0)
       _mt_opp = int(getattr(config, 'NetDef_MoveTokenOppMax', 0) or 0)
       _mt_opp_pool = bool(getattr(config, 'NetDef_MoveTokenOppPool', False))
       _mt_wb = bool(getattr(config, 'NetDef_MoveTokenWriteBack', False))
@@ -1615,9 +1620,10 @@ class CeresNet(nn.Module):
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
           post_move=_mt_pm, post_move_blocks=getattr(config, 'NetDef_MoveTokenPostMoveBlocks', None),
-          value_query=_mt_vq, value_order=self.mt_vord_w > 0,
+          value_query=_mt_vq, value_order=(self.mt_vord_w > 0 or self.mt_qreg_w > 0),
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
-          expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel)
+          expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel,
+          minimax=self.mt_minimax)
       if _mt_ev:
         # ev [B] -> WDL logits through a zero-init 3-vector: exact step-0 no-op; the value
         # target then teaches both the direction and (through w_ev) the per-token scalars.
@@ -1632,12 +1638,13 @@ class CeresNet(nn.Module):
             f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
             f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {("ON blocks %s" % sorted(self.move_tokens.pm_blocks)) if _mt_pm else "off"}; '
             f'value query {"ON" if _mt_vq else "off"}; '
-            f'value-order head {("ON w=%g top-%d" % (self.mt_vord_w, self.mt_vord_topk)) if self.mt_vord_w > 0 else "off"}; '
+            f'value-order head {("ON w=%g top-%d target=%s%s" % (self.mt_vord_w, self.mt_vord_topk, "CHILD-Q" if self.mt_vord_child_q else "visit-mass", (" minvis=%g" % self.mt_vord_min_visits) if self.mt_vord_min_visits > 0 else "")) if self.mt_vord_w > 0 else ("Q-REGRESSION w=%g" % self.mt_qreg_w) if self.mt_qreg_w > 0 else "off"}; '
             f'opponent keys {("ON Mo=%d%s" % (_mt_opp, " +pool" if _mt_opp_pool else "")) if _mt_opp > 0 else "off"}; '
             f'square write-back {"ON" if _mt_wb else "off"}; '
             f'expected-value readout {"ON" if _mt_ev else "off"}; per-block square update {"ON" if _mt_su else "off"}; '
             f'trunk layer mix {("ON (zero-init gains on states %s)" % _mt_mix) if _mt_mix else "off"}; '
             f'relational self-attn bias {"ON (zero-init, %d relations)" % NREL if _mt_rel else "off"}; '
+            f'MINIMAX readout {("ON w=%g" % self.mt_mm_w) if self.mt_minimax else "off"}; '
             f'absent-move floor {-30.0}')
 
 
@@ -2667,9 +2674,57 @@ class CeresNet(nn.Module):
       if _vo_u is not None and _vo_mt is not None:
         self.move_tokens._last_vord = None
         from move_tokens import move_token_value_order_loss
+        _vo_child = None
+        if getattr(self, 'mt_vord_child_q', False):
+          _ci = batch.get('child_idx') if isinstance(batch, dict) else None
+          if _ci is None:
+            # The config guard checked SourceType; only the batch proves the corpus is
+            # actually v8. Falling back to the visit-mass target here would run the
+            # TREATMENT arm on the CONTROL's target and look like a null result.
+            raise ValueError('MoveTokenValueOrderUseChildQ is on but the batch has no '
+                             'child_idx — the corpus is not v8 (DirectFromV6 supplies it '
+                             'only for version-8 records)')
+          _vo_child = (_ci, batch['child_q'], batch['child_n'])
         mt_vord_loss, _vo_log = move_token_value_order_loss(
             _vo_u, _vo_mt[0], _vo_mt[1], policy_target, self.move_tokens.mv_pair_flat, self.mt_vord_topk,
-            min_mass=self.policy_rank_min_mass)
+            min_mass=self.policy_rank_min_mass, child=_vo_child,
+            min_visits=getattr(self, 'mt_vord_min_visits', 0.0))
+
+    # q-REGRESSION: the same stashed per-token scalar, regressed onto child q instead
+    # of ranked. Config refuses both losses at once (one scalar, one question).
+    mt_mm_loss = 0
+    if getattr(self, 'mt_minimax', False) and getattr(self, 'mt_mm_w', 0) > 0 and not gradient_norm_logging_mode:
+      _mm = getattr(self.move_tokens, '_last_minimax', None)
+      _mm_mt = getattr(self, '_last_mt', None)
+      if _mm is not None and _mm_mt is not None:
+        self.move_tokens._last_minimax = None
+        _mm_ci = batch.get('child_idx') if isinstance(batch, dict) else None
+        if _mm_ci is None:
+          raise ValueError('LossMoveTokenMinimaxMultiplier > 0 but the batch has no child_idx')
+        from move_tokens import move_token_minimax_loss
+        mt_mm_loss, _mm_log = move_token_minimax_loss(
+            _mm[0], _mm[1], _mm_mt[0], _mm_mt[1], self.move_tokens.mv_pair_flat,
+            (_mm_ci, batch['child_q'], batch['child_n'], batch['child_rq']))
+        _vo_log.update(_mm_log)
+        with torch.no_grad():
+          _vo_log['mt_mm_alpha_v'] = self.move_tokens.mm_alpha_v.detach()
+          _vo_log['mt_mm_alpha_r'] = self.move_tokens.mm_alpha_r.detach()
+
+    mt_qreg_loss = 0
+    if getattr(self, 'use_move_tokens', False) and getattr(self, 'mt_qreg_w', 0) > 0 and not gradient_norm_logging_mode:
+      _qr_u = getattr(self.move_tokens, '_last_vord', None)
+      _qr_mt = getattr(self, '_last_mt', None)
+      if _qr_u is not None and _qr_mt is not None:
+        self.move_tokens._last_vord = None
+        _qr_ci = batch.get('child_idx') if isinstance(batch, dict) else None
+        if _qr_ci is None:
+          raise ValueError('LossMoveTokenQRegressionMultiplier > 0 but the batch has no '
+                           'child_idx -- the corpus is not v8')
+        from move_tokens import move_token_q_regression_loss
+        mt_qreg_loss, _qr_log = move_token_q_regression_loss(
+            _qr_u, _qr_mt[0], _qr_mt[1], self.move_tokens.mv_pair_flat,
+            (_qr_ci, batch['child_q'], batch['child_n']))
+        _vo_log.update(_qr_log)
 
     # Value CONTRAST aux (see __init__): per-move WDL CE — solution move keeps
     # the record's WDL, every other legal move is labeled LOSS-for-STM.
@@ -3158,6 +3213,8 @@ class CeresNet(nn.Module):
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
         + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
         + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
+        + (self.mt_qreg_w * mt_qreg_loss if not isinstance(mt_qreg_loss, int) else 0)
+        + (self.mt_mm_w * mt_mm_loss if not isinstance(mt_mm_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
         + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
@@ -3190,6 +3247,8 @@ class CeresNet(nn.Module):
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
           + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
           + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
+          + (self.mt_qreg_w * mt_qreg_loss if not isinstance(mt_qreg_loss, int) else 0)
+          + (self.mt_mm_w * mt_mm_loss if not isinstance(mt_mm_loss, int) else 0)
           # pi-edge is a policy-target CE (rel-aux is neither family: kept out).
           + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the

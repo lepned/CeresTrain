@@ -66,7 +66,8 @@ except ImportError:
   _GZIP_IMPL = 'gzip'
 
 from config import NUM_AUX_FEATURES_PER_SQUARE, split_roots
-from tpg_dataset import stable_str_hash, TPGDataset, _RUN_SHUFFLE_SEED, V7Extras
+from tpg_dataset import (stable_str_hash, TPGDataset, _RUN_SHUFFLE_SEED,
+                         V7Extras, V8Extras)
 
 MAX_MOVES = 92               # TPGRecord.MAX_MOVES — top-K policy slots
 POLICY_FLOOR = 0.0005        # CompressedPolicyVector.DEFAULT_MIN_PROBABILITY_LEGAL_MOVE
@@ -594,9 +595,35 @@ class V6ChunkDataset(TPGDataset):
                      act_q=np.nan_to_num(recs['q_after_played']).astype(np.float32).reshape(-1, 1),
                      act_d=np.nan_to_num(recs['root_m']).astype(np.float32).reshape(-1, 1))   # repurposed: d_after
 
+    # ---- v8 child table (cv4): per-move search values ----
+    v8x = None
+    if 'slot_idx' in recs.dtype.names:
+      ns = recs['n_stored'].astype(np.int64)[:, None]                     # [n,1]
+      k = np.arange(V8_SLOTS, dtype=np.int64)[None, :]                    # [1,S]
+      idx = recs['slot_idx'].astype(np.int32)
+      nraw = recs['slot_n_raw'].astype(np.int32)
+      # A slot is usable only inside n_stored AND actually visited: q carries the
+      # -32768 sentinel wherever n_raw == 0, and an unvisited child has no value to
+      # learn from. Fold both into the index so no consumer has to know the sentinels.
+      ok = (k < ns) & (nraw > 0) & (idx < 1858)
+      # reply_q has its OWN validity: a visited child need not have a recorded reply
+      # (block_flags bit6), and its sentinel is the same -32768. Zeroing it where absent
+      # would train the head toward "the opponent replies with a dead draw".
+      rq_raw = recs['slot_reply_q'].astype(np.float32)
+      rq_ok = ok & (recs['slot_reply_q'] != -32768)
+      v8x = V8Extras(
+          child_idx=np.where(ok, idx, -1).astype(np.int16),
+          child_q=np.where(ok, recs['slot_q'].astype(np.float32) / 32767.0, 0.0).astype(np.float32),
+          child_n=np.where(ok, nraw, 0).astype(np.int32),
+          child_d=np.where(ok, recs['slot_d'].astype(np.float32) / 32767.0, 0.0).astype(np.float32),
+          # -2 marks "no reply recorded"; it is outside q's [-1,1] range so a consumer
+          # cannot mistake it for a value, and the mask is derivable without a flag.
+          child_rq=np.where(rq_ok, rq_raw / 32767.0, -2.0).astype(np.float32),
+          child_ndef=np.where(ok, recs['slot_n_deforced'].astype(np.int32), 0).astype(np.int32))
+
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
             unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,
-            pip, played_q_subopt, unc_policy, v7x)
+            pip, played_q_subopt, unc_policy, v7x, v8x)
 
   # ---- generation -------------------------------------------------------
 
@@ -634,13 +661,17 @@ class V6ChunkDataset(TPGDataset):
         block = recs[i0:i0 + CONVERT_BLOCK]
         out = self._records_to_arrays(block)
         v7x = out[13]                        # V7Extras or None
+        v8x = out[14]                        # V8Extras or None (v8 records only)
         for b0 in range(0, len(block), B):
           sl = slice(b0, b0 + B)
           # Slice each field but KEEP the V7Extras type (a plain tuple here
           # loses the named contract the consumer reads by).
           v7x_b = (V7Extras(*[a[sl] if a is not None else None for a in v7x])
                    if v7x is not None else None)
-          yield tuple(a[sl] for a in out[:13]) + (None, v7x_b)
+          v8x_b = (V8Extras(*[a[sl] for a in v8x]) if v8x is not None else None)
+          # Slots 13/15 are survival and the stream tag, which this path does not
+          # produce; the consumer reads everything positionally (tpg_dataset:869-880).
+          yield tuple(a[sl] for a in out[:13]) + (None, v7x_b, None, v8x_b)
       rec_pool = [leftover] if len(leftover) and not final else []
       pool_count = len(leftover) if not final else 0
 
