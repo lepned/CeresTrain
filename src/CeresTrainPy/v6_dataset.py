@@ -619,7 +619,10 @@ class V6ChunkDataset(TPGDataset):
           # -2 marks "no reply recorded"; it is outside q's [-1,1] range so a consumer
           # cannot mistake it for a value, and the mask is derivable without a flag.
           child_rq=np.where(rq_ok, rq_raw / 32767.0, -2.0).astype(np.float32),
-          child_ndef=np.where(ok, recs['slot_n_deforced'].astype(np.int32), 0).astype(np.int32))
+          child_ndef=np.where(ok, recs['slot_n_deforced'].astype(np.int32), 0).astype(np.int32),
+          # slot_prior = the generating net's prior stored as -log2(p) in 1/2048 units (scale solved from
+          # normalisation on 994 fully-stored cv4 positions: K = 2048*ln2 to 4 digits); 65535 = sentinel.
+          child_prior=np.where(ok & (recs['slot_prior'] != 65535), np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0), 0.0).astype(np.float32))
 
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
             unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,

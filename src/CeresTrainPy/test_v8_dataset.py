@@ -285,6 +285,25 @@ def child_table(path):
     assert dq_flip.max() > 1e-3, 'negated q also matches — check cannot detect a sign flip'
     print(f'    sign/frame OK: slot 0 q == best_q to {dq.max():.1e} on {int(s0.sum())} records')
 
+  # PRIOR (2026-09-17): slot_prior stores -log2(p) in 1/2048 units; the loader decodes it to a probability on live
+  # slots only, never from the 65535 sentinel. Over a position's live children the decoded priors must be a proper
+  # sub-distribution (sum <= 1) and lie in (0, 1]; the argmax prior should agree with the search's top move often
+  # (~70 % on cv4) -- a wrong scale or sign would break that.
+  cp = v8x.child_prior
+  assert cp.shape == ci.shape and (cp[~live] == 0).all()
+  sent = recs['slot_prior'] == 65535
+  assert (cp[live & ~sent] > 0).all() and (cp[live & ~sent] <= 1.0).all() and (cp[live & sent] == 0).all()
+  assert (cp.sum(1) <= 1.0 + 1e-3).all(), f'decoded priors exceed 1 per position: max {cp.sum(1).max():.4f}'
+  want_p = np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0)
+  assert np.allclose(cp[live & ~sent], want_p[live & ~sent], rtol=1e-6)
+  multi = live.sum(1) >= 2
+  if multi.sum() >= 10:
+    top_search = np.argmax(np.where(live, cn, -1), axis=1)[multi]
+    top_prior = np.argmax(np.where(live, cp, -1.0), axis=1)[multi]
+    agree = float((top_search == top_prior).mean())
+    assert agree > 0.4, f'prior argmax agrees with the search top move on only {agree:.0%} of positions (scale/sign?)'
+    print(f'    prior OK: decoded 2^(-u/2048), sum<=1 per position (max {cp.sum(1).max():.3f}), argmax agrees with search {agree:.0%}')
+
   nlive = int(live.sum())
   print(f'  child table OK: {len(recs)} records, {nlive:,} live children '
         f'({nlive / len(recs):.1f} per position, max {int(live.sum(1).max())}), '

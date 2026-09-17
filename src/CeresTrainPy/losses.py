@@ -332,7 +332,8 @@ class LossCalculator():
     return torch.nn.functional.cross_entropy(torch.log(clipped_probabilities),clipped_probabilities)
 
 
-  def policy_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float):
+  def policy_loss(self, target: torch.Tensor, output: torch.Tensor, subtract_entropy : bool, calc_grad_norm_mode : bool, loss_wt : float,
+                  row_weights: torch.Tensor = None):
     if calc_grad_norm_mode:
       self.model.zero_grad()
 
@@ -341,7 +342,20 @@ class LossCalculator():
     output = torch.where(legalMoves, output, illegalMaskValue)
 
     entropy = self.entropy(target) if subtract_entropy else 0.0
-    if POLICY_ONLYMOVE_LAMBDA > 0:
+    if row_weights is not None:
+      # 2026-09-17 v8 child-table weighting (policy_v8.py: only-move q-gap / search-surprise). Same contract as the
+      # only-move block below: weights are mean-1 per batch (scale unchanged, gradient redistributed), the LOGGED
+      # number stays the unweighted mean CE.
+      _ce_i = F.cross_entropy(output.float(), target.float(), reduction='none')
+      _w_i = row_weights.detach().float()
+      if POLICY_ONLYMOVE_LAMBDA > 0:
+        # both weightings requested: multiply (a mixed run would otherwise weight primary batches one way and
+        # child-table-less secondary batches the other, silently)
+        _t2 = target.float().topk(2, dim=1).values
+        _w_i = _w_i * (1.0 + POLICY_ONLYMOVE_LAMBDA * (_t2[:, 0] - _t2[:, 1]).detach())
+      loss = (_w_i * _ce_i).sum() / _w_i.sum().clamp_min(1e-6) - entropy
+      _log_loss = _ce_i.mean() - entropy
+    elif POLICY_ONLYMOVE_LAMBDA > 0:
       # Only-move weighting (see module header). fp32 CE mirrors the value
       # path; entropy subtraction stays unweighted (informational only — the
       # target entropy carries no gradient wrt the output).

@@ -840,6 +840,36 @@ class Configuration:
     self.Opt_LossOppPolicyMultiplier = config_opt.get('LossOppPolicyMultiplier', 0)
     # Played-move action training (v7 q_after_played target; head is exported)
     self.Opt_LossActionPlayedMultiplier = config_opt.get('LossActionPlayedMultiplier', 0)
+    # MOVE-TOKEN ACTION HEAD (2026-09-17): per-token WDL exported as the 'action' output Ceres consumes (TensorRT;
+    # per-child FPU of unvisited children). NetDef because it changes the graph; the loss needs the v8 child table.
+    self.NetDef_MoveTokenActionHead = bool(config_net_def.get('MoveTokenActionHead', False))
+    self.Opt_LossMoveTokenActionMultiplier = float(config_opt.get('LossMoveTokenActionMultiplier', 0) or 0)
+    if self.NetDef_MoveTokenActionHead and not self.NetDef_UseMoveTokens:
+      raise ValueError('MoveTokenActionHead needs UseMoveTokens (silent no-op refused)')
+    if self.Opt_LossMoveTokenActionMultiplier > 0 and not self.NetDef_MoveTokenActionHead:
+      raise ValueError('LossMoveTokenActionMultiplier > 0 but MoveTokenActionHead is off (nothing to supervise)')
+    if self.NetDef_MoveTokenActionHead and self.Opt_LossMoveTokenActionMultiplier <= 0:
+      raise ValueError('MoveTokenActionHead is on but LossMoveTokenActionMultiplier is 0: an untrained head would be '
+                       'exported as the action output Ceres acts on (silent no-op refused)')
+    if self.Opt_LossMoveTokenActionMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError(f'LossMoveTokenActionMultiplier > 0 requires SourceType DirectFromV6 with a v8 corpus '
+                       f'(got {self.Data_SourceType!r}; the child table is the only per-move value target)')
+    # POLICY-LOSS RESHAPING from the v8 child table (2026-09-17, policy_v8.py): loss/target-side only, no serving change.
+    self.Opt_PolicyLossQGapLambda = float(config_opt.get('PolicyLossQGapLambda', 0) or 0)        # only-move weight
+    self.Opt_PolicyLossSurpriseRefKL = float(config_opt.get('PolicyLossSurpriseRefKL', 0) or 0)  # search-vs-prior weight (ref = corpus median KL)
+    self.Opt_PolicyTargetQBeta = float(config_opt.get('PolicyTargetQBeta', 0) or 0)              # completed-Q target sharpening
+    for _k, _v in (('PolicyLossQGapLambda', self.Opt_PolicyLossQGapLambda), ('PolicyLossSurpriseRefKL', self.Opt_PolicyLossSurpriseRefKL),
+                   ('PolicyTargetQBeta', self.Opt_PolicyTargetQBeta)):
+      if _v < 0:
+        raise ValueError(f'{_k} must be >= 0 (got {_v})')
+      if _v > 0 and self.Data_SourceType != 'DirectFromV6':
+        raise ValueError(f'{_k} > 0 requires SourceType DirectFromV6 with a v8 corpus (got {self.Data_SourceType!r})')
+    if self.NetDef_MoveTokenActionHead and (float(self.Opt_LossActionMultiplier or 0) > 0
+                                            or float(self.Opt_LossActionPlayedMultiplier or 0) > 0):
+      raise ValueError('MoveTokenActionHead and the MLP action head (LossActionMultiplier / LossActionPlayedMultiplier) '
+                       'both fill the single exported action output; choose one. NOTE they are NOT interchangeable: '
+                       'the played-move MLP target is W=(1+q_after-d)/2 with q_after = -next.best_q (root/mover frame), '
+                       'the move-token head targets the CHILD frame Ceres stores and negates (verify before serving either)')
     # Value min/max pool side-channels (2026-08 tactics toolbox T1.2): trunk
     # amin/amax over squares into the value family's hidden pre-activation.
     # Zero-init no-op add-on (the 'inject' class).

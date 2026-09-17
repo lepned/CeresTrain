@@ -329,6 +329,7 @@ class MoveTokenDecoder(nn.Module):
                opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
                expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
                minimax: bool = False,
+               action_head: bool = False,
                rel_bias: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
@@ -363,6 +364,7 @@ class MoveTokenDecoder(nn.Module):
     self.expected_value = bool(expected_value)
     self.square_update = bool(square_update)
     self.minimax = bool(minimax)
+    self.action_head = bool(action_head)
     assert not (self.square_update and write_back), 'MoveTokenSquareUpdate already writes back at every block; MoveTokenWriteBack is redundant'
     # opp_max: number of OPPONENT candidate tokens offered as extra keys/values to the
     #   own-token self-attention (0 = off). opp_pool: also mean|max-pool them into the
@@ -490,6 +492,16 @@ class MoveTokenDecoder(nn.Module):
       self.mm_alpha_v = nn.Parameter(torch.zeros(()))
       self.mm_alpha_r = nn.Parameter(torch.zeros(()))
       self._last_minimax = None
+    if self.action_head:
+      # ACTION HEAD (2026-09-17): a WDL readout per move token, exported as the 'action' output [B,1858,3] that Ceres
+      # reads by name (TensorRT evaluator; used as the per-child FPU of UNVISITED children and for the first-visit
+      # re-sort, gated by the ACTION_ENABLED build + UCI EnableActionHead). Trained on the v8 child table: the search's
+      # q/d of every visited child, converted to the CHILD frame because Ceres stores (W,L) from the side to move AFTER
+      # the move and negates it. Cost ~M*dm*3 MACs per position (the MLP action head on the trunk costs 9-12 % EPS).
+      self.act = nn.Linear(dm, 3)
+      nn.init.uniform_(self.act.weight, -0.02, 0.02)
+      nn.init.zeros_(self.act.bias)
+      self._last_act = None
     if self.value_query:
       self.vq_block = ValueQueryBlock(dm, s_dim, heads, ffn_mult, norm_type)
     if self.M_opp > 0:
@@ -783,6 +795,17 @@ class MoveTokenDecoder(nn.Module):
     buf = torch.full((B, 4096, 4), MT_FLOOR, device=tok.device, dtype=tok.dtype)
     buf = buf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, 4), tok)
     pol = buf.reshape(B, 16384).index_select(1, self.mv_pair_slot) + self.mt_pol_bias.to(tok.dtype)
+    act = None
+    if self.action_head:
+      act_tok = self.act(xo)                                                 # [B,M,3] WDL logits (child frame)
+      if self.training:
+        self._last_act = act_tok                                             # consumed by move_token_action_loss
+      # Absent tokens emit neutral logits (uniform WDL, never NaN); the four promotion variants of a pair share the
+      # token's WDL (the value is a property of the from-to move; non-queen promotions are rare).
+      act_tok = torch.where(valid.unsqueeze(-1), act_tok, torch.zeros_like(act_tok))
+      abuf = torch.zeros((B, 4096, 3), device=act_tok.device, dtype=act_tok.dtype)
+      abuf = abuf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, 3), act_tok)
+      act = abuf.index_select(1, self.mv_pair_flat)                          # [B,1858,3]
     # Pools over VALID tokens (mean + max).
     w = valid.to(xo.dtype).unsqueeze(-1)
     n_valid = w.sum(dim=1)                                                   # [B,1]
@@ -852,7 +875,7 @@ class MoveTokenDecoder(nn.Module):
       if self.training:
         stats['mt_ev_mean'] = ev.detach().mean()
         stats['mt_ev_absmean'] = ev.detach().abs().mean()
-    return pol, pooled, stats, sel, valid, wb, ev
+    return pol, pooled, stats, sel, valid, wb, ev, act
 
 
 def _children_to_tokens(sel, valid, mv_pair_flat, child_idx, child_n, *child_vals):
@@ -919,6 +942,41 @@ def move_token_minimax_loss(v_tok, r_tok, sel, valid, mv_pair_flat, child,
             'mt_mm_rows_v': rows_v, 'mt_mm_rows_r': rows_r,
             'mt_mm_targets_per_row': (w > 0).float().sum(dim=1).mean()}
   return l_v + l_r, diag
+
+
+def move_token_action_loss(act_tok, sel, valid, mv_pair_flat, child, visit_pow: float = 0.5):
+  """Supervise the per-token WDL action head with the v8 child table.
+
+  child = (idx, q, d, n_raw), all [B,S], q/d in the ROOT frame (slot-0 q == best_q). The target is expressed in the
+  CHILD frame, i.e. from the side to move after the move, because that is what Ceres stores and negates:
+      W = (1 - q - d) / 2,   L = (1 + q - d) / 2,   D = d.
+  Per token the most-visited child on its from-to pair supplies the target (_children_to_tokens). Loss = visit-weighted
+  (n_raw ** visit_pow, row-normalised) cross-entropy MINUS the target entropy (house convention: the logged number is
+  a KL, so a d-distribution shift between corpora does not read as a regression). Rows without a visited child
+  contribute 0. Returns (loss, diagnostics)."""
+  ci, cq, cd, cn = child
+  w, q, d = _children_to_tokens(sel, valid, mv_pair_flat, ci, cn, cq, cd)           # [B,M]
+  d = d.clamp(0.0, 1.0)
+  W = ((1.0 - q - d) * 0.5).clamp(0.0, 1.0)
+  L = ((1.0 + q - d) * 0.5).clamp(0.0, 1.0)
+  D = (1.0 - W - L).clamp(0.0, 1.0)
+  tgt = torch.stack([W, D, L], dim=-1)
+  tgt = tgt / tgt.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+  logp = torch.log_softmax(act_tok.float(), dim=-1)
+  kl = -(tgt * logp).sum(-1) + (tgt * tgt.clamp_min(1e-12).log()).sum(-1)          # [B,M] CE - H(target)
+  wt = w.pow(visit_pow) if visit_pow != 1.0 else w
+  ws = wt.sum(dim=1)
+  rows = ws > 0
+  per = (wt * kl).sum(dim=1) / ws.clamp_min(1e-6)
+  loss = per[rows].mean() if rows.any() else act_tok.sum() * 0.0
+  with torch.no_grad():
+    v_pred = logp[..., 0].exp() - logp[..., 2].exp()                                 # W - L (child frame)
+    v_tgt = tgt[..., 0] - tgt[..., 2]
+    mae = ((wt * (v_pred - v_tgt).abs()).sum(dim=1) / ws.clamp_min(1e-6))[rows]
+    zero = torch.zeros((), device=act_tok.device)
+    diag = {'mt_act_kl': loss.detach(), 'mt_act_v_mae': mae.mean() if rows.any() else zero,
+            'mt_act_targets_per_row': (w > 0).float().sum(dim=1).mean(), 'mt_act_rows': rows.float().mean()}
+  return loss, diag
 
 
 def move_token_q_regression_loss(u, sel, valid, mv_pair_flat, child, huber_delta: float = 0.2):

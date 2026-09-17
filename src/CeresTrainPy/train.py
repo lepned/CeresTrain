@@ -679,6 +679,7 @@ def Train():
       if 'move_tokens.pol' in n: return False    # move-token policy readout [4, dm]: the final policy layer, AdamW
       if 'move_tokens.vord' in n: return False   # value-order scalar [1, dm]: a training-only readout, AdamW
       if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
+      if 'move_tokens.act.' in n: return False   # action WDL readout [3, dm]: a final layer like pol, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -800,7 +801,9 @@ def Train():
                     # are ADDED to the `pol` logits, so they are part of the policy readout. Without
                     # this they would train at the base/decoder rate while the readout they feed
                     # trains at half that -- an unintended 2x on one side of the same sum.
-                    'move_tokens.mm_')
+                    'move_tokens.mm_',
+                    # 2026-09-17: the action WDL readout is a final layer of the same class as pol/vord.
+                    'move_tokens.act.')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
@@ -1637,6 +1640,21 @@ def Train():
       if not any(f.endswith('.v7x.zst') for d in _dirs_pw for f in os.listdir(d)):
         raise ValueError('CERES_VALUE_PROV_WEIGHTS set with CERES_TPG_V7X_SIDECAR=auto but no '
                          f'.v7x.zst sidecars found in any dataset dir: {_dirs_pw}')
+
+  # Child-table (v8) losses: the per-batch check cannot tell a puzzle secondary from a wrong corpus, so refuse here.
+  _needs_child = [k for k, v in (('MoveTokenValueOrderUseChildQ', getattr(config, 'Opt_MoveTokenValueOrderUseChildQ', False)),
+                                 ('LossMoveTokenMinimaxMultiplier', getattr(config, 'Opt_LossMoveTokenMinimaxMultiplier', 0)),
+                                 ('LossMoveTokenQRegressionMultiplier', getattr(config, 'Opt_LossMoveTokenQRegressionMultiplier', 0)),
+                                 ('LossMoveTokenActionMultiplier', getattr(config, 'Opt_LossMoveTokenActionMultiplier', 0)),
+                                 ('PolicyLossQGapLambda', getattr(config, 'Opt_PolicyLossQGapLambda', 0)),
+                                 ('PolicyLossSurpriseRefKL', getattr(config, 'Opt_PolicyLossSurpriseRefKL', 0)),
+                                 ('PolicyTargetQBeta', getattr(config, 'Opt_PolicyTargetQBeta', 0))) if v]
+  if _needs_child and not _IS_V6_SOURCE:
+    raise ValueError(f'{_needs_child} need the v8 child table: SourceType must be DirectFromV6 (got {config.Data_SourceType!r})')
+  if _needs_child and set(getattr(primary_dataset, '_diag_versions', set())) != {8}:
+    raise ValueError(f'{_needs_child} need the v8 child table but the DirectFromV6 primary corpus reports versions '
+                     f'{sorted(getattr(primary_dataset, "_diag_versions", set()))} (the primary must be PURELY version 8: '
+                     f'v6/v7 chunks would silently train the arm on the control target through the child-less fallbacks)')
 
   # Short-term value head requires V7-extras sidecar targets (censored q_st/d_st).
   if getattr(core, 'stvalue_weight', 0) > 0 and _IS_V6_SOURCE:

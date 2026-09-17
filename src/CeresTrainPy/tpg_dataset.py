@@ -113,7 +113,7 @@ V7Extras = namedtuple('V7Extras',
 # single move per position (see train.py's action two-position trick).
 V8Extras = namedtuple('V8Extras',
                       ['child_idx', 'child_q', 'child_n',
-                       'child_d', 'child_rq', 'child_ndef'])
+                       'child_d', 'child_rq', 'child_ndef', 'child_prior'])
 
 # SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
 # re-reading the env here. This guarantees the data width (how many aux channels
@@ -959,6 +959,7 @@ class TPGDataset(Dataset):
         filtered_dict['child_d'] = filter_tensor(torch.tensor(v8x.child_d, dtype=torch.float32), mod_value)
         filtered_dict['child_rq'] = filter_tensor(torch.tensor(v8x.child_rq, dtype=torch.float32), mod_value)
         filtered_dict['child_ndef'] = filter_tensor(torch.tensor(v8x.child_ndef, dtype=torch.int64), mod_value)
+        filtered_dict['child_prior'] = filter_tensor(torch.tensor(v8x.child_prior, dtype=torch.float32), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

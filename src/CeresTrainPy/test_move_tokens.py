@@ -156,7 +156,7 @@ def main():
   sq = random_boards(B)
   flow = torch.randn(B, 64, 32)
   dec.pol.weight.data.normal_()                       # make token logits non-trivial
-  pol, pooled, stats, sel, valid, _, _ = dec(sq[:, :, 0:13], flow)
+  pol, pooled, stats, sel, valid, _, _, _ = dec(sq[:, :, 0:13], flow)
   assert pol.shape == (B, 1858) and pooled.shape == (B, 64)
   # recompute reference: for each move index, token logit if its pair is selected+valid
   for b in range(B):
@@ -196,7 +196,7 @@ def main():
   # no-candidate board (lone kings, stm king boxed by own pawns): pooled must stay finite/zero
   s0 = board_from_pieces({'a1': 'K', 'a2': 'P', 'b2': 'P', 'b1': 'P'}, {'h8': 'K'})
   s0[0, SQ['b2'], 0] = 0
-  _, pooled0, st0, _, v0, _, _ = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
+  _, pooled0, st0, _, v0, _, _, _ = net.move_tokens(s0, torch.randn(1, 64, net.EMBEDDING_DIM))
   assert torch.isfinite(pooled0).all() and float(pooled0.abs().max()) < 1e3, 'empty-candidate pool guard'
   net.eval()
   with torch.no_grad(): out = net(sq, None)
@@ -245,7 +245,7 @@ def main():
   assert g_aux is not None and g_aux.abs().sum() > 0, 'aux MLP policy CE must train the MLP head'
   from wd_partition import partition_weight_decay as _pwd
   _pwd(net2)
-  _, pooled2, st2, _, _, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
+  _, pooled2, st2, _, _, _, _, _ = net2.move_tokens(s0, torch.randn(1, 64, net2.EMBEDDING_DIM))
   assert pooled2.shape[-1] == 3 * 64 and torch.isfinite(pooled2).all() and float(pooled2.abs().max()) < 1e3
   assert 'mt_polpool_entropy' in st2
   net2.eval()
@@ -524,7 +524,7 @@ def main():
   # empty-candidate board: write-back must be exactly zero
   net_wb.eval()
   with torch.no_grad():
-    *_, wb0, _ = net_wb.move_tokens(s0, torch.randn(1, 64, net_wb.EMBEDDING_DIM))
+    *_, wb0, _, _ = net_wb.move_tokens(s0, torch.randn(1, 64, net_wb.EMBEDDING_DIM))
   assert wb0 is not None and float(wb0.abs().max()) == 0.0, 'no-candidate board -> zero write-back'
   print('  square write-back OK: exact step-0 no-op on all heads, grads flow into wo, zero on empty boards')
   # (ii) opponent keys: candidate superset vs python-chess with the side to move flipped
@@ -571,13 +571,13 @@ def main():
   _pwd(net_o)
   net_o.eval()
   with torch.no_grad():
-    _, pooled_o, st_o, _, _, _, _ = net_o.move_tokens(s0, torch.randn(1, 64, net_o.EMBEDDING_DIM))
+    _, pooled_o, st_o, _, _, _, _, _ = net_o.move_tokens(s0, torch.randn(1, 64, net_o.EMBEDDING_DIM))
     out_o = net_o(sq, None)
   assert pooled_o.shape[-1] == 4 * 64 and torch.isfinite(pooled_o).all() and float(pooled_o.abs().max()) < 1e3
   assert 'mt_opp_count_mean' in st_o and torch.isfinite(out_o[0]).all() and torch.isfinite(out_o[1]).all()
   # logit monitor: present in training stats, absent in eval
   net_o.train()
-  _, _, st_tr, _, _, _, _ = net_o.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_o.EMBEDDING_DIM))
+  _, _, st_tr, _, _, _, _, _ = net_o.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_o.EMBEDDING_DIM))
   assert 'mt_qk_max_self' in st_tr and 'mt_qk_max_cross' in st_tr and torch.isfinite(st_tr['mt_qk_max_self'])
   assert 'mt_qk_max_self' not in st_o
   print(f'  opponent keys OK: {net_o.move_tokens.M_opp} opp tokens as extra K/V, pool 4dm, grads flow, empty-board guard, '
@@ -635,7 +635,7 @@ def main():
     net4.move_tokens.export_fused = True; assert net4.move_tokens._fusable(); fus4 = net4(sq, None)
   d4p = float((fus4[0] - ref4[0]).abs().max()); d4v = float((fus4[1] - ref4[1]).abs().max())
   assert d4p < 1e-4 and d4v < 1e-4, (d4p, d4v)
-  _, pooled4, _, _, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
+  _, pooled4, _, _, _, _, _, _ = net4.move_tokens(s0, torch.randn(1, 64, net4.EMBEDDING_DIM))
   assert torch.isfinite(pooled4).all() and float(pooled4.abs().max()) < 1e3
   print(f'  post-move + value-query OK: step-0 no-op (|d| {d0:.1e}), all params get grad, fused identity '
         f'(policy {d4p:.1e}, value {d4v:.1e}), empty-board guard')
@@ -698,8 +698,8 @@ def main():
   s_none = board_from_pieces({}, {'h8': 'K'})   # no own pieces => zero candidates by construction (s0 still has pawn pushes)
   assert float(net_ev.move_tokens.candidates(s_none)[0].sum()) == 0.0
   with torch.no_grad():
-    *_, ev_b = net_ev.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_ev.EMBEDDING_DIM))
-    *_, ev_0 = net_ev.move_tokens(s_none, torch.randn(1, 64, net_ev.EMBEDDING_DIM))
+    *_, ev_b, _ = net_ev.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_ev.EMBEDDING_DIM))
+    *_, ev_0, _ = net_ev.move_tokens(s_none, torch.randn(1, 64, net_ev.EMBEDDING_DIM))
   assert ev_b is not None and ev_b.shape == (sq.shape[0],) and torch.isfinite(ev_b).all()
   assert float(ev_b.abs().max()) > 0.0, 'ev must be non-zero at init (per-token scalar has a small fixed-key init)'
   assert ev_0 is not None and float(ev_0.abs().max()) == 0.0, 'no-candidate board -> ev exactly zero'
@@ -740,7 +740,7 @@ def main():
   net_su.eval()
   with torch.no_grad():
     o_su = net_su(sq, None)
-    *_, wb_su, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
+    *_, wb_su, _, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
   assert wb_su is not None and float(wb_su.abs().max()) == 0.0, 'square update must be an exact zero at init'
   # step-0 no-op on the heads is only checkable when the extra params did not shift the RNG stream
   # of later layers; assert on the wb tensor instead (above) and on finite outputs here.
@@ -757,8 +757,8 @@ def main():
       blk.wo.weight.normal_(0.0, 0.05)
   net_su.eval()
   with torch.no_grad():
-    *_, wb_su2, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
-    *_, wb_su0, _ = net_su.move_tokens(s_none, torch.randn(1, 64, net_su.EMBEDDING_DIM))
+    *_, wb_su2, _, _ = net_su.move_tokens(sq[:, :, 0:13].float(), torch.randn(sq.shape[0], 64, net_su.EMBEDDING_DIM))
+    *_, wb_su0, _, _ = net_su.move_tokens(s_none, torch.randn(1, 64, net_su.EMBEDDING_DIM))
   assert float(wb_su2.abs().max()) > 0.0, 'perturbed wo must produce a non-zero square update'
   assert float(wb_su0.abs().max()) == 0.0, 'no-candidate board -> zero square update'
   try:
