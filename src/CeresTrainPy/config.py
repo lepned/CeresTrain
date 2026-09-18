@@ -854,6 +854,22 @@ class Configuration:
     if self.Opt_LossMoveTokenActionMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
       raise ValueError(f'LossMoveTokenActionMultiplier > 0 requires SourceType DirectFromV6 with a v8 corpus '
                        f'(got {self.Data_SourceType!r}; the child table is the only per-move value target)')
+    # REPLY SUPERVISION of the opponent keys (2026-09-18): CE of one attention head toward the search's recorded reply +
+    # Huber of the reply-attended readout toward reply q. Training-only losses; needs MoveTokenOppMax > 0 and a v8 corpus.
+    self.NetDef_MoveTokenReplySup = bool(config_net_def.get('MoveTokenReplySup', False))
+    self.Opt_LossMoveTokenReplyMultiplier = float(config_opt.get('LossMoveTokenReplyMultiplier', 0) or 0)
+    self.Opt_LossMoveTokenReplyQMultiplier = float(config_opt.get('LossMoveTokenReplyQMultiplier', 0) or 0)
+    _rep_any = self.Opt_LossMoveTokenReplyMultiplier > 0 or self.Opt_LossMoveTokenReplyQMultiplier > 0
+    if self.NetDef_MoveTokenReplySup and not self.NetDef_UseMoveTokens:
+      raise ValueError('MoveTokenReplySup needs UseMoveTokens (silent no-op refused)')
+    if self.NetDef_MoveTokenReplySup and int(getattr(self, 'NetDef_MoveTokenOppMax', 0) or 0) <= 0:
+      raise ValueError('MoveTokenReplySup needs MoveTokenOppMax > 0 (it supervises the opponent keys)')
+    if _rep_any and not self.NetDef_MoveTokenReplySup:
+      raise ValueError('LossMoveTokenReply*Multiplier > 0 but MoveTokenReplySup is off (nothing to supervise)')
+    if self.NetDef_MoveTokenReplySup and not _rep_any:
+      raise ValueError('MoveTokenReplySup is on but both LossMoveTokenReply*Multiplier are 0 (silent no-op refused)')
+    if _rep_any and self.Data_SourceType != 'DirectFromV6':
+      raise ValueError(f'LossMoveTokenReply*Multiplier > 0 requires SourceType DirectFromV6 with a v8 corpus (got {self.Data_SourceType!r})')
     # POLICY-LOSS RESHAPING from the v8 child table (2026-09-17, policy_v8.py): loss/target-side only, no serving change.
     self.Opt_PolicyLossQGapLambda = float(config_opt.get('PolicyLossQGapLambda', 0) or 0)        # only-move weight
     self.Opt_PolicyLossSurpriseRefKL = float(config_opt.get('PolicyLossSurpriseRefKL', 0) or 0)  # search-vs-prior weight (ref = corpus median KL)

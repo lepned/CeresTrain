@@ -330,6 +330,7 @@ class MoveTokenDecoder(nn.Module):
                expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
                minimax: bool = False,
                action_head: bool = False,
+               reply_sup: bool = False,
                rel_bias: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
@@ -365,6 +366,12 @@ class MoveTokenDecoder(nn.Module):
     self.square_update = bool(square_update)
     self.minimax = bool(minimax)
     self.action_head = bool(action_head)
+    # REPLY SUPERVISION (2026-09-18): the opponent-key branch gets a target from the v8 child table. For one head of the
+    # LAST block's self-attention, the own-token -> opponent-token scores are trained (CE) toward the opponent token that
+    # is the search's recorded reply to that move, and the attended opponent state is read out (rq_head) toward the
+    # reply's q. Training-only: nothing is added to the served graph (the opponent keys themselves are the serving cost).
+    self.reply_sup = bool(reply_sup)
+    assert not (self.reply_sup and int(opp_max) <= 0), 'MoveTokenReplySup needs opponent tokens (MoveTokenOppMax > 0)'
     assert not (self.square_update and write_back), 'MoveTokenSquareUpdate already writes back at every block; MoveTokenWriteBack is redundant'
     # opp_max: number of OPPONENT candidate tokens offered as extra keys/values to the
     #   own-token self-attention (0 = off). opp_pool: also mean|max-pool them into the
@@ -502,6 +509,11 @@ class MoveTokenDecoder(nn.Module):
       nn.init.uniform_(self.act.weight, -0.02, 0.02)
       nn.init.zeros_(self.act.bias)
       self._last_act = None
+    if self.reply_sup:
+      self.rq_head = nn.Linear(dm // heads, 1)          # reads the reply-attended opponent state of ONE head
+      nn.init.uniform_(self.rq_head.weight, -0.02, 0.02)
+      nn.init.zeros_(self.rq_head.bias)
+      self._last_reply = None
     if self.value_query:
       self.vq_block = ValueQueryBlock(dm, s_dim, heads, ffn_mult, norm_type)
     if self.M_opp > 0:
@@ -763,19 +775,46 @@ class MoveTokenDecoder(nn.Module):
         Ws.append(self.vq_block.kv2.weight * self.vq_block.ln_s.scale.unsqueeze(0))
       kv_all = torch.nn.functional.linear(n, torch.cat(Ws, dim=0).to(n.dtype))  # [B,64,sum]
       kvs = list(kv_all.split([w.shape[0] for w in Ws], dim=-1))
+      x_last_in = None
       for i, blk in enumerate(self.blocks):
+        if i == len(self.blocks) - 1:
+          x_last_in = x
         x = blk(x, None, key_bias, kv=kvs[i], pm=pm, pm_kv=(kvs[_pm_idx[i]] if blk.post_move else None),
                 x_opp=x_opp, opp_bias=opp_bias, rel=rel)
       vq_kv2 = kvs[-1] if self.value_query else None
     else:
       flow_cur = flow
       any_valid_early = valid.any(dim=1)                                      # [B]
+      x_last_in = None
       for i, blk in enumerate(self.blocks):
+        if i == len(self.blocks) - 1:
+          x_last_in = x
         x = blk(x, blk.ln_s(flow_cur), key_bias, pm=pm, x_opp=x_opp, opp_bias=opp_bias, rel=rel)   # each block re-norms the squares under ITS norm (review B1)
         if self.square_update:
           flow_cur = flow_cur + self.sq_upd[i](flow_cur, x, key_bias, any_valid_early)
       vq_kv2 = None
     xo = self.out_ln(x)
+    if self.reply_sup and self.training and x_opp is not None:
+      # Recompute head 0 of the last block's own->opponent attention from the block's OWN q/k/v projections (no new
+      # parameters besides rq_head), so the supervision lands on the weights the served graph uses.
+      blk = self.blocks[-1]
+      dm = x_opp.shape[-1]; dk = blk.dk
+      hq = blk.ln1(x_last_in)
+      q = torch.nn.functional.linear(hq, blk.qkv.weight[:dm], None if blk.qkv.bias is None else blk.qkv.bias[:dm])
+      kv_o = torch.nn.functional.linear(blk.ln1(x_opp), blk.qkv.weight[dm:], None if blk.qkv.bias is None else blk.qkv.bias[dm:])
+      ko, vo = kv_o.chunk(2, dim=-1)
+      kv_own = torch.nn.functional.linear(hq, blk.qkv.weight[dm:], None if blk.qkv.bias is None else blk.qkv.bias[dm:])
+      kw, vw = kv_own.chunk(2, dim=-1)
+      # head 0 = columns [:dk] (the block reshapes (B,T,h,dk)); JOINT key row = own keys then opponent keys, exactly the
+      # row the served attention softmaxes over, so the CE can only be satisfied by attending the reply among ALL keys.
+      q0 = q[..., :dk].float()
+      k0 = torch.cat([kw[..., :dk], ko[..., :dk]], dim=1).float()            # [B,M+Mo,dk]
+      v0 = torch.cat([vw[..., :dk], vo[..., :dk]], dim=1)
+      kb = torch.cat([key_bias.reshape(B, 1, self.M), opp_bias.reshape(B, 1, self.M_opp)], dim=-1).float()
+      rl = torch.matmul(q0, k0.transpose(1, 2)) * (dk ** -0.5) + kb          # [B,M,M+Mo]
+      rp = torch.softmax(rl, dim=-1)
+      rq_pred = self.rq_head(torch.matmul(rp.to(v0.dtype), v0)).squeeze(-1)  # [B,M]
+      self._last_reply = (rl, rq_pred, sel_o, valid_o)
     if self.value_order and self.training:
       # Stash the per-token order scalar for the loss (consumed in ceres_net). Not traced at export.
       self._last_vord = self.vord(xo).squeeze(-1)                           # [B,M]
@@ -942,6 +981,58 @@ def move_token_minimax_loss(v_tok, r_tok, sel, valid, mv_pair_flat, child,
             'mt_mm_rows_v': rows_v, 'mt_mm_rows_r': rows_r,
             'mt_mm_targets_per_row': (w > 0).float().sum(dim=1).mean()}
   return l_v + l_r, diag
+
+
+def mirror_pair(pair):
+  """from*64+to pair seen from the other side: LC0 move indices are always in the side-to-move frame, so a reply recorded
+  in the child position sits on the root board mirrored rank-wise (square ^ 56)."""
+  fr, to = pair // 64, pair % 64
+  return (fr ^ 56) * 64 + (to ^ 56)
+
+
+def reply_targets(sel, valid, sel_o, valid_o, mv_pair_flat, child):
+  """Per own token: the JOINT key index (M + j) of the opponent token that is the search's recorded reply (-1 if the reply
+  is not among the Mo opponent tokens), the reply's q (root frame; -2 = not recorded) and the child's visits.
+  child = (idx, n, reply_idx, rq). `live` needs only a reply move; the q term masks rq separately."""
+  ci, cn, crep, crq = child
+  w, rep_f, rq = _children_to_tokens(sel, valid, mv_pair_flat, ci, cn, crep.float(), crq)   # [B,M]
+  rep = rep_f.round().long()
+  live = (w > 0) & (rep >= 0)
+  rep_pair = mirror_pair(mv_pair_flat[rep.clamp_min(0)])                                    # root-frame from-to of the reply
+  match = (sel_o.unsqueeze(1) == rep_pair.unsqueeze(2)) & valid_o.unsqueeze(1)             # [B,M,Mo]
+  has = match.any(dim=2) & live
+  tgt = torch.where(has, sel.shape[1] + match.float().argmax(dim=2), torch.full_like(rep, -1))   # joint index M + j
+  return tgt, rq, w, live, has
+
+
+def move_token_reply_loss(reply_logits, rq_pred, sel, valid, sel_o, valid_o, mv_pair_flat, child,
+                          visit_pow: float = 0.5, huber_delta: float = 0.2):
+  """(1) CE of the own->opponent attention scores (one head, last block) toward the recorded reply token, (2) Huber of the
+  reply-attended readout toward the reply's q (root frame). Visit-weighted (n^visit_pow), row-normalised; tokens whose reply
+  is not among the Mo opponent tokens are excluded (coverage is logged). Returns (ce, rq_loss, diag)."""
+  tgt, rq, w, live, has = reply_targets(sel, valid, sel_o, valid_o, mv_pair_flat, child)
+  wt = (w.pow(visit_pow) if visit_pow != 1.0 else w) * has
+  ws = wt.sum(dim=1); rows = ws > 0
+  logp = torch.log_softmax(reply_logits.float(), dim=-1)                                     # [B,M,M+Mo], joint row
+  nll = -torch.gather(logp, 2, tgt.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+  ce = ((wt * nll).sum(dim=1) / ws.clamp_min(1e-6))[rows].mean() if rows.any() else reply_logits.sum() * 0.0
+  wq = wt * (rq > -1.5)                                                                       # reply q recorded
+  wqs = wq.sum(dim=1); rows_q = wqs > 0
+  e = rq_pred.float() - rq
+  a = e.abs()
+  hub = torch.where(a <= huber_delta, 0.5 * e * e, huber_delta * (a - 0.5 * huber_delta))
+  rq_loss = ((wq * hub).sum(dim=1) / wqs.clamp_min(1e-6))[rows_q].mean() if rows_q.any() else rq_pred.sum() * 0.0
+  with torch.no_grad():
+    zero = torch.zeros((), device=reply_logits.device)
+    top1 = (reply_logits.argmax(dim=-1) == tgt) & has
+    mass = torch.gather(logp.exp(), 2, tgt.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    diag = {'mt_rep_ce': ce.detach(), 'mt_rep_rq_loss': rq_loss.detach(),
+            'mt_rep_top1': (top1.float().sum() / has.float().sum().clamp_min(1.0)),
+            'mt_rep_joint_mass': ((mass * has).sum() / has.float().sum().clamp_min(1.0)),
+            'mt_rep_coverage': (has.float().sum() / live.float().sum().clamp_min(1.0)),
+            'mt_rep_targets_per_row': has.float().sum(dim=1).mean(),
+            'mt_rep_rq_mae': ((wq * a).sum(dim=1) / wqs.clamp_min(1e-6))[rows_q].mean() if rows_q.any() else zero}
+  return ce, rq_loss, diag
 
 
 def move_token_action_loss(act_tok, sel, valid, mv_pair_flat, child, visit_pow: float = 0.5):

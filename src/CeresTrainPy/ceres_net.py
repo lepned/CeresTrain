@@ -1592,6 +1592,9 @@ class CeresNet(nn.Module):
       self.mt_qreg_w = float(getattr(config, 'Opt_LossMoveTokenQRegressionMultiplier', 0) or 0)
       self.mt_minimax = bool(getattr(config, 'NetDef_MoveTokenMinimax', False))
       self.mt_mm_w = float(getattr(config, 'Opt_LossMoveTokenMinimaxMultiplier', 0) or 0)
+      self.mt_reply = bool(getattr(config, 'NetDef_MoveTokenReplySup', False))
+      self.mt_rep_w = float(getattr(config, 'Opt_LossMoveTokenReplyMultiplier', 0) or 0)
+      self.mt_repq_w = float(getattr(config, 'Opt_LossMoveTokenReplyQMultiplier', 0) or 0)
       self.mt_action = bool(getattr(config, 'NetDef_MoveTokenActionHead', False))
       self.mt_act_w = float(getattr(config, 'Opt_LossMoveTokenActionMultiplier', 0) or 0)
       _mt_opp = int(getattr(config, 'NetDef_MoveTokenOppMax', 0) or 0)
@@ -1633,7 +1636,7 @@ class CeresNet(nn.Module):
           value_query=_mt_vq, value_order=(self.mt_vord_w > 0 or self.mt_qreg_w > 0),
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
           expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel,
-          minimax=self.mt_minimax, action_head=self.mt_action)
+          minimax=self.mt_minimax, action_head=self.mt_action, reply_sup=self.mt_reply)
       if _mt_ev:
         # ev [B] -> WDL logits through a zero-init 3-vector: exact step-0 no-op; the value
         # target then teaches both the direction and (through w_ev) the per-token scalars.
@@ -1656,6 +1659,7 @@ class CeresNet(nn.Module):
             f'relational self-attn bias {"ON (zero-init, %d relations)" % NREL if _mt_rel else "off"}; '
             f'MINIMAX readout {("ON w=%g" % self.mt_mm_w) if self.mt_minimax else "off"}; '
             f'ACTION head {("ON w=%g, exported as output action [B,1858,3], child frame" % self.mt_act_w) if self.mt_action else "off"}; '
+            f'REPLY supervision of opponent keys {("ON ce w=%g rq w=%g (head 0, last block)" % (self.mt_rep_w, self.mt_repq_w)) if self.mt_reply else "off"}; '
             f'absent-move floor {-30.0}')
 
 
@@ -2762,6 +2766,24 @@ class CeresNet(nn.Module):
               (_qr_ci, batch['child_q'], batch['child_n']))
           _vo_log.update(_qr_log)
 
+    # REPLY SUPERVISION of the opponent keys (child table: reply move + reply q). Secondary batches: participation only.
+    mt_rep_loss = 0; mt_repq_loss = 0
+    if getattr(self, 'mt_reply', False) and not gradient_norm_logging_mode:
+      _rep = getattr(self.move_tokens, '_last_reply', None)
+      _rep_mt = getattr(self, '_last_mt', None)
+      if _rep is not None and _rep_mt is not None:
+        self.move_tokens._last_reply = None
+        _rl, _rqp, _sel_o, _valid_o = _rep
+        _rep_ci = batch.get('child_idx') if isinstance(batch, dict) else None
+        if _rep_ci is None:
+          mt_rep_loss = 0.0 * _rl.float().sum(); mt_repq_loss = 0.0 * _rqp.float().sum()
+        else:
+          from move_tokens import move_token_reply_loss
+          mt_rep_loss, mt_repq_loss, _rep_log = move_token_reply_loss(
+              _rl, _rqp, _rep_mt[0], _rep_mt[1], _sel_o, _valid_o, self.move_tokens.mv_pair_flat,
+              (_rep_ci, batch['child_n'], batch['child_reply'], batch['child_rq']))
+          _vo_log.update(_rep_log)
+
     # MOVE-TOKEN ACTION HEAD: per-token WDL vs the child table (child frame). Puzzle/secondary batches carry no child
     # table -> participation term only, like the played-move action path.
     mt_act_loss = 0
@@ -3270,6 +3292,8 @@ class CeresNet(nn.Module):
         + (self.mt_qreg_w * mt_qreg_loss if not isinstance(mt_qreg_loss, int) else 0)
         + (self.mt_mm_w * mt_mm_loss if not isinstance(mt_mm_loss, int) else 0)
         + (self.mt_act_w * mt_act_loss if not isinstance(mt_act_loss, int) else 0)
+        + (self.mt_rep_w * mt_rep_loss if not isinstance(mt_rep_loss, int) else 0)
+        + (self.mt_repq_w * mt_repq_loss if not isinstance(mt_repq_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
         + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
@@ -3464,6 +3488,9 @@ class CeresNet(nn.Module):
           self._log(_k + stat_suffix, _v, step=num_pos)
       for _k, _v in _pw_log.items():
         self._log(_k + stat_suffix, _v, step=num_pos)
+      if isinstance(mt_vord_loss, int):
+        for _k, _v in _vo_log.items():
+          self._log(_k + stat_suffix, _v, step=num_pos)
       if not isinstance(refiner_ploss, int):
         self._log("refiner_deepsup_policy_loss" + stat_suffix, refiner_ploss, step=num_pos)
       if not gradient_norm_logging_mode:
