@@ -288,9 +288,15 @@ def main():
                     help='minmax = scale to max (outliers dominate); percentile = clip '
                          'outliers at --percentile (recommended to reduce quality loss); '
                          'entropy = histograms (OOM-prone)')
-    ap.add_argument('--percentile', type=float, default=99.999,
+    ap.add_argument('--percentile', type=float, default=99.9999,
                     help='percentile for --method percentile (clip activation outliers; '
-                         'lower = more aggressive clipping, e.g. 99.99)')
+                         'lower = more aggressive clipping, e.g. 99.99). Default raised '
+                         '99.999 -> 99.9999 on 2026-09-22, the first sweep where the knob '
+                         'actually reached ORT (see CalibPercentile above): on 1024x10 @6.6B '
+                         'it cut the summed INT8 puzzle tax from -44 to -37 Elo, best on '
+                         'policy rg2500 (-8 -> -4) and value rg2500 (-4 -> 0). No band is '
+                         'significant on its own (mean paired z +0.43), and POLICY wants LESS '
+                         'clipping while VALUE wants MORE, so no single value suits both.')
     ap.add_argument('--exclude_tail', type=int, default=0,
                     help='exclude the last N MatMul nodes from quantization (keep the '
                          'value-feeding late-trunk path FP16; value head is INT8-hostile)')
@@ -485,7 +491,17 @@ def main():
     # fails 'Non-zero zero point'. Force symmetric on both.
     extra_opts = {'ActivationSymmetric': True, 'WeightSymmetric': True}
     if args.method == 'percentile':
-        extra_opts['percentile'] = args.percentile  # clip activation outliers (ORT key)
+        # ORT key is 'CalibPercentile' for quantize_static: quantize.py maps
+        # ('CalibPercentile' -> calibrator kwarg 'percentile') and DROPS every
+        # extra_options key not in that table. We passed 'percentile' until
+        # 2026-09-22 => it was silently ignored and every run used ORT's default
+        # 99.999 (verified: --percentile 99.9999 produced a byte-identical onnx,
+        # and the ORT log still printed 99.999). That makes the 09-04 conclusion
+        # "percentile 99.999/99.99/99.9 identical" an artifact of this bug, not a
+        # saturation result. Keep the old key too: harmless, and 'percentile' IS
+        # the accepted spelling on ORT's other (QuantizationConfig) API path.
+        extra_opts['CalibPercentile'] = args.percentile
+        extra_opts['percentile'] = args.percentile
     # --train_ranges: pin activation scales to the QAT ckpt's frozen ranges.
     if args.train_ranges:
         import hashlib
