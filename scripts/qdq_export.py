@@ -237,6 +237,36 @@ class TPGReader(CalibrationDataReader):
         self.i = 0
 
 
+class ListReader(CalibrationDataReader):
+    """Calibration batches held as a plain list — DEEPCOPY-SAFE.
+
+    SmoothQuant (neural-compressor, via ORT's SmoothQuant extra_option) deep-copies
+    the data reader; TPGReader holds a live TPGDataset whose shard streaming uses
+    generators, so that deepcopy dies with "cannot pickle 'generator' object"
+    (hit 2026-09-22). Draining TPGReader into a list up front is cheap (a 128-pos
+    calibration set is a few MB) and also makes the calibration set reproducible.
+    """
+    def __init__(self, src):
+        self.batches = []
+        while True:
+            b = src.get_next()
+            if b is None:
+                break
+            self.batches.append(b)
+        self.i = 0
+        print(f'[qdq] materialized {len(self.batches)} calibration batches (deepcopy-safe)')
+
+    def get_next(self):
+        if self.i >= len(self.batches):
+            return None
+        b = self.batches[self.i]
+        self.i += 1
+        return b
+
+    def rewind(self):
+        self.i = 0
+
+
 def _in_dtype(runner):
     """Numpy dtype the engine expects for its input tensor (FP16 ref vs FP32 QDQ)."""
     import int8_validate as iv
@@ -297,6 +327,30 @@ def main():
                          'policy rg2500 (-8 -> -4) and value rg2500 (-4 -> 0). No band is '
                          'significant on its own (mean paired z +0.43), and POLICY wants LESS '
                          'clipping while VALUE wants MORE, so no single value suits both.')
+    ap.add_argument('--smoothquant', type=float, default=None, metavar='ALPHA',
+                    help="enable SmoothQuant with this alpha (ORT extra_options "
+                         "'SmoothQuant'/'SmoothQuantAlpha'). Migrates per-channel "
+                         "ACTIVATION outliers into the WEIGHTS via an exact diagonal "
+                         "rescale (X.diag(s)^-1 . diag(s).W == X.W), which suits us "
+                         "because TRT quantizes activations PER-TENSOR (one outlier "
+                         "channel coarsens the whole scale) while our weights are "
+                         "per-channel. alpha 0.5 = ORT default; HIGHER migrates more "
+                         "into the weights. Needs neural-compressor 2.x in the env "
+                         "(3.x dropped the adaptor.ox_utils path ORT imports): use "
+                         "/home/lep/sq-env. NB ORT forwards only alpha+folding; "
+                         "auto-alpha and scales_per_op need INC called directly.")
+    ap.add_argument('--sq_no_folding', action='store_true',
+                    help='do not fold the SmoothQuant rescale into the preceding op '
+                         '(folding is free for RMSNorm-preceded GEMMs; where it fails an '
+                         'explicit Mul node is inserted, which costs EPS -> count Mul '
+                         'nodes after the export to see where folding did not apply)')
+    ap.add_argument('--calib_symmetric', action='store_true',
+                    help="collect SYMMETRIC activation ranges during calibration (ORT "
+                         "extra_options 'CalibTensorRangeSymmetric'). NO-OP for "
+                         "--method percentile: create_calibrator already defaults "
+                         "symmetric=True there (calibrate.py, Percentile branch), and "
+                         "passing it produced a byte-identical onnx (verified 2026-09-22). "
+                         "It DOES matter for minmax/entropy, whose default is False.")
     ap.add_argument('--exclude_tail', type=int, default=0,
                     help='exclude the last N MatMul nodes from quantization (keep the '
                          'value-feeding late-trunk path FP16; value head is INT8-hostile)')
@@ -421,6 +475,9 @@ def main():
     calib_batch = min(args.batch, 16)
     reader = TPGReader(args.tpg_dir, calib_batch, args.calib_batches,
                        input_name=in_name, channels=in_channels, byte_div=args.byte_divisor)
+    if args.smoothquant is not None:
+        # SmoothQuant deep-copies the reader -> it must not hold generators.
+        reader = ListReader(reader)
     # Exclude the last N MatMuls (the value-feeding late trunk) from quantization.
     nodes_to_exclude = []
     _m = onnx.load(quant_input) if (args.exclude_tail > 0 or args.exclude_act_matmuls
@@ -502,6 +559,14 @@ def main():
         # the accepted spelling on ORT's other (QuantizationConfig) API path.
         extra_opts['CalibPercentile'] = args.percentile
         extra_opts['percentile'] = args.percentile
+    if args.calib_symmetric:
+        extra_opts['CalibTensorRangeSymmetric'] = True
+    if args.smoothquant is not None:
+        extra_opts['SmoothQuant'] = True
+        extra_opts['SmoothQuantAlpha'] = args.smoothquant
+        extra_opts['SmoothQuantFolding'] = not args.sq_no_folding
+        print(f'[qdq] SmoothQuant ON: alpha={args.smoothquant} '
+              f'folding={not args.sq_no_folding}')
     # --train_ranges: pin activation scales to the QAT ckpt's frozen ranges.
     if args.train_ranges:
         import hashlib
