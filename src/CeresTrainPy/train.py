@@ -1134,8 +1134,14 @@ def Train():
   if _IS_V6_SOURCE:
     # q-deviation targets do not exist in v6 records; the loader yields zeros,
     # so a nonzero loss weight would silently train the head toward zero.
-    assert float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) == 0, \
-        'DirectFromV6 requires LossQDeviationMultiplier=0 (no q-deviation data in v6 records)'
+    # LossQDeviationMultiplier also decides whether the heads EXIST, so a resume
+    # from a checkpoint that has them must keep it > 0: the heads stay built and in
+    # the forward (state dict and optimizer state match), but their loss is scaled
+    # to 0 — they receive zero gradient on this source.
+    if float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) > 0:
+      core.q_deviation_loss_scale = 0.0
+      print('[train] DirectFromV6: q-deviation heads kept (checkpoint compatibility) '
+            'but their loss is scaled to 0 — no q-deviation targets in v6/v8 records', flush=True)
     from v6_dataset import V6ChunkDataset
     if getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0):
       raise ValueError('NumTPGFilesToSkipAfterShuffle is only implemented for the TPG loader (silent no-op refused on V6)')

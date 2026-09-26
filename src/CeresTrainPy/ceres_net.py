@@ -110,6 +110,10 @@ class CeresNet(nn.Module):
     self.prior_state_dim = config.NetDef_PriorStateDim
     self.moves_left_loss_weight = moves_left_loss_weight
     self.q_deviation_loss_weight = q_deviation_loss_weight
+    # Multiplies ONLY the q-deviation loss terms, leaving the heads built and in the
+    # forward pass (so a checkpoint that has them still loads and its optimizer state
+    # still matches). train.py sets it to 0 for sources without q-deviation targets.
+    self.q_deviation_loss_scale = 1.0
     self.value2_loss_weight = value2_loss_weight
     self.uncertainty_policy_weight = uncertainty_policy_weight
     self.action_uncertainty_loss_weight = action_uncertainty_loss_weight
@@ -3262,8 +3266,8 @@ class CeresNet(nn.Module):
         + self.value2_loss_weight * v2_loss
         + self.moves_left_loss_weight * ml_loss
         + self.unc_loss_weight * u_loss
-        + self.q_deviation_loss_weight * q_deviation_lower_loss
-        + self.q_deviation_loss_weight * q_deviation_upper_loss
+        + self.q_deviation_loss_weight * self.q_deviation_loss_scale * q_deviation_lower_loss
+        + self.q_deviation_loss_weight * self.q_deviation_loss_scale * q_deviation_upper_loss
         + self.value_diff_loss_weight * value_diff_loss
         + self.value2_diff_loss_weight * value2_diff_loss
         + self.action_loss_weight * action_loss
@@ -3336,8 +3340,8 @@ class CeresNet(nn.Module):
       self._gc_value_loss = (self.value_loss_weight * v_loss
           + self.value2_loss_weight * v2_loss
           + self.unc_loss_weight * u_loss
-          + self.q_deviation_loss_weight * q_deviation_lower_loss
-          + self.q_deviation_loss_weight * q_deviation_upper_loss
+          + self.q_deviation_loss_weight * self.q_deviation_loss_scale * q_deviation_lower_loss
+          + self.q_deviation_loss_weight * self.q_deviation_loss_scale * q_deviation_upper_loss
           + self.value_diff_loss_weight * value_diff_loss
           + self.value2_diff_loss_weight * value2_diff_loss
           + self.stvalue_weight * stvalue_loss
