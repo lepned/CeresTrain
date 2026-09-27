@@ -1315,7 +1315,8 @@ class CeresNet(nn.Module):
     self.transformer_layer = torch.nn.Sequential(
        *[EncoderLayer('T', num_tokens_q, num_tokens_kv,
                       self.NUM_LAYERS, self.EMBEDDING_DIM,
-                      self.FFN_MULT*self.EMBEDDING_DIM, 
+                      # int(): a fractional FFNMultiplier (e.g. 1.5) must give an integer width.
+                      int(round(self.FFN_MULT * self.EMBEDDING_DIM)),
                       config.NetDef_UseQKV,
                       config.NetDef_SoftCapCutoff,
                       config.NetDef_UseQKNorm,
