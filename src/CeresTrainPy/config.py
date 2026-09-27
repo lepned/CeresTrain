@@ -854,6 +854,19 @@ class Configuration:
     if self.Opt_LossMoveTokenActionMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
       raise ValueError(f'LossMoveTokenActionMultiplier > 0 requires SourceType DirectFromV6 with a v8 corpus '
                        f'(got {self.Data_SourceType!r}; the child table is the only per-move value target)')
+    # POST-HOC ACTION HEAD (2026-09-26): freeze EVERYTHING except move_tokens.act and train only the head on a
+    # finished net, so policy/value stay bit-identical to the base checkpoint. No LoRA needed to trigger the freeze.
+    self.Opt_TrainOnlyActionHead = bool(config_opt.get('TrainOnlyActionHead', False))
+    if self.Opt_TrainOnlyActionHead:
+      if not self.NetDef_MoveTokenActionHead or self.Opt_LossMoveTokenActionMultiplier <= 0:
+        raise ValueError('TrainOnlyActionHead needs MoveTokenActionHead and LossMoveTokenActionMultiplier > 0')
+      if not self.Opt_CheckpointResumeFromFileName:
+        raise ValueError('TrainOnlyActionHead needs CheckpointResumeFromFileName (a head on a random net is meaningless)')
+      if self.Opt_LoRARankDivisor:
+        raise ValueError('TrainOnlyActionHead and LoRA are mutually exclusive (both decide what trains)')
+      if self.Opt_QKClipTau > 0:
+        raise ValueError('TrainOnlyActionHead needs QKClipTau 0: QK-clip rescales frozen attention weights after the '
+                         'optimizer step, which would silently change the base net')
     # REPLY SUPERVISION of the opponent keys (2026-09-18): CE of one attention head toward the search's recorded reply +
     # Huber of the reply-attended readout toward reply q. Training-only losses; needs MoveTokenOppMax > 0 and a v8 corpus.
     self.NetDef_MoveTokenReplySup = bool(config_net_def.get('MoveTokenReplySup', False))

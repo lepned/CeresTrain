@@ -551,10 +551,27 @@ def Train():
                         or "dp_pol_" in name or "dpva_" in name or "dp_surv" in name
                         or "dpv_" in name or "dpe_w" in name or "dpd_" in name
                         or "dpcv_" in name or "dpc_" in name or "dpch_" in name or "dpgi_" in name
-                        or "kdist_proj" in name or "spe_proj" in name or "cbk_" in name)
+                        or "kdist_proj" in name or "spe_proj" in name or "cbk_" in name
+                        # Move-token action head: a NEW module when warm-started from a head-less
+                        # checkpoint — without this it froze at its init and exported a dead head.
+                        or "move_tokens.act." in name)
       if not keep_trainable:
         param.requires_grad = False
-   
+
+  if config.Opt_TrainOnlyActionHead:
+    # Post-hoc action head: freeze everything else, so policy/value stay bit-identical to
+    # the base checkpoint. SUBSTRING match: names carry '_orig_mod.'/'module.' prefixes later.
+    _act_kept = []
+    for name, param in model.named_parameters():
+      if "move_tokens.act." in name:
+        _act_kept.append(name)
+      else:
+        param.requires_grad = False
+    if not _act_kept:
+      raise RuntimeError('TrainOnlyActionHead: no move_tokens.act parameters found (head not built?)')
+    print(f'[train] TRAIN-ONLY ACTION HEAD: {len(_act_kept)} tensors trainable {_act_kept}, '
+          f'{sum(p.numel() for p in model.parameters() if p.requires_grad)} params; everything else frozen', flush=True)
+
   # Per-head QK-clip (config 'QKClipTau', see config.py): arm the per-module
   # max-logit monitors BEFORE torch.compile so the training-only stash branch
   # specializes into the compiled graph. Module refs kept for the post-step clip.
