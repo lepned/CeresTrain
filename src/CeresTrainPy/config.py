@@ -933,7 +933,8 @@ class Configuration:
     # Nested bottleneck trunk (KataGo v1.17 transformers, see nbt_layer.py): 0 = off (plain
     # layers). N > 0 makes EVERY trunk layer a block that projects ModelDim down to
     # ModelDim / NBTWidthDivisor, runs N ordinary encoder layers (attention + FFN, same
-    # NumHeads and FFNMultiplier) there, and projects back up (zero-init).
+    # FFNMultiplier; heads/norm/projection activation per NBTInnerHeads, NBTInnerPreNorm,
+    # NBTProjActivation below) there, and projects back up (zero-init).
     self.NetDef_NBTInnerLayers = int(config_net_def.get('NBTInnerLayers', 0))
     self.NetDef_NBTWidthDivisor = int(config_net_def.get('NBTWidthDivisor', 2))
     # NBTMidDim: the validated inner width, read by ceres_net (0 when NBT is off).
@@ -945,8 +946,37 @@ class Configuration:
       if _div < 1 or self.NetDef_ModelDim % _div != 0:
         raise ValueError(f"NBTWidthDivisor ({_div}) must be >= 1 and divide ModelDim ({self.NetDef_ModelDim})")
       self.NetDef_NBTMidDim = self.NetDef_ModelDim // _div
-      if self.NetDef_NBTMidDim % self.NetDef_NumHeads != 0:
-        raise ValueError(f"NBT inner width {self.NetDef_NBTMidDim} must be divisible by NumHeads ({self.NetDef_NumHeads})")
+    # KataGo-style knobs (their nbt transformers: head dim 32 at the inner width, pure pre-norm
+    # inner stream, norm -> activation -> 1x1 on both projections). Defaults keep the first port.
+    # NBTInnerHeads: attention heads in the inner layers (0 = NumHeads). NBTProjActivation uses
+    # the FFNActivationType vocabulary (activation_functions.to_activation: Swish = SiLU).
+    _nbt_heads_raw = int(config_net_def.get('NBTInnerHeads', 0) or 0)
+    if _nbt_heads_raw < 0:
+      raise ValueError(f"NBTInnerHeads must be >= 0 (was {_nbt_heads_raw})")
+    self.NetDef_NBTInnerHeads = _nbt_heads_raw or self.NetDef_NumHeads
+    # NBTInnerPreNorm absent = inherit the trunk's PreNorm (review 2026-09-28: a False default
+    # silently forced post-norm inner layers into a PreNorm trunk).
+    _nbt_prenorm_raw = config_net_def.get('NBTInnerPreNorm', None)
+    self.NetDef_NBTInnerPreNorm = bool(self.NetDef_PreNorm if _nbt_prenorm_raw is None else _nbt_prenorm_raw)
+    self.NetDef_NBTProjActivation = config_net_def.get('NBTProjActivation', 'None') or 'None'
+    if self.NetDef_NBTProjActivation not in ('None', 'Swish', 'Mish', 'ReLU'):
+      raise ValueError(f"NBTProjActivation must be None, Swish, Mish or ReLU (was {self.NetDef_NBTProjActivation!r})")
+    # NBTProjNorm: 'Norm' (NormType, default) or 'Affine' (KataGo's fixscale NormMask: fixed
+    # constant x (1+gamma) + beta, no statistics) in front of the two projections.
+    # NBTFixupInit: KataGo's LEGACY fixup scaling of the down projection init,
+    # (1/sqrt(num blocks))^(1/(1+NBTInnerLayers)); their trained transformer nets use
+    # fixscaleonenorm instead (KataGoMethods.md: fixup "NOT used any more").
+    self.NetDef_NBTProjNorm = config_net_def.get('NBTProjNorm', 'Norm') or 'Norm'
+    if self.NetDef_NBTProjNorm not in ('Norm', 'Affine'):
+      raise ValueError(f"NBTProjNorm must be Norm or Affine (was {self.NetDef_NBTProjNorm!r})")
+    self.NetDef_NBTFixupInit = bool(config_net_def.get('NBTFixupInit', False))
+    if self.NetDef_NBTInnerLayers > 0:
+      if self.NetDef_NBTMidDim % self.NetDef_NBTInnerHeads != 0:
+        raise ValueError(f"NBT inner width {self.NetDef_NBTMidDim} must be divisible by the inner head count ({self.NetDef_NBTInnerHeads})")
+    elif (_nbt_heads_raw or _nbt_prenorm_raw is not None or self.NetDef_NBTProjActivation != 'None'
+          or self.NetDef_NBTProjNorm != 'Norm' or self.NetDef_NBTFixupInit):
+      # Refuse a silent no-op: these knobs only exist inside NBT blocks.
+      raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation / NBTProjNorm / NBTFixupInit require NBTInnerLayers > 0")
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
     if getattr(self, 'NetDef_ExportFolds', 'none') in ('ffn', 'all'):
       # export_folds.py only fuses plain SwiGLU FFNs; anything else would make the fold a no-op

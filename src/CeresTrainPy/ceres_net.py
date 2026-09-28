@@ -1327,13 +1327,25 @@ class CeresNet(nn.Module):
       # its DWA mixes full-width block outputs only.
       assert not getattr(self, 'vis_edge_gate_mode', None), 'NBT: visibility-edge gates are not supported'
       assert not getattr(self, 'use_graph_route', False), 'NBT: graph-route heads are not supported'
+      if config.NetDef_NBTInnerHeads != self.NUM_HEADS:
+        # Everything that produces a per-head [B, NumHeads, 64, 64] bias or a per-head table is
+        # sized by the trunk head count; with a different inner head count it cannot feed the
+        # inner attentions. Refused at construction (nbt_layer also asserts at forward).
+        _head_sized = {'smolgen basis/static banks': getattr(self, 'smol_basis_k', 0) or getattr(self, 'smol_static_mode', 0),
+                       'UsePieceRelationBias': config.NetDef_UsePieceRelationBias,
+                       'UseRayAttentionBias': getattr(config, 'NetDef_UseRayAttentionBias', False),
+                       'UseVisEdgeBias': self.use_vis_edge_bias,
+                       'UseDualPlane (edge-to-trunk bias)': self.use_dual_plane}
+        _on = [k for k, v in _head_sized.items() if v]
+        assert not _on, f'NBT: NBTInnerHeads != NumHeads is not supported with {_on}'
 
     # layer_num / num_layers are the position and count of attention+FFN layers in the real
     # stack: inside an NBT trunk that is block * NBTInnerLayers + inner index, out of
     # NUM_LAYERS * NBTInnerLayers, so everything keyed on them (DIFF++ lambda plan, SoftMoE on
     # odd layers, FFNUseGlobalEveryNLayers, CERES_LORA layer ranges, print-once logs) is
-    # per layer, not repeated per block.
-    def _make_encoder_layer(i, hidden, num_layers):
+    # per layer, not repeated per block. num_heads / pre_norm: the NBT inner layers may differ
+    # from the trunk (NBTInnerHeads, NBTInnerPreNorm).
+    def _make_encoder_layer(i, hidden, num_layers, num_heads=None, pre_norm=None):
       return EncoderLayer('T', num_tokens_q, num_tokens_kv,
                       num_layers, hidden,
                       # int(): a fractional FFNMultiplier (e.g. 1.5) must give an integer width.
@@ -1341,7 +1353,7 @@ class CeresNet(nn.Module):
                       config.NetDef_UseQKV,
                       config.NetDef_SoftCapCutoff,
                       config.NetDef_UseQKNorm,
-                      self.NUM_HEADS,
+                      self.NUM_HEADS if num_heads is None else num_heads,
                       ffn_activation_type = config.NetDef_FFNActivationType, 
                       norm_type = config.NetDef_NormType, layernorm_eps=EPS, 
                       use_global = config.NetDef_FFNUseGlobalEveryNLayers > 0 and (i % config.NetDef_FFNUseGlobalEveryNLayers) == config.NetDef_FFNUseGlobalEveryNLayers - 1,
@@ -1360,7 +1372,9 @@ class CeresNet(nn.Module):
                       smol_rel_bins = getattr(self, 'smol_rel_bins', None),
                       smolgen_activation_type = config.NetDef_SmolgenActivationType,
                       smolgen_delta_rank = config.NetDef_SmolgenDeltaRank,
-                      alpha=self.alpha, layerNum=i, dropout_rate=self.DROPOUT_RATE,
+                      # An NBT inner layer asked to be pre-norm is KataGo's x + sub(norm(x)):
+                      # no DeepNorm residual scaling inside the block.
+                      alpha=(1.0 if pre_norm else self.alpha), layerNum=i, dropout_rate=self.DROPOUT_RATE,
                       use_rpe=config.NetDef_UseRPE, 
                       use_rpe_v=config.NetDef_UseRPE_V,
                       rpe_factor_shared=self.rpe_factor_shared,
@@ -1378,17 +1392,27 @@ class CeresNet(nn.Module):
                       softmin_heads = self.softmin_heads,
                       softmax_agg_heads = self.softmax_agg_heads,
                       use_head_logit_temp = self.use_head_logit_temp,
-                      pre_norm = config.NetDef_PreNorm)
+                      pre_norm = config.NetDef_PreNorm if pre_norm is None else pre_norm)
 
     if self.NBT_INNER_LAYERS > 0:
       _k = self.NBT_INNER_LAYERS
+      _nbt_heads = config.NetDef_NBTInnerHeads
+      _nbt_prenorm = config.NetDef_NBTInnerPreNorm
+      # KataGo LEGACY fixup: fixup_scale = 1/sqrt(num blocks), down projection at fixup_scale^(1/(1+K))
+      # (their trained transformer nets use fixscaleonenorm, not fixup -- off by default).
+      _down_scale = math.pow(1.0 / math.sqrt(self.NUM_DISTINCT_LAYERS), 1.0 / (1.0 + _k)) if config.NetDef_NBTFixupInit else 1.0
       self.transformer_layer = torch.nn.Sequential(
          *[NestedBottleneckLayer(self.EMBEDDING_DIM, self.NBT_MID_DIM,
-                                 lambda j, i=i: _make_encoder_layer(i * _k + j, self.NBT_MID_DIM, self.NUM_LAYERS * _k),
-                                 _k, config.NetDef_NormType, EPS)
+                                 lambda j, i=i: _make_encoder_layer(i * _k + j, self.NBT_MID_DIM, self.NUM_LAYERS * _k,
+                                                                    num_heads=_nbt_heads, pre_norm=_nbt_prenorm),
+                                 _k, config.NetDef_NormType, EPS,
+                                 proj_activation=config.NetDef_NBTProjActivation,
+                                 proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i)
            for i in range(self.NUM_DISTINCT_LAYERS)])
-      print(f'[ceres_net] NBT trunk: {self.NUM_DISTINCT_LAYERS} blocks x {_k} inner layers '
-            f'at {self.NBT_MID_DIM} (ModelDim {self.EMBEDDING_DIM}), zero-init up projections')
+      print(f'[ceres_net] NBT trunk: {self.NUM_DISTINCT_LAYERS} blocks x {_k} inner layers at {self.NBT_MID_DIM} '
+            f'(ModelDim {self.EMBEDDING_DIM}), {_nbt_heads} inner heads (dim {self.NBT_MID_DIM // _nbt_heads}), '
+            f'inner {"pre" if _nbt_prenorm else "post"}-norm, projections {config.NetDef_NBTProjNorm} -> '
+            f'{config.NetDef_NBTProjActivation} -> Linear, down init scale {_down_scale:.3f}, zero-init up projections')
     else:
       self.transformer_layer = torch.nn.Sequential(
          *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])

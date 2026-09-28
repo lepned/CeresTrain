@@ -77,7 +77,24 @@ def make_norm(norm_type: str, d_model: int, eps: float = 1e-6) -> torch.nn.Modul
 # swept into `decay` by the trunk catch-all with no assert firing).
 # L2NormScaled = SoftMoE normPhi (dormant: SMOE_USE_NORMALIZATION is hard-off),
 # included so that path is right the day it is armed.
+class ChannelAffine(torch.nn.Module):
+  """fixed_scale * gamma * x + beta per channel, no statistics: what KataGo's NormMask is in its
+  fixup / fixscale modes (model_pytorch.py NormMask.forward -> apply_gamma_beta_scale_mask(x),
+  x * ((gamma + 1) * scale) + beta with a FIXED scale constant such as 1/sqrt(block + 1)).
+  Used by nbt_layer.py (NBTProjNorm 'Affine'); the caller passes the constant. gamma is
+  parameterized as `scale` (init 1) rather than KataGo's gamma+1 (init 0): same function.
+  Its scale/bias are norm gains: no weight decay."""
+  def __init__(self, d_model: int, fixed_scale: float = 1.0):
+    super().__init__()
+    self.fixed_scale = float(fixed_scale)
+    self.scale = torch.nn.Parameter(torch.ones(d_model))
+    self.bias = torch.nn.Parameter(torch.zeros(d_model))
+
+  def forward(self, x: Tensor) -> Tensor:
+    return x * (self.scale * self.fixed_scale) + self.bias
+
+
 from derf_norm import DerfNorm
 from dyt_norm import DyTNorm
 from l2norm_scaled import L2NormScaled
-NORM_MODULE_TYPES = (torch.nn.LayerNorm, RMSNorm, DerfNorm, DyTNorm, L2NormScaled)
+NORM_MODULE_TYPES = (torch.nn.LayerNorm, RMSNorm, DerfNorm, DyTNorm, L2NormScaled, ChannelAffine)

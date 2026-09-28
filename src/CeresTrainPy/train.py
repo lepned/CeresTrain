@@ -684,15 +684,16 @@ def Train():
     # unsuitable" for low-rank adapters); 'all-non-trunk'/'ffn-only' lacked it,
     # so env-gated transformer-layer LoRA adapters ran under Muon Newton-Schulz.
     # For non-LoRA runs the exclusion changes nothing (no matching names).
-    def _is_nbt_up(n):
-      # Zero-init up projection of a nested bottleneck block (nbt_layer.py,
-      # transformer_layer.N.up.weight): same class as the excluded zero-init couplings
-      # below (pm_proj, v_inject, wb.wo, dpe_w) -- Newton-Schulz turns its first low-rank
-      # gradient into a full fixed-norm update and the block leaves identity in one step.
-      return 'transformer_layer' in n and n.endswith('.up.weight')
+    # The zero-init up projection of a nested bottleneck block (nbt_layer.py,
+    # transformer_layer.N.up.weight) stays in Muon on purpose, unlike the zero-init
+    # couplings excluded below. Measured 2026-09-28 on paired 256x10 smokes (same data
+    # order): with it in AdamW the blocks stay near identity for millions of positions and
+    # the net trains like a shallower one (4-6M: value 0.196 vs 0.170, policy 0.758 vs 0.710).
+    # Note for resumes: an NBT checkpoint saved with `up` in AdamW has a different Muon
+    # partition, so resuming it here takes the 'partition differs' path and restarts the
+    # optimizer moments (only the 09-28 v8nbt2f smoke was saved that way).
     def _use_muon_final_only(n, p):
       if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
-      if _is_nbt_up(n): return False
       if 'embedding' in n: return False         # lookup-table-like: AdamW
       if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
       if 'smol_basis_bank' in n or 'smol_static_bank' in n: return False  # raa logit-tabeller, ikke vektmatriser (review-funn 3)
@@ -713,7 +714,7 @@ def Train():
       # trunk param (e.g. the [H, C, d_k] vis edge-bias gate tensors) must go
       # to the internal AdamW group — same rule the 'final-only' scope applies.
       return (p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
-              and 'lora' not in n.lower() and not _is_nbt_up(n))
+              and 'lora' not in n.lower())
     def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
       # AdamW substituted for NAdam by design — the load-bearing choice is
