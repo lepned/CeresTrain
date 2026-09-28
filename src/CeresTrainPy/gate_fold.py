@@ -31,7 +31,9 @@ def fold_gate_on_warm_start(model) -> tuple:
   double-count)."""
   n = 0
   g0 = None
-  for lyr in model.transformer_layer:
+  # A nested bottleneck block (nbt_layer.py) holds its attentions in its inner layers.
+  layers = [inner for lyr in model.transformer_layer for inner in getattr(lyr, 'inner', [lyr])]
+  for lyr in layers:
     att = getattr(lyr, 'attention', None)
     if att is None or not getattr(att, 'use_gated_attn_out', False):
       continue

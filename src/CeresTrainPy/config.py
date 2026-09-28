@@ -930,6 +930,23 @@ class Configuration:
     self.NetDef_AttentionMultiplier = config_net_def.get('AttentionMultiplier', 1)
     self.NetDef_NonLinearAttention = config_net_def.get('NonLinearAttention', False)
     self.NetDef_FFNMultiplier = config_net_def.get('FFNMultiplier', 1)
+    # Nested bottleneck trunk (KataGo v1.17 transformers, see nbt_layer.py): 0 = off (plain
+    # layers). N > 0 makes EVERY trunk layer a block that projects ModelDim down to
+    # ModelDim / NBTWidthDivisor, runs N ordinary encoder layers (attention + FFN, same
+    # NumHeads and FFNMultiplier) there, and projects back up (zero-init).
+    self.NetDef_NBTInnerLayers = int(config_net_def.get('NBTInnerLayers', 0))
+    self.NetDef_NBTWidthDivisor = int(config_net_def.get('NBTWidthDivisor', 2))
+    # NBTMidDim: the validated inner width, read by ceres_net (0 when NBT is off).
+    self.NetDef_NBTMidDim = 0
+    if self.NetDef_NBTInnerLayers < 0:
+      raise ValueError(f"NBTInnerLayers must be >= 0 (was {self.NetDef_NBTInnerLayers})")
+    if self.NetDef_NBTInnerLayers > 0:
+      _div = self.NetDef_NBTWidthDivisor
+      if _div < 1 or self.NetDef_ModelDim % _div != 0:
+        raise ValueError(f"NBTWidthDivisor ({_div}) must be >= 1 and divide ModelDim ({self.NetDef_ModelDim})")
+      self.NetDef_NBTMidDim = self.NetDef_ModelDim // _div
+      if self.NetDef_NBTMidDim % self.NetDef_NumHeads != 0:
+        raise ValueError(f"NBT inner width {self.NetDef_NBTMidDim} must be divisible by NumHeads ({self.NetDef_NumHeads})")
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
     if getattr(self, 'NetDef_ExportFolds', 'none') in ('ffn', 'all'):
       # export_folds.py only fuses plain SwiGLU FFNs; anything else would make the fold a no-op

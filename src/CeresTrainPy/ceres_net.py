@@ -27,6 +27,7 @@ from torch.utils.tensorboard import SummaryWriter
 from activation_functions import to_activation
 from losses import LossCalculator
 from encoder_layer import EncoderLayer
+from nbt_layer import NestedBottleneckLayer
 from config import Configuration
 from mlp2_layer import MLP2Layer
 from rms_norm import RMSNorm, make_norm
@@ -672,8 +673,10 @@ class CeresNet(nn.Module):
 
 
 
-    if self.DEEPNORM:     
-      self.alpha = math.pow(2 * self.NUM_LAYERS, 0.25)
+    if self.DEEPNORM:
+      # Sized for the real number of attention+FFN layers: a nested bottleneck trunk runs
+      # NBTInnerLayers of them per block.
+      self.alpha = math.pow(2 * self.NUM_LAYERS * max(1, config.NetDef_NBTInnerLayers), 0.25)
     else:      
       self.alpha = 1
 
@@ -1312,11 +1315,29 @@ class CeresNet(nn.Module):
     num_tokens_q = NUM_TOKENS_NET
     num_tokens_kv = NUM_TOKENS_NET
 
-    self.transformer_layer = torch.nn.Sequential(
-       *[EncoderLayer('T', num_tokens_q, num_tokens_kv,
-                      self.NUM_LAYERS, self.EMBEDDING_DIM,
+    # Nested bottleneck trunk (nbt_layer.py): every layer becomes a block of NBTInnerLayers
+    # encoder layers at ModelDim / NBTWidthDivisor. The encoder layers inside are built by the
+    # same factory as the plain ones, only narrower.
+    self.NBT_INNER_LAYERS = config.NetDef_NBTInnerLayers
+    self.NBT_MID_DIM = config.NetDef_NBTMidDim   # validated once in config.py
+    if self.NBT_INNER_LAYERS > 0:
+      # Paths that feed full-width per-layer tensors into an attention's own projections,
+      # or reach into transformer_layer[i].attention directly, are not wired for NBT.
+      # (RPE-from-embedding is set further down and checked there.) DenseFormer is fine:
+      # its DWA mixes full-width block outputs only.
+      assert not getattr(self, 'vis_edge_gate_mode', None), 'NBT: visibility-edge gates are not supported'
+      assert not getattr(self, 'use_graph_route', False), 'NBT: graph-route heads are not supported'
+
+    # layer_num / num_layers are the position and count of attention+FFN layers in the real
+    # stack: inside an NBT trunk that is block * NBTInnerLayers + inner index, out of
+    # NUM_LAYERS * NBTInnerLayers, so everything keyed on them (DIFF++ lambda plan, SoftMoE on
+    # odd layers, FFNUseGlobalEveryNLayers, CERES_LORA layer ranges, print-once logs) is
+    # per layer, not repeated per block.
+    def _make_encoder_layer(i, hidden, num_layers):
+      return EncoderLayer('T', num_tokens_q, num_tokens_kv,
+                      num_layers, hidden,
                       # int(): a fractional FFNMultiplier (e.g. 1.5) must give an integer width.
-                      int(round(self.FFN_MULT * self.EMBEDDING_DIM)),
+                      int(round(self.FFN_MULT * hidden)),
                       config.NetDef_UseQKV,
                       config.NetDef_SoftCapCutoff,
                       config.NetDef_UseQKNorm,
@@ -1358,14 +1379,27 @@ class CeresNet(nn.Module):
                       softmax_agg_heads = self.softmax_agg_heads,
                       use_head_logit_temp = self.use_head_logit_temp,
                       pre_norm = config.NetDef_PreNorm)
-        for i in range(self.NUM_DISTINCT_LAYERS)])
+
+    if self.NBT_INNER_LAYERS > 0:
+      _k = self.NBT_INNER_LAYERS
+      self.transformer_layer = torch.nn.Sequential(
+         *[NestedBottleneckLayer(self.EMBEDDING_DIM, self.NBT_MID_DIM,
+                                 lambda j, i=i: _make_encoder_layer(i * _k + j, self.NBT_MID_DIM, self.NUM_LAYERS * _k),
+                                 _k, config.NetDef_NormType, EPS)
+           for i in range(self.NUM_DISTINCT_LAYERS)])
+      print(f'[ceres_net] NBT trunk: {self.NUM_DISTINCT_LAYERS} blocks x {_k} inner layers '
+            f'at {self.NBT_MID_DIM} (ModelDim {self.EMBEDDING_DIM}), zero-init up projections')
+    else:
+      self.transformer_layer = torch.nn.Sequential(
+         *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])
 
     # Pre-norm trunks need a final norm AFTER the stack and before the heads,
     # because the residual stream is unnormalized at the stack output (each
     # block applies norm only to its sublayer input, never to the residual).
     # Without this, the head input's distribution depends on stack depth /
     # init scale and can blow up. Standard pattern in LLaMA, GPT-NeoX, etc.
-    if config.NetDef_PreNorm:
+    # An NBT trunk has the same un-normalized outer residual, whatever PreNorm says.
+    if config.NetDef_PreNorm or self.NBT_INNER_LAYERS > 0:
       self.trunk_end_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
     else:
       self.trunk_end_norm = None
@@ -1456,6 +1490,8 @@ class CeresNet(nn.Module):
     # pre-divided by sqrt(d_k) to match the entry point after score scaling);
     # rpe_v intentionally dropped (measured dead weight, pvsmoke8).
     self.rpe_genphase = int(os.environ.get('CERES_RPE_GENPHASE', '0') or 0) > 0
+    # NBT inner attentions project rpe_src with their own narrower qkv (nbt_layer.py).
+    assert not (self.rpe_from_embedding and self.NBT_INNER_LAYERS > 0), 'NBT: RPE-from-embedding is not supported'
     if self.rpe_genphase:
       assert self.rpe_from_embedding, 'CERES_RPE_GENPHASE requires CERES_RPE_FROM_EMBEDDING=1'
       print('[ceres_net] RPE GENERATOR-PHASE serving graph enabled: per-layer QK-rpe '
@@ -1973,7 +2009,9 @@ class CeresNet(nn.Module):
     # TSB: collect per-block gate values across all layers for the gate-sparsity
     # regularizer in train.py. Each layer caches its last gate in _last_tsb_gate.
     if self.use_tsb:
-      _gates = [layer._last_tsb_gate for layer in self.transformer_layer
+      # A nested bottleneck block keeps its encoder layers (and their gates) in .inner.
+      _gates = [layer._last_tsb_gate
+                for block in self.transformer_layer for layer in getattr(block, 'inner', [block])
                 if getattr(layer, '_last_tsb_gate', None) is not None]
       if len(_gates) > 0:
         self._last_tsb_gates = torch.stack(_gates, dim=0) if self.training else None  # training-gated (dynamo-eksport avviser attributt-mutasjon; bugfunn 2026-08-28)  # [num_layers, B, 1, 1]
