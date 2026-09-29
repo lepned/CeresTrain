@@ -572,6 +572,24 @@ def Train():
     print(f'[train] TRAIN-ONLY ACTION HEAD: {len(_act_kept)} tensors trainable {_act_kept}, '
           f'{sum(p.numel() for p in model.parameters() if p.requires_grad)} params; everything else frozen', flush=True)
 
+  # Trunk block freeze (config TrunkFreezeBlocks / TrunkFreezeUntilPositions): only the listed NBT blocks'
+  # up projections train until the cut-off. Implemented by dropping the other grads right before
+  # optimizer.step() (Muon and its AdamW part skip grad None: no update, no weight decay), so requires_grad,
+  # the DDP reducer (static_graph) and the compiled graph are untouched.
+  _trunk_frozen_params = []
+  if config.Opt_TrunkFreezeBlocks:
+    import re as _re_tf
+    _tf_set = set(config.Opt_TrunkFreezeBlocks)
+    for name, param in model.named_parameters():
+      _mt = _re_tf.search(r'(?:^|\.)transformer_layer\.(\d+)\.', name)
+      if _mt and int(_mt.group(1)) in _tf_set and '.up.' not in name:
+        _trunk_frozen_params.append(param)
+    if not _trunk_frozen_params:
+      raise RuntimeError(f'TrunkFreezeBlocks {config.Opt_TrunkFreezeBlocks}: no parameters matched')
+    print(f'[train] TRUNK FREEZE: blocks {sorted(_tf_set)} train only their up projection until '
+          f'{config.Opt_TrunkFreezeUntilPositions:,} positions ({len(_trunk_frozen_params)} tensors held)', flush=True)
+  _trunk_freeze_announced_end = False
+
   # Per-head QK-clip (config 'QKClipTau', see config.py): arm the per-module
   # max-logit monitors BEFORE torch.compile so the training-only stash branch
   # specializes into the compiled graph. Module refs kept for the post-step clip.
@@ -2972,6 +2990,14 @@ def Train():
 #      GRAD_NORM_LOG_FREQUENCY = 200
 #      if (num_pos // BATCH_SIZE) % GRAD_NORM_LOG_FREQUENCY == GRAD_NORM_LOG_FREQUENCY - 1:
       on_before_optimizer_step(writer, model, optimizer, num_pos)
+
+      if _trunk_frozen_params:
+        if num_pos < config.Opt_TrunkFreezeUntilPositions:
+          for _p in _trunk_frozen_params:
+            _p.grad = None
+        elif not _trunk_freeze_announced_end:
+          _trunk_freeze_announced_end = True
+          print(f'[train] TRUNK FREEZE ended at {num_pos:,}: blocks {config.Opt_TrunkFreezeBlocks} train fully', flush=True)
 
       optimizer.step()
       optimizer.zero_grad()

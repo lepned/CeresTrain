@@ -1056,6 +1056,20 @@ class Configuration:
     self.NetDef_UseDiffAttention = config_net_def.get('UseDiffAttention', False)
     self.NetDef_UseQKNorm = config_net_def.get('UseQKNorm', False)
     self.NetDef_SoftCapCutoff = config_net_def.get('SoftCapCutoff', 100)
+    # TRUNK BLOCK FREEZE (2026-09-29): train ONLY the up projection of the listed NBT blocks (current model
+    # indices) until num_pos reaches TrunkFreezeUntilPositions. For grown blocks: under Muon the tiny, noisy
+    # gradients of a near-silent block become full-size steps, the inner layers wander and `up` never finds a
+    # stable target. Frozen down/inner/norms give `up` fixed features to learn against.
+    self.Opt_TrunkFreezeBlocks = [int(v) for v in (config_opt.get('TrunkFreezeBlocks') or [])]
+    self.Opt_TrunkFreezeUntilPositions = int(config_opt.get('TrunkFreezeUntilPositions', 0) or 0)
+    if self.Opt_TrunkFreezeBlocks:
+      if self.NetDef_NBTInnerLayers <= 0:
+        raise ValueError('TrunkFreezeBlocks requires an NBT trunk (NBTInnerLayers > 0)')
+      if any(v < 0 or v >= self.NetDef_NumLayers for v in self.Opt_TrunkFreezeBlocks):
+        raise ValueError(f'TrunkFreezeBlocks {self.Opt_TrunkFreezeBlocks}: indices must lie in [0, {self.NetDef_NumLayers - 1}]')
+      if self.Opt_TrunkFreezeUntilPositions <= 0:
+        raise ValueError('TrunkFreezeBlocks needs TrunkFreezeUntilPositions > 0 (absolute position where the freeze ends)')
+
     # TrunkGrowInsertAfter identity guards (review 2026-09-29): these settings hold per-layer constants
     # OUTSIDE the state dict (DeepNorm alpha from NumLayers, Affine fixscale from the block index, Diff++
     # norm scale from the layer index), so moving a trained block to a new index would silently change it.
