@@ -1828,6 +1828,23 @@ def Train():
       print(f"INFO: QAT_RESUME stripped {len(_fq_keys)} fake-quant buffer keys "
             f"from checkpoint (ranges will be re-calibrated)", flush=True)
 
+    # NBT TRUNK GROW (config TrunkGrowInsertAfter, 2026-09-29): renumber the checkpoint's trunk blocks
+    # into the deeper model and leave the inserted blocks fresh. A fresh NBT block has a zero-init up
+    # projection, so it is an exact identity and the grown net is function-identical at the switch.
+    _grown_trunk_prefixes = ()
+    if config.Opt_TrunkGrowInsertAfter:
+      from nbt_grow import grow_trunk_state_dict, TRUNK_PREFIX
+      _n_new = len(model_nocompile.transformer_layer)
+      _n_old = _n_new - len(config.Opt_TrunkGrowInsertAfter)
+      loaded["model"], _old_to_new, _fresh_idx = grow_trunk_state_dict(loaded["model"], _n_new, config.Opt_TrunkGrowInsertAfter)
+      _grown_trunk_prefixes = tuple(f'{TRUNK_PREFIX}{i}.' for i in _fresh_idx)
+      for _i in _fresh_idx:
+        if float(model_nocompile.transformer_layer[_i].up.weight.detach().abs().max()) != 0.0:
+          raise RuntimeError(f'TrunkGrow: fresh block {_i} up projection is not zero -> the grown net would not be an identity')
+      if IS_MASTER:
+        print(f"INFO: NBT TRUNK GROWN on resume: {_n_old} -> {_n_new} blocks; checkpoint block -> new index "
+              f"{_old_to_new}; fresh identity blocks at {_fresh_idx}", flush=True)
+
     # name adjustment sometimes needed for reload
     # loaded["model"] = {f'_orig_mod.{key}': value for key, value in loaded["model"].items()}
 
@@ -1912,7 +1929,8 @@ def Train():
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.
-      return k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
+      return (k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
+              or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # Placement value head etc. are config/env-gated, so their params can

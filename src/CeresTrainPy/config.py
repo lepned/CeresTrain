@@ -977,6 +977,22 @@ class Configuration:
           or self.NetDef_NBTProjNorm != 'Norm' or self.NetDef_NBTFixupInit):
       # Refuse a silent no-op: these knobs only exist inside NBT blocks.
       raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation / NBTProjNorm / NBTFixupInit require NBTInnerLayers > 0")
+    # NBT TRUNK GROW on resume (2026-09-29): the checkpoint has NumLayers - len(list) blocks; a fresh block
+    # (zero-init up projection = exact identity) is inserted after each listed CHECKPOINT block index
+    # (-1 = before block 0; repeats insert several). The grown net is function-identical at the switch.
+    # One-shot: REMOVE the key before any later resume of the grown run (its checkpoint already has NumLayers
+    # blocks; nbt_grow raises on the count mismatch rather than guessing).
+    _grow = config_opt.get('TrunkGrowInsertAfter', None)
+    self.Opt_TrunkGrowInsertAfter = None if _grow is None else [int(v) for v in _grow]
+    if self.Opt_TrunkGrowInsertAfter:
+      if self.NetDef_NBTInnerLayers <= 0:
+        raise ValueError('TrunkGrowInsertAfter requires an NBT trunk (NBTInnerLayers > 0): only NBT blocks start as an identity')
+      if not self.Opt_CheckpointResumeFromFileName:
+        raise ValueError('TrunkGrowInsertAfter requires CheckpointResumeFromFileName (growing a random net is meaningless)')
+      _n_old = self.NetDef_NumLayers - len(self.Opt_TrunkGrowInsertAfter)
+      if _n_old < 1 or any(v < -1 or v >= _n_old for v in self.Opt_TrunkGrowInsertAfter):
+        raise ValueError(f'TrunkGrowInsertAfter {self.Opt_TrunkGrowInsertAfter}: indices must lie in [-1, {_n_old - 1}] '
+                         f'(checkpoint blocks = NumLayers {self.NetDef_NumLayers} - {len(self.Opt_TrunkGrowInsertAfter)} inserted)')
     self.NetDef_FFNActivationType = config_net_def.get('FFNActivationType', 'ReLUSquared')
     if getattr(self, 'NetDef_ExportFolds', 'none') in ('ffn', 'all'):
       # export_folds.py only fuses plain SwiGLU FFNs; anything else would make the fold a no-op
@@ -1040,6 +1056,18 @@ class Configuration:
     self.NetDef_UseDiffAttention = config_net_def.get('UseDiffAttention', False)
     self.NetDef_UseQKNorm = config_net_def.get('UseQKNorm', False)
     self.NetDef_SoftCapCutoff = config_net_def.get('SoftCapCutoff', 100)
+    # TrunkGrowInsertAfter identity guards (review 2026-09-29): these settings hold per-layer constants
+    # OUTSIDE the state dict (DeepNorm alpha from NumLayers, Affine fixscale from the block index, Diff++
+    # norm scale from the layer index), so moving a trained block to a new index would silently change it.
+    if self.Opt_TrunkGrowInsertAfter:
+      if self.NetDef_DeepNorm and not self.NetDef_NBTInnerPreNorm:
+        raise ValueError('TrunkGrowInsertAfter with DeepNorm post-norm inner layers: alpha depends on NumLayers, the grown net would not be an identity')
+      if self.NetDef_NBTProjNorm == 'Affine':
+        raise ValueError("TrunkGrowInsertAfter with NBTProjNorm 'Affine': the fixscale depends on the block index, moved blocks would change")
+      if int(self.NetDef_UseDiffAttention or 0) >= 2:
+        raise ValueError('TrunkGrowInsertAfter with UseDiffAttention >= 2: the Diff++ norm scale depends on the layer index')
+      if self.NetDef_LoopCount != 1:
+        raise ValueError('TrunkGrowInsertAfter requires LoopCount 1')
 
     self.NetDef_TestValue = config_net_def.get('TestValue', 0)
 
