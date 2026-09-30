@@ -1345,7 +1345,8 @@ class CeresNet(nn.Module):
     # odd layers, FFNUseGlobalEveryNLayers, CERES_LORA layer ranges, print-once logs) is
     # per layer, not repeated per block. num_heads / pre_norm: the NBT inner layers may differ
     # from the trunk (NBTInnerHeads, NBTInnerPreNorm).
-    def _make_encoder_layer(i, hidden, num_layers, num_heads=None, pre_norm=None):
+    def _make_encoder_layer(i, hidden, num_layers, num_heads=None, pre_norm=None, smolgen_off=False):
+      # smolgen_off: NBT inner layers under NBTSharedSmolgen get the block's bias instead of their own generator.
       return EncoderLayer('T', num_tokens_q, num_tokens_kv,
                       num_layers, hidden,
                       # int(): a fractional FFNMultiplier (e.g. 1.5) must give an integer width.
@@ -1361,10 +1362,10 @@ class CeresNet(nn.Module):
                       smoe_mode = config.NetDef_SoftMoE_MoEMode,
                       smoe_num_experts = config.NetDef_SoftMoE_NumExperts,
                       smoe_expert_input_dim = config.NetDef_SoftMoE_ExpertInputDim,
-                      smolgen_per_square_dim = SMOLGEN_PER_SQUARE_DIM,
-                      smolgen_intermediate_dim = SMOLGEN_INTERMEDIATE_DIM,
+                      smolgen_per_square_dim = 0 if smolgen_off else SMOLGEN_PER_SQUARE_DIM,
+                      smolgen_intermediate_dim = 0 if smolgen_off else SMOLGEN_INTERMEDIATE_DIM,
                       smolgen_head_divisor = config.NetDef_SmolgenToHeadDivisor,
-                      smolgenPrepLayer = self.smolgenPrepLayer,
+                      smolgenPrepLayer = None if smolgen_off else self.smolgenPrepLayer,
                       smol_basis_k = getattr(self, 'smol_basis_k', 0),
                       smol_basis_bank = getattr(self, 'smol_basis_bank', None),
                       smol_static_mode = getattr(self, 'smol_static_mode', 0),
@@ -1404,14 +1405,28 @@ class CeresNet(nn.Module):
       # KataGo LEGACY fixup: fixup_scale = 1/sqrt(num blocks), down projection at fixup_scale^(1/(1+K))
       # (their trained transformer nets use fixscaleonenorm, not fixup -- off by default).
       _down_scale = math.pow(1.0 / math.sqrt(self.NUM_DISTINCT_LAYERS), 1.0 / (1.0 + _k)) if config.NetDef_NBTFixupInit else 1.0
+      _shared_sm = bool(getattr(config, 'NetDef_NBTSharedSmolgen', False))
+      if _shared_sm:
+        assert self.smolgenPrepLayer is not None, 'NBTSharedSmolgen needs the global smolgen prep layer (smolgen on)'
+        from nbt_layer import SharedSmolgen
+        _sm_hidden = int(getattr(config, 'NetDef_NBTSharedSmolgenDim', 0) or 0) or SMOLGEN_INTERMEDIATE_DIM
+        _make_shared_sm = lambda: SharedSmolgen(self.EMBEDDING_DIM, _nbt_heads, SMOLGEN_PER_SQUARE_DIM, _sm_hidden,
+                                                SMOLGEN_INTERMEDIATE_DIM // config.NetDef_SmolgenToHeadDivisor,
+                                                self.smolgenPrepLayer, config.NetDef_SmolgenActivationType,
+                                                config.NetDef_NormType, EPS, NUM_TOKENS_NET)
       self.transformer_layer = torch.nn.Sequential(
          *[NestedBottleneckLayer(self.EMBEDDING_DIM, self.NBT_MID_DIM,
                                  lambda j, i=i: _make_encoder_layer(i * _k + j, self.NBT_MID_DIM, self.NUM_LAYERS * _k,
-                                                                    num_heads=_nbt_heads, pre_norm=_nbt_prenorm),
+                                                                    num_heads=_nbt_heads, pre_norm=_nbt_prenorm,
+                                                                    smolgen_off=_shared_sm),
                                  _k, config.NetDef_NormType, EPS,
                                  proj_activation=config.NetDef_NBTProjActivation,
-                                 proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i)
+                                 proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i,
+                                 shared_smolgen=_make_shared_sm() if _shared_sm else None)
            for i in range(self.NUM_DISTINCT_LAYERS)])
+      if _shared_sm:
+        print(f'[ceres_net] NBT SHARED SMOLGEN: one generator per block on the {self.EMBEDDING_DIM}-wide block input '
+              f'(sm2 width {_sm_hidden}), inner layers without smolgen')
       print(f'[ceres_net] NBT trunk: {self.NUM_DISTINCT_LAYERS} blocks x {_k} inner layers at {self.NBT_MID_DIM} '
             f'(ModelDim {self.EMBEDDING_DIM}), {_nbt_heads} inner heads (dim {self.NBT_MID_DIM // _nbt_heads}), '
             f'inner {"pre" if _nbt_prenorm else "post"}-norm, projections {config.NetDef_NBTProjNorm} -> '

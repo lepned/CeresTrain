@@ -971,13 +971,26 @@ class Configuration:
     if self.NetDef_NBTProjNorm not in ('Norm', 'Affine'):
       raise ValueError(f"NBTProjNorm must be Norm or Affine (was {self.NetDef_NBTProjNorm!r})")
     self.NetDef_NBTFixupInit = bool(config_net_def.get('NBTFixupInit', False))
+    # NBTSharedSmolgen (2026-10-01): ONE smolgen generator per NBT block on the block input,
+    # shared by its inner layers (nbt_layer.SharedSmolgen); the inner layers get no smolgen of
+    # their own. NBTSharedSmolgenDim = its sm2 width (0 = SmolgenDim). Needs smolgen on.
+    self.NetDef_NBTSharedSmolgen = bool(config_net_def.get('NBTSharedSmolgen', False))
+    self.NetDef_NBTSharedSmolgenDim = int(config_net_def.get('NBTSharedSmolgenDim', 0) or 0)
     if self.NetDef_NBTInnerLayers > 0:
       if self.NetDef_NBTMidDim % self.NetDef_NBTInnerHeads != 0:
         raise ValueError(f"NBT inner width {self.NetDef_NBTMidDim} must be divisible by the inner head count ({self.NetDef_NBTInnerHeads})")
+      if self.NetDef_NBTSharedSmolgen:
+        # smolgen / diff / qkv fields are parsed further down: the cross-checks live in the
+        # post-validation block after UseDiffAttention (search NBTSharedSmolgen there).
+        if self.NetDef_NBTSharedSmolgenDim < 0:
+          raise ValueError('NBTSharedSmolgenDim must be >= 0 (0 = SmolgenDim)')
+      elif self.NetDef_NBTSharedSmolgenDim:
+        raise ValueError('NBTSharedSmolgenDim requires NBTSharedSmolgen: true')
     elif (_nbt_heads_raw or _nbt_prenorm_raw is not None or self.NetDef_NBTProjActivation != 'None'
-          or self.NetDef_NBTProjNorm != 'Norm' or self.NetDef_NBTFixupInit):
+          or self.NetDef_NBTProjNorm != 'Norm' or self.NetDef_NBTFixupInit or self.NetDef_NBTSharedSmolgen
+          or self.NetDef_NBTSharedSmolgenDim):
       # Refuse a silent no-op: these knobs only exist inside NBT blocks.
-      raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation / NBTProjNorm / NBTFixupInit require NBTInnerLayers > 0")
+      raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation / NBTProjNorm / NBTFixupInit / NBTSharedSmolgen(Dim) require NBTInnerLayers > 0")
     # NBT TRUNK GROW on resume (2026-09-29): the checkpoint has NumLayers - len(list) blocks; a fresh block
     # (zero-init up projection = exact identity) is inserted after each listed CHECKPOINT block index
     # (-1 = before block 0; repeats insert several). The grown net is function-identical at the switch.
@@ -1078,6 +1091,23 @@ class Configuration:
     # attention maps (Option A — both branches inherit same per-position prior;
     # differential cancels Q1-vs-Q2 noise on top). Untested with RoPE / softcap.
     self.NetDef_UseDiffAttention = config_net_def.get('UseDiffAttention', False)
+    # NBTSharedSmolgen cross-checks (fields above are now parsed; review 2026-10-01):
+    if self.NetDef_NBTSharedSmolgen:
+      if not (int(self.NetDef_SmolgenDimPerSquare or 0) > 0 and int(self.NetDef_SmolgenDim or 0) > 0):
+        raise ValueError('NBTSharedSmolgen needs smolgen on (SmolgenDimPerSquare and SmolgenDim > 0): the shared prep layer comes from there')
+      if (int(config_net_def.get('SmolgenStaticBasisK', 0) or 0) > 0 or int(config_net_def.get('SmolgenStaticMode', 0) or 0) > 0
+          or int(config_net_def.get('SmolgenDeltaRank', 0) or 0) > 0):
+        raise ValueError('NBTSharedSmolgen is incompatible with SmolgenStaticBasisK / SmolgenStaticMode / SmolgenDeltaRank')
+      if not self.NetDef_UseQKV:
+        raise ValueError('NBTSharedSmolgen requires UseQKV: true (the V-only attention path needs its own smolgen)')
+      if int(self.NetDef_UseDiffAttention or 0) == 4:
+        raise ValueError('NBTSharedSmolgen is incompatible with UseDiffAttention 4 (smolref-diff needs per-layer smolgen)')
+      if self.NetDef_NBTProjNorm == 'Affine':
+        raise ValueError('NBTSharedSmolgen requires NBTProjNorm Norm (the generator reads the normalized block input)')
+      if self.NetDef_SmolgenActivationType not in ('None', 'ReLU', 'ReLUSquared', 'Swish', 'SwiGLU'):
+        raise ValueError(f'NBTSharedSmolgen: SmolgenActivationType must be one of the per-layer smolgen set (was {self.NetDef_SmolgenActivationType!r})')
+      if int(os.environ.get('CERES_LORA_SMOLGEN_RANK_DIV', '0') or 0) > 0:
+        raise ValueError('NBTSharedSmolgen is incompatible with CERES_LORA_SMOLGEN_RANK_DIV (the shared generator is not LoRA-wrapped)')
     self.NetDef_UseQKNorm = config_net_def.get('UseQKNorm', False)
     self.NetDef_SoftCapCutoff = config_net_def.get('SoftCapCutoff', 100)
     # TRUNK BLOCK FREEZE (2026-09-29): train ONLY the up projection of the listed NBT blocks (current model

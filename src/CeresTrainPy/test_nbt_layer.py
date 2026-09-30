@@ -75,6 +75,43 @@ def test_affine_proj_norm_and_fixup_init():
   assert torch.allclose(blk(x), ref_out, atol=1e-6), 'affine must be const*gamma*x+beta with no normalization'
 
 
+def test_shared_smolgen():
+  from nbt_layer import SharedSmolgen
+  torch.manual_seed(5)
+  prep = torch.nn.Linear(128, 64 * 64)                      # the global smolgenPrepLayer (SmolgenDim 256 // divisor 2)
+  sm = SharedSmolgen(128, 4, 32, 256, 128, prep, 'Swish', 'RMSNorm', 1e-6)
+  assert 'prep' not in dict(sm.named_parameters()) and all(not n.startswith('_prep') for n, _ in sm.named_parameters()), \
+    'the shared prep layer must not be re-registered inside the generator'
+  blk = NestedBottleneckLayer(128, 64, lambda j: _make(64, j), 2, 'RMSNorm', 1e-6, proj_activation='Swish', shared_smolgen=sm)
+  x = torch.randn(3, 64, 128)
+  assert torch.equal(blk(x), x), 'still an exact identity at init (zero-init up)'
+  with torch.no_grad():
+    blk.up.weight.normal_(0, 0.05)
+  blk.eval()
+  prb = torch.randn(3, 4, 64, 64) * 0.5
+  with torch.no_grad():
+    y0, y1 = blk(x), blk(x, piece_relation_bias=prb)
+    h0 = blk.norm_in(x); sb = sm(h0)
+    assert sb.shape == (3, 4, 64, 64)
+    h = blk.down(torch.nn.functional.silu(h0))
+    for l in blk.inner:
+      h = l(h, piece_relation_bias=sb + prb)
+    ref = x + blk.up(torch.nn.functional.silu(blk.norm_out(h)))
+  assert torch.allclose(y1, ref, atol=1e-5), 'block bias must be summed with the incoming per-head bias and reach every inner layer'
+  assert not torch.allclose(y0, y1), 'incoming bias must still matter'
+  # Gradient reaches the generator and the shared prep layer through the block.
+  blk.train(); blk(x).square().sum().backward()
+  assert float(sm.sm2.weight.grad.abs().sum()) > 0 and float(prep.weight.grad.abs().sum()) > 0
+  # Head-count mismatch is refused at construction.
+  bad = SharedSmolgen(128, 2, 32, 256, 128, prep, 'Swish', 'RMSNorm', 1e-6)
+  refused = False
+  try:
+    NestedBottleneckLayer(128, 64, lambda j: _make(64, j), 2, 'RMSNorm', 1e-6, shared_smolgen=bad)
+  except AssertionError:
+    refused = True
+  assert refused
+
+
 def test_identity_at_init_and_grad():
   blk = _block(3)
   x = torch.randn(5, 64, 128, requires_grad=True)
@@ -166,6 +203,69 @@ def _config_inheritance(cfg_dir, cfg_id):
     for p in ('data', 'exec', 'monitoring', 'opt', 'net'):
       os.remove(f'{cfg_dir}/{tag}_ceres_{p}.json')
   print('  config OK: NBTInnerPreNorm inherits PreNorm when absent')
+  _shared_smolgen_real(cfg_dir, cfg_id)
+
+
+def _shared_smolgen_real(cfg_dir, cfg_id):
+  # NBTSharedSmolgen on the real config: one generator per block, prep layer registered once, inner
+  # attentions without smolgen, generator == per-layer calc_smolgen with copied weights; guards.
+  import json, os, shutil
+  from config import Configuration
+  from ceres_net import CeresNet
+  from nbt_layer import SharedSmolgen
+  tag = 'zz_nbt_shsm'
+  base = json.load(open(f'{cfg_dir}/{cfg_id}_ceres_net.json'))
+  def cfg_with(**over):
+    net = dict(base); net.update(over)
+    for k in [k for k, v in over.items() if v is None]: net.pop(k, None)
+    json.dump(net, open(f'{cfg_dir}/{tag}_ceres_net.json', 'w'), indent=1)
+    return Configuration(cfg_dir, tag)
+  def build(cfg):
+    return CeresNet(None, cfg, policy_loss_weight=1, value_loss_weight=1, moves_left_loss_weight=0, unc_loss_weight=0,
+                    value2_loss_weight=0, q_deviation_loss_weight=0, value_diff_loss_weight=0, value2_diff_loss_weight=0,
+                    action_loss_weight=0, uncertainty_policy_weight=0, action_uncertainty_loss_weight=0, q_ratio=1)
+  try:
+    for p in ('data', 'exec', 'monitoring', 'opt'):
+      shutil.copy(f'{cfg_dir}/{cfg_id}_ceres_{p}.json', f'{cfg_dir}/{tag}_ceres_{p}.json')
+    cfg = cfg_with(NBTSharedSmolgen=True)
+    net = build(cfg)
+    blocks = list(net.transformer_layer)
+    assert all(b.shared_smolgen is not None for b in blocks)
+    assert all(not l.attention.use_smolgen for b in blocks for l in b.inner), 'inner layers must have no smolgen'
+    keys = [k for k in net.state_dict() if 'smolgenPrepLayer' in k]
+    assert len(keys) == 2, f'prep layer must be registered exactly once: {keys}'
+    assert all(b.shared_smolgen.prep_layer is net.smolgenPrepLayer for b in blocks)
+    # Equivalence with the per-layer generator: copy an inner attention's sm*/ln* into a SharedSmolgen
+    # of the same input width and compare against its calc_smolgen.
+    ref_net = build(cfg_with(NBTSharedSmolgen=None))
+    att = ref_net.transformer_layer[0].inner[0].attention
+    assert att.use_smolgen
+    g = SharedSmolgen(att.d_model, att.num_heads, att.smolgen_per_square_dim, att.smolgen_intermediate_dim,
+                      att.smolgen_intermediate_dim // att.smolgen_head_divisor, att.smolgenPrepLayer,
+                      cfg.NetDef_SmolgenActivationType, cfg.NetDef_NormType, 1e-6)
+    with torch.no_grad():
+      for src, dst in ((att.sm1, g.sm1), (att.sm2, g.sm2), (att.sm3, g.sm3), (att.ln1, g.ln1), (att.ln2, g.ln2)):
+        dst.load_state_dict(src.state_dict())
+      x = torch.randn(2, 64, att.d_model)
+      assert torch.allclose(g(x), att.calc_smolgen(x), atol=1e-6), 'shared generator must equal the per-layer one'
+    # Guards: defaults (keys absent) mean smolgen ON -> accepted; Diff 4 / UseQKV false / Dim without flag refused.
+    cfg_with(NBTSharedSmolgen=True, SmolgenDimPerSquare=None, SmolgenDim=None)
+    for over in (dict(NBTSharedSmolgen=True, UseDiffAttention=4), dict(NBTSharedSmolgen=True, UseQKV=False),
+                 dict(NBTSharedSmolgen=True, SmolgenDim=0, SmolgenDimPerSquare=0), dict(NBTSharedSmolgenDim=512),
+                 dict(NBTSharedSmolgen=True, NBTSharedSmolgenDim=-1), dict(NBTSharedSmolgen=True, NBTProjNorm='Affine')):
+      refused = None
+      try:
+        cfg_with(**over)
+      except ValueError as e:
+        refused = str(e)
+      assert refused is not None and 'NBTSharedSmolgen' in refused, f'must be refused by the NBTSharedSmolgen checks: {over} -> {refused}'
+    n_sh = sum(p.numel() for n, p in net.named_parameters() if '.shared_smolgen.' in n)
+    print(f'  shared smolgen OK: {len(blocks)} generators ({n_sh:,} params), prep layer shared, == per-layer generator, guards OK')
+  finally:
+    for p in ('data', 'exec', 'monitoring', 'opt', 'net'):
+      fn = f'{cfg_dir}/{tag}_ceres_{p}.json'
+      if os.path.exists(fn):
+        os.remove(fn)
 
 
 if __name__ == '__main__':
@@ -174,6 +274,7 @@ if __name__ == '__main__':
   test_film_on_branch_output()
   test_katago_style_options()
   test_affine_proj_norm_and_fixup_init()
+  test_shared_smolgen()
   if len(sys.argv) >= 3:
     real(sys.argv[1], sys.argv[2])
   print('test_nbt_layer: OK')

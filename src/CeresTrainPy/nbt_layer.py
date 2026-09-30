@@ -51,9 +51,9 @@ e.g. b4c256h4nbttflrs = mid 128 / 4 heads), NBTInnerPreNorm (their inner stream 
 pre-norm: x + attn(norm(x)), x + ffn(norm(x))) and NBTProjActivation (their projections are
 norm -> activation -> 1x1). The first port (8 heads at 128 = dim 16, halved again by Diff++
 half-dim, post-norm inner layers, no projection activation) trailed the plain 256x10 smoke --
-at 0.71x its trunk FLOPs. Remaining deliberate deviations: smolgen in every inner layer
-instead of 2D RoPE, SoftCap/QK-clip on the inner attentions, a per-token RMSNorm (no
-activation) at the trunk end, biases on W_h and the FFN linears, no beta before the
+at 0.71x its trunk FLOPs. Remaining deliberate deviations: smolgen (per inner layer, or one
+per block with NBTSharedSmolgen) instead of 2D RoPE (learnable 2D RoPE exists: RoPELearnable),
+SoftCap/QK-clip on the inner attentions, a per-token RMSNorm (no activation) at the trunk end, biases on W_h and the FFN linears, no beta before the
 projection activations.
 """
 
@@ -63,6 +63,57 @@ import torch
 
 from activation_functions import to_activation
 from rms_norm import make_norm, ChannelAffine
+from dot_product_attention import LinearWrapper
+
+
+class SharedSmolgen(torch.nn.Module):
+  """One smolgen generator per NBT block (config NBTSharedSmolgen), shared by its K inner layers.
+
+  Same three stages as the per-layer generator in dot_product_attention.smolgen (sm1 per square,
+  sm2 over the flattened board, sm3 to a per-head vector, activation + norm after sm2/sm3, then
+  the GLOBAL smolgenPrepLayer to a 64x64 logit bias per head), but it reads the BLOCK INPUT --
+  the full-width residual stream after the block's input norm (256/512/1536 wide) instead of
+  the K x narrower inner states -- and its bias is added to every inner attention's logits
+  (via the piece_relation_bias path: the same MatMul -> Add -> softmax graph as smolgen itself).
+  Motivation (09-30/10-01): the per-layer generators do not shrink with the inner width (sm2 is
+  2048 -> SmolgenDim whatever the width): 30 of them are 40 % of the params on the 512x10x3 net
+  and 60 % on the 256x10x3 smoke net, and ~2/3 of the smolgen kernels at serving. The block
+  input is the richer signal (3x wider than the inner state on the 1536/3 net). Whether
+  per-layer adaptivity matters is what the paired smoke measures (NB the shared arm is also
+  the smaller net: 20M vs 33M params on 256x10x3).
+  `hidden_dim` = the sm2 width (NBTSharedSmolgenDim, default SmolgenDim; may be wider than the
+  per-layer one since there are K x fewer generators); sm3 must still emit
+  heads x (SmolgenDim // SmolgenToHeadDivisor) because the prep layer is shared with that width."""
+  def __init__(self, model_dim: int, num_heads: int, per_square_dim: int, hidden_dim: int, prep_in_dim: int,
+               prep_layer: torch.nn.Linear, activation: str, norm_type: str, layernorm_eps: float, num_tokens: int = 64):
+    super().__init__()
+    assert isinstance(prep_layer, torch.nn.Linear), f'SharedSmolgen: prep layer must be a plain nn.Linear (LoRA-wrapped smolgen is not supported), was {type(prep_layer).__name__}'
+    assert prep_layer.in_features == prep_in_dim and prep_layer.out_features == num_tokens * num_tokens, (
+      f'shared smolgenPrepLayer must be Linear({prep_in_dim} -> {num_tokens * num_tokens}), was {prep_layer}')
+    self.num_heads = num_heads
+    self.num_tokens = num_tokens
+    self.per_square_dim = per_square_dim
+    self.prep_in_dim = prep_in_dim
+    self.sm1 = torch.nn.Linear(model_dim, per_square_dim)
+    self.sm2 = torch.nn.Linear(num_tokens * per_square_dim, hidden_dim)
+    self.ln1 = make_norm(norm_type, hidden_dim, eps=layernorm_eps)
+    self.sm3 = torch.nn.Linear(hidden_dim, num_heads * prep_in_dim)
+    self.ln2 = make_norm(norm_type, num_heads * prep_in_dim, eps=layernorm_eps)
+    assert activation in ('None', 'ReLU', 'ReLUSquared', 'Swish', 'SwiGLU'), f'SharedSmolgen: activation {activation!r} not in the per-layer smolgen set'
+    self.act = to_activation(activation)
+    self._prep = LinearWrapper(prep_layer)     # not a submodule: the prep layer is registered once, at the net root
+
+  @property
+  def prep_layer(self):
+    return self._prep.linear
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    """x: [B, 64, model_dim] (block input, normalized) -> [B, heads, 64, 64] logit bias."""
+    s = self.sm1(x).reshape(-1, self.num_tokens * self.per_square_dim)
+    s = self.ln1(self.act(self.sm2(s)))
+    s = self.ln2(self.act(self.sm3(s)))
+    s = s.reshape(-1, self.num_heads, self.prep_in_dim)
+    return self.prep_layer(s).reshape(-1, self.num_heads, self.num_tokens, self.num_tokens)
 
 
 def _make_proj_norm(proj_norm: str, norm_type: str, d: int, eps: float, fixed_scale: float) -> torch.nn.Module:
@@ -77,9 +128,13 @@ def _make_proj_norm(proj_norm: str, norm_type: str, d: int, eps: float, fixed_sc
 class NestedBottleneckLayer(torch.nn.Module):
   def __init__(self, model_dim: int, mid_dim: int, make_inner_layer: Callable[[int], torch.nn.Module],
                num_inner_layers: int, norm_type: str, layernorm_eps: float, proj_activation: str = 'None',
-               proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0):
+               proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
+               shared_smolgen: torch.nn.Module = None):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
+    # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
+    # layers are then built WITHOUT their own smolgen and receive this bias instead.
+    self.shared_smolgen = shared_smolgen
     self.model_dim = model_dim
     self.mid_dim = mid_dim
     # NBTProjNorm: 'Norm' = the trunk's NormType (RMSNorm normalizes what KataGo's fixed
@@ -102,6 +157,10 @@ class NestedBottleneckLayer(torch.nn.Module):
     self.act_in = to_activation(proj_activation)
     self.act_out = to_activation(proj_activation)
     self.inner_heads = self.inner[0].num_attention_heads
+    if self.shared_smolgen is not None:
+      assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
+      assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
+        'NBTSharedSmolgen: inner layers must be built without their own smolgen')
 
 
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None,
@@ -117,7 +176,12 @@ class NestedBottleneckLayer(torch.nn.Module):
     # A per-head bias is built with the trunk head count; it only fits inner layers that use it.
     assert piece_relation_bias is None or piece_relation_bias.shape[1] == self.inner_heads, \
       f'NBT: per-head attention bias has {piece_relation_bias.shape[1]} heads, inner layers use {self.inner_heads} (NBTInnerHeads)'
-    h = self.down(self.act_in(self.norm_in(x)))
+    h0 = self.norm_in(x)
+    if self.shared_smolgen is not None:
+      # Block-level content bias, summed with any incoming per-head bias (piece-relation etc.).
+      sb = self.shared_smolgen(h0)
+      piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
+    h = self.down(self.act_in(h0))
     for layer in self.inner:
       h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge)
     out = self.up(self.act_out(self.norm_out(h)))
