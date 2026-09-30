@@ -314,6 +314,14 @@ def save_model(NAME : str,
             # i ALLE moduler, ogsaa tupler — runde-4 fant hullene i den forste
             # versjonen av denne fiksen).
             model_nocompile = _deepcopy_model_for_export(model_nocompile).float().eval()
+          # Learnable 2D RoPE (rope.LearnableRope2D): freeze the cos/sin tables as fp32
+          # constants on an EXPORT COPY. The dynamo exporter only constant-folds tensors up to
+          # 8192 elements, so above ModelDim 256 the graph would keep Cos/Sin on FP16 angles
+          # (up to ~14 rad => ~24x the rotation error after the FP16 conversion; review 09-30).
+          from rope import LearnableRope2D as _LR2D, bake_learnable_rope as _bake_rope
+          if any(isinstance(_m, _LR2D) for _m in model_nocompile.modules()):
+            model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+            print(f'INFO: learnable RoPE tables baked for export ({_bake_rope(model_nocompile)} modules)')
           # Ceres's TRT inference backend (TensorRTWrapper.cpp:2209, TRT_InferAsync)
           # only calls setTensorAddress on inputNames[0] — additional inputs are
           # never bound, causing enqueueV3 to fail with "Address is not set for

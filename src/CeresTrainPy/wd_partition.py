@@ -76,6 +76,13 @@ def partition_weight_decay(model):
           fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
           if pn.endswith('bias') or fpn in norm_owned:
               no_decay.add(fpn)
+          elif fpn.endswith('.rope.freqs'):
+              # Learnable 2D RoPE frequencies (rope.LearnableRope2D, 2026-09-30): a 3-D
+              # (H, pairs, 2) table of rotation rates, not a weight matrix. KataGo trains
+              # these with plain Adam and ~zero weight decay. NB no_decay is inert under
+              # Muon (see module docstring); train.py therefore gives `.rope.freqs` Muon wd
+              # scale 0 unconditionally. Must sit above the "transformer_layer" catch-all.
+              no_decay.add(fpn)
           elif "rpe" in fpn:
               decay.add(fpn)
           elif "lora" in fpn:

@@ -967,6 +967,17 @@ def Train():
       if _hnd_scope != 'all' and not _kept:
         raise ValueError(f"MuonHonorNoDecayScope {_hnd_scope!r} kept NO params under the group wd "
                          f"— it is indistinguishable from 'all'; check the policy-path matcher")
+    # Learnable 2D RoPE frequencies (rope.LearnableRope2D, 2026-09-30): ALWAYS wd scale 0,
+    # independent of MuonHonorNoDecay. They are rotation rates, not weights; KataGo trains
+    # them with ~zero decay, and the group wd would otherwise pull every head toward
+    # "no position" (0.01 x summed LR ~ 4 % over a 25M smoke -- small, but a bias that the
+    # A/B against fixed RoPE should not carry). Substring match: compiled/DDP prefixes.
+    _rope_pns = sorted(pn for pn in param_dict if pn.endswith('.rope.freqs') and param_dict[pn].requires_grad)
+    if _rope_pns:
+      _wd_scales = dict(_wd_scales or {})
+      _wd_scales.update({param_dict[pn]: 0.0 for pn in _rope_pns})
+      print(f"[train] learnable RoPE: {len(_rope_pns)} freqs tables at Muon-AdamW wd 0 "
+            f"({sum(param_dict[pn].numel() for pn in _rope_pns):,} elements)", flush=True)
     # MuonHyperball: the Muon matrices minus the no_decay (embedding-like) set.
     _hb_params = None; _hb_ratio = 1.0
     if getattr(config, 'Opt_MuonHyperball', False):

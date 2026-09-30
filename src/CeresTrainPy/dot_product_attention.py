@@ -174,6 +174,8 @@ class DotProductAttention(torch.nn.Module):
                use_rope : bool = False,
                test : bool = False,
                layer_num : int = None,
+               rope_learnable : bool = False,
+               rope_init : str = 'stratified', rope_freq_min : float = 1.0 / 16.0, rope_freq_max : float = 1.5707963267948966,
                use_diff_attention : bool = False,
                vis_gate_channels : int = 0,
                vis_gate_mode : str = 'qk',
@@ -234,7 +236,14 @@ class DotProductAttention(torch.nn.Module):
     # smolgen + RoPE coexistence allowed: RoPE rotates Q/K before scores;
     # smolgen adds learned bias to scores after. Compose cleanly (verified 2026-05-22).
 
-    if self.use_rope:
+    self.rope_learnable = bool(rope_learnable) and self.use_rope
+    if self.rope_learnable:
+      # KataGo-style learnable 2D RoPE: per-head, per-pair (omega_x, omega_y), own spectrum
+      # per layer; tables rebuilt from the parameter each forward (see rope.LearnableRope2D).
+      from rope import LearnableRope2D
+      self.rope = LearnableRope2D(num_attention_heads, kv_channels * attention_multiplier, layer_num=layer_num or 0,
+                                  init=rope_init, freq_min=rope_freq_min, freq_max=rope_freq_max)
+    elif self.use_rope:
       from rope import precompute_rope_freqs
       d_per_head = kv_channels * attention_multiplier
       cos_table, sin_table = precompute_rope_freqs(d_per_head)
@@ -275,8 +284,14 @@ class DotProductAttention(torch.nn.Module):
       assert not use_qk_norm and not use_rope and vis_gate_channels == 0           and graph_route_channels == 0,           'use_qkv=False stoetter ikke qk-norm/rope/vis-gates/graph-route (Q/K er None)'
     if self.use_diff_attention:
       assert self.use_qkv, "DiffAttention requires use_qkv"
-      assert not use_rope, ('DiffAttention + RoPE unsupported: V2/nonlinear crashes on the Q-tuple, and '
-           'half-dim would silently split RoPE file/rank geometry across the two maps. (guard 2026-08-28)')
+      # Fixed RoPE stays refused with every Diff mode. LEARNABLE RoPE is allowed with the
+      # single-Q-tensor modes 3 (half-dim) and 4: the rotation is applied before the split, and
+      # a learnable pair carries both (omega_x, omega_y) itself, so splitting the pairs between
+      # the two maps loses no geometry (review 2026-09-30, finding 6).
+      assert not use_rope or (rope_learnable and int(use_diff_attention) in (3, 4)), (
+           'DiffAttention + RoPE unsupported: V2/nonlinear crashes on the Q-tuple, and half-dim would '
+           'silently split FIXED RoPE file/rank geometry across the two maps (guard 2026-08-28); '
+           'only RoPELearnable with UseDiffAttention 3 or 4 is allowed')
       assert not use_head_logit_temp, ('DiffAttention + UseHeadLogitTemp unsupported: temp is only applied in '
            'the standard path (param would be dead weight). (guard 2026-08-28)')
       # Runde-3-guards (2026-08-29): LSE-aggregering og graph-route finnes kun i
@@ -1038,8 +1053,16 @@ class DotProductAttention(torch.nn.Module):
       # Apply rotation to Q and K (not V). Position info is intrinsic to
       # rotated Q/K — no bias addition needed. Stays on the fast SDPA path.
       from rope import apply_rope
-      Q = apply_rope(Q, self.rope_cos, self.rope_sin)
-      K = apply_rope(K, self.rope_cos, self.rope_sin)
+      if self.rope_learnable:
+        # (H, 64, d) fp32 tables broadcast over B. Deliberately NOT cast to Q's dtype: the
+        # fixed path multiplies fp32 tables into bf16 Q/K (promoting them to fp32), and the
+        # two variants must rotate at the same precision to be A/B-comparable (review 09-30:
+        # a bf16 rotation had 1.6x the score error of the fixed path).
+        rope_cos, rope_sin = self.rope()
+      else:
+        rope_cos, rope_sin = self.rope_cos, self.rope_sin
+      Q = apply_rope(Q, rope_cos, rope_sin)
+      K = apply_rope(K, rope_cos, rope_sin)
 
     # Graph-route heads (see __init__): build the row-stochastic routing matrix
     # from the raw shared E once per layer. relu(w) mixture keeps entries

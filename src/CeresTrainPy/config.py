@@ -11,6 +11,7 @@ If not, see <http://www.gnu.org/licenses/>.
 
 # End of License Notice
 
+import math
 import os
 import json
 from lr_schedule import validate_knots as _validate_lr_knots   # pure module, no torch
@@ -1048,6 +1049,29 @@ class Configuration:
     # som ALDRI ble tildelt — den har aldri kunnet kjoere. RPE superseder.
     assert not config_net_def.get('UseRelBias', False), 'UseRelBias er fjernet (virket aldri) — bruk UseRPE'
     self.NetDef_UseRoPE = config_net_def.get('UseRoPE', False)
+    # RoPELearnable (2026-09-30): KataGo-style learnable 2D RoPE -- per head / dim pair / layer
+    # frequency vectors (omega_x, omega_y) instead of the fixed file+rank spectrum (rope.py
+    # LearnableRope2D). Only meaningful with UseRoPE; without it the key would be a silent
+    # no-op, so it is refused. RoPELearnableInit 'stratified' (default: geometric magnitude bank
+    # per head, random directions) | 'loguniform' (KataGo); RoPELearnableFreqMin/Max in rad/square,
+    # default 1/16 .. pi/2 for the 8x8 board (KataGo: 1/50 .. 1, calibrated on 19x19; 09-30 assessment).
+    self.NetDef_RoPELearnable = bool(config_net_def.get('RoPELearnable', False))
+    self.NetDef_RoPELearnableInit = config_net_def.get('RoPELearnableInit', 'stratified') or 'stratified'
+    self.NetDef_RoPELearnableFreqMin = float(config_net_def.get('RoPELearnableFreqMin', 1.0 / 16.0))
+    self.NetDef_RoPELearnableFreqMax = float(config_net_def.get('RoPELearnableFreqMax', math.pi / 2))
+    if self.NetDef_RoPELearnable:
+      if not self.NetDef_UseRoPE:
+        raise ValueError('RoPELearnable requires UseRoPE: true')
+      if self.NetDef_RoPELearnableInit not in ('loguniform', 'stratified'):
+        raise ValueError(f"RoPELearnableInit must be loguniform or stratified (was {self.NetDef_RoPELearnableInit!r})")
+      if not (0 < self.NetDef_RoPELearnableFreqMin < self.NetDef_RoPELearnableFreqMax):
+        raise ValueError('RoPELearnableFreqMin/Max must satisfy 0 < min < max')
+      if getattr(self, 'Exec_DataType', 'BFloat16') == 'BFloat16Pure':
+        # bf16 storage without an fp32 master copy: a +8e-4 Adam step rounds away for every
+        # |omega| above ~0.25, i.e. a third of the frequencies could never move (review 09-30).
+        raise ValueError('RoPELearnable requires DataType BFloat16 (autocast); under BFloat16Pure the frequencies cannot train')
+    elif any(k in config_net_def for k in ('RoPELearnableInit', 'RoPELearnableFreqMin', 'RoPELearnableFreqMax')):
+      raise ValueError('RoPELearnableInit / RoPELearnableFreqMin / RoPELearnableFreqMax require RoPELearnable: true')
     # Differential Attention V2 (Microsoft Apr 2026): doubles Q heads (Q1, Q2
     # split), computes two attention maps, subtracts with per-token sigmoid(λ)
     # gate to cancel attention noise. When smolgen is on, bias is added to both
