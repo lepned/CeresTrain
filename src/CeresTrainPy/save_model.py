@@ -426,6 +426,37 @@ def save_model(NAME : str,
                   _fixed += 1
             if _fixed:
               print(f'INFO: ONNX_FP16_CAST_RECONCILED {_fixed} Cast node(s)')
+            # FP32 ISLANDS (2026-10-01, branch trt11-strongly-typed): precision control inside the graph.
+            # TensorRT 11 drops weak typing, so the per-layer FP32 the Ceres wrapper used to pin (RMSNorm
+            # chains; softmax) must be Cast pairs in the ONNX. Default 'norms' (config ExportFP32Islands);
+            # env CERES_EXPORT_FP32_ISLANDS overrides ('none' | 'norms' | 'norms,softmax').
+            from fp32_islands import apply_fp32_islands, inspect_precision, ISLAND_KINDS
+            _isl_env = os.environ.get('CERES_EXPORT_FP32_ISLANDS')
+            _isl = (tuple(x for x in _isl_env.replace(' ', '').lower().split(',') if x and x != 'none') if _isl_env is not None
+                    else tuple(getattr(config, 'NetDef_ExportFP32Islands', ('norms',))))
+            _bad = [x for x in _isl if x not in ISLAND_KINDS]
+            if _bad:
+              raise ValueError(f'CERES_EXPORT_FP32_ISLANDS: unknown island kind(s) {_bad}; use {ISLAND_KINDS} or none')
+            if _isl:
+              # Any failure here must NOT fall through to the outer except (that would leave torch's fp32
+              # ONNX on disk under the fp16 name): fall back to the plain fp16 graph, loudly.
+              import copy as _copy
+              _m_try = _copy.deepcopy(onnx_model_16)
+              try:
+                _st = apply_fp32_islands(_m_try, _isl)
+                _onnx.checker.check_model(_m_try)
+                _onnx.shape_inference.infer_shapes(_m_try, strict_mode=True)
+                onnx_model_16 = _m_try
+                _rep = inspect_precision(onnx_model_16)
+                print(f'INFO: ONNX_FP32_ISLANDS {",".join(_isl)}: {_st["nodes"]} nodes, casts in/out {_st["casts_in"]}/{_st["casts_out"]}, '
+                      f'norm chains fp32 {_rep["norm_chains_fp32"]}/{_rep["norm_chains"]} (incomplete {_rep["norm_chains_incomplete"]}), '
+                      f'softmax fp32 {_rep["softmax_fp32"]}/{_rep["softmax"]}, '
+                      f'attention patterns with fusion blockers {_rep["attention_patterns_with_blockers"]}/{_rep["attention_patterns"]}')
+              except Exception as _e:
+                print(f'ERROR: ONNX_FP32_ISLANDS FAILED ({type(_e).__name__}: {_e}) -- saving the plain fp16 graph WITHOUT '
+                      f'fp32 islands; a strongly-typed build of this file runs the norms in fp16', flush=True)
+            else:
+              print('INFO: ONNX_FP32_ISLANDS none (every layer fp16 in a strongly-typed build)')
             # Embed weights inline in the .onnx file (same as production Ceres nets
             # like C3-768-30-pre3-I8.onnx). Our nets are well under the 2 GB protobuf
             # limit so no external data file is needed.

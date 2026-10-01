@@ -360,6 +360,9 @@ def main():
                          'GEMMs (nn.Linear), so quantizing these at export is '
                          'train/deploy skew; excluding them deploys exactly what QAT '
                          'trained against.')
+    ap.add_argument('--fp32_islands', default='norms',
+                    help="with --internal_fp16: comma list of norms|softmax (or 'none') to keep in FP32 via Cast "
+                         "pairs in the deployed graph (fp32_islands.py); default norms = the RMSNorm chains")
     ap.add_argument('--internal_fp16', action='store_true',
                     help='quantize the FP16 graph directly (opset 19, fp16 Q/DQ scales) so every '
                          'non-quantized op runs in FP16 in the strongly-typed engine, instead of '
@@ -458,12 +461,17 @@ def main():
     #    proto is neither tensor nor sequence), so skip it; fall back to the
     #    plain FP32 model if even the lite preprocess fails. quantize_static
     #    still runs onnx shape inference internally.
+    #    --internal_fp16: ALSO skip the ORT graph optimizer. On an fp16 graph the CPU-EP optimizer wraps
+    #    every op it has no fp16 kernel for in Cast(fp32)/Cast(fp16) pairs (tf3s: 4 -> 783 Casts) and
+    #    decomposes Softmax, so the RMSNorm chains / Softmax / attention patterns are no longer
+    #    recognizable (fp32_islands finds 0 chains) and TRT would run most of the net in fp32.
+    #    With skip_optimization the graph is byte-for-byte the export (116/116 chains, 38 softmax; 10-01).
     quant_input = fp32_path
     try:
         from onnxruntime.quantization.shape_inference import quant_pre_process
-        quant_pre_process(fp32_path, pre_path, skip_symbolic_shape=True)
+        quant_pre_process(fp32_path, pre_path, skip_optimization=args.internal_fp16, skip_symbolic_shape=True)
         quant_input = pre_path
-        print(f'[pre] quant_pre_process (skip_symbolic_shape) -> {pre_path}')
+        print(f'[pre] quant_pre_process (skip_symbolic_shape{", skip_optimization" if args.internal_fp16 else ""}) -> {pre_path}')
     except Exception as e:
         print(f'[pre] quant_pre_process skipped ({type(e).__name__}: {e}); using FP32 model directly')
 
@@ -659,6 +667,36 @@ def main():
         qdq_deploy = args.out if args.out else (base + '.' + tag + '.fp16io.onnx')
         restore_fp16_io(qdq_path, qdq_deploy)
     qdq_path = qdq_deploy
+    # FP32 islands (2026-10-01, strongly-typed/TRT-11 serving): on an fp16-internal QDQ graph
+    # (--internal_fp16) wrap the RMSNorm chains (and optionally the softmaxes) in Cast pairs,
+    # exactly as save_model.py does for the FP16 export. On the default fp32-internal graph every
+    # non-quantized op is already fp32, so this is a no-op there. Q/DQ sit on the weight-GEMM
+    # inputs only, so the islands never touch them; pass --exclude_act_matmuls to keep the
+    # attention MatMuls out of QDQ too (a Q/DQ pair inside MatMul->Softmax->MatMul blocks TRT's
+    # fused MHA kernel, as a Cast would).
+    # MEASURED 2026-10-01 (tf3s 512x10 NBT @25M, TRT 10.15 strongly typed, 4090, paired rg2600 n6000):
+    #   default path (fp32-internal, all MatMuls quantized, percentile) 2326/2759/2421 KLD 1.364, 17.9 Keps
+    #   --internal_fp16 --fp32_islands norms --exclude_act_matmuls      2318/2752/2419 KLD 1.379, 15.3 Keps
+    #   fp16 reference                                                   2323/2756/2419 KLD 1.382, ~15.0 Keps
+    # => the default path is both more accurate (paired z +2.7 policy) and 1.17x faster; keep it as the
+    # INT8 recipe. The fp16-internal path stays available for experiments only. The default graph is
+    # already fully typed (fp32 everywhere except the INT8 GEMM inputs), so it needs no islands under
+    # TensorRT 11's strongly-typed-only builder.
+    _isl = tuple(x for x in (args.fp32_islands or '').replace(' ', '').split(',') if x and x != 'none')
+    if _isl and args.internal_fp16:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'CeresTrainPy'))
+        from fp32_islands import apply_fp32_islands, inspect_precision
+        _dm = onnx.load(qdq_deploy)
+        _st = apply_fp32_islands(_dm, _isl)     # raises if the graph has no RMSNorm chain left (quant_pre_process rewrote it)
+        onnx.checker.check_model(_dm)
+        onnx.save(_dm, qdq_deploy)
+        _rep = inspect_precision(_dm)
+        print(f'[fp32_islands] {",".join(_isl)}: {_st["nodes"]} nodes, casts in/out {_st["casts_in"]}/{_st["casts_out"]}, '
+              f'norm chains fp32 {_rep["norm_chains_fp32"]}/{_rep["norm_chains"]}, softmax fp32 {_rep["softmax_fp32"]}/{_rep["softmax"]}, '
+              f'attention patterns with blockers {_rep["attention_patterns_with_blockers"]}/{_rep["attention_patterns"]}, '
+              f'act-matmuls quantized {_rep["act_matmuls_quantized"]}')
+    elif _isl:
+        print(f'[fp32_islands] skipped: graph is fp32-internal (no --internal_fp16), every non-quantized op is fp32 already')
     print(f'[deploy] {qdq_deploy}')
 
     if args.no_verify:

@@ -729,6 +729,17 @@ class Configuration:
     # 'mt' = decoder attention-scale + pre-norm scale folds: exact, measured +6-8 % EPS in EB
     # on the 700M prod net. 'ffn' (SwiGLU gate|up fusion) measured EPS-neutral/negative; kept
     # for A/B only. Applies to every export of the run (train-time and recover_export).
+    # ExportFP32Islands (2026-10-01, TRT-11 / strongly-typed serving): which subgraphs of the exported
+    # FP16 ONNX are wrapped in Cast(fp32)..Cast(fp16) pairs (fp32_islands.py). 'norms' (default) =
+    # every RMSNorm chain -- the protection a pre-norm/NBT trunk needs (x*x overflows fp16 past |x|>256);
+    # 'softmax' is a separate, default-OFF island because Casts around Softmax block TensorRT's fused
+    # MHA kernel. Env CERES_EXPORT_FP32_ISLANDS overrides the config (e.g. for A/B exports).
+    _isl_raw = config_net_def.get('ExportFP32Islands', 'norms')
+    _isl = ','.join(_isl_raw) if isinstance(_isl_raw, (list, tuple)) else str(_isl_raw or 'none')
+    _isl = _isl.replace(' ', '').lower()
+    self.NetDef_ExportFP32Islands = tuple(sorted(set(x for x in _isl.split(',') if x and x != 'none')))
+    if any(x not in ('norms', 'softmax') for x in self.NetDef_ExportFP32Islands):
+      raise ValueError(f"ExportFP32Islands must be a comma list of norms|softmax or 'none', got {_isl!r}")
     self.NetDef_ExportFolds = str(config_net_def.get('ExportFolds', 'none') or 'none')
     if self.NetDef_ExportFolds not in ('none', 'mt', 'ffn', 'all'):
       raise ValueError(f"ExportFolds must be none|mt|ffn|all, got {self.NetDef_ExportFolds!r}")
