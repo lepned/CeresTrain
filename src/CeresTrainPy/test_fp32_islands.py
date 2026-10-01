@@ -165,6 +165,16 @@ def test_robustness():
   m.ir_version = 9
   chains, inc = find_rmsnorm_chains(m.graph, return_incomplete=True)
   assert len(chains) == 1 and len(inc) == 1, (chains, inc)
+  # two norms sharing ONE square node (CSE): both chains must be found (keyed on the ReduceMean, not the square)
+  m2 = onnx.ModelProto(); m2.CopyFrom(m)
+  g2 = m2.graph
+  g2.node.extend([helper.make_node('ReduceMean', ['sq', 'ax'], ['mean_b'], keepdims=1),
+                  helper.make_node('Add', ['mean_b', 'eps'], ['me_b']), helper.make_node('Sqrt', ['me_b'], ['s_b']),
+                  helper.make_node('Reciprocal', ['s_b'], ['r_b']), helper.make_node('Mul', ['x', 'r_b'], ['nrm_b']),
+                  helper.make_node('Mul', ['nrm_b', 'two'], ['y_b'])])
+  g2.output.append(helper.make_tensor_value_info('y_b', onnx.TensorProto.FLOAT16, [1, 4, 8]))
+  ch2, inc2 = find_rmsnorm_chains(g2, return_incomplete=True)
+  assert len(ch2) == 2 and len(inc2) == 1, (ch2, inc2)
   st = apply_fp32_islands(m, {'norms'})
   onnx.checker.check_model(m)
   onnx.shape_inference.infer_shapes(m, strict_mode=True)

@@ -360,7 +360,7 @@ def main():
                          'GEMMs (nn.Linear), so quantizing these at export is '
                          'train/deploy skew; excluding them deploys exactly what QAT '
                          'trained against.')
-    ap.add_argument('--fp32_islands', default='norms',
+    ap.add_argument('--fp32_islands', default=None,
                     help="with --internal_fp16: comma list of norms|softmax (or 'none') to keep in FP32 via Cast "
                          "pairs in the deployed graph (fp32_islands.py); default norms = the RMSNorm chains")
     ap.add_argument('--internal_fp16', action='store_true',
@@ -682,7 +682,9 @@ def main():
     # INT8 recipe. The fp16-internal path stays available for experiments only. The default graph is
     # already fully typed (fp32 everywhere except the INT8 GEMM inputs), so it needs no islands under
     # TensorRT 11's strongly-typed-only builder.
-    _isl = tuple(x for x in (args.fp32_islands or '').replace(' ', '').split(',') if x and x != 'none')
+    # Default (None) = 'norms' on the fp16-internal path, nothing on the default path (silently: it has nothing to do there).
+    _isl_arg = args.fp32_islands if args.fp32_islands is not None else ('norms' if args.internal_fp16 else '')
+    _isl = tuple(x for x in _isl_arg.replace(' ', '').lower().split(',') if x and x != 'none')
     if _isl and args.internal_fp16:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'CeresTrainPy'))
         from fp32_islands import apply_fp32_islands, inspect_precision
@@ -696,7 +698,8 @@ def main():
               f'attention patterns with blockers {_rep["attention_patterns_with_blockers"]}/{_rep["attention_patterns"]}, '
               f'act-matmuls quantized {_rep["act_matmuls_quantized"]}')
     elif _isl:
-        print(f'[fp32_islands] skipped: graph is fp32-internal (no --internal_fp16), every non-quantized op is fp32 already')
+        print(f'[fp32_islands] --fp32_islands {args.fp32_islands} ignored: graph is fp32-internal (no --internal_fp16), '
+              f'every non-quantized op is fp32 already')
     print(f'[deploy] {qdq_deploy}')
 
     if args.no_verify:

@@ -446,12 +446,12 @@ def save_model(NAME : str,
                 _st = apply_fp32_islands(_m_try, _isl)
                 _onnx.checker.check_model(_m_try)
                 _onnx.shape_inference.infer_shapes(_m_try, strict_mode=True)
-                onnx_model_16 = _m_try
-                _rep = inspect_precision(onnx_model_16)
+                _rep = inspect_precision(_m_try)
                 print(f'INFO: ONNX_FP32_ISLANDS {",".join(_isl)}: {_st["nodes"]} nodes, casts in/out {_st["casts_in"]}/{_st["casts_out"]}, '
                       f'norm chains fp32 {_rep["norm_chains_fp32"]}/{_rep["norm_chains"]} (incomplete {_rep["norm_chains_incomplete"]}), '
                       f'softmax fp32 {_rep["softmax_fp32"]}/{_rep["softmax"]}, '
                       f'attention patterns with fusion blockers {_rep["attention_patterns_with_blockers"]}/{_rep["attention_patterns"]}')
+                onnx_model_16 = _m_try   # adopt only after every check and the report succeeded (the except below says "WITHOUT islands")
               except Exception as _e:
                 print(f'ERROR: ONNX_FP32_ISLANDS FAILED ({type(_e).__name__}: {_e}) -- saving the plain fp16 graph WITHOUT '
                       f'fp32 islands; a strongly-typed build of this file runs the norms in fp16', flush=True)

@@ -143,11 +143,11 @@ def find_rmsnorm_chains(graph, return_incomplete=False):
       continue
     is_square = (sq.op_type == 'Pow' and len(sq.input) > 1 and _const_value(sq.input[1], prod, inits) == 2.0) or \
                 (sq.op_type == 'Mul' and len(sq.input) == 2 and sq.input[0] == sq.input[1])
-    if not is_square or sq.name in seen:
+    if not is_square or n.name in seen:
       continue
     base = sq.input[0]
     chain = [sq.name, n.name]
-    seen.add(sq.name)
+    seen.add(n.name)   # keyed on the ReduceMean: two norms may share one square node (CSE)
     frontier = [n]
     depth = 0
     applied = None            # the Mul/Div that applies the inverse RMS to x
@@ -350,8 +350,8 @@ def inspect_precision(model):
   or Tanh (softcap) = fusion blockers; QDQ placement (activation*activation MatMuls quantized?)."""
   try:
     model = onnx.shape_inference.infer_shapes(model)
-  except Exception:
-    pass
+  except Exception as e:   # the fp32 counts below then rely on whatever value_info the file carries
+    print(f'[fp32_islands] note: shape inference failed ({type(e).__name__}: {e}); *_fp32 counts may under-report', flush=True)
   g = model.graph
   prod, cons, inits = _maps(g)
   vtypes = {vi.name: vi.type.tensor_type.elem_type for vi in list(g.value_info) + list(g.output)}
