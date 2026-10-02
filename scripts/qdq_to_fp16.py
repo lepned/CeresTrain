@@ -14,14 +14,30 @@ Recipe that produced the best 500M read (int8f16_dec):
       --exclude_regex 'node_(linear_1(2[4-9]|[3-5][0-9]|6[0-3])|MatMul_1664)' --no_verify --out X.int8_dec.onnx
   qdq_to_fp16.py X.int8_dec.onnx X.int8f16_dec.onnx
 (the regex = the move-token decoder + heads of the dynamo export; check node names per net)
+
+FP32 islands (2026-10-02): the converter also turns the RMSNorm chains fp16, which in a strongly-typed
+engine overflows on pre-norm / NBT trunks (1920/3 @400M: policy -57..-63, pTop3 -80..-93, value -70..-81
+vs FP16). The norm islands of fp32_islands.py are therefore re-inserted after the conversion (stale
+value_info cleared first; it conflicts with the inserted Casts). With them INT8 == FP16 within +-2 on all
+six puzzle bands at 1.27x EPS. --no_islands restores the old output.
 """
 import sys, os
 import onnx
 from modelopt.onnx.autocast.convert import convert_to_f16
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'CeresTrainPy'))
+from fp32_islands import apply_fp32_islands
 
-src = sys.argv[1]
-dst = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(src)[0] + '.f16.onnx'
+args = [a for a in sys.argv[1:] if not a.startswith('--')]
+islands = '--no_islands' not in sys.argv
+src = args[0]
+dst = args[1] if len(args) > 1 else os.path.splitext(src)[0] + '.f16.onnx'
 m = convert_to_f16(onnx.load(src), low_precision_type='fp16', keep_io_types=True)
+if islands:
+  del m.graph.value_info[:]
+  st = apply_fp32_islands(m, ['norms'])
+  onnx.checker.check_model(m)
+  m = onnx.shape_inference.infer_shapes(m, strict_mode=True)
+  print(f'[qdq_to_fp16] fp32 islands: {st}')
 onnx.save(m, dst)
 g = m.graph
 print(f'[qdq_to_fp16] {src} -> {dst}: opset {[(o.domain, o.version) for o in m.opset_import]}, '
