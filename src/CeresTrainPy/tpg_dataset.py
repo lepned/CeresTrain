@@ -113,7 +113,12 @@ V7Extras = namedtuple('V7Extras',
 # single move per position (see train.py's action two-position trick).
 V8Extras = namedtuple('V8Extras',
                       ['child_idx', 'child_q', 'child_n',
-                       'child_d', 'child_rq', 'child_ndef', 'child_prior', 'child_reply'])
+                       'child_d', 'child_rq', 'child_ndef', 'child_prior', 'child_reply',
+                       # Grill/completed-Q target (2026-10-02): EVERY stored slot (visited or not) with its prior, and the
+                       # generating net's root value. stored_idx = -1 outside n_stored; the child_* fields keep their
+                       # visited-only contract (slot-aligned with these).
+                       'stored_idx', 'stored_prior', 'root_q'],
+                      defaults=(None, None, None))
 
 # SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
 # re-reading the env here. This guarantees the data width (how many aux channels
@@ -961,6 +966,10 @@ class TPGDataset(Dataset):
         filtered_dict['child_ndef'] = filter_tensor(torch.tensor(v8x.child_ndef, dtype=torch.int64), mod_value)
         filtered_dict['child_prior'] = filter_tensor(torch.tensor(v8x.child_prior, dtype=torch.float32), mod_value)
         filtered_dict['child_reply'] = filter_tensor(torch.tensor(v8x.child_reply, dtype=torch.int64), mod_value)
+        if v8x.stored_idx is not None:
+          filtered_dict['stored_idx'] = filter_tensor(torch.tensor(v8x.stored_idx, dtype=torch.int64), mod_value)
+          filtered_dict['stored_prior'] = filter_tensor(torch.tensor(v8x.stored_prior, dtype=torch.float32), mod_value)
+          filtered_dict['root_q'] = filter_tensor(torch.tensor(v8x.root_q, dtype=torch.float32), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

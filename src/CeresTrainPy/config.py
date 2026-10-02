@@ -899,8 +899,27 @@ class Configuration:
     self.Opt_PolicyLossQGapLambda = float(config_opt.get('PolicyLossQGapLambda', 0) or 0)        # only-move weight
     self.Opt_PolicyLossSurpriseRefKL = float(config_opt.get('PolicyLossSurpriseRefKL', 0) or 0)  # search-vs-prior weight (ref = corpus median KL)
     self.Opt_PolicyTargetQBeta = float(config_opt.get('PolicyTargetQBeta', 0) or 0)              # completed-Q target sharpening
+    # Grill et al. (2020) RPO target on the visited children (policy_v8.grill_target): lambda = c*sqrt(N)/(N+|A|); 0 = off.
+    # Also reorders the Plackett-Luce ranking loss (PL after Grill, as Kovax runs it).
+    self.Opt_PolicyTargetGrillC = float(config_opt.get('PolicyTargetGrillC', 0) or 0)
+    # Mode 'completed' (default, Kovax 10-02): completed-Q over every stored move + visit blend (policy_v8.grill_completed_target);
+    # 'visited': plain Grill on the visited children only, visited mass kept (policy_v8.grill_target).
+    self.Opt_PolicyTargetGrillMode = str(config_opt.get('PolicyTargetGrillMode', 'completed') or 'completed')
+    _gb = config_opt.get('PolicyTargetGrillBeta', None); _gn = config_opt.get('PolicyTargetGrillN0', None)
+    self.Opt_PolicyTargetGrillBeta = 0.25 if _gb is None else float(_gb)     # visit-blend weight (completed)
+    self.Opt_PolicyTargetGrillN0 = 1.0 if _gn is None else float(_gn)        # q_hat pseudo-count (completed)
+    self.Opt_PolicyTargetGrillVisits = str(config_opt.get('PolicyTargetGrillVisits', 'deforced') or 'deforced')  # KataGo: forced playouts out
+    if self.Opt_PolicyTargetGrillMode not in ('completed', 'visited'):
+      raise ValueError(f"PolicyTargetGrillMode must be 'completed' or 'visited' (got {self.Opt_PolicyTargetGrillMode!r})")
+    if self.Opt_PolicyTargetGrillVisits not in ('deforced', 'raw'):
+      raise ValueError(f"PolicyTargetGrillVisits must be 'deforced' or 'raw' (got {self.Opt_PolicyTargetGrillVisits!r})")
+    if not (0.0 <= self.Opt_PolicyTargetGrillBeta <= 1.0) or self.Opt_PolicyTargetGrillN0 <= 0:
+      # n0 = 0 makes q_hat = 0/0 on every stored slot without (de-forced) visits (review 2026-10-02)
+      raise ValueError('PolicyTargetGrillBeta must be in [0,1] and PolicyTargetGrillN0 > 0')
+    if self.Opt_PolicyTargetGrillC > 0 and self.Opt_PolicyTargetQBeta > 0:
+      raise ValueError('PolicyTargetGrillC and PolicyTargetQBeta both replace the policy target; choose one')
     for _k, _v in (('PolicyLossQGapLambda', self.Opt_PolicyLossQGapLambda), ('PolicyLossSurpriseRefKL', self.Opt_PolicyLossSurpriseRefKL),
-                   ('PolicyTargetQBeta', self.Opt_PolicyTargetQBeta)):
+                   ('PolicyTargetQBeta', self.Opt_PolicyTargetQBeta), ('PolicyTargetGrillC', self.Opt_PolicyTargetGrillC)):
       if _v < 0:
         raise ValueError(f'{_k} must be >= 0 (got {_v})')
       if _v > 0 and self.Data_SourceType != 'DirectFromV6':

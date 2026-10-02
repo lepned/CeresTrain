@@ -176,6 +176,8 @@ class V6ChunkDataset(TPGDataset):
                skip_count: int = None,
                shuffle_pool: int = None,
                max_resultq_delta: float = None,
+               exclude_files=None,
+               start_offsets=None,
                **_ignored):
     assert NUM_AUX_FEATURES_PER_SQUARE == 0, \
         'DirectFromV6 requires CERES_AUX_FEATURES_PER_SQUARE=0 (137-channel model)'
@@ -197,6 +199,16 @@ class V6ChunkDataset(TPGDataset):
     self.rank = rank
     self.world_size = world_size
     self.num_workers = max(1, num_workers)
+    # DATA-STREAM RESUME (2026-10-02), chunk level. Each batch is tagged (via the shared TPG tag slot) with
+    # '__v6__:W{world}x{workers}:r{rank}w{worker}:e{epoch}' and the number of chunks that worker has read into its
+    # shuffle pool this epoch; train.py stores it in <ckpt>.datastream.json like a TPG shard offset. On resume each
+    # worker replays its deterministic per-epoch shuffles and skips the chunks already read. Records still sitting in
+    # the shuffle pool at checkpoint time (<= pool_size per worker records; yielded-but-unconsumed batches and prefetch)
+    # are lost, never duplicated; un-flushed pool chunks are re-read. A different world size / worker count / entry
+    # count (corpus changed) invalidates the state (warned; the stream restarts).
+    self._v6_resume = {}
+    self._v6_start_offsets = dict(start_offsets or {})
+
     self.worker_id = 0
     self.boards_per_batch = boards_per_batch
     # Knobs: constructor (from Data config via train.py) beats env, env beats default.
@@ -254,6 +266,21 @@ class V6ChunkDataset(TPGDataset):
                          '(rank-divergent shuffles silently skip/duplicate corpus slices)')
     random.Random(_RUN_SHUFFLE_SEED).shuffle(entries)
     self.files = entries
+    self._v6_key_prefix = f'__v6__:W{world_size}x{self.num_workers}N{len(entries)}:'
+    for _k, _v in self._v6_start_offsets.items():
+      if not str(_k).startswith('__v6__:'):
+        continue
+      if not str(_k).startswith(self._v6_key_prefix):
+        # Refuse loudly (review 2026-10-02): a restart would silently re-read the whole consumed prefix. Set the same
+        # GPU count / CERES_NUM_DATASET_WORKERS and an unchanged corpus, or ResumeDataStream: false to restart deliberately.
+        raise ValueError(f'DirectFromV6 datastream resume: state {_k} was written with a different world size / worker '
+                         f'count / chunk count than now ({self._v6_key_prefix}). Use the same GPU count and '
+                         f'CERES_NUM_DATASET_WORKERS on an unchanged corpus, or ResumeDataStream: false to restart the stream.')
+      _rw, _ep = str(_k)[len(self._v6_key_prefix):].split(':e')
+      self._v6_resume[_rw] = (int(_ep), int(_v))
+    if self._v6_resume and rank == 0:
+      print(f'[v6_dataset] datastream resume: {len(self._v6_resume)} worker stream(s) fast-forwarded '
+            f'(max epoch {max(e for e, _ in self._v6_resume.values())})', flush=True)
     self._tar_handles = {}           # tar_path -> fh, LRU-bounded (finding 7)
     self._version = None             # pinned record version (finding 9)
     self._skipped_other_version = 0
@@ -625,7 +652,12 @@ class V6ChunkDataset(TPGDataset):
           child_prior=np.where(ok & (recs['slot_prior'] != 65535), np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0), 0.0).astype(np.float32),
           # The search's expected REPLY to each child (1858 index in the CHILD position's frame, i.e. the opponent's
           # side-to-move frame = the root board mirrored); valid only where a reply q was recorded. -1 = none.
-          child_reply=np.where(ok & (recs['slot_reply_idx'] < 1858), recs['slot_reply_idx'].astype(np.int32), -1).astype(np.int16))
+          child_reply=np.where(ok & (recs['slot_reply_idx'] < 1858), recs['slot_reply_idx'].astype(np.int32), -1).astype(np.int16),
+          # Every STORED slot (also unvisited), for the Grill/completed-Q target; prior sentinel 65535 -> 0.
+          stored_idx=np.where((k < ns) & (idx < 1858), idx, -1).astype(np.int16),
+          stored_prior=np.where((k < ns) & (idx < 1858) & (recs['slot_prior'] != 65535),
+                                np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0), 0.0).astype(np.float32),
+          root_q=np.nan_to_num(recs['root_q']).astype(np.float32).reshape(-1, 1))
 
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
             unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,
@@ -655,7 +687,10 @@ class V6ChunkDataset(TPGDataset):
     pool_count = 0
     processed = 0
 
-    def _flush(final=False):
+    _tag_key = f'{self._v6_key_prefix}r{self.rank}w{self.worker_id}'
+    _start_epoch, _start_k = self._v6_resume.get(f'r{self.rank}w{self.worker_id}', (0, 0))
+
+    def _flush(final=False, tag=None):
       nonlocal rec_pool, pool_count
       recs = np.concatenate(rec_pool)
       perm = np.random.permutation(len(recs))
@@ -677,7 +712,7 @@ class V6ChunkDataset(TPGDataset):
           v8x_b = (V8Extras(*[a[sl] for a in v8x]) if v8x is not None else None)
           # Slots 13/15 are survival and the stream tag, which this path does not
           # produce; the consumer reads everything positionally (tpg_dataset:869-880).
-          yield tuple(a[sl] for a in out[:13]) + (None, v7x_b, None, v8x_b)
+          yield tuple(a[sl] for a in out[:13]) + (None, v7x_b, tag, v8x_b)
       rec_pool = [leftover] if len(leftover) and not final else []
       pool_count = len(leftover) if not final else 0
 
@@ -686,12 +721,20 @@ class V6ChunkDataset(TPGDataset):
       files = list(my_files)
       rng.shuffle(files)
       chunks_seen = 0
+      if epoch < _start_epoch:            # resume: replay this epoch's shuffle (keeps rng in step), read nothing
+        epoch += 1
+        continue
+      if epoch == _start_epoch and _start_k > 0:
+        files = files[_start_k:]
+        chunks_seen = _start_k
+      _read_this_session = 0
       for fp in files:
         recs = self._decode_chunk(self._read_entry(fp))
         chunks_seen += 1
+        _read_this_session += 1
         # Fail fast on a wrong-corpus mistake (finding 13) instead of idling
         # the GPUs for a full silent pass.
-        if processed == 0 and chunks_seen == _FAILFAST_CHUNKS and not rec_pool:
+        if processed == 0 and _read_this_session == _FAILFAST_CHUNKS and not rec_pool:
           raise RuntimeError(
               f'DirectFromV6: first {_FAILFAST_CHUNKS} chunks yielded no usable records '
               f'(read errors {self._read_errors}, other-version {self._skipped_other_version}, '
@@ -702,7 +745,8 @@ class V6ChunkDataset(TPGDataset):
         pool_count += len(recs)
         if pool_count >= self.pool_size:
           processed += pool_count
-          yield from _flush()
+          _tag = (f'{_tag_key}:e{epoch}', chunks_seen, chunks_seen)   # (file, pos, pos_end) shape of the TPG tag
+          yield from _flush(tag=_tag)
       epoch += 1
       diags = []
       if self._skipped_other_version:

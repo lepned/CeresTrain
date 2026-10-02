@@ -1479,9 +1479,16 @@ class CeresNet(nn.Module):
     self.pol_qgap_lambda = float(getattr(config, 'Opt_PolicyLossQGapLambda', 0) or 0)
     self.pol_surprise_ref = float(getattr(config, 'Opt_PolicyLossSurpriseRefKL', 0) or 0)
     self.pol_target_qbeta = float(getattr(config, 'Opt_PolicyTargetQBeta', 0) or 0)
-    if self.pol_qgap_lambda > 0 or self.pol_surprise_ref > 0 or self.pol_target_qbeta > 0:
+    self.pol_target_grill_c = float(getattr(config, 'Opt_PolicyTargetGrillC', 0) or 0)
+    self.pol_grill_mode = getattr(config, 'Opt_PolicyTargetGrillMode', 'completed')
+    self.pol_grill_beta = float(getattr(config, 'Opt_PolicyTargetGrillBeta', 0.25))
+    self.pol_grill_n0 = float(getattr(config, 'Opt_PolicyTargetGrillN0', 1.0))
+    self.pol_grill_visits = getattr(config, 'Opt_PolicyTargetGrillVisits', 'deforced')
+    if self.pol_qgap_lambda > 0 or self.pol_surprise_ref > 0 or self.pol_target_qbeta > 0 or self.pol_target_grill_c > 0:
       print(f'[ceres_net] POLICY RESHAPING from the v8 child table: only-move q-gap lambda {self.pol_qgap_lambda}, '
-            f'search-surprise ref KL {self.pol_surprise_ref} (clip 0.5..4), completed-Q target beta {self.pol_target_qbeta} '
+            f'search-surprise ref KL {self.pol_surprise_ref} (clip 0.5..4), completed-Q target beta {self.pol_target_qbeta}, '
+            f'Grill RPO target c {self.pol_target_grill_c} mode {self.pol_grill_mode} beta {self.pol_grill_beta} n0 {self.pol_grill_n0} '
+            f'visits {self.pol_grill_visits} (the Grill target, not QBeta, also orders the PL loss) '
             f'(loss/target-side only; batches without a child table are unweighted)')
     self.value_loss_weight = value_loss_weight
     self.moves_left_loss_weight = moves_left_loss_weight
@@ -2708,9 +2715,9 @@ class CeresNet(nn.Module):
     # every other consumer of policy_target (aux heads, KLD logs, vord) keeps the plain search target.
     _pw_log = {}
     _pt_pl, _prow = policy_target, None
-    _pw_on = (self.pol_qgap_lambda > 0 or self.pol_surprise_ref > 0 or self.pol_target_qbeta > 0)
+    _pw_on = (self.pol_qgap_lambda > 0 or self.pol_surprise_ref > 0 or self.pol_target_qbeta > 0 or self.pol_target_grill_c > 0)
     if _pw_on and isinstance(batch, dict) and batch.get('child_idx') is not None and policy_out is not None:
-      from policy_v8 import qgap_weights, surprise_weights, q_improved_target
+      from policy_v8 import qgap_weights, surprise_weights, q_improved_target, grill_target, grill_completed_target
       _ci, _cq, _cn = batch['child_idx'], batch['child_q'], batch['child_n']
       if self.pol_qgap_lambda > 0:
         _prow, _d = qgap_weights(_ci, _cq, _cn, self.pol_qgap_lambda); _pw_log.update(_d)
@@ -2719,8 +2726,28 @@ class CeresNet(nn.Module):
         _prow = _w2 if _prow is None else (_prow * _w2) / (_prow * _w2).mean().clamp_min(1e-6)
       if _prow is not None:
         _pw_log['pw_w_max'] = _prow.max(); _pw_log['pw_w_frac_gt_15'] = (_prow > 1.5).float().mean()   # the composite actually applied
-      if self.pol_target_qbeta > 0:
-        _pt_pl, _d = q_improved_target(policy_target, _ci, _cq, _cn, self.pol_target_qbeta); _pw_log.update(_d)
+      if self.pol_target_qbeta > 0 or self.pol_target_grill_c > 0:
+        if self.pol_target_grill_c > 0 and self.pol_grill_mode == 'completed':
+          if batch.get('stored_idx') is None:
+            raise RuntimeError("PolicyTargetGrillMode 'completed' needs stored_idx/stored_prior/root_q from the v8 loader")
+          _cv = batch['child_ndef'] if self.pol_grill_visits == 'deforced' else _cn
+          _pt_pl, _d = grill_completed_target(policy_target, batch['stored_idx'], batch['stored_prior'], _ci, _cq, _cv,
+                                              batch['root_q'], c=self.pol_target_grill_c, beta=self.pol_grill_beta,
+                                              n0=self.pol_grill_n0); _pw_log.update(_d)
+        elif self.pol_target_grill_c > 0:
+          _cv = batch['child_ndef'] if self.pol_grill_visits == 'deforced' else _cn
+          _pt_pl, _d = grill_target(policy_target, _ci, _cq, _cv, batch['child_prior'], self.pol_target_grill_c); _pw_log.update(_d)
+        else:
+          _pt_pl, _d = q_improved_target(policy_target, _ci, _cq, _cn, self.pol_target_qbeta); _pw_log.update(_d)
+        if self.pol_target_grill_c > 0 and not getattr(self, '_grill_rows_checked', False):
+          # Startup insurance (review 2026-10-02): rows the Grill target cannot handle silently keep the plain target.
+          self._grill_rows_checked = True
+          _ru = float(_d['pw_grill_rows_used'])
+          print(f'[ceres_net] Grill target first batch: {_ru:.1%} of rows use the Grill target '
+                f'(mass moved {float(_d["pw_grill_mass_moved"]):.3f}, top-1 changed {float(_d["pw_grill_top1_changed"]):.3f})', flush=True)
+          if _ru < 0.5:
+            raise RuntimeError(f'Grill target used on only {_ru:.1%} of the first batch rows: is slot_n_deforced / the prior '
+                               f'populated in this corpus? (rows without usable visits/prior fall back to the plain target)')
         with torch.no_grad():
           # The CE/accuracy the loss path logs are now measured against the SHARPENED target; keep a plain-target CE
           # (same illegal-move mask as policy_loss) so the run stays comparable with the other arms.
@@ -2771,7 +2798,9 @@ class CeresNet(nn.Module):
     policy_pl_loss = 0
     _pl_log = {}
     if self.policy_pl_weight > 0 and policy_out is not None and not gradient_norm_logging_mode:
-      _pl_t = policy_target.float()
+      # PL after Grill: with the Grill target on, rank the moves by the improved target (plain target otherwise / on
+      # child-less batches, where _pt_pl IS policy_target).
+      _pl_t = (_pt_pl if self.pol_target_grill_c > 0 else policy_target).float()
       _pl_logits = policy_out.float().masked_fill(_pl_t <= 0, float('-inf'))
       _pl_order = torch.argsort(_pl_t, dim=1, descending=True)                     # target rank order
       _pl_s = torch.gather(_pl_logits, 1, _pl_order)                               # logits in target order
