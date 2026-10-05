@@ -30,8 +30,9 @@ NOT provided by this path (by design): TB rescoring/deblunder (train on
 pre-rescored chunks; see the z-integrity filter below for non-deblundered
 sets), aux feature channels (requires CERES_AUX_FEATURES_PER_SQUARE=0; the
 qz ablation showed aux-neutrality), survival sidecars, PlySinceLastMove and
-blunder-counter square bytes (zeros), q-deviation targets (zeros — the
-trainer asserts LossQDeviationMultiplier is 0 for this source).
+blunder-counter square bytes (zeros). q-deviation targets ARE computed per game
+(see _decode_chunk); the trainer uses them only with data config
+V6QDeviationTargets=true, otherwise their loss is scaled to 0.
 
 Square encoding (post-divisor floats, one-hot = 1.0), matches TPGSquareRecord:
     [0..103]   8 history positions x 13 piece one-hot (empty, our PNBRQK, their pnbrqk)
@@ -468,6 +469,25 @@ class V6ChunkDataset(TPGDataset):
       pqs[1:] = np.maximum(bq[:-1] - pq[:-1], 0.0)
     recs = recs.copy()                             # frombuffer view is read-only
     recs['played_m'] = pqs                         # repurposed (see docstring)
+    # q-deviation targets (TPG generator CalcForwardBlunders, ported 2026-10-05):
+    # over the rest of the game j >= i, q_our(j) = best_q(j) from the side to move
+    # at i; lower = largest drop below best_q(i), upper = largest rise (j = i gives
+    # 0). With s = best_q * (-1)^j, q_our(j) = (-1)^i * s(j), so both reduce to
+    # suffix max/min of s. Game order and every ply are required, hence here,
+    # before any filtering/sampling. Stored in the otherwise unused best_m/orig_m.
+    # NaN best_q as in C#: a NaN ply j is skipped (its comparisons are false), a NaN
+    # baseline i gives 0/0. Like played_m/d_after, assumes one game per chunk.
+    raw = recs['best_q'].astype(np.float32)
+    nan = np.isnan(raw)
+    even = np.arange(n) % 2 == 0
+    s = np.where(even, raw, -raw)
+    suf_max = np.maximum.accumulate(np.where(nan, -np.inf, s)[::-1])[::-1]
+    suf_min = np.minimum.accumulate(np.where(nan, np.inf, s)[::-1])[::-1]
+    with np.errstate(invalid='ignore'):
+      dev_max = np.where(even, suf_max, -suf_min) - raw
+      dev_min = np.where(even, suf_min, -suf_max) - raw
+    recs['best_m'] = np.where(nan, 0.0, np.maximum(-dev_min, 0.0))     # q_deviation_lower
+    recs['orig_m'] = np.where(nan, 0.0, np.maximum(dev_max, 0.0))      # q_deviation_upper
     # Played-move action targets (v7 only): d-after-played = next record's
     # best_d (game order, side-symmetric so no flip; q comes from the
     # q_after_played field itself, verified == -next.best_q to MAE 0.000).
@@ -592,7 +612,6 @@ class V6ChunkDataset(TPGDataset):
     # MLH: clamp at 255 plies (TPG encoding range [0, 2.55]).
     mlh = (np.minimum(np.nan_to_num(recs['plies_left']), 255.0)
            .astype(np.float32) / 100.0).reshape(-1, 1)
-    zeros16 = np.zeros((n, 1), dtype=np.float16)
     pip = np.full((n, 1), -1, dtype=np.int16)
 
     v7x = None
@@ -659,8 +678,10 @@ class V6ChunkDataset(TPGDataset):
                                 np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0), 0.0).astype(np.float32),
           root_q=np.nan_to_num(recs['root_q']).astype(np.float32).reshape(-1, 1))
 
+    qdev_lower = recs['best_m'].astype(np.float16).reshape(-1, 1)   # see _decode_chunk
+    qdev_upper = recs['orig_m'].astype(np.float16).reshape(-1, 1)
     return (policies_indices, policies_values, wdl_deblundered, wdl_q, mlh,
-            unc, wdl_nondeblundered, zeros16, zeros16.copy(), squares,
+            unc, wdl_nondeblundered, qdev_lower, qdev_upper, squares,
             pip, played_q_subopt, unc_policy, v7x, v8x)
 
   # ---- generation -------------------------------------------------------
