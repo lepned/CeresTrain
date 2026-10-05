@@ -1224,16 +1224,24 @@ def Train():
   # training straight from pre-rescored LC0 data; see v6_dataset.py).
   _IS_V6_SOURCE = str(getattr(config, 'Data_SourceType', '') or '') == 'DirectFromV6'
   if _IS_V6_SOURCE:
-    # q-deviation targets do not exist in v6 records; the loader yields zeros,
-    # so a nonzero loss weight would silently train the head toward zero.
+    # q-deviation targets are not stored in v6 records; the loader derives them per game
+    # (forward min/max of best_q, as the TPG generator does). Without V6QDeviationTargets
+    # the old behaviour holds: a nonzero loss weight would train toward targets the run
+    # did not opt into, so the loss is scaled to 0.
     # LossQDeviationMultiplier also decides whether the heads EXIST, so a resume
     # from a checkpoint that has them must keep it > 0: the heads stay built and in
     # the forward (state dict and optimizer state match), but their loss is scaled
     # to 0 — they receive zero gradient on this source.
-    if float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) > 0:
+    if float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) > 0 and getattr(config, 'Data_V6QDeviationTargets', False):
+      print('[train] DirectFromV6: q-deviation targets computed per game by the loader (V6QDeviationTargets) — '
+            'q-deviation loss ACTIVE', flush=True)
+    elif float(getattr(config, 'Opt_LossQDeviationMultiplier', 0) or 0) > 0:
       core.q_deviation_loss_scale = 0.0
       print('[train] DirectFromV6: q-deviation heads kept (checkpoint compatibility) '
-            'but their loss is scaled to 0 — no q-deviation targets in v6/v8 records', flush=True)
+            'but their loss is scaled to 0 (data config V6QDeviationTargets is off)', flush=True)
+    elif getattr(config, 'Data_V6QDeviationTargets', False):
+      print('[train] WARNING: V6QDeviationTargets is on but LossQDeviationMultiplier is 0 — the net has no '
+            'q-deviation heads, the targets are unused', flush=True)
     from v6_dataset import V6ChunkDataset
     if getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0):
       raise ValueError('NumTPGFilesToSkipAfterShuffle is only implemented for the TPG loader (silent no-op refused on V6)')
@@ -2001,6 +2009,23 @@ def Train():
       return (k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
               or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
+    # ReinitParamsOnResume (2026-10-05): keep the construction-time init of the listed params so it
+    # can be put back after the checkpoint load below (and their optimizer state cleared further down).
+    _reinit_prefixes = tuple(getattr(config, 'Opt_ReinitParamsOnResume', []) or [])
+    _reinit_fresh = {}
+    if _reinit_prefixes and os.path.basename(str(config.Opt_CheckpointResumeFromFileName)) != str(config.Opt_ReinitParamsOnResumeCheckpoint):
+      if IS_MASTER:
+        print(f"INFO: ReinitParamsOnResume NOT applied: resuming {os.path.basename(str(config.Opt_CheckpointResumeFromFileName))}, "
+              f"one-shot target is {config.Opt_ReinitParamsOnResumeCheckpoint}", flush=True)
+      _reinit_prefixes = ()
+    if _reinit_prefixes and getattr(config, 'Exec_ExportOnly', False):
+      raise ValueError('ReinitParamsOnResume with ExportOnly would export re-initialized heads')
+    if _reinit_prefixes:
+      _reinit_fresh = {n: p.detach().clone() for n, p in model_nocompile.named_parameters() if n.startswith(_reinit_prefixes)}
+      _unmatched = [x for x in _reinit_prefixes if not any(n.startswith(x) for n in _reinit_fresh)]
+      if _unmatched:
+        raise ValueError(f'ReinitParamsOnResume: prefixes match no parameter: {_unmatched}')
+
     if config.Opt_LoRARankDivisor == 0 and not _body_lora_active:
       # Placement value head etc. are config/env-gated, so their params can
       # exist on exactly one side of a resume. Handle both directions LOUDLY
@@ -2115,6 +2140,15 @@ def Train():
       lora.apply_pissa_to_model(model)
 
 
+    if _reinit_fresh:
+      with torch.no_grad():
+        _named = dict(model_nocompile.named_parameters())
+        for _n, _v in _reinit_fresh.items():
+          _named[_n].copy_(_v)
+      if IS_MASTER:
+        print(f"INFO: ReinitParamsOnResume: {len(_reinit_fresh)} params put back to their fresh init "
+              f"({sorted(_reinit_fresh)}); optimizer state for them is cleared after the optimizer load", flush=True)
+
     # Check all layers for zero parameters
     if config.Opt_CheckpointResumeFromFileName is not None and IS_MASTER:
       for name, param in model.named_parameters():
@@ -2206,6 +2240,20 @@ def Train():
     for _g, _pre in zip(optimizer.param_groups, _pre_load_hparams):
       for _k, _v in _pre.items():
         _g[_k] = _v
+    if _reinit_fresh:
+      # Moments/momentum of the re-initialized params belong to the drifted weights: drop them so they
+      # restart lazily (Muon/AdamW create them on first use); keep Muon's per-param routing flags.
+      _named = dict(model_nocompile.named_parameters())
+      _n_cleared = 0
+      for _n in _reinit_fresh:
+        _st_p = optimizer.state.get(_named[_n])
+        if _st_p:
+          for _k in [k for k in _st_p if k not in ('use_muon', 'head_split')]:
+            del _st_p[_k]
+          _n_cleared += 1
+      if IS_MASTER:
+        print(f"INFO: ReinitParamsOnResume: optimizer state cleared for {_n_cleared}/{len(_reinit_fresh)} params"
+              + (" (the rest had no state: optimizer state already fresh)" if _n_cleared < len(_reinit_fresh) else ""), flush=True)
 
     # Re-assert construction-time Muon settings that load_state_dict clobbers
     # (or drops entirely on the fresh-state paths above):

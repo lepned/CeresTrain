@@ -120,6 +120,12 @@ class Configuration:
     # These live in the DATA config (review finding 15: the opt-config
     # bootstrap bridge alone made the recipe's data-config examples no-ops).
     self.Data_V6SkipCount = config_data.get('V6SkipCount', None)
+    # q-deviation targets computed per game by the V6 loader (ported from the TPG generator,
+    # 2026-10-05). Opt-in: false keeps the old behaviour (loss scaled to 0 on V6).
+    _qd = config_data.get('V6QDeviationTargets', False)
+    if not isinstance(_qd, bool):
+      raise ValueError(f'V6QDeviationTargets must be a JSON boolean, got {_qd!r}')
+    self.Data_V6QDeviationTargets = _qd
     self.Data_V6ShufflePool = config_data.get('V6ShufflePool', None)
     self.Data_V6MaxResultQDelta = config_data.get('V6MaxResultQDelta', None)
 
@@ -866,6 +872,23 @@ class Configuration:
     if self.Opt_LossMoveTokenActionMultiplier > 0 and self.Data_SourceType != 'DirectFromV6':
       raise ValueError(f'LossMoveTokenActionMultiplier > 0 requires SourceType DirectFromV6 with a v8 corpus '
                        f'(got {self.Data_SourceType!r}; the child table is the only per-move value target)')
+    # Re-initialize parameters on resume (2026-10-05): name prefixes of model_nocompile parameters
+    # (e.g. ["qdev_upper.", "qdev_lower."]) that get their FRESH construction-time init back after the
+    # checkpoint load, with their optimizer state cleared. For heads that drifted untrained (q-deviation
+    # heads on a V6 stretch) before their loss is switched back on. Every prefix must match.
+    # ONE-SHOT (review 2026-10-05): applied only when the resumed checkpoint's file name equals
+    # ReinitParamsOnResumeCheckpoint, so a later crash-resume with the same config does not wipe the heads again.
+    self.Opt_ReinitParamsOnResume = list(config_opt.get('ReinitParamsOnResume', []) or [])
+    self.Opt_ReinitParamsOnResumeCheckpoint = config_opt.get('ReinitParamsOnResumeCheckpoint', None)
+    if not all(isinstance(x, str) and x for x in self.Opt_ReinitParamsOnResume):
+      raise ValueError(f'ReinitParamsOnResume must be a list of non-empty name prefixes, got {self.Opt_ReinitParamsOnResume!r}')
+    if self.Opt_ReinitParamsOnResume:
+      if not self.Opt_ReinitParamsOnResumeCheckpoint or not isinstance(self.Opt_ReinitParamsOnResumeCheckpoint, str):
+        raise ValueError('ReinitParamsOnResume needs ReinitParamsOnResumeCheckpoint = the checkpoint file name it applies to (one-shot)')
+      if not self.Opt_CheckpointResumeFromFileName:
+        raise ValueError('ReinitParamsOnResume needs CheckpointResumeFromFileName (fresh heads are already fresh)')
+      if self.Opt_LoRARankDivisor:
+        raise ValueError('ReinitParamsOnResume and LoRA are mutually exclusive (a re-initialized frozen base is not a fresh head)')
     # POST-HOC ACTION HEAD (2026-09-26): freeze EVERYTHING except move_tokens.act and train only the head on a
     # finished net, so policy/value stay bit-identical to the base checkpoint. No LoRA needed to trigger the freeze.
     self.Opt_TrainOnlyActionHead = bool(config_opt.get('TrainOnlyActionHead', False))
