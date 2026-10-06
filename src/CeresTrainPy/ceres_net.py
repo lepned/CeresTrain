@@ -664,12 +664,55 @@ class CeresNet(nn.Module):
     # carried by V7-extras sidecars — a "what happens over the next few moves" value signal
     # that never blends across a detected blunder. Same additive per-square decomposition
     # and export-safe stash pattern as the placement head. Requires CERES_TPG_V7X_SIDECAR.
-    self.stvalue_weight = float(os.environ.get('CERES_STVALUE_WEIGHT', '0') or 0)
+    self.stvalue_weight = float(getattr(config, 'Opt_LossSTValueMultiplier', 0) or 0)   # config only (env retired 2026-10-07)
     if self.stvalue_weight > 0:
       self.stvalue_head = nn.Linear(self.EMBEDDING_DIM, 3)
       self.stvalue_bias = nn.Parameter(torch.zeros(3))
       print(f'[ceres_net] SHORT-TERM VALUE HEAD enabled: aux weight {self.stvalue_weight} '
             f'(WDL vs censored q_st/d_st from .v7x sidecars)')
+
+    # CHILD-Q DISTRIBUTION heads (childq_dist.py; Kovax' cq_abs / cq_gap). Training-only, read the trunk flow
+    # (gradient into the trunk). Built in a FORKED RNG under a fixed seed: the global RNG stream is untouched, so every
+    # other parameter initializes bit-identically with and without these heads; their bin weights are zero-init.
+    self.cq_abs_weight = float(getattr(config, 'Opt_ChildQDistAbsWeight', 0) or 0)
+    self.cq_gap_weight = float(getattr(config, 'Opt_ChildQDistGapWeight', 0) or 0)
+    if self.cq_abs_weight > 0 or self.cq_gap_weight > 0:
+      from childq_dist import ChildQDistHead, move_tables_1858
+      self.cq_bins = int(config.Opt_ChildQDistBins)
+      self.cq_kappa = float(config.Opt_ChildQDistKappa)
+      self.cq_sigma_ratio = float(config.Opt_ChildQDistSigmaRatio)
+      self.cq_edge_taper = float(config.Opt_ChildQDistEdgeTaper)
+      _cq_embed = int(config.Opt_ChildQDistEmbed) or self.EMBEDDING_DIM
+      _cq_args = (self.EMBEDDING_DIM, _cq_embed, int(config.Opt_ChildQDistDim), self.cq_bins, self.Activation,
+                  bool(config.Opt_ChildQDistPositionBias))
+      with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0x0C0D15)
+        self.cq_abs_head = ChildQDistHead(*_cq_args) if self.cq_abs_weight > 0 else None
+        torch.manual_seed(0x0C0D16)
+        self.cq_gap_head = ChildQDistHead(*_cq_args) if self.cq_gap_weight > 0 else None
+      _cq_f, _cq_t, _cq_p = move_tables_1858()
+      self.register_buffer('cq_from', _cq_f, persistent=False)
+      self.register_buffer('cq_to', _cq_t, persistent=False)
+      self.register_buffer('cq_promo', _cq_p, persistent=False)
+      print(f'[ceres_net] CHILD-Q DIST heads enabled: abs w={self.cq_abs_weight}, gap w={self.cq_gap_weight}, '
+            f'K={self.cq_bins}, kappa={self.cq_kappa}, d={config.Opt_ChildQDistDim}, embed={_cq_embed} (training-only, trunk-attached)')
+
+    # GRILL aux policy head (config GrillAuxHeadWeight): training-only policy head, CE vs the Grill completed-Q target.
+    # Reads the same features as the main policy head; the main target is untouched.
+    self.grill_aux_weight = float(getattr(config, 'Opt_GrillAuxHeadWeight', 0) or 0)
+    if self.grill_aux_weight > 0:
+      self.grill_aux_c = float(config.Opt_GrillAuxC)
+      self.grill_aux_beta = float(config.Opt_GrillAuxBeta)
+      self.grill_aux_n0 = float(config.Opt_GrillAuxN0)
+      self.grill_aux_visits = str(config.Opt_GrillAuxVisits)
+      self.grill_aux_value = str(config.Opt_GrillAuxValue)
+      self.grill_aux_min_visited = int(config.Opt_GrillAuxMinVisited)
+      with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0x6E111)
+        self.grill_head = Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, 0)
+      print(f'[ceres_net] GRILL aux policy head enabled: w={self.grill_aux_weight}, c={self.grill_aux_c}, '
+            f'beta={self.grill_aux_beta}, n0={self.grill_aux_n0}, visits={self.grill_aux_visits}, v={self.grill_aux_value}_q, '
+            f'min visited={self.grill_aux_min_visited} (training-only)')
 
 
 
@@ -2314,6 +2357,16 @@ class CeresNet(nn.Module):
         st_contrib = self.stvalue_head(flow_aux_src)                               # [B, 64, 3]
         self._last_stvalue_out = st_contrib.sum(dim=1) + self.stvalue_bias         # [B, 3]
 
+    # Child-q distribution heads (see __init__): only the cheap per-square q/k projections are stashed here; the
+    # per-child logits need the batch's child table and are formed in compute_loss. Training-only.
+    if self.training and (self.cq_abs_weight > 0 or self.cq_gap_weight > 0):
+      self._last_cq_abs = self.cq_abs_head(flow) if self.cq_abs_head is not None else None
+      self._last_cq_gap = self.cq_gap_head(flow) if self.cq_gap_head is not None else None
+
+    # Grill aux policy head (see __init__): training-only stash.
+    if self.grill_aux_weight > 0 and self.training:
+      self._last_grill_out = self.grill_head(fS_policy)
+
     # Value-contrast aux head (see __init__): training-only stash, never in the
     # export graph (same gating pattern as the placement/survival aux heads).
     if self.value_contrast_weight > 0 and self.training:
@@ -3255,6 +3308,70 @@ class CeresNet(nn.Module):
       soft_policy_loss = loss_calc.ce_loss.forward(_sp_m.float(), _sp_t) \
           - (loss_calc.entropy(_sp_t) if SUBTRACT_ENTROPY else 0.0)
 
+    # Child-q distribution losses (see __init__ / childq_dist.py). Batches without a child table (the TPG secondary of a
+    # mixed run) contribute a 0 * sum participation term (DDP static graph). Consume-and-clear; skipped on gradnorm.
+    cq_abs_loss = 0
+    cq_gap_loss = 0
+    _cq_diag = {}
+    if (self.cq_abs_weight > 0 or self.cq_gap_weight > 0) and not gradient_norm_logging_mode:
+      from childq_dist import childq_dist_loss
+      _cq_ci = batch.get('child_idx') if isinstance(batch, dict) else None
+      _cq_tables = (self.cq_from, self.cq_to, self.cq_promo)
+      for _tag, _head, _gap in (('abs', self.cq_abs_head, False), ('gap', self.cq_gap_head, True)):
+        _stash = getattr(self, '_last_cq_' + _tag, None)
+        if _head is None or _stash is None:
+          continue
+        setattr(self, '_last_cq_' + _tag, None)
+        if _cq_ci is None:
+          _l = _head.participation(_stash)
+        else:
+          _lg = _head.child_logits(_stash, _cq_ci, _cq_tables)
+          _l, _d = childq_dist_loss(_lg, _cq_ci, batch['child_q'], batch['child_n'], gap=_gap, kappa=self.cq_kappa,
+                                    sigma_ratio=self.cq_sigma_ratio, edge_taper=self.cq_edge_taper)
+          _cq_diag.update({f'cq_{_tag}_{_k}': _v for _k, _v in _d.items()})
+          _cq_diag[f'cq_{_tag}_loss'] = _l
+        if _gap:
+          cq_gap_loss = _l
+        else:
+          cq_abs_loss = _l
+
+    # Grill aux policy CE (see __init__): CE of the aux head against the Grill completed-Q target; same legality mask
+    # as the main policy loss. Child-less batches: participation only.
+    grill_aux_loss = 0
+    _gr = getattr(self, '_last_grill_out', None)
+    if _gr is not None and not gradient_norm_logging_mode:
+      self._last_grill_out = None
+      if isinstance(batch, dict) and batch.get('stored_idx') is not None and batch.get('child_idx') is not None:
+        from policy_v8 import grill_completed_target
+        if self.grill_aux_value == 'orig':
+          if batch.get('orig_q') is None:
+            raise RuntimeError("GrillAuxValue 'orig' needs orig_q from the v8 loader")
+          _gv = batch['orig_q']
+        else:
+          _gv = batch['root_q']
+        _gvis = batch['child_ndef'] if self.grill_aux_visits == 'deforced' else batch['child_n']
+        with torch.no_grad():
+          _gt, _gd = grill_completed_target(policy_target, batch['stored_idx'], batch['stored_prior'], batch['child_idx'],
+                                            batch['child_q'], _gvis, _gv, c=self.grill_aux_c, beta=self.grill_aux_beta,
+                                            n0=self.grill_aux_n0, min_visited=self.grill_aux_min_visited,
+                                            nonfinite_v_fallback=True)
+        if not getattr(self, '_grill_aux_rows_checked', False):
+          self._grill_aux_rows_checked = True
+          _ru = float(_gd['pw_grill_rows_used'])
+          print(f'[ceres_net] Grill aux head first batch: {_ru:.1%} of rows use the Grill target '
+                f'(top-1 changed {float(_gd["pw_grill_top1_changed"]):.3f})', flush=True)
+          if _ru < 0.5:
+            raise RuntimeError(f'Grill aux target used on only {_ru:.1%} of the first batch rows (prior / visits / orig_q populated?)')
+        _g_legal = _gt > 0
+        _g_m = torch.where(_g_legal, _gr, torch.full_like(_gr, loss_calc.MASK_POLICY_VALUE))
+        grill_aux_loss = loss_calc.ce_loss.forward(_g_m.float(), _gt) \
+            - (loss_calc.entropy(_gt) if SUBTRACT_ENTROPY else 0.0)
+        _cq_diag['grill_aux_loss'] = grill_aux_loss
+        _cq_diag['grill_aux_top1_changed'] = _gd['pw_grill_top1_changed']
+        _cq_diag['grill_aux_rows_used'] = _gd['pw_grill_rows_used']
+      else:
+        grill_aux_loss = 0.0 * _gr.float().sum()
+
     # Move-token aux MLP policy CE (see __init__): the bypassed MLP head trained on the
     # same target with the same legality masking. Uses ce_loss directly (NOT
     # loss_calc.policy_loss, which would fold into the logged policy number).
@@ -3410,7 +3527,10 @@ class CeresNet(nn.Module):
         + (self.mt_repq_w * mt_repq_loss if not isinstance(mt_repq_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
-        + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0))
+        + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0)
+        + (self.cq_abs_weight * cq_abs_loss if not isinstance(cq_abs_loss, int) else 0)
+        + (self.cq_gap_weight * cq_gap_loss if not isinstance(cq_gap_loss, int) else 0)
+        + (self.grill_aux_weight * grill_aux_loss if not isinstance(grill_aux_loss, int) else 0))
 
     # POLICY/VALUE GRADIENT-CONFLICT PROBE (config GradConflictProbeSteps; the
     # measurement lives in train.py). When armed for this step, stash the two family
@@ -3446,7 +3566,8 @@ class CeresNet(nn.Module):
           + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
           # policy family (unlike the depth probes, which span both).
-          + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0))
+          + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
+          + (self.grill_aux_weight * grill_aux_loss if not isinstance(grill_aux_loss, int) else 0))
       self._gc_value_loss = (self.value_loss_weight * v_loss
           + self.value2_loss_weight * v2_loss
           + self.unc_loss_weight * u_loss
@@ -3459,7 +3580,10 @@ class CeresNet(nn.Module):
           + (self.vda_aux_weight * vda_aux_loss if self.vda_mode == 4 else 0)
           + (self.value_rank_weight * value_rank_loss if not isinstance(value_rank_loss, int) else 0)
           + (self.value_contrast_weight * vc_loss if not isinstance(vc_loss, int) else 0)
-          + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0))
+          + (self.hlg_weight * hlg_loss if not isinstance(hlg_loss, int) else 0)
+          # child-q distributions predict values (per child), so they belong to the value family
+          + (self.cq_abs_weight * cq_abs_loss if not isinstance(cq_abs_loss, int) else 0)
+          + (self.cq_gap_weight * cq_gap_loss if not isinstance(cq_gap_loss, int) else 0))
 
     if (log_stats):
       if not gradient_norm_logging_mode:
@@ -3557,6 +3681,9 @@ class CeresNet(nn.Module):
         self._log("survival_loss" + stat_suffix, survival_loss, step=num_pos)
       if getattr(self, 'dp_surv_weight', 0) > 0 and not isinstance(dp_surv_loss, int)           and not _dp_surv_participation_only:
         self._log("dp_survival_loss" + stat_suffix, dp_surv_loss, step=num_pos)
+      if not gradient_norm_logging_mode:
+        for _k, _v in _cq_diag.items():
+          self._log(_k, _v, step=num_pos)
       if self.stvalue_weight > 0 and not isinstance(stvalue_loss, int)           and not _stvalue_participation_only:
         self._log("stvalue_loss" + stat_suffix, stvalue_loss, step=num_pos)
       if self.vda_mode == 4 and not isinstance(vda_aux_loss, int):

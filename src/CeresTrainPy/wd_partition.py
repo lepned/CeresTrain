@@ -126,6 +126,12 @@ def partition_weight_decay(model):
               # convention (cbk_*, smol_*_bank). Hits B and C identically.
               # NB inert under Muon anyway (group wd) — completeness is the point.
               no_decay.add(fpn)
+          elif ("cq_abs_head." in fpn or "cq_gap_head." in fpn) and (
+                fpn.endswith(".w_bins") or fpn.endswith(".w_promo") or fpn.endswith(".pos_w") or fpn.endswith(".pos_b")):
+              # Child-q distribution heads (2026-10-07): zero-init raw readout tables, not nn.Linear
+              # weights. no_decay, as Kovax runs them (his decay selector is '**/kernel' = Linear
+              # kernels only); the heads' own Linears (tokens/q/k) fall through to the whitelist.
+              no_decay.add(fpn)
           elif fpn.endswith("mm_alpha_v") or fpn.endswith("mm_alpha_r"):
               # 2026-09-16 minimax readout: two zero-init SCALARS mixing the per-move value
               # and value-after-reply estimates into the policy logit. Scalars are not

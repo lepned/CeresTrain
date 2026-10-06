@@ -113,6 +113,28 @@ def test_8b_example():
   print('  8B two-slope example: 8e-4 @2B, 6e-4 @4B, 4e-5 @8B; describe():', line)
 
 
+def test_rewarm():
+  from lr_schedule import rewarm_factor, validate_rewarm
+  S, L = 1_100_054_528, 20_000_000
+  assert rewarm_factor(S - 1, S, L) == 1.0 and rewarm_factor(S + L, S, L) == 1.0, 'outside the window = 1'
+  assert abs(rewarm_factor(S, S, L) - 0.1) < 1e-12 and abs(rewarm_factor(S + L // 2, S, L) - 0.55) < 1e-9
+  assert rewarm_factor(S + L - 1, S, L) < 1.0 and rewarm_factor(S + 5, S, 0) == 1.0, 'length 0 = off'
+  # continuity at the window end and monotone inside
+  xs = [rewarm_factor(S + i * L // 100, S, L) for i in range(101)]
+  assert all(b >= a for a, b in zip(xs, xs[1:])) and abs(xs[-1] - 1.0) < 1e-12
+  # the 1920 run: hold at 8e-4 at 1.1B, so the effective LR ramps 8e-5 -> 8e-4
+  knots = validate_knots([[0.25, 1.0], [0.4375, 0.55]], 0.4375, 0.05, 8e9)
+  eff = lambda pos: 8e-4 * lr_factor(pos, 8e9, 100_000_000, 0.4375, 0.05, 'linear', knots) * rewarm_factor(pos, S, L)
+  assert abs(eff(S) - 8e-5) < 1e-12 and abs(eff(S + L) - 8e-4) < 1e-12
+  assert validate_rewarm(0, 0, 0.1, 8e9) == (0, 0, 0.1)
+  for args in ((0, L, 0.1), (S, L, 0.0), (S, L, 1.5), (S, -1, 0.1), (int(8e9) - 10, L, 0.1)):
+    try:
+      validate_rewarm(*args, 8e9); raise AssertionError(f'accepted {args}')
+    except ValueError:
+      pass
+  print('  rewarm OK: 0.1 -> 1 linear over the absolute window, 1 outside, 5 rejections; 1920 run ramps 8e-5 -> 8e-4')
+
+
 if __name__ == '__main__':
-  test_legacy_identical(); test_knots_shape(); test_validation(); test_8b_example()
+  test_legacy_identical(); test_knots_shape(); test_validation(); test_8b_example(); test_rewarm()
   print('ALL OK')

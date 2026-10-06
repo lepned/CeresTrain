@@ -117,8 +117,10 @@ V8Extras = namedtuple('V8Extras',
                        # Grill/completed-Q target (2026-10-02): EVERY stored slot (visited or not) with its prior, and the
                        # generating net's root value. stored_idx = -1 outside n_stored; the child_* fields keep their
                        # visited-only contract (slot-aligned with these).
-                       'stored_idx', 'stored_prior', 'root_q'],
-                      defaults=(None, None, None))
+                       'stored_idx', 'stored_prior', 'root_q',
+                       # orig_q (2026-10-07, Grill aux head v = orig_q as Kovax runs it); NaN kept = "unknown".
+                       'orig_q'],
+                      defaults=(None, None, None, None))
 
 # SINGLE SOURCE OF TRUTH: import the aux-feature count from config rather than
 # re-reading the env here. This guarantees the data width (how many aux channels
@@ -970,6 +972,8 @@ class TPGDataset(Dataset):
           filtered_dict['stored_idx'] = filter_tensor(torch.tensor(v8x.stored_idx, dtype=torch.int64), mod_value)
           filtered_dict['stored_prior'] = filter_tensor(torch.tensor(v8x.stored_prior, dtype=torch.float32), mod_value)
           filtered_dict['root_q'] = filter_tensor(torch.tensor(v8x.root_q, dtype=torch.float32), mod_value)
+        if v8x.orig_q is not None:
+          filtered_dict['orig_q'] = filter_tensor(torch.tensor(v8x.orig_q, dtype=torch.float32), mod_value)
       return filtered_dict
     
     return [create_filtered_dict(i) for i in range(self.boards_per_batch)]

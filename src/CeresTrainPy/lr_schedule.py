@@ -85,6 +85,31 @@ def lr_factor(num_pos, max_pos, warmup_pos, frac_start_decay, min_lr, shape='lin
   return top + (min_lr - top) * prog   # linear
 
 
+def rewarm_factor(num_pos, start_pos, length, min_factor=0.1):
+  """Extra multiplier for a one-off warmup in the middle of a run (2026-10-07: resuming with a FRESH optimizer state,
+  e.g. after adding a head). Linear ramp min_factor -> 1 over [start_pos, start_pos + length); 1 everywhere else, so a
+  later resume past the window is unaffected. length 0 = off."""
+  if length <= 0 or num_pos < start_pos or num_pos >= start_pos + length:
+    return 1.0
+  return min_factor + (1.0 - min_factor) * (num_pos - start_pos) / float(length)
+
+
+def validate_rewarm(start_pos, length, min_factor, max_pos):
+  """Returns (start_pos, length, min_factor) as (int, int, float); raises ValueError on a bad window."""
+  start_pos, length, min_factor = int(start_pos or 0), int(length or 0), float(min_factor)
+  if length < 0 or start_pos < 0:
+    raise ValueError(f'LRRewarmPositions / LRRewarmStartPos must be >= 0 (got {length}, {start_pos})')
+  if length > 0:
+    if start_pos <= 0:
+      raise ValueError('LRRewarmPositions > 0 needs LRRewarmStartPos (the absolute position where the rewarm starts, '
+                       'normally the position of the resume checkpoint)')
+    if not (0.0 < min_factor <= 1.0):
+      raise ValueError(f'LRRewarmMinFactor must be in (0, 1] (got {min_factor})')
+    if start_pos + length > max_pos:
+      raise ValueError(f'rewarm window [{start_pos}, {start_pos + length}) runs past NumTrainingPositions {max_pos}')
+  return start_pos, length, min_factor
+
+
 def describe(lr_base, max_pos, warmup_pos, frac_start_decay, min_lr, shape, knots):
   """One-line-per-landmark description for the boot log."""
   marks = [("warmup end", warmup_pos)]

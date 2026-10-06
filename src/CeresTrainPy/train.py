@@ -742,6 +742,7 @@ def Train():
       if 'move_tokens.vord' in n: return False   # value-order scalar [1, dm]: a training-only readout, AdamW
       if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
       if 'move_tokens.act.' in n: return False   # action WDL readout [3, dm]: a final layer like pol, AdamW
+      if ('cq_abs_head.' in n or 'cq_gap_head.' in n) and (n.endswith('w_bins') or n.endswith('pos_w')): return False  # zero-init child-q readout tables (review 2026-10-07), AdamW
       if 'move_tokens.rq_head.' in n: return False   # reply-q readout [1, dk]: training-only 1-row final layer, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
@@ -849,7 +850,7 @@ def Train():
     #   LearningRateCouplingsRatio — dual-plane zero-init couplings (plan H2)
     _HEAD_FAMILY = ('policy_head.', 'value_head.', 'value2_head.', 'unc_head.',
                     'mlh_head.', 'qdev_upper.', 'qdev_lower.', 'headPremap.',
-                    'headSharedLinear.', 'unc_policy.',
+                    'headSharedLinear.', 'unc_policy.', 'grill_head.',
                     # 2026-09-09 (policy-training review): on a move-token net the POLICY readout is
                     # the decoder's 4-slot linear + per-move bias, not `policy_head` (bypassed, unused),
                     # and value reads the decoder through the injects. Without these the ratio would
@@ -1033,11 +1034,16 @@ def Train():
   _LR_KNOTS = config.Opt_LRKnots
   print(_lr_describe(LR, config.Opt_NumTrainingPositions, num_warmup_positions(), config.Opt_LRBeginDecayAtFractionComplete,
                      MIN_LR, _LR_SHAPE, _LR_KNOTS), flush=True)
+  from lr_schedule import rewarm_factor as _rewarm_factor
+  _RW = (config.Opt_LRRewarmStartPos, config.Opt_LRRewarmPositions, config.Opt_LRRewarmMinFactor)
+  if _RW[1] > 0:
+    print(f'[lr-schedule] REWARM: x{_RW[2]:g} -> x1 linear over [{_RW[0]/1e6:.1f}M, {(_RW[0] + _RW[1])/1e6:.1f}M)', flush=True)
 
   def lr_lambda(epoch : int):
     global num_pos
-    return _lr_factor(num_pos, config.Opt_NumTrainingPositions, num_warmup_positions(),
-                      config.Opt_LRBeginDecayAtFractionComplete, MIN_LR, _LR_SHAPE, _LR_KNOTS)
+    return (_lr_factor(num_pos, config.Opt_NumTrainingPositions, num_warmup_positions(),
+                       config.Opt_LRBeginDecayAtFractionComplete, MIN_LR, _LR_SHAPE, _LR_KNOTS)
+            * _rewarm_factor(num_pos, *_RW))
 
   scheduler = LambdaLR(optimizer, lr_lambda)
 
@@ -1696,10 +1702,13 @@ def Train():
       or getattr(core, 'refiner_deep_sup_weight', 0) > 0
       # move-token stash-only losses (review 2026-09-04 finding 2): value-order head, aux MLP CE
       or getattr(core, 'mt_vord_w', 0) > 0
-      or getattr(core, 'mt_aux_mlp_w', 0) > 0) and WORLD_SIZE > 1:
+      or getattr(core, 'mt_aux_mlp_w', 0) > 0
+      # child-q distribution heads + Grill aux head (2026-10-07)
+      or getattr(core, 'cq_abs_weight', 0) > 0 or getattr(core, 'cq_gap_weight', 0) > 0
+      or getattr(core, 'grill_aux_weight', 0) > 0) and WORLD_SIZE > 1:
     if not _static_graph:
       raise NotImplementedError(
-        'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy/move-token-value-order '
+        'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy/move-token-value-order/child-q-dist/grill-aux '
         'aux heads under DDP require static_graph: the stashed aux output is invisible to DDP\'s '
         'default reducer. Re-launch with CERES_DDP_STATIC_GRAPH=1.')
     print(f'[ddp] stash-only aux heads enabled under DDP via '
@@ -1759,7 +1768,10 @@ def Train():
                                  ('PolicyTargetQBeta', getattr(config, 'Opt_PolicyTargetQBeta', 0)),
                                  ('PolicyTargetGrillC', getattr(config, 'Opt_PolicyTargetGrillC', 0)),
                                  ('LossMoveTokenReplyMultiplier', getattr(config, 'Opt_LossMoveTokenReplyMultiplier', 0)),
-                                 ('LossMoveTokenReplyQMultiplier', getattr(config, 'Opt_LossMoveTokenReplyQMultiplier', 0))) if v]
+                                 ('LossMoveTokenReplyQMultiplier', getattr(config, 'Opt_LossMoveTokenReplyQMultiplier', 0)),
+                                 ('ChildQDistAbsWeight', getattr(config, 'Opt_ChildQDistAbsWeight', 0)),
+                                 ('ChildQDistGapWeight', getattr(config, 'Opt_ChildQDistGapWeight', 0)),
+                                 ('GrillAuxHeadWeight', getattr(config, 'Opt_GrillAuxHeadWeight', 0))) if v]
   if _needs_child and not _IS_V6_SOURCE:
     raise ValueError(f'{_needs_child} need the v8 child table: SourceType must be DirectFromV6 (got {config.Data_SourceType!r})')
   if _needs_child and set(getattr(primary_dataset, '_diag_versions', set())) != {8}:
@@ -1770,12 +1782,12 @@ def Train():
   # Short-term value head requires V7-extras sidecar targets (censored q_st/d_st).
   if getattr(core, 'stvalue_weight', 0) > 0 and _IS_V6_SOURCE:
     if not getattr(primary_dataset, '_diag_has_v7_tail', False):
-      raise ValueError('CERES_STVALUE_WEIGHT > 0 but the DirectFromV6 corpus lacks the '
+      raise ValueError('LossSTValueMultiplier > 0 but the DirectFromV6 corpus lacks the '
                        'ExtraV7 tail (no censored q_st/d_st in v6 records; v7 and v8 have it)')
   elif getattr(core, 'stvalue_weight', 0) > 0:
     _v7x_mode = (os.environ.get('CERES_TPG_V7X_SIDECAR', '0') or '0').strip().lower()
     if _v7x_mode in ('0', ''):
-      raise ValueError('CERES_STVALUE_WEIGHT > 0 requires CERES_TPG_V7X_SIDECAR=1 or auto '
+      raise ValueError('LossSTValueMultiplier > 0 requires CERES_TPG_V7X_SIDECAR=1 or auto '
                        '(and a corpus generated with gen-tpg --v7-extras)')
     if _v7x_mode == 'auto':
       _dirs = [TPG_TRAIN_DIR]
@@ -1955,7 +1967,9 @@ def Train():
     # fresh-initializing them never corrupts the served heads. (action_head is
     # exported but zero-impact on the other heads; fresh-init is exactly the
     # from-scratch state.)
-    _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.', 'action_head.')
+    _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.', 'action_head.',
+                          # 2026-10-07: child-q distribution heads + Grill aux head (training-only; cq bins zero-init)
+                          'cq_abs_head.', 'cq_gap_head.', 'grill_head.')
     # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
     # exist on one side of a resume — they are zero-init, so the net is bit-identical
     # to the base at step 0 and fresh-initializing them is exactly right.
@@ -2309,6 +2323,13 @@ def Train():
 
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
     print("INFO: LOAD_CHECKPOINT", config.Opt_CheckpointResumeFromFileName, num_pos)
+    if config.Opt_LRRewarmPositions > 0:
+      _rw_end = config.Opt_LRRewarmStartPos + config.Opt_LRRewarmPositions
+      if num_pos < config.Opt_LRRewarmStartPos:
+        raise ValueError(f'LRRewarmStartPos {config.Opt_LRRewarmStartPos} lies AFTER the resume position {num_pos}: '
+                         f'the rewarm would hit mid-segment (set it to the resume checkpoint position)')
+      print(f'INFO: LR rewarm window [{config.Opt_LRRewarmStartPos}, {_rw_end}) '
+            f'{"ACTIVE from x%.3f" % _rewarm_factor(num_pos, *_RW) if num_pos < _rw_end else "already passed (no effect)"}', flush=True)
 
     # NB (runde-4-dok): en resume starter shard-sekvensen fra fil 0 igjen —
     # tidligste data re-trenes. Det gamle NUM_POS_TO_SKIP-maskineriet var doedt

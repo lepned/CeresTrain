@@ -154,7 +154,8 @@ def grill_target(policy_target, child_idx, child_q, child_n, child_prior, c: flo
 
 
 def grill_completed_target(policy_target, stored_idx, stored_prior, child_idx, child_q, child_visits, root_q,
-                           c: float = 2.5, beta: float = 0.25, n0: float = 1.0, iters: int = 60):
+                           c: float = 2.5, beta: float = 0.25, n0: float = 1.0, iters: int = 60,
+                           min_visited: int = 1, nonfinite_v_fallback: bool = False):
   """Kovax's Grill target (2026-10-02), Gumbel-style completed Q + a visit blend, over EVERY stored move:
     N = sum n_a (n_a = child_visits on visited slots, 0 elsewhere), |A| = number of stored moves,
     v_hat = sum_vis pi*q / sum_vis pi  (falls back to v = root_q when nothing is visited),
@@ -163,7 +164,10 @@ def grill_completed_target(policy_target, stored_idx, stored_prior, child_idx, c
     Y = (1 - beta)*pi_hat + beta*n_a/N,  renormalised.
   Slots are aligned: stored_idx/stored_prior cover every stored slot, child_idx/child_q the visited ones (-1 elsewhere).
   Rows with N == 0 or no usable prior keep the plain target. Legal moves outside the stored set get a 1e-7 floor
-  (policy_loss masks legality by target > 0)."""
+  (policy_loss masks legality by target > 0).
+  min_visited / nonfinite_v_fallback (Kovax' fallbacks, used by the Grill aux head): rows with fewer than min_visited
+  visited children, or (when set) a non-finite v (root_q argument; the aux head passes orig_q, NaN when unknown), also
+  keep the plain target. Defaults reproduce the original behaviour."""
   t = policy_target.float()
   legal = t > 0
   stored = stored_idx >= 0
@@ -173,13 +177,19 @@ def grill_completed_target(policy_target, stored_idx, stored_prior, child_idx, c
   q = torch.where(vis, child_q.float(), torch.zeros_like(pi))
   N = n.sum(dim=1, keepdim=True)
   n_act = stored.sum(dim=1, keepdim=True).float()
-  v = root_q.float().reshape(-1, 1)
+  v_raw = root_q.float().reshape(-1, 1)
+  v_ok = torch.isfinite(v_raw).squeeze(1)
+  v = torch.where(torch.isfinite(v_raw), v_raw, torch.zeros_like(v_raw))
   pv = torch.where(vis & (n > 0), pi, torch.zeros_like(pi))
   v_hat = torch.where(pv.sum(1, keepdim=True) > 0, (pv * q).sum(1, keepdim=True) / pv.sum(1, keepdim=True).clamp_min(1e-12), v)
   v_mix = (v + N * v_hat) / (1.0 + N)
   q_hat = torch.where(stored, (n * q + n0 * v_mix) / (n + n0).clamp_min(1e-9), torch.zeros_like(pi))
   pi_sum = pi.sum(dim=1, keepdim=True)
   ok = (N.squeeze(1) > 0) & (pi_sum.squeeze(1) > 0)
+  if min_visited > 1:
+    ok = ok & ((vis & (n > 0)).sum(dim=1) >= min_visited)
+  if nonfinite_v_fallback:
+    ok = ok & v_ok
   mu = pi / pi_sum.clamp_min(1e-12)
   lam = (c * N.sqrt() / (N + n_act).clamp_min(1.0)).squeeze(1)
   live = stored & (mu > 0) & ok.unsqueeze(1)

@@ -515,6 +515,14 @@ class Configuration:
     # legacy hold-then-decay. CONFIG-ONLY.
     self.Opt_LRKnots = _validate_lr_knots(config_opt.get('LRKnots'), self.Opt_LRBeginDecayAtFractionComplete,
                                           self.Opt_LRMinFactor, self.Opt_NumTrainingPositions)
+    # One-off mid-run REWARM (2026-10-07; lr_schedule.rewarm_factor): LR x linear ramp LRRewarmMinFactor -> 1 over
+    # [LRRewarmStartPos, LRRewarmStartPos + LRRewarmPositions). Absolute window, so a later crash-resume past it is
+    # unaffected. For resuming with a fresh optimizer state (new head => param-group mismatch). 0 = off.
+    from lr_schedule import validate_rewarm as _validate_rewarm
+    _rmf = config_opt.get('LRRewarmMinFactor', None)
+    (self.Opt_LRRewarmStartPos, self.Opt_LRRewarmPositions, self.Opt_LRRewarmMinFactor) = _validate_rewarm(
+        config_opt.get('LRRewarmStartPos', 0), config_opt.get('LRRewarmPositions', 0), 0.1 if _rmf is None else _rmf,
+        self.Opt_NumTrainingPositions)
     self.Opt_Beta1 = config_opt.get('Beta1', 0.90)
     self.Opt_Beta2 = config_opt.get('Beta2', 0.98)
     self.Opt_Beta3 = config_opt.get('Beta3', 0.9999)
@@ -947,6 +955,56 @@ class Configuration:
         raise ValueError(f'{_k} must be >= 0 (got {_v})')
       if _v > 0 and self.Data_SourceType != 'DirectFromV6':
         raise ValueError(f'{_k} > 0 requires SourceType DirectFromV6 with a v8 corpus (got {self.Data_SourceType!r})')
+    # CHILD-Q DISTRIBUTION heads (2026-10-07, childq_dist.py; port of Kovax' cq_abs/cq_gap): per stored child an HL-Gauss
+    # histogram over its q, read from the TRUNK through an own embedding. Training-only. 0 = off.
+    self.Opt_ChildQDistAbsWeight = float(config_opt.get('ChildQDistAbsWeight', 0) or 0)
+    self.Opt_ChildQDistGapWeight = float(config_opt.get('ChildQDistGapWeight', 0) or 0)
+    self.Opt_ChildQDistBins = int(config_opt.get('ChildQDistBins', 33) or 33)
+    _cqk = config_opt.get('ChildQDistKappa', None)
+    self.Opt_ChildQDistKappa = 2.0 if _cqk is None else float(_cqk)          # child weight n/(n+kappa)
+    self.Opt_ChildQDistDim = int(config_opt.get('ChildQDistDim', 128) or 128)
+    self.Opt_ChildQDistEmbed = int(config_opt.get('ChildQDistEmbed', 0) or 0)  # 0 = trunk width
+    _cqs = config_opt.get('ChildQDistSigmaRatio', None); _cqt = config_opt.get('ChildQDistEdgeTaper', None)
+    self.Opt_ChildQDistSigmaRatio = 0.75 if _cqs is None else float(_cqs)
+    self.Opt_ChildQDistEdgeTaper = 0.1875 if _cqt is None else float(_cqt)
+    self.Opt_ChildQDistPositionBias = bool(config_opt.get('ChildQDistPositionBias', True))
+    if self.Opt_ChildQDistAbsWeight < 0 or self.Opt_ChildQDistGapWeight < 0:
+      raise ValueError('ChildQDistAbsWeight / ChildQDistGapWeight must be >= 0')
+    if (self.Opt_ChildQDistAbsWeight > 0 or self.Opt_ChildQDistGapWeight > 0):
+      if self.Data_SourceType != 'DirectFromV6':
+        raise ValueError(f'ChildQDist*Weight > 0 requires SourceType DirectFromV6 with a v8 corpus (got {self.Data_SourceType!r})')
+      if self.Opt_ChildQDistKappa < 0 or self.Opt_ChildQDistSigmaRatio <= 0 or self.Opt_ChildQDistEdgeTaper < 0:
+        raise ValueError('ChildQDistKappa >= 0, ChildQDistSigmaRatio > 0 and ChildQDistEdgeTaper >= 0 required')
+    # GRILL AS AN EXTRA POLICY HEAD (2026-10-07, Kovax' 'grill' head): a training-only policy head trained by CE against
+    # policy_v8.grill_completed_target; the main policy target and the PL ranking are untouched (contrast:
+    # PolicyTargetGrillC REPLACES the main target). Defaults = Kovax' run: c 2.5, n0 2, raw visits, v = orig_q, blend 0.25.
+    self.Opt_GrillAuxHeadWeight = float(config_opt.get('GrillAuxHeadWeight', 0) or 0)
+    _gac = config_opt.get('GrillAuxC', None); _gab = config_opt.get('GrillAuxBeta', None); _gan = config_opt.get('GrillAuxN0', None)
+    self.Opt_GrillAuxC = 2.5 if _gac is None else float(_gac)
+    self.Opt_GrillAuxBeta = 0.25 if _gab is None else float(_gab)
+    self.Opt_GrillAuxN0 = 2.0 if _gan is None else float(_gan)
+    self.Opt_GrillAuxVisits = str(config_opt.get('GrillAuxVisits', 'raw') or 'raw')
+    self.Opt_GrillAuxValue = str(config_opt.get('GrillAuxValue', 'orig') or 'orig')    # v in v_mix: 'orig' (orig_q) | 'root'
+    # fewer VISITED children => plain target. Kovax' check counts STORED moves (n_actions >= 2); identical on cv4,
+    # where every legal move is stored and visited (review 2026-10-07), stricter on sparse-visit data.
+    self.Opt_GrillAuxMinVisited = int(config_opt.get('GrillAuxMinVisited', 2) or 2)
+    if self.Opt_GrillAuxHeadWeight < 0:
+      raise ValueError('GrillAuxHeadWeight must be >= 0')
+    if self.Opt_GrillAuxHeadWeight > 0:
+      if self.Data_SourceType != 'DirectFromV6':
+        raise ValueError(f'GrillAuxHeadWeight > 0 requires SourceType DirectFromV6 with a v8 corpus (got {self.Data_SourceType!r})')
+      if self.Opt_GrillAuxVisits not in ('raw', 'deforced'):
+        raise ValueError(f"GrillAuxVisits must be 'raw' or 'deforced' (got {self.Opt_GrillAuxVisits!r})")
+      if self.Opt_GrillAuxValue not in ('orig', 'root'):
+        raise ValueError(f"GrillAuxValue must be 'orig' or 'root' (got {self.Opt_GrillAuxValue!r})")
+      if self.Opt_GrillAuxC <= 0 or not (0.0 <= self.Opt_GrillAuxBeta <= 1.0) or self.Opt_GrillAuxN0 <= 0 or self.Opt_GrillAuxMinVisited < 1:
+        raise ValueError('GrillAuxC > 0, GrillAuxBeta in [0,1], GrillAuxN0 > 0 and GrillAuxMinVisited >= 1 required')
+    # SHORT-TERM VALUE aux head weight (censored q_st/d_st). Was env-only (CERES_STVALUE_WEIGHT): retired, config only.
+    if os.environ.get('CERES_STVALUE_WEIGHT') not in (None, ''):
+      raise ValueError('CERES_STVALUE_WEIGHT is retired: set "LossSTValueMultiplier" in the opt config')
+    self.Opt_LossSTValueMultiplier = float(config_opt.get('LossSTValueMultiplier', 0) or 0)
+    if self.Opt_LossSTValueMultiplier < 0:
+      raise ValueError('LossSTValueMultiplier must be >= 0')
     if self.NetDef_MoveTokenActionHead and (float(self.Opt_LossActionMultiplier or 0) > 0
                                             or float(self.Opt_LossActionPlayedMultiplier or 0) > 0):
       raise ValueError('MoveTokenActionHead and the MLP action head (LossActionMultiplier / LossActionPlayedMultiplier) '

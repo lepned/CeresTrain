@@ -676,7 +676,8 @@ class V6ChunkDataset(TPGDataset):
           stored_idx=np.where((k < ns) & (idx < 1858), idx, -1).astype(np.int16),
           stored_prior=np.where((k < ns) & (idx < 1858) & (recs['slot_prior'] != 65535),
                                 np.exp2(-recs['slot_prior'].astype(np.float32) / 2048.0), 0.0).astype(np.float32),
-          root_q=np.nan_to_num(recs['root_q']).astype(np.float32).reshape(-1, 1))
+          root_q=np.nan_to_num(recs['root_q']).astype(np.float32).reshape(-1, 1),
+          orig_q=recs['orig_q'].astype(np.float32).reshape(-1, 1))
 
     qdev_lower = recs['best_m'].astype(np.float16).reshape(-1, 1)   # see _decode_chunk
     qdev_upper = recs['orig_m'].astype(np.float16).reshape(-1, 1)
