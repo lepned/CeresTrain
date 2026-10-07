@@ -128,6 +128,7 @@ class Configuration:
       raise ValueError(f'V6QDeviationTargets must be a JSON boolean, got {_qd!r}')
     self.Data_V6QDeviationTargets = _qd
     self.Data_V6ShufflePool = config_data.get('V6ShufflePool', None)
+    self.Data_V6StreamPool = config_data.get('V6StreamPool', None)       # streaming shuffle pool (v6_dataset), steady output
     self.Data_V6MaxResultQDelta = config_data.get('V6MaxResultQDelta', None)
 
     # Initialize class members from config_exec

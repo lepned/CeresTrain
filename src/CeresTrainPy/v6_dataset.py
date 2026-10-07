@@ -176,6 +176,7 @@ class V6ChunkDataset(TPGDataset):
                file_mirror_prob: float = None,
                skip_count: int = None,
                sample_slots: int = None,
+               stream_pool: bool = None,
                shuffle_pool: int = None,
                max_resultq_delta: float = None,
                exclude_files=None,
@@ -232,6 +233,12 @@ class V6ChunkDataset(TPGDataset):
       raise ValueError(f'V6SampleSlots ({self.sample_slots}) and V6SkipCount ({self.skip_count}) both thin the games; '
                        f'set V6SkipCount 1 with V6SampleSlots')
     self.pool_size = _knob(shuffle_pool, 'CERES_V6_SHUFFLE_POOL', 50000, int)
+    # STREAMING SHUFFLE POOL (2026-10-07): instead of "fill the whole pool, then convert and emit all of it" (which leaves
+    # the worker silent for the 2-3 s a refill takes with rotating slots, and starves the GPUs when the prefetch runs dry),
+    # keep a resident pool and, once it holds pool_size records, emit a small random block (~2K records) after every
+    # chunk read (reservoir style). Same MEAN mixing window, with an exponential residence tail (some records leave
+    # early, some stay several pool-lengths); steady output. Off = the original fill/flush behaviour.
+    self.stream_pool = bool(_knob(stream_pool, 'CERES_V6_STREAM_POOL', False, lambda v: str(v).strip().lower() in ('1', 'true', 'yes')))
     self.max_resultq_delta = _knob(max_resultq_delta, 'CERES_V6_MAX_RESULTQ_DELTA', 0.0, float)
     # NOTE: num_files_to_skip counts CHUNKS (games, ~100 pos) here, not TPG
     # shards (millions of pos) — semantically different from the TPG path.
@@ -306,7 +313,8 @@ class V6ChunkDataset(TPGDataset):
     self._startup_diagnosis(entries_by_root)
     _n_tar = sum(1 for e in entries if e[0] == 'tar')
     print(f'[v6_dataset] {root_dir}: {len(entries):,} chunks ({_n_tar:,} in-tar), '
-          f'skip_count={self.skip_count}, sample_slots={self.sample_slots}, pool={self.pool_size:,}, '
+          f'skip_count={self.skip_count}, sample_slots={self.sample_slots}, pool={self.pool_size:,}'
+          f'{" (streaming)" if self.stream_pool else ""}, '
           f'rank {rank}/{world_size}, gzip={_GZIP_IMPL}')
     self.generator = self.item_generator()
 
@@ -774,6 +782,48 @@ class V6ChunkDataset(TPGDataset):
       rec_pool = [leftover] if len(leftover) and not final else []
       pool_count = len(leftover) if not final else 0
 
+    def _emit(recs, tag):
+      """Convert one block of records and yield it as batches of B (same tuple layout as _flush)."""
+      out = self._records_to_arrays(recs)
+      v7x = out[13]
+      v8x = out[14]
+      for b0 in range(0, len(recs), B):
+        sl = slice(b0, b0 + B)
+        v7x_b = (V7Extras(*[a[sl] if a is not None else None for a in v7x]) if v7x is not None else None)
+        v8x_b = (V8Extras(*[a[sl] for a in v8x]) if v8x is not None else None)
+        yield tuple(a[sl] for a in out[:13]) + (None, v7x_b, tag, v8x_b)
+
+    # streaming pool state: a preallocated record buffer and its fill count
+    EMIT = max(1, 2048 // B) * B                 # records per emitted block (a multiple of B; ~2K records)
+    sbuf = None
+    sn = 0
+
+    def _stream_add(recs):
+      nonlocal sbuf, sn
+      if sbuf is None:
+        sbuf = np.empty(self.pool_size + EMIT + 4 * len(recs) + 1024, dtype=recs.dtype)
+        sn = 0
+      elif sbuf.dtype != recs.dtype:
+        # unreachable while _decode_chunk pins the record version; never silently drop a full pool (review 10-07)
+        raise RuntimeError(f'DirectFromV6 stream pool: record dtype changed mid-stream ({sbuf.dtype} -> {recs.dtype})')
+      if sn + len(recs) > len(sbuf):
+        sbuf = np.concatenate([sbuf[:sn], np.empty(len(sbuf) + len(recs), dtype=sbuf.dtype)])
+      sbuf[sn:sn + len(recs)] = recs
+      sn += len(recs)
+
+    def _stream_take(k):
+      """Remove k uniformly random records from the pool (holes refilled from the tail) and return them."""
+      nonlocal sn
+      idx = np.random.choice(sn, k, replace=False)
+      taken = sbuf[idx].copy()
+      tail_start = sn - k
+      chosen_tail = idx[idx >= tail_start]
+      keep_tail = np.setdiff1d(np.arange(tail_start, sn), chosen_tail, assume_unique=True)
+      holes = idx[idx < tail_start]
+      sbuf[holes] = sbuf[keep_tail]
+      sn -= k
+      return taken
+
     epoch = 0
     while True:
       files = list(my_files)
@@ -792,12 +842,20 @@ class V6ChunkDataset(TPGDataset):
         _read_this_session += 1
         # Fail fast on a wrong-corpus mistake (finding 13) instead of idling
         # the GPUs for a full silent pass.
-        if processed == 0 and _read_this_session == _FAILFAST_CHUNKS and not rec_pool:
+        if processed == 0 and _read_this_session == _FAILFAST_CHUNKS and not rec_pool and sn == 0:
           raise RuntimeError(
               f'DirectFromV6: first {_FAILFAST_CHUNKS} chunks yielded no usable records '
               f'(read errors {self._read_errors}, other-version {self._skipped_other_version}, '
               f'non-format-1 {self._skipped_formats}) — wrong corpus?')
         if recs is None or len(recs) == 0:
+          continue
+        if self.stream_pool:
+          _stream_add(recs)
+          if sn >= self.pool_size + EMIT:
+            _tag = (f'{_tag_key}:e{epoch}', chunks_seen, chunks_seen)
+            while sn >= self.pool_size + EMIT:
+              processed += EMIT
+              yield from _emit(_stream_take(EMIT), _tag)
           continue
         rec_pool.append(recs)
         pool_count += len(recs)

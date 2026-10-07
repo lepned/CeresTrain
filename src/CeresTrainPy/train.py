@@ -1172,7 +1172,7 @@ def Train():
   NUM_DATASET_WORKERS = int(os.environ.get('CERES_NUM_DATASET_WORKERS', _DEFAULT_NUM_DATASET_WORKERS))
   if NUM_DATASET_WORKERS != _DEFAULT_NUM_DATASET_WORKERS:
     print(f'[train] NUM_DATASET_WORKERS override: {_DEFAULT_NUM_DATASET_WORKERS} -> {NUM_DATASET_WORKERS} (via CERES_NUM_DATASET_WORKERS)')
-  PREFETCH_FACTOR = None if NUM_DATASET_WORKERS == 0 else 4 # to keep GPU busy
+  PREFETCH_FACTOR = None if NUM_DATASET_WORKERS == 0 else int(os.environ.get('CERES_PREFETCH_FACTOR', '4') or 4)  # to keep GPU busy
  
   # world_size/rank come from torchrun (single-GPU: 1 and 0). Each rank reads a
   # disjoint file-shard (tpg_dataset slices files by rank/world_size) and a
@@ -1277,6 +1277,7 @@ def Train():
                                      skip_count=getattr(config, 'Data_V6SkipCount', None),
                                      sample_slots=getattr(config, 'Data_V6SampleSlots', None),
                                      shuffle_pool=getattr(config, 'Data_V6ShufflePool', None),
+                                     stream_pool=getattr(config, 'Data_V6StreamPool', None),
                                      max_resultq_delta=getattr(config, 'Data_V6MaxResultQDelta', None),
                                      **_ds_args(TPG_TRAIN_DIR))   # chunk-level datastream resume (v6_dataset, 2026-10-02)
   else:

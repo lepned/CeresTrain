@@ -104,6 +104,7 @@ BOOTSTRAP_ENV_MAP = {
     'V6SkipCount': 'CERES_V6_SKIP_COUNT',
     'V6SampleSlots': 'CERES_V6_SAMPLE_SLOTS',
     'V6ShufflePool': 'CERES_V6_SHUFFLE_POOL',
+    'V6StreamPool': 'CERES_V6_STREAM_POOL',
     # z-integrity filter for non-deblundered sets: drop positions where
     # |best_q - result_q| exceeds this (0 = off; ~neutral on deblundered data)
     'V6MaxResultQDelta': 'CERES_V6_MAX_RESULTQ_DELTA',
