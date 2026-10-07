@@ -471,6 +471,12 @@ class Configuration:
     #   DDPBF16Compress  send gradients as bf16 (halves the payload)
     self.Opt_DDPBucketCapMB = config_opt.get('DDPBucketCapMB', 0)
     self.Opt_DDPBF16Compress = bool(config_opt.get('DDPBF16Compress', False))
+    # DDPManualGradSync (2026-10-07, grad_sync.py): no DDP wrapper; gradients accumulate locally and are averaged across
+    # ranks ONCE per optimizer step (DDP static_graph all-reduces every micro-step). DDPBF16Compress applies to it too.
+    self.Opt_DDPManualGradSync = bool(config_opt.get('DDPManualGradSync', False))
+    # MuonDistributed (2026-10-07, muon.py enable_distributed): Newton-Schulz per matrix on one owner rank, updates
+    # broadcast; bit-identical to the replicated step, ~1/world of the NS compute per rank.
+    self.Opt_MuonDistributed = bool(config_opt.get('MuonDistributed', False))
     # Per-head Muon (Muon only, Kimi K3-style): orthogonalize each attention head's
     # projection block independently (qkv per-head x per-projection on the linear
     # path / per-projection on the nonlinear path; q2/k2/v2/q2b per-head rows;

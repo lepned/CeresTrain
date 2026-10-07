@@ -201,6 +201,84 @@ class Muon(torch.optim.Optimizer):
         for p in (hyperball_params or []):
             assert self.state[p].get("use_muon", False), "Hyperball only applies to Muon params"
 
+    def enable_distributed(self, rank: int, world_size: int):
+        """Distributed Muon (2026-10-07; opt MuonDistributed): the Newton-Schulz orthogonalisation of each Muon matrix
+        runs on ONE owner rank (owners balanced by NS cost) and the bf16 updates are shared with one broadcast per owner.
+        Momentum, weight decay and the update itself still run on every rank, so every rank keeps the full optimizer
+        state (rank 0 checkpoints it) and the result is bit-identical to the single-rank step. Requires identical
+        gradients on all ranks at step time (DDP or grad_sync.all_reduce_grads)."""
+        self._dist = (int(rank), int(world_size)) if world_size > 1 else None
+        self._owner = None
+
+    def _block_shape(self, p, g):
+        """Shape the lr adjustment uses: the per-head block for per-head Muon, else the parameter shape."""
+        hs = self.state[p].get("head_split")
+        if hs is not None:
+            axis, nb = hs
+            rows, cols = g.shape
+            return (rows // nb, cols) if axis == 0 else (rows, cols // nb)
+        return p.shape
+
+    def _assign_owners(self, entries, world):
+        """Greedy longest-processing-time assignment on the NS cost ~ rows * cols * min(rows, cols) per block."""
+        def cost(e):
+            p, g = e
+            r, c = self._block_shape(p, g)[:2]
+            nb = self.state[p]["head_split"][1] if self.state[p].get("head_split") is not None else 1
+            return nb * r * c * min(r, c)
+        load = [0] * world
+        owner = {}
+        for i in sorted(range(len(entries)), key=lambda i: (-cost(entries[i]), i)):
+            k = min(range(world), key=lambda r: (load[r], r))
+            owner[id(entries[i][0])] = k
+            load[k] += cost(entries[i])
+        return owner
+
+    def _orthogonalize(self, p, g, ns_steps):
+        """-> u (bf16, g's 2-D shape)."""
+        head_split = self.state[p].get("head_split")
+        if head_split is not None:
+            # Per-head Muon: orthogonalize each head's block independently.
+            axis, nb = head_split
+            rows, cols = g.shape
+            if axis == 0:
+                G3 = g.view(nb, rows // nb, cols)
+            else:
+                G3 = g.view(rows, nb, cols // nb).transpose(0, 1)
+            U3 = zeropower_via_newtonschulz5_batched(G3, steps=ns_steps)
+            if axis == 0:
+                return U3.reshape(rows, cols)
+            return U3.transpose(0, 1).reshape(rows, cols)
+        return zeropower_via_newtonschulz5(g, steps=ns_steps)
+
+    def _apply_update(self, group, p, u, block_shape, lr, wd):
+        """Weight decay + the orthogonalised update (or the Hyperball step) for one Muon parameter."""
+        state = self.state[p]
+        lr_p = lr * self._lr_ratios.get(p, 1.0)
+        adjusted_lr = self.adjust_lr_for_muon(lr_p, block_shape)
+        if id(p) in self._hyperball:
+            # Hyperball step: fixed update norm, then projection back onto the sphere
+            # of radius R. fp32 math; the model keeps fp32 master weights (bf16-mixed).
+            if "hb_radius" not in state:
+                state["hb_radius"] = p.data.float().norm().item()
+                if state["hb_radius"] == 0.0:
+                    print('[muon] Hyperball: a parameter has ZERO norm at its first Hyperball step (zero-init warm-start '
+                          'module, e.g. a grown decoder block) — the sphere projection would pin it at 0 forever; '
+                          'taking plain Muon steps for it instead (R stays 0 => excluded)', flush=True)
+        if id(p) in self._hyperball and state.get("hb_radius", 0.0) > 0.0:
+            R = state["hb_radius"]
+            u32 = u.float()
+            eta = lr_p * group.get("hyperball_lr_ratio", 1.0)
+            w = p.data.float().add_(u32, alpha=-(eta * R / (u32.norm() + 1e-12)))
+            w.mul_(R / (w.norm() + 1e-12))
+            p.data.copy_(w)
+            return
+        # apply weight decay (family-scaled lr => decay stays
+        # proportional to the actual step size, matching AdamW branch)
+        p.data.mul_(1 - lr_p * wd * self._wd_scales.get(p, 1.0))
+        # apply update
+        p.data.add_(u, alpha=-adjusted_lr)
+
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
         # We adjust the learning rate and weight decay based on the size of the parameter matrix
@@ -233,74 +311,69 @@ class Muon(torch.optim.Optimizer):
             wd = group["wd"]
             momentum = group["momentum"]
 
-            # generate weight updates in distributed fashion
-            for p in params:
-                # sanity check
+            dist_cfg = getattr(self, "_dist", None)
+
+            def _momentum(p):
+                """Momentum update (every rank) -> the Nesterov gradient (2-D), or None if p has no grad."""
                 g = p.grad
                 if g is None:
-                    continue
+                    return None
                 if g.ndim > 2:
                     g = g.view(g.size(0), -1)
-                assert g is not None
-
-                # calc update
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-                lr_p = lr * self._lr_ratios.get(p, 1.0)
-                head_split = state.get("head_split")
-                if head_split is not None:
-                    # Per-head Muon: orthogonalize each head's block independently.
-                    axis, nb = head_split
-                    rows, cols = g.shape
-                    if axis == 0:
-                        G3 = g.view(nb, rows // nb, cols)
+                return g.add(buf, alpha=momentum) if group["nesterov"] else buf
+
+            if dist_cfg is None:
+                # replicated step, streamed one parameter at a time (peak memory as before the distributed rework)
+                for p in params:
+                    g = _momentum(p)
+                    if g is None:
+                        continue
+                    u = self._orthogonalize(p, g, group["ns_steps"])
+                    self._apply_update(group, p, u, self._block_shape(p, g), lr, wd)
+            else:
+                # distributed: momentum everywhere, Newton-Schulz on the owner, one broadcast per owner, apply everywhere.
+                # Non-owners keep only the shapes; owners drop each Nesterov gradient as soon as its NS is done.
+                import torch.distributed as _tdist
+                from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+                rank, world = dist_cfg
+                entries = []                                   # (p, 2-D shape, block shape, device)
+                us = {}
+                gs = []
+                for p in params:
+                    g = _momentum(p)
+                    if g is None:
+                        continue
+                    entries.append((p, tuple(g.shape), self._block_shape(p, g), g.device))
+                    gs.append(g)
+                if self._owner is None:
+                    self._owner = {}
+                if any(id(e[0]) not in self._owner for e in entries):
+                    self._owner.update(self._assign_owners([(e[0], g) for e, g in zip(entries, gs)], world))
+                for (p, _, _, _), g in zip(entries, gs):
+                    if self._owner[id(p)] == rank:
+                        us[id(p)] = self._orthogonalize(p, g, group["ns_steps"])
+                del gs, g
+                for r in range(world):
+                    mine = [e for e in entries if self._owner[id(e[0])] == r]
+                    if not mine:
+                        continue
+                    if r == rank:
+                        tens = [us[id(e[0])].contiguous() for e in mine]
                     else:
-                        G3 = g.view(rows, nb, cols // nb).transpose(0, 1)
-                    U3 = zeropower_via_newtonschulz5_batched(G3, steps=group["ns_steps"])
-                    if axis == 0:
-                        u = U3.reshape(rows, cols)
-                        block_shape = (rows // nb, cols)
-                    else:
-                        u = U3.transpose(0, 1).reshape(rows, cols)
-                        block_shape = (rows, cols // nb)
-                    adjusted_lr = self.adjust_lr_for_muon(lr_p, block_shape)
-                else:
-                    u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-
-                    # scale update
-                    adjusted_lr = self.adjust_lr_for_muon(lr_p, p.shape)
-
-                if id(p) in self._hyperball:
-                    # Hyperball step: fixed update norm, then projection back onto the sphere
-                    # of radius R. fp32 math; the model keeps fp32 master weights (bf16-mixed).
-                    if "hb_radius" not in state:
-                        state["hb_radius"] = p.data.float().norm().item()
-                        if state["hb_radius"] == 0.0:
-                            print('[muon] Hyperball: a parameter has ZERO norm at its first Hyperball step (zero-init warm-start '
-                                  'module, e.g. a grown decoder block) — the sphere projection would pin it at 0 forever; '
-                                  'taking plain Muon steps for it instead (R stays 0 => excluded)', flush=True)
-                    R = state["hb_radius"]
-                if id(p) in self._hyperball and state.get("hb_radius", 0.0) > 0.0:
-                    R = state["hb_radius"]
-                    u32 = u.float()
-                    eta = lr_p * group.get("hyperball_lr_ratio", 1.0)
-                    w = p.data.float().add_(u32, alpha=-(eta * R / (u32.norm() + 1e-12)))
-                    w.mul_(R / (w.norm() + 1e-12))
-                    p.data.copy_(w)
-                    continue
-                # apply weight decay (family-scaled lr => decay stays
-                # proportional to the actual step size, matching AdamW branch)
-                p.data.mul_(1 - lr_p * wd * self._wd_scales.get(p, 1.0))
-
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
+                        tens = [torch.empty(e[1], dtype=torch.bfloat16, device=e[3]) for e in mine]
+                    flat = _flatten_dense_tensors(tens)
+                    _tdist.broadcast(flat, src=r)
+                    if r != rank:
+                        for e, t in zip(mine, _unflatten_dense_tensors(flat, tens)):
+                            us[id(e[0])] = t
+                    del flat, tens
+                for p, _, block_shape, _ in entries:
+                    self._apply_update(group, p, us.pop(id(p)), block_shape, lr, wd)
 
             ############################
             #       AdamW backup       #

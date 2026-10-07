@@ -1010,6 +1010,10 @@ def Train():
             f"relative step {config.Opt_HyperballRelativeLR} at peak (ratio {_hb_ratio:.4g} to LearningRateBase {LR}); "
             f"no weight decay on them (R = norm at first Hyperball step, kept in optimizer state)", flush=True)
     optimizer = Muon(lr=LR, wd=WEIGHT_DECAY, momentum=_muon_mom, adamw_betas=(config.Opt_Beta1, config.Opt_Beta2), adamw_eps=_muon_aeps, muon_params=muon_params, adamw_params=adamw_params, adamw_lr=_heads_lr, head_split_specs=_phm_specs or None, lr_ratios=_lr_ratios or None, wd_scales=_wd_scales, hyperball_params=_hb_params, hyperball_lr_ratio=_hb_ratio)
+    if IS_DISTRIBUTED and bool(getattr(config, 'Opt_MuonDistributed', False)):
+      # Newton-Schulz on one owner rank per matrix, updates broadcast (muon.py enable_distributed); bit-identical result
+      optimizer.enable_distributed(RANK, WORLD_SIZE)
+      print(f'[muon] DISTRIBUTED Newton-Schulz across {WORLD_SIZE} ranks (owner-balanced, bf16 updates broadcast)', flush=True)
     if getattr(config, 'Opt_MuonMomentum', None) is not None or getattr(config, 'Opt_MuonAdamWEps', None) is not None:
       print(f'[train] Muon decoupled: momentum={_muon_mom} (adamw beta1={config.Opt_Beta1}), adamw_eps={_muon_aeps}')
   elif config.Opt_Optimizer == 'AdEMAMix':
@@ -1070,7 +1074,18 @@ def Train():
   if config.Exec_DataType == 'BFloat16Pure':
     model = model.to(torch.bfloat16)
   DDP_STATIC_GRAPH = False   # set below when DDP is active; read by the train loop
-  if IS_DISTRIBUTED:
+  MANUAL_GRAD_SYNC = bool(IS_DISTRIBUTED and getattr(config, 'Opt_DDPManualGradSync', False))
+  _sync_params = None
+  if MANUAL_GRAD_SYNC:
+    # No DDP wrapper (grad_sync.py): start every rank from rank 0's weights, then average gradients once per
+    # optimizer step in the train loop. The used-parameter set may vary per step (handled by the presence mask).
+    from grad_sync import broadcast_model as _gs_broadcast, all_reduce_grads as _gs_all_reduce
+    _gs_broadcast(model)
+    _sync_params = [p for p in model.parameters() if p.requires_grad]
+    print(f'[ddp] MANUAL gradient sync: no DDP wrapper, one all-reduce per optimizer step over {len(_sync_params)} '
+          f'params ({"bf16" if bool(getattr(config, "Opt_DDPBF16Compress", False)) else "fp32"} on the wire); '
+          f'CERES_DDP_STATIC_GRAPH / CERES_DDP_FIND_UNUSED / DDPBucketCapMB do not apply', flush=True)
+  elif IS_DISTRIBUTED:
     # Two DDP modes, chosen by the data layout:
     #
     #  * BOARDS_PER_BATCH==1 (single forward per backward): default mode with
@@ -1708,7 +1723,7 @@ def Train():
       or getattr(core, 'mt_aux_mlp_w', 0) > 0
       # child-q distribution heads + Grill aux head (2026-10-07)
       or getattr(core, 'cq_abs_weight', 0) > 0 or getattr(core, 'cq_gap_weight', 0) > 0
-      or getattr(core, 'grill_aux_weight', 0) > 0) and WORLD_SIZE > 1:
+      or getattr(core, 'grill_aux_weight', 0) > 0) and WORLD_SIZE > 1 and not MANUAL_GRAD_SYNC:
     if not _static_graph:
       raise NotImplementedError(
         'placement/survival/stvalue/depth-probe/opp-policy/optimistic-policy/move-token-value-order/child-q-dist/grill-aux '
@@ -2566,7 +2581,7 @@ def Train():
     # and sum-over-microsteps of mean-over-ranks == mean-over-ranks of
     # sum-over-microsteps. The only cost is one all-reduce per micro-step
     # instead of one per optimizer step — bandwidth, not correctness.
-    if IS_DISTRIBUTED and not DDP_STATIC_GRAPH:
+    if IS_DISTRIBUTED and not DDP_STATIC_GRAPH and not MANUAL_GRAD_SYNC:
       model.require_backward_grad_sync = (not is_accumulating)
     # Autocast handles bf16-mixed precision (Fabric did this implicitly via
     # precision='bf16-mixed').
@@ -3152,6 +3167,8 @@ def Train():
     loss.backward()
 
     if not is_accumulating:
+      if MANUAL_GRAD_SYNC:
+        _gs_all_reduce(_sync_params, WORLD_SIZE, bf16=bool(getattr(config, 'Opt_DDPBF16Compress', False)))
       if config.Opt_GradientClipLevel > 0:
         # NOTE: we deliberately do NOT pass error_if_nonfinite=True here. Lightning
         # Fabric's clip_gradients defaulted that to True, which forced a CUDA-sync
