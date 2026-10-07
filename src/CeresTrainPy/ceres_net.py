@@ -1478,6 +1478,28 @@ class CeresNet(nn.Module):
       self.transformer_layer = torch.nn.Sequential(
          *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])
 
+    # EGT edge stream (egt_edge.py; config EGTEdgeStream). Built in a forked RNG under a fixed seed so every other
+    # parameter initializes bit-identically with and without it; its readers are zero-init (step 0 == without it).
+    self.egt = None
+    if getattr(config, 'NetDef_EGTEdgeStream', False):
+      assert self.NBT_INNER_LAYERS > 0 and self.LOOP_COUNT == 1 and not self.denseformer, (
+        'EGTEdgeStream: NBT trunk, LoopCount 1, no DenseFormer')
+      assert not (config.NetDef_UseDiffAttention or config.NetDef_UseRoPE or config.NetDef_UseRPE
+                  or config.NetDef_NonLinearAttention), 'EGTEdgeStream: plain QKV inner attention only'
+      assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),         'EGTEdgeStream: per-layer smolgen in the inner layers is not supported (NBTSharedSmolgen or smolgen off)'
+      from egt_edge import EGTEdgeStream
+      _egt_fams = [f.strip() for f in config.NetDef_EGTEdgeFamilies.split(',') if f.strip()]
+      with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0xE6E)
+        self.egt_vis_module = VisibilityChannels(families=_egt_fams)
+        self.egt = EGTEdgeStream(self.egt_vis_module.num_channels, self.NUM_DISTINCT_LAYERS, config.NetDef_NBTInnerHeads,
+                                 config.NetDef_EGTEdgeDim, config.NetDef_EGTEdgeSites, config.NetDef_EGTEdgeTripletHeads,
+                                 config.NetDef_EGTEdgeFFNMult)
+      print(f'[ceres_net] EGT EDGE STREAM (TRT form): d_e={config.NetDef_EGTEdgeDim}, families={self.egt_vis_module.families} '
+            f'({self.egt_vis_module.num_channels} ch), read once per NBT block, update sites after blocks '
+            f'{list(self.egt.sites)} (readback + path triplet x{config.NetDef_EGTEdgeTripletHeads} + FFN x{config.NetDef_EGTEdgeFFNMult}), '
+            f'{sum(p.numel() for p in self.egt.parameters()) / 1e3:.1f}k params, zero-init readers')
+
     # Pre-norm trunks need a final norm AFTER the stack and before the heads,
     # because the residual stream is unnormalized at the stack output (each
     # block applies norm only to its sublayer input, never to the residual).
@@ -2045,6 +2067,9 @@ class CeresNet(nn.Module):
     # per effective layer position) — guard against it explicitly.
     if self.denseformer and self.LOOP_COUNT != 1:
       raise NotImplementedError("DenseFormer is not supported with LoopCount > 1.")
+    _egt_e = None
+    if self.egt is not None:
+      _egt_e = self.egt.init_state(self.egt_vis_module(squares[:, :, 0:13]).to(flow.dtype))   # [B, 64, 64, d_e]
     for loop_iter in range(self.LOOP_COUNT):
       for i in range(self.NUM_DISTINCT_LAYERS):
         _prb_l = piece_relation_bias_tensor
@@ -2053,13 +2078,24 @@ class CeresNet(nn.Module):
         if vis_edge_biases is not None:
           _vb = vis_edge_biases[i]  # [B, H, 64, 64], precomputed above
           _prb_l = _vb if _prb_l is None else _prb_l + _vb
+        _egt_kw = {}
+        _egt_site = False
+        if _egt_e is not None:
+          _egt_bias, _egt_scales = self.egt.read(i, _egt_e)
+          _prb_l = _egt_bias if _prb_l is None else _prb_l + _egt_bias.to(_prb_l.dtype)
+          _egt_site = self.egt.is_site(i)
+          _egt_kw = {'edge_scales': _egt_scales, 'want_logits': _egt_site}
         flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l,
                                          film=None if phase_film_tensor is None else
                                               (phase_film_tensor[:, i, 0].unsqueeze(1),
                                                phase_film_tensor[:, i, 1].unsqueeze(1)),
                                          rpe_src=rpe_src_tensor,
                                          rpe_precomputed=rpe_gen_biases is not None,
-                                         vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None)
+                                         vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None,
+                                         **_egt_kw)
+        if _egt_site:
+          flow, _egt_logits = flow
+          _egt_e = self.egt.update(i, _egt_e, _egt_logits)
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)

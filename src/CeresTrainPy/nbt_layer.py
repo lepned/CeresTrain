@@ -59,6 +59,7 @@ projection activations.
 
 from typing import Callable, Tuple
 
+import math
 import torch
 
 from activation_functions import to_activation
@@ -167,7 +168,8 @@ class NestedBottleneckLayer(torch.nn.Module):
               film: Tuple[torch.Tensor, torch.Tensor] = None,
               rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False,
-              vis_edge: torch.Tensor = None) -> torch.Tensor:
+              vis_edge: torch.Tensor = None,
+              edge_scales = None, want_logits: bool = False):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -182,8 +184,12 @@ class NestedBottleneckLayer(torch.nn.Module):
       sb = self.shared_smolgen(h0)
       piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
     h = self.down(self.act_in(h0))
-    for layer in self.inner:
-      h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge)
+    logits = None
+    for j, layer in enumerate(self.inner):
+      if want_logits and j == len(self.inner) - 1:
+        logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales)
+      h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
+                edge_scales=edge_scales)
     out = self.up(self.act_out(self.norm_out(h)))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output
@@ -191,4 +197,35 @@ class NestedBottleneckLayer(torch.nn.Module):
     # (it is zero-init, so the block stays an identity at step 0).
     if film is not None:
       out = out * (1.0 + film[0]) + film[1]
+    if want_logits:
+      return x + out, logits
     return x + out
+
+  @staticmethod
+  def _raw_logits(layer, h, piece_relation_bias, edge_scales):
+    """Pre-softmax scores [B,H,64,64] of one inner layer, for the EGT edge-stream readback (egt_edge.py). Recomputes
+    Q/K with the layer's own projection (one extra qkv GEMM per site) instead of returning them from the attention,
+    which keeps the attention's fused score path and its signature unchanged. Standard QKV attention only."""
+    att = layer.attention
+    assert (att.use_qkv and not att.use_nonlinear_attention and not att.use_diff_attention and not att.use_rope
+            and not att.use_rpe and not att.use_smolgen), 'EGT readback: plain QKV inner attention only'
+    inp = layer.ln1(h) if layer.pre_norm else h
+    B = inp.shape[0]
+    dk = att.d_k * att.attention_multiplier
+    qkv = att.qkv(inp).reshape(B, -1, att.num_heads, 3 * dk).permute(0, 2, 1, 3)
+    Q, K, _ = qkv.chunk(3, dim=-1)
+    if att.use_qk_norm:
+      Q, K = att.qLN(Q), att.kLN(K)
+    if edge_scales is not None:
+      Q = Q * edge_scales[0].unsqueeze(-1).to(Q.dtype)
+      K = K * edge_scales[1].unsqueeze(-1).to(K.dtype)
+    s = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(dk)
+    if piece_relation_bias is not None:
+      s = s + piece_relation_bias.to(s.dtype)
+    # same post-bias steps as sdp_and_smol_or_rpe (review 2026-10-07): the readback must see exactly the scores the
+    # softmax saw, so the per-head logit temperature and the softcap are applied here too
+    if att.use_head_logit_temp:
+      s = s * torch.exp(att.head_logit_temp.clamp(-2.0, 2.0)).reshape(1, att.num_heads, 1, 1).to(s.dtype)
+    if att.softcap_cutoff > 0:
+      s = att.soft_cap(s, att.softcap_cutoff)
+    return s

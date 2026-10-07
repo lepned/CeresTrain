@@ -743,6 +743,7 @@ def Train():
       if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
       if 'move_tokens.act.' in n: return False   # action WDL readout [3, dm]: a final layer like pol, AdamW
       if ('cq_abs_head.' in n or 'cq_gap_head.' in n) and (n.endswith('w_bins') or n.endswith('pos_w')): return False  # zero-init child-q readout tables (review 2026-10-07), AdamW
+      if n.startswith('egt.'): return False      # EGT edge stream: zero-init readers + lookup tables (review 2026-10-07), AdamW
       if 'move_tokens.rq_head.' in n: return False   # reply-q readout [1, dk]: training-only 1-row final layer, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
@@ -1969,7 +1970,9 @@ def Train():
     # from-scratch state.)
     _AUX_HEAD_PREFIXES = ('placement_value_', 'survival_head.', 'stvalue_', 'vda_', 'phase_film', 'ray_bias_', 'depth_probe_', 'depth_ctl_', 'rc_', 'vc_head.', 'sp_head.', 'hlg_head.', 'opt_head.', 'oppp_head.', 'action_head.',
                           # 2026-10-07: child-q distribution heads + Grill aux head (training-only; cq bins zero-init)
-                          'cq_abs_head.', 'cq_gap_head.', 'grill_head.')
+                          'cq_abs_head.', 'cq_gap_head.', 'grill_head.',
+                          # EGT edge stream: zero-init readers => fresh-init on warm start reproduces the base net
+                          'egt.')
     # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
     # exist on one side of a resume — they are zero-init, so the net is bit-identical
     # to the base at step 0 and fresh-initializing them is exactly right.

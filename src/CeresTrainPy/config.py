@@ -1087,6 +1087,25 @@ class Configuration:
     # their own. NBTSharedSmolgenDim = its sm2 width (0 = SmolgenDim). Needs smolgen on.
     self.NetDef_NBTSharedSmolgen = bool(config_net_def.get('NBTSharedSmolgen', False))
     self.NetDef_NBTSharedSmolgenDim = int(config_net_def.get('NBTSharedSmolgenDim', 0) or 0)
+    # EGT EDGE STREAM in TRT-servable form (2026-10-07, egt_edge.py; NBT trunks only): a learned edge state read once per
+    # NBT block (additive bias + log-door, separable q/k premult, row-scale door) and updated (readback, path triplet,
+    # edge FFN) after the blocks listed in EGTEdgeSites. Zero-init readers: step 0 == the net without it.
+    self.NetDef_EGTEdgeStream = bool(config_net_def.get('EGTEdgeStream', False))
+    self.NetDef_EGTEdgeDim = int(config_net_def.get('EGTEdgeDim', 16) or 16)
+    _egt_sites = config_net_def.get('EGTEdgeSites', [2, 5])
+    if isinstance(_egt_sites, str):
+      _egt_sites = [int(t) for t in _egt_sites.split(',') if t.strip()]
+    self.NetDef_EGTEdgeSites = [int(t) for t in _egt_sites]
+    self.NetDef_EGTEdgeFFNMult = int(config_net_def.get('EGTEdgeFFNMult', 2) or 2)
+    self.NetDef_EGTEdgeTripletHeads = int(config_net_def.get('EGTEdgeTripletHeads', 4) or 4)
+    self.NetDef_EGTEdgeFamilies = str(config_net_def.get('EGTEdgeFamilies', 'vis,xray,pinray,check,flight'))
+    if self.NetDef_EGTEdgeStream:
+      if self.NetDef_NBTInnerLayers <= 0:
+        raise ValueError('EGTEdgeStream requires an NBT trunk (NBTInnerLayers > 0)')
+      if not self.NetDef_EGTEdgeSites:
+        raise ValueError('EGTEdgeStream needs at least one EGTEdgeSites entry (the readback/triplet/FFN update sites)')
+      if self.NetDef_EGTEdgeDim % self.NetDef_EGTEdgeTripletHeads != 0:
+        raise ValueError('EGTEdgeDim must be divisible by EGTEdgeTripletHeads')
     if self.NetDef_NBTInnerLayers > 0:
       if self.NetDef_NBTMidDim % self.NetDef_NBTInnerHeads != 0:
         raise ValueError(f"NBT inner width {self.NetDef_NBTMidDim} must be divisible by the inner head count ({self.NetDef_NBTInnerHeads})")

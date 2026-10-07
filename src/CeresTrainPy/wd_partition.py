@@ -132,6 +132,10 @@ def partition_weight_decay(model):
               # weights. no_decay, as Kovax runs them (his decay selector is '**/kernel' = Linear
               # kernels only); the heads' own Linears (tokens/q/k) fall through to the whitelist.
               no_decay.add(fpn)
+          elif fpn.startswith("egt."):
+              # EGT edge stream (2026-10-07, egt_edge.py): raw edge-space tables and gains (readers zero-init),
+              # not nn.Linear weights. no_decay, as Kovax runs them (his decay selector is '**/kernel').
+              no_decay.add(fpn)
           elif fpn.endswith("mm_alpha_v") or fpn.endswith("mm_alpha_r"):
               # 2026-09-16 minimax readout: two zero-init SCALARS mixing the per-move value
               # and value-after-reply estimates into the policy logit. Scalars are not

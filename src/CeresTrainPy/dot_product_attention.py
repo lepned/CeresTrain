@@ -924,7 +924,8 @@ class DotProductAttention(torch.nn.Module):
 
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
-              rpe_precomputed: bool = False, vis_edge: torch.Tensor = None) -> torch.Tensor:
+              rpe_precomputed: bool = False, vis_edge: torch.Tensor = None,
+              edge_scales = None) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -983,6 +984,13 @@ class DotProductAttention(torch.nn.Module):
       else:
         Q = self.qLN(Q)
       K = self.kLN(K)
+
+    # EGT edge stream (egt_edge.py): separable premult as per-(head, square) scales on Q (rows) and K (columns).
+    # Elementwise on Q/K, so the score path stays a plain QK^T (+ additive bias) that TRT can fuse.
+    if edge_scales is not None:
+      assert not isinstance(Q, tuple), 'EGT edge stream: standard (non-diff) attention only'
+      Q = Q * edge_scales[0].unsqueeze(-1).to(Q.dtype)
+      K = K * edge_scales[1].unsqueeze(-1).to(K.dtype)
 
     # RPE-from-embedding experiment: project the layer-0 embedding through THIS
     # layer's own qkv weights and route the results into the RPE einsums only
@@ -1114,6 +1122,10 @@ class DotProductAttention(torch.nn.Module):
         H_cat, A = self.sdp_diff(Q1, Q2, K, V, None, qkv_x, piece_relation_bias=piece_relation_bias)
       else:
         H_cat, A = self.sdp_and_smol_or_rpe(Q, K, V, None, piece_relation_bias=piece_relation_bias, Q_rpe=Q_rpe, K_rpe=K_rpe, rpe_precomputed=rpe_precomputed, graph_route=_graph_route)
+
+    # EGT edge stream: the post-softmax door as a per-(head, row) scale on the head output.
+    if edge_scales is not None:
+      H_cat = H_cat * edge_scales[2].unsqueeze(-1).to(H_cat.dtype)
 
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)
