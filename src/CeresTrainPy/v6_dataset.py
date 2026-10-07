@@ -175,6 +175,7 @@ class V6ChunkDataset(TPGDataset):
                test: bool = False,
                file_mirror_prob: float = None,
                skip_count: int = None,
+               sample_slots: int = None,
                shuffle_pool: int = None,
                max_resultq_delta: float = None,
                exclude_files=None,
@@ -219,6 +220,17 @@ class V6ChunkDataset(TPGDataset):
       v = os.environ.get(env)
       return cast(v) if v not in (None, '') else default
     self.skip_count = _knob(skip_count, 'CERES_V6_SKIP_COUNT', 30, int)
+    # ROTATING DISJOINT SLOTS (2026-10-07, Kovax' position_sampling_rate made resume-exact): every record of a game gets
+    # a fixed slot in 0..S-1 (balanced random permutation seeded by run seed + chunk identity); epoch e of a worker keeps
+    # only slot e mod S. Over S epochs every position is used exactly once (no repeats, no holes), and each pass sees
+    # ~1/S of every game, i.e. S times more games per window than skip 1. The epoch is part of the datastream resume
+    # state, so a restart continues the same rotation. 0 = off. Mutually exclusive with V6SkipCount > 1.
+    self.sample_slots = _knob(sample_slots, 'CERES_V6_SAMPLE_SLOTS', 0, int)
+    if self.sample_slots < 0 or self.sample_slots == 1:
+      raise ValueError(f'V6SampleSlots must be 0 (off) or >= 2 (got {self.sample_slots})')
+    if self.sample_slots and self.skip_count > 1:
+      raise ValueError(f'V6SampleSlots ({self.sample_slots}) and V6SkipCount ({self.skip_count}) both thin the games; '
+                       f'set V6SkipCount 1 with V6SampleSlots')
     self.pool_size = _knob(shuffle_pool, 'CERES_V6_SHUFFLE_POOL', 50000, int)
     self.max_resultq_delta = _knob(max_resultq_delta, 'CERES_V6_MAX_RESULTQ_DELTA', 0.0, float)
     # NOTE: num_files_to_skip counts CHUNKS (games, ~100 pos) here, not TPG
@@ -294,7 +306,7 @@ class V6ChunkDataset(TPGDataset):
     self._startup_diagnosis(entries_by_root)
     _n_tar = sum(1 for e in entries if e[0] == 'tar')
     print(f'[v6_dataset] {root_dir}: {len(entries):,} chunks ({_n_tar:,} in-tar), '
-          f'skip_count={self.skip_count}, pool={self.pool_size:,}, '
+          f'skip_count={self.skip_count}, sample_slots={self.sample_slots}, pool={self.pool_size:,}, '
           f'rank {rank}/{world_size}, gzip={_GZIP_IMPL}')
     self.generator = self.item_generator()
 
@@ -435,7 +447,20 @@ class V6ChunkDataset(TPGDataset):
 
   # ---- decoding ---------------------------------------------------------
 
-  def _decode_chunk(self, data: bytes):
+  @staticmethod
+  def slot_of_records(n: int, chunk_key: str, num_slots: int) -> np.ndarray:
+    """[n] slot index per record of one game: a balanced random assignment (each slot gets n/S records, +-1),
+    seeded by the run seed and the chunk's identity, identical on every pass and every resume."""
+    rng = np.random.default_rng(stable_str_hash(f'{chunk_key}|{_RUN_SHUFFLE_SEED}') & 0x7fffffff)
+    slots = np.empty(n, dtype=np.int64)
+    slots[rng.permutation(n)] = np.arange(n) % num_slots
+    return slots
+
+  @staticmethod
+  def chunk_key(entry) -> str:
+    return entry[1] if entry[0] == 'fs' else f'{entry[1]}@{entry[2]}'
+
+  def _decode_chunk(self, data: bytes, entry=None, epoch: int = None):
     """Bytes of one chunk -> structured record array (game order preserved;
     downsampled; played_q_suboptimality precomputed game-wise into the
     otherwise-unused 'played_m' field — finding 5: C# takes it from the
@@ -469,6 +494,9 @@ class V6ChunkDataset(TPGDataset):
       pqs[1:] = np.maximum(bq[:-1] - pq[:-1], 0.0)
     recs = recs.copy()                             # frombuffer view is read-only
     recs['played_m'] = pqs                         # repurposed (see docstring)
+    # rotating slots: assigned on the FULL game (before any filtering) so a record's slot never depends on filters
+    slot = (self.slot_of_records(n, self.chunk_key(entry), self.sample_slots)
+            if (getattr(self, 'sample_slots', 0) and entry is not None and epoch is not None) else None)
     # q-deviation targets (TPG generator CalcForwardBlunders, ported 2026-10-05):
     # over the rest of the game j >= i, q_our(j) = best_q(j) from the side to move
     # at i; lower = largest drop below best_q(i), upper = largest rise (j = i gives
@@ -504,8 +532,16 @@ class V6ChunkDataset(TPGDataset):
       zok = np.abs(bq - np.nan_to_num(recs['result_q'])) <= self.max_resultq_delta
       self._zfiltered += int((~zok).sum())
       recs = recs[zok]
+      if slot is not None:
+        slot = slot[zok]
       if len(recs) == 0:
         return None
+    # Rotating disjoint slots: this pass keeps slot (epoch mod S).
+    if slot is not None:
+      keep = slot == (epoch % self.sample_slots)
+      if not keep.any():
+        return None
+      recs = recs[keep]
     # Downsample 1/skip_count (decorrelation, random per pass).
     if self.skip_count > 1:
       keep = np.random.random(len(recs)) < (1.0 / self.skip_count)
@@ -751,7 +787,7 @@ class V6ChunkDataset(TPGDataset):
         chunks_seen = _start_k
       _read_this_session = 0
       for fp in files:
-        recs = self._decode_chunk(self._read_entry(fp))
+        recs = self._decode_chunk(self._read_entry(fp), entry=fp, epoch=epoch)
         chunks_seen += 1
         _read_this_session += 1
         # Fail fast on a wrong-corpus mistake (finding 13) instead of idling

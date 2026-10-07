@@ -1259,6 +1259,7 @@ def Train():
                                      config.Exec_TestFlag,
                                      file_mirror_prob=_MIRROR_PRIMARY,
                                      skip_count=getattr(config, 'Data_V6SkipCount', None),
+                                     sample_slots=getattr(config, 'Data_V6SampleSlots', None),
                                      shuffle_pool=getattr(config, 'Data_V6ShufflePool', None),
                                      max_resultq_delta=getattr(config, 'Data_V6MaxResultQDelta', None),
                                      **_ds_args(TPG_TRAIN_DIR))   # chunk-level datastream resume (v6_dataset, 2026-10-02)

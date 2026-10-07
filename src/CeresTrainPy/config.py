@@ -120,6 +120,7 @@ class Configuration:
     # These live in the DATA config (review finding 15: the opt-config
     # bootstrap bridge alone made the recipe's data-config examples no-ops).
     self.Data_V6SkipCount = config_data.get('V6SkipCount', None)
+    self.Data_V6SampleSlots = config_data.get('V6SampleSlots', None)   # rotating disjoint slots (v6_dataset), 0 = off
     # q-deviation targets computed per game by the V6 loader (ported from the TPG generator,
     # 2026-10-05). Opt-in: false keeps the old behaviour (loss scaled to 0 on V6).
     _qd = config_data.get('V6QDeviationTargets', False)

@@ -102,6 +102,7 @@ BOOTSTRAP_ENV_MAP = {
     # across epochs, unlike gen-tpg's permanent skip) and the per-worker
     # raw-record shuffle pool (RAM = pool * workers * 8.4 KB).
     'V6SkipCount': 'CERES_V6_SKIP_COUNT',
+    'V6SampleSlots': 'CERES_V6_SAMPLE_SLOTS',
     'V6ShufflePool': 'CERES_V6_SHUFFLE_POOL',
     # z-integrity filter for non-deblundered sets: drop positions where
     # |best_q - result_q| exceeds this (0 = off; ~neutral on deblundered data)
