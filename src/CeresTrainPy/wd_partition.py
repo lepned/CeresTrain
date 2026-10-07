@@ -132,7 +132,7 @@ def partition_weight_decay(model):
               # weights. no_decay, as Kovax runs them (his decay selector is '**/kernel' = Linear
               # kernels only); the heads' own Linears (tokens/q/k) fall through to the whitelist.
               no_decay.add(fpn)
-          elif fpn.startswith("egt."):
+          elif fpn.replace("_orig_mod.", "").startswith("egt."):     # torch.compile prefixes names with _orig_mod.
               # EGT edge stream (2026-10-07, egt_edge.py): raw edge-space tables and gains (readers zero-init),
               # not nn.Linear weights. no_decay, as Kovax runs them (his decay selector is '**/kernel').
               no_decay.add(fpn)

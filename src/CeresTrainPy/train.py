@@ -743,7 +743,7 @@ def Train():
       if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
       if 'move_tokens.act.' in n: return False   # action WDL readout [3, dm]: a final layer like pol, AdamW
       if ('cq_abs_head.' in n or 'cq_gap_head.' in n) and (n.endswith('w_bins') or n.endswith('pos_w')): return False  # zero-init child-q readout tables (review 2026-10-07), AdamW
-      if n.startswith('egt.'): return False      # EGT edge stream: zero-init readers + lookup tables (review 2026-10-07), AdamW
+      if n.replace('_orig_mod.', '').startswith('egt.'): return False      # EGT edge stream (torch.compile adds _orig_mod.): zero-init readers + lookup tables (review 2026-10-07), AdamW
       if 'move_tokens.rq_head.' in n: return False   # reply-q readout [1, dk]: training-only 1-row final layer, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True

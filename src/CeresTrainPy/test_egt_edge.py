@@ -128,6 +128,13 @@ def main():
         pc.copy_(w); pe.copy_(w)
   dec, nodec = partition_weight_decay(egt)
   assert all(k in nodec for k in extra if k in dict(egt.named_parameters()))
+  # torch.compile wraps the model: every name gains an _orig_mod. prefix (launch failure 10-07: startswith('egt.') missed)
+  class _Compiled(nn.Module):
+    def __init__(self, m):
+      super().__init__()
+      self._orig_mod = m
+  dec_c, nodec_c = partition_weight_decay(_Compiled(egt))          # asserts completeness itself
+  assert all(('_orig_mod.' + k) in nodec_c for k in extra if k in dict(egt.named_parameters()))
   ctrl.eval(); egt.eval()
   with torch.no_grad():
     oc, oe = ctrl(sq, None), egt(sq, None)
