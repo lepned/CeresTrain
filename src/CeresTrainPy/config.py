@@ -136,6 +136,10 @@ class Configuration:
     self.Exec_DeviceIDs = config_exec.get('DeviceIDs', [0])
     self.Exec_DataType = config_exec.get('DataType', 'BFloat16')
     self.Exec_UseFP8 = config_exec.get('UseFP8', False)
+    # One-off torch.profiler window on rank 0 (2026-10-07; train.py): ProfileSteps micro-batches starting at micro-batch
+    # ProfileStartBatch, report to <OUTPUTS>/logs/<ID>_profile.txt; training continues normally. 0 = off.
+    self.Exec_ProfileSteps = int(config_exec.get('ProfileSteps', 0) or 0)
+    self.Exec_ProfileStartBatch = int(config_exec.get('ProfileStartBatch', 300) or 300)
     self.Exec_DropoutRate = config_exec.get('DropoutRate', 0)
     self.Exec_DropoutDuringInference = config_exec.get('DropoutDuringInference', False)
     self.Exec_EngineType = config_exec.get('EngineType', 0)

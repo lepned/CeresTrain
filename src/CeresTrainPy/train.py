@@ -12,6 +12,7 @@ If not, see <http://www.gnu.org/licenses/>.
 # End of License Notice
 
 import os
+import time
 import re
 import sys
 import socket
@@ -2462,10 +2463,57 @@ def Train():
   
 
   _last_show_losses_pos = 0
+  # One-off profiler window (config Exec ProfileSteps / ProfileStartBatch), rank 0 only. Measures where the
+  # step time goes: CPU-side op dispatch vs GPU kernel time vs waiting for the dataloader.
+  _prof_n = int(getattr(config, 'Exec_ProfileSteps', 0) or 0) if IS_MASTER else 0
+  _prof_start = int(getattr(config, 'Exec_ProfileStartBatch', 300) or 300)
+  _prof = None
+  _prof_wait = [0.0]
+  def _timed_batches(it):
+    # accumulates the time spent inside the dataloader's next() while a profile window is open
+    it = iter(it)
+    while True:
+      _t = time.time()
+      try:
+        b = next(it)
+      except StopIteration:
+        return
+      if _prof is not None:
+        _prof_wait[0] += time.time() - _t
+      yield b
   # Train Network
-  for batch_idx, (batch) in enumerate(dataloader):
+  for batch_idx, (batch) in enumerate(_timed_batches(dataloader) if _prof_n > 0 else dataloader):
     if (num_pos >= MAX_POSITIONS and not config.Exec_ExportOnly):
         break
+    if _prof_n > 0:
+      if batch_idx == _prof_start:
+        torch.cuda.synchronize()
+        _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                   torch.profiler.ProfilerActivity.CUDA])
+        _prof.__enter__()
+        _prof_t0 = time.time()
+      elif _prof is not None and batch_idx == _prof_start + _prof_n:
+        torch.cuda.synchronize()
+        _prof_wall = time.time() - _prof_t0
+        _prof.__exit__(None, None, None)
+        _ka = _prof.key_averages()
+        _cpu_self = sum(e.self_cpu_time_total for e in _ka) / 1e6
+        _gpu_self = sum(getattr(e, 'self_device_time_total', getattr(e, 'self_cuda_time_total', 0)) for e in _ka) / 1e6
+        _launch = sum(e.count for e in _ka if e.key in ('cudaLaunchKernel', 'cuLaunchKernel', 'cudaLaunchKernelExC',
+                                                        'cudaGraphLaunch', 'cudaMemcpyAsync'))
+        _summary = (f'[profile] {_prof_n} micro-batches (from #{_prof_start}): wall {_prof_wall:.2f}s | '
+                    f'dataloader wait {_prof_wait[0]:.2f}s | CPU self-time (all ops) {_cpu_self:.2f}s | '
+                    f'GPU kernel time {_gpu_self:.2f}s ({100 * _gpu_self / max(_prof_wall, 1e-9):.0f}% of wall) | '
+                    f'kernel launches + memcpys {_launch:,} ({_launch / _prof_n:,.0f} per micro-batch)')
+        _sort_dev = 'self_device_time_total' if hasattr(_ka[0], 'self_device_time_total') else 'self_cuda_time_total'
+        _path = os.path.join(OUTPUTS_DIR, 'logs', f'{config.Exec_ID}_profile.txt')
+        with open(_path, 'w') as _f:
+          _f.write(_summary + '\n\n== by self CPU time ==\n')
+          _f.write(_ka.table(sort_by='self_cpu_time_total', row_limit=40))
+          _f.write('\n\n== by self GPU time ==\n')
+          _f.write(_ka.table(sort_by=_sort_dev, row_limit=40))
+        print(_summary + f' -> {_path}', flush=True)
+        _prof, _prof_n = None, 0
 
     # Move the freshly-fetched batch to GPU. Replaces Lightning's recursive
     # auto-move; with pin_memory=True these are true async DMA transfers.
