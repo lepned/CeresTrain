@@ -1142,6 +1142,10 @@ class Configuration:
                          f"(got {self.NetDef_EGTEdgeGateScope!r})")
     elif self.NetDef_EGTEdgeGateScope:
       raise ValueError(f"EGTEdgeGateScope {self.NetDef_EGTEdgeGateScope!r} without EGTEdgeGates would be a silent no-op")
+    # Move-token decoder reads the final EGT edge state of each token's (from, to) pair (2026-10-08)
+    self.NetDef_MoveTokenEdgeInput = bool(config_net_def.get('MoveTokenEdgeInput', False))
+    if self.NetDef_MoveTokenEdgeInput and not (self.NetDef_EGTEdgeStream and self.NetDef_UseMoveTokens):
+      raise ValueError('MoveTokenEdgeInput requires EGTEdgeStream and the move-token decoder')
     if not self.NetDef_EGTEdgeStream and self.NetDef_EGTEdgeGates:
       raise ValueError('EGTEdgeGates requires EGTEdgeStream (the gates read the edge stream; would be a silent no-op)')
     if self.NetDef_EGTEdgeStream:

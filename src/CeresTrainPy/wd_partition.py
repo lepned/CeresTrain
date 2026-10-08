@@ -112,7 +112,9 @@ def partition_weight_decay(model):
               # trunk states = the norm-gain class -> no_decay (1-D, so AdamW under every Muon scope).
               no_decay.add(fpn)
           elif "move_tokens." in fpn and (fpn.endswith(".pm_dk") or fpn.endswith(".pm_dv") or fpn.endswith("vq_block.vq")
-                                           or fpn.endswith(".opp_side") or fpn.endswith(".rel_w")):
+                                           or fpn.endswith(".opp_side") or fpn.endswith(".rel_w")
+                                           or fpn.endswith(".w_edge")):
+              # (.w_edge, 2026-10-08: zero-init EGT edge -> token input coupling, MoveTokenEdgeInput; same class)
               # Move-token post-move deltas (per-piece key/value edits) and the learned value
               # query token (2026-09-03): raw nn.Parameters, embedding-like -> no_decay.
               no_decay.add(fpn)

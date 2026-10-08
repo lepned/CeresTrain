@@ -331,9 +331,15 @@ class MoveTokenDecoder(nn.Module):
                minimax: bool = False,
                action_head: bool = False,
                reply_sup: bool = False,
-               rel_bias: bool = False):
+               rel_bias: bool = False,
+               edge_dim: int = 0):
     super().__init__()
     self.dm, self.M = dm, max_tokens
+    # EDGE INPUT (2026-10-08, NetDef MoveTokenEdgeInput): a move token IS a (from, to) pair, and the EGT edge stream
+    # keeps a learned d_e state per pair. Each token (own and opponent) adds w_edge . rms(e_final[from, to]) to its input
+    # embedding: one gather per token, zero-init (plain zeros: no RNG draw, so every other init is unchanged).
+    self.edge_dim = int(edge_dim)
+    self.w_edge = nn.Parameter(torch.zeros(self.edge_dim, dm)) if self.edge_dim > 0 else None
     # Relational self-attention bias (REL_NAMES): static square-pair tables (from the visibility
     # module, registered below once self.vis exists), gathered per token pair.
     self.rel_bias = bool(rel_bias)
@@ -695,7 +701,16 @@ class MoveTokenDecoder(nn.Module):
     cnts = torch.stack([att_to, def_to, att_from, def_from], dim=-1) * 0.25   # [B,M,4]
     return torch.cat([mover, captured, promo.unsqueeze(-1), cnts], dim=-1)
 
-  def forward(self, squares13, flow, mix_states=None):
+  def _edge_tokens(self, edge, sel, dt):
+    """edge [B,64,64,d_e] (EGT state after the last site), sel [B,T] pair indices (from*64+to) -> [B,T,dm]."""
+    B = edge.shape[0]
+    e_tok = torch.gather(edge.reshape(B, 4096, self.edge_dim), 1, sel.unsqueeze(-1).expand(-1, -1, self.edge_dim)).float()
+    # contract guard: EGT already ends init/every site with an RMS norm (idempotent today), keeps w_edge's scale fixed
+    # if the edge stream's output normalisation ever changes
+    e_tok = e_tok * torch.rsqrt(e_tok.pow(2).mean(-1, keepdim=True) + 1e-6)
+    return (e_tok.to(dt) @ self.w_edge.to(dt))
+
+  def forward(self, squares13, flow, mix_states=None, edge=None):
     """flow [B,64,S] (post trunk norm). Returns (policy_add [B,1858], pooled [B,pool_dim],
     stats dict, sel [B,M], valid [B,M], write_back [B,64,S] or None, ev [B] or None).
     mix_states: list of [B,64,S] intermediate trunk states (trunk_mix of them) or None."""
@@ -731,6 +746,9 @@ class MoveTokenDecoder(nn.Module):
       x = self._w_in_fused(P, fr, to, rest, S)                               # [B,M,dm]
     else:
       x = self.w_in(torch.cat([f_from, f_to, rest], dim=-1))                 # [B,M,dm]
+    if self.w_edge is not None:
+      assert edge is not None, 'MoveTokenEdgeInput: the decoder needs the EGT edge state'
+      x = x + self._edge_tokens(edge, sel, x.dtype)
     # Relations in the TOKEN-STREAM dtype (bf16 under autocast, not the fp32 residual dtype of
     # `flow`): one tensor shared by every block's bias matmul, no per-block autocast copies.
     rel = self.relations(fr, to, x.dtype) if self.rel_bias else None        # [B,M,M,NREL], computed once
@@ -753,6 +771,8 @@ class MoveTokenDecoder(nn.Module):
       else:
         f_both_o = torch.gather(flow, 1, torch.cat([fto[..., 0], fto[..., 1]], dim=1).unsqueeze(-1).expand(-1, -1, S))
         x_opp = self.w_in(torch.cat([f_both_o[:, :self.M_opp], f_both_o[:, self.M_opp:], e_pair_o], dim=-1))
+      if self.w_edge is not None:
+        x_opp = x_opp + self._edge_tokens(edge, sel_o, x_opp.dtype)
       x_opp = x_opp + self.opp_side.to(flow.dtype)
       opp_bias = ((~valid_o).to(flow.dtype) * -1e4).reshape(B, 1, 1, self.M_opp)
     pm = None
