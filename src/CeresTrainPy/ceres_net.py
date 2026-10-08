@@ -404,7 +404,7 @@ class CeresNet(nn.Module):
             f'pseudo-query over {self.NUM_LAYERS + 1} depth states [{self.EMBEDDING_DIM}], '
             f'zero-init no-op')
 
-    # Depth probes (CERES_DEPTH_PROBES=1): per-depth deep supervision + in-process
+    # Depth probes (opt DepthProbePolicyWeight / DepthProbeValueWeight > 0): per-depth deep supervision + in-process
     # control heads (adapted from the T1 vda+pda package, 2026-08 — its TB evidence:
     # ~2x early sample efficiency measured via a last-layer-only control head).
     # TRAINING-ONLY (self.training gated, stash pattern) -> export graph unchanged,
@@ -413,14 +413,16 @@ class CeresNet(nn.Module):
     #     depth state (weight sharing keeps params ~= one small head and makes the
     #     per-depth loss curves directly comparable); depth_probe_value: shared
     #     Linear D->3 (WDL). Losses = mean-over-depths CE at weights
-    #     CERES_DEPTH_PROBE_POLICY_WEIGHT / _VALUE_WEIGHT (default 0.05 each).
+    #     DepthProbePolicyWeight / DepthProbeValueWeight (0 = that half off; e.g. value 0.25, policy 0 with the decoder).
     #   depth_ctl_policy / depth_ctl_value: identical-shape heads reading ONLY the
     #     final state through a DETACHED input — pure measurement apparatus for
     #     paired in-process reads (they train themselves, never shape the trunk).
-    self.depth_probes_enabled = int(os.environ.get('CERES_DEPTH_PROBES', '0') or 0) > 0
+    _dpw_p = float(getattr(config, 'Opt_DepthProbePolicyWeight', 0) or 0)
+    _dpw_v = float(getattr(config, 'Opt_DepthProbeValueWeight', 0) or 0)
+    self.depth_probes_enabled = (_dpw_p > 0 or _dpw_v > 0)       # config only (opt DepthProbe*Weight), 2026-10-07
     if self.depth_probes_enabled:
-      self.depth_probe_policy_weight = float(os.environ.get('CERES_DEPTH_PROBE_POLICY_WEIGHT', '0.05') or 0.05)
-      self.depth_probe_value_weight = float(os.environ.get('CERES_DEPTH_PROBE_VALUE_WEIGHT', '0.05') or 0.05)
+      self.depth_probe_policy_weight = _dpw_p
+      self.depth_probe_value_weight = _dpw_v
       self.depth_probe_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
       self.depth_probe_policy = nn.Linear(self.EMBEDDING_DIM, 1858)
       self.depth_probe_value = nn.Linear(self.EMBEDDING_DIM, 3)
@@ -1439,6 +1441,7 @@ class CeresNet(nn.Module):
                       softmin_heads = self.softmin_heads,
                       softmax_agg_heads = self.softmax_agg_heads,
                       use_head_logit_temp = self.use_head_logit_temp,
+                      attention_norm = config.NetDef_AttentionNorm,
                       pre_norm = config.NetDef_PreNorm if pre_norm is None else pre_norm)
 
     if self.NBT_INNER_LAYERS > 0:
@@ -1494,10 +1497,13 @@ class CeresNet(nn.Module):
         self.egt_vis_module = VisibilityChannels(families=_egt_fams)
         self.egt = EGTEdgeStream(self.egt_vis_module.num_channels, self.NUM_DISTINCT_LAYERS, config.NetDef_NBTInnerHeads,
                                  config.NetDef_EGTEdgeDim, config.NetDef_EGTEdgeSites, config.NetDef_EGTEdgeTripletHeads,
-                                 config.NetDef_EGTEdgeFFNMult)
+                                 config.NetDef_EGTEdgeFFNMult, gates=config.NetDef_EGTEdgeGates,
+                                 inner_layers=self.NBT_INNER_LAYERS, head_dim=self.NBT_MID_DIM // config.NetDef_NBTInnerHeads,
+                                 gate_scope=config.NetDef_EGTEdgeGateScope, x_dim=self.EMBEDDING_DIM)
       print(f'[ceres_net] EGT EDGE STREAM (TRT form): d_e={config.NetDef_EGTEdgeDim}, families={self.egt_vis_module.families} '
             f'({self.egt_vis_module.num_channels} ch), read once per NBT block, update sites after blocks '
             f'{list(self.egt.sites)} (readback + path triplet x{config.NetDef_EGTEdgeTripletHeads} + FFN x{config.NetDef_EGTEdgeFFNMult}), '
+            f'content gates {(config.NetDef_EGTEdgeGates + "/" + config.NetDef_EGTEdgeGateScope) if config.NetDef_EGTEdgeGates else "off"}, '
             f'{sum(p.numel() for p in self.egt.parameters()) / 1e3:.1f}k params, zero-init readers')
 
     # Pre-norm trunks need a final norm AFTER the stack and before the heads,
@@ -2069,7 +2075,10 @@ class CeresNet(nn.Module):
       raise NotImplementedError("DenseFormer is not supported with LoopCount > 1.")
     _egt_e = None
     if self.egt is not None:
-      _egt_e = self.egt.init_state(self.egt_vis_module(squares[:, :, 0:13]).to(flow.dtype))   # [B, 64, 64, d_e]
+      # same channels as the visibility edge bias -> reuse them (review 10-08: no second VisibilityChannels pass)
+      _egt_E = (vis_edge_E if (vis_edge_E is not None and self.vis_channels_module.families == self.egt_vis_module.families)
+                else self.egt_vis_module(squares[:, :, 0:13]))
+      _egt_e = self.egt.init_state(_egt_E.to(flow.dtype))   # [B, 64, 64, d_e]
     for loop_iter in range(self.LOOP_COUNT):
       for i in range(self.NUM_DISTINCT_LAYERS):
         _prb_l = piece_relation_bias_tensor
@@ -2081,10 +2090,10 @@ class CeresNet(nn.Module):
         _egt_kw = {}
         _egt_site = False
         if _egt_e is not None:
-          _egt_bias, _egt_scales = self.egt.read(i, _egt_e)
+          _egt_bias, _egt_scales = self.egt.read(i, _egt_e, flow)
           _prb_l = _egt_bias if _prb_l is None else _prb_l + _egt_bias.to(_prb_l.dtype)
           _egt_site = self.egt.is_site(i)
-          _egt_kw = {'edge_scales': _egt_scales, 'want_logits': _egt_site}
+          _egt_kw = {'edge_scales': _egt_scales, 'want_logits': _egt_site, 'edge_gates': self.egt.gate_args(i, _egt_e)}
         flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l,
                                          film=None if phase_film_tensor is None else
                                               (phase_film_tensor[:, i, 0].unsqueeze(1),

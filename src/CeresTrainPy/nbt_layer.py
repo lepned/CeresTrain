@@ -65,6 +65,7 @@ import torch
 from activation_functions import to_activation
 from rms_norm import make_norm, ChannelAffine
 from dot_product_attention import LinearWrapper
+from egt_edge import edge_gate_bias
 
 
 class SharedSmolgen(torch.nn.Module):
@@ -169,7 +170,7 @@ class NestedBottleneckLayer(torch.nn.Module):
               rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
-              edge_scales = None, want_logits: bool = False):
+              edge_scales = None, want_logits: bool = False, edge_gates = None):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -186,10 +187,11 @@ class NestedBottleneckLayer(torch.nn.Module):
     h = self.down(self.act_in(h0))
     logits = None
     for j, layer in enumerate(self.inner):
+      _eg = None if edge_gates is None else edge_gates[j]
       if want_logits and j == len(self.inner) - 1:
-        logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales)
+        logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales, _eg)
       h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
-                edge_scales=edge_scales)
+                edge_scales=edge_scales, edge_gate=_eg)
     out = self.up(self.act_out(self.norm_out(h)))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output
@@ -202,7 +204,7 @@ class NestedBottleneckLayer(torch.nn.Module):
     return x + out
 
   @staticmethod
-  def _raw_logits(layer, h, piece_relation_bias, edge_scales):
+  def _raw_logits(layer, h, piece_relation_bias, edge_scales, edge_gate=None):
     """Pre-softmax scores [B,H,64,64] of one inner layer, for the EGT edge-stream readback (egt_edge.py). Recomputes
     Q/K with the layer's own projection (one extra qkv GEMM per site) instead of returning them from the attention,
     which keeps the attention's fused score path and its signature unchanged. Standard QKV attention only."""
@@ -222,6 +224,10 @@ class NestedBottleneckLayer(torch.nn.Module):
     s = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(dk)
     if piece_relation_bias is not None:
       s = s + piece_relation_bias.to(s.dtype)
+    if edge_gate is not None:
+      _gb = edge_gate_bias(Q, K, edge_gate)
+      if _gb is not None:
+        s = s + _gb.to(s.dtype)
     # same post-bias steps as sdp_and_smol_or_rpe (review 2026-10-07): the readback must see exactly the scores the
     # softmax saw, so the per-head logit temperature and the softcap are applied here too
     if att.use_head_logit_temp:

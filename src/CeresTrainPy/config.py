@@ -599,6 +599,13 @@ class Configuration:
     self.NetDef_SoftMinHeads = config_net_def.get('SoftMinHeads', 0)
     self.NetDef_SoftMaxAggHeads = config_net_def.get('SoftMaxAggHeads', 0)
     self.NetDef_UseHeadLogitTemp = config_net_def.get('UseHeadLogitTemp', False)
+    # Attention normalizer of the trunk attentions (2026-10-08): 'softmax' (default) or 'softpick' = rectified softmax
+    # (arXiv 2504.20966): ReLU(e^x - 1) / (sum |e^x - 1| + eps). Rows may sum to < 1 (a head can attend nowhere: no
+    # attention sinks / massive activations). ARCH key (changes the function from step 0). Not with SinkLogit,
+    # DiffAttention or SoftMin/SoftMaxAgg heads.
+    self.NetDef_AttentionNorm = str(config_net_def.get('AttentionNorm', 'softmax') or 'softmax').lower()
+    if self.NetDef_AttentionNorm not in ('softmax', 'softpick'):
+      raise ValueError(f"AttentionNorm must be 'softmax' or 'softpick' (got {self.NetDef_AttentionNorm!r})")
     self.NetDef_UseTacticalCodebook = config_net_def.get('UseTacticalCodebook', False)
     self.NetDef_UseKingDistChannels = config_net_def.get('UseKingDistChannels', False)
     self.NetDef_UseSpectralPE = config_net_def.get('UseSpectralPE', False)
@@ -1015,6 +1022,16 @@ class Configuration:
     if os.environ.get('CERES_STVALUE_WEIGHT') not in (None, ''):
       raise ValueError('CERES_STVALUE_WEIGHT is retired: set "LossSTValueMultiplier" in the opt config')
     self.Opt_LossSTValueMultiplier = float(config_opt.get('LossSTValueMultiplier', 0) or 0)
+    # DEPTH PROBES (per-depth deep supervision, training-only; ceres_net): config only since 2026-10-07 (env
+    # CERES_DEPTH_PROBES / _POLICY_WEIGHT / _VALUE_WEIGHT retired). Enabled when either weight > 0. With the move-token
+    # decoder the VALUE probes are the relevant half (the decoder does its own policy refinement).
+    for _env in ('CERES_DEPTH_PROBES', 'CERES_DEPTH_PROBE_POLICY_WEIGHT', 'CERES_DEPTH_PROBE_VALUE_WEIGHT'):
+      if os.environ.get(_env) not in (None, ''):
+        raise ValueError(f'{_env} is retired: set "DepthProbePolicyWeight" / "DepthProbeValueWeight" in the opt config')
+    self.Opt_DepthProbePolicyWeight = float(config_opt.get('DepthProbePolicyWeight', 0) or 0)
+    self.Opt_DepthProbeValueWeight = float(config_opt.get('DepthProbeValueWeight', 0) or 0)
+    if self.Opt_DepthProbePolicyWeight < 0 or self.Opt_DepthProbeValueWeight < 0:
+      raise ValueError('DepthProbePolicyWeight / DepthProbeValueWeight must be >= 0')
     if self.Opt_LossSTValueMultiplier < 0:
       raise ValueError('LossSTValueMultiplier must be >= 0')
     if self.NetDef_MoveTokenActionHead and (float(self.Opt_LossActionMultiplier or 0) > 0
@@ -1111,6 +1128,22 @@ class Configuration:
     self.NetDef_EGTEdgeFFNMult = int(config_net_def.get('EGTEdgeFFNMult', 2) or 2)
     self.NetDef_EGTEdgeTripletHeads = int(config_net_def.get('EGTEdgeTripletHeads', 4) or 4)
     self.NetDef_EGTEdgeFamilies = str(config_net_def.get('EGTEdgeFamilies', 'vis,xray,pinray,check,flight'))
+    # content-dependent edge gates (Kovax' attack key/query gates, read from the edge state): '' | 'q' | 'k' | 'qk'
+    self.NetDef_EGTEdgeGates = str(config_net_def.get('EGTEdgeGates', '') or '')
+    if self.NetDef_EGTEdgeGates not in ('', 'q', 'k', 'qk'):
+      raise ValueError(f"EGTEdgeGates must be '', 'q', 'k' or 'qk' (got {self.NetDef_EGTEdgeGates!r})")
+    # 'layer' = from every inner layer's Q/K (expensive in TRT); 'block' = from the NBT block input, once per block;
+    # 'scale' = block input into the separable q/k score scales only (no extra pairwise tensor)
+    # No default: the scopes differ ~0.69x..0.97x in served EPS, so gates on REQUIRE an explicit scope (review 10-08).
+    self.NetDef_EGTEdgeGateScope = str(config_net_def.get('EGTEdgeGateScope', '') or '')
+    if self.NetDef_EGTEdgeGates:
+      if self.NetDef_EGTEdgeGateScope not in ('layer', 'block', 'scale'):
+        raise ValueError(f"EGTEdgeGates {self.NetDef_EGTEdgeGates!r} needs EGTEdgeGateScope 'layer', 'block' or 'scale' "
+                         f"(got {self.NetDef_EGTEdgeGateScope!r})")
+    elif self.NetDef_EGTEdgeGateScope:
+      raise ValueError(f"EGTEdgeGateScope {self.NetDef_EGTEdgeGateScope!r} without EGTEdgeGates would be a silent no-op")
+    if not self.NetDef_EGTEdgeStream and self.NetDef_EGTEdgeGates:
+      raise ValueError('EGTEdgeGates requires EGTEdgeStream (the gates read the edge stream; would be a silent no-op)')
     if self.NetDef_EGTEdgeStream:
       if self.NetDef_NBTInnerLayers <= 0:
         raise ValueError('EGTEdgeStream requires an NBT trunk (NBTInnerLayers > 0)')

@@ -22,6 +22,7 @@ from rms_norm import RMSNorm, make_norm
 
 from activation_functions import Swish, ReLUSquared
 from lora import LoRALinear
+from egt_edge import edge_gate_bias
 
 # Vis edge-bias B/C gate fusion crossover (see forward): fusing both gate terms
 # into one E contraction was measured −11% TRT engine time at C=12 per-layer
@@ -142,6 +143,25 @@ class SinkSoftmax(torch.nn.Module):
     return torch.softmax(torch.cat([scores, _z], dim=-1), dim=-1)[..., :-1]
 
 
+class Softpick(torch.nn.Module):
+  """Rectified softmax (Softpick, arXiv 2504.20966): ReLU(e^x - 1) / (sum_j |e^x_j - 1| + eps) over the last dim.
+  Stable form: numerator and denominator scaled by e^-m with m = max(rowmax, 0) (detached), so every exp is <= 1:
+  ReLU(e^(x-m) - e^-m) / (sum |e^(x-m) - e^-m| + eps e^-m). Outputs lie in [0, 1], rows sum to <= 1; a row whose
+  logits are all <= 0 is all zero (the head attends nowhere). Computed in fp32."""
+
+  def __init__(self, eps: float = 1e-6):
+    super().__init__()
+    self.eps = eps
+
+  def forward(self, scores):
+    x = scores.float()
+    m = x.amax(dim=-1, keepdim=True).clamp(min=0.0).detach()
+    em = torch.exp(-m)
+    d = torch.exp(x - m) - em
+    out = torch.relu(d) / (d.abs().sum(dim=-1, keepdim=True) + self.eps * em)
+    return out.to(scores.dtype)
+
+
 class DotProductAttention(torch.nn.Module):
   """
   Implements (scaled) Dot Product Attention.
@@ -183,6 +203,7 @@ class DotProductAttention(torch.nn.Module):
                softmin_heads : int = 0,
                softmax_agg_heads : int = 0,
                use_head_logit_temp : bool = False,
+               attention_norm : str = 'softmax',
                smol_basis_k : int = 0, smol_basis_bank = None,
                smol_static_mode : int = 0, smol_static_bank = None, smol_rel_bins = None) -> None:
     super().__init__()
@@ -203,6 +224,15 @@ class DotProductAttention(torch.nn.Module):
     # every softmax site in this module (standard + both diff-attention maps).
     self.use_sink_logit = int(os.environ.get('CERES_ATTENTION_SINK_LOGIT', '0') or 0) > 0
     self.softmax = SinkSoftmax() if self.use_sink_logit else torch.nn.Softmax(-1)
+    self.attention_norm = attention_norm
+    assert attention_norm in ('softmax', 'softpick'), f'bad attention_norm {attention_norm!r}'
+    if attention_norm == 'softpick':
+      assert not self.use_sink_logit, 'AttentionNorm softpick + AttentionSinkLogit: both are attend-nowhere mechanisms, pick one'
+      assert not use_diff_attention, 'AttentionNorm softpick + DiffAttention unsupported'
+      assert softmin_heads == 0 and softmax_agg_heads == 0, 'AttentionNorm softpick + SoftMin/SoftMaxAgg heads unsupported'
+      self.softmax = Softpick()
+      if not layer_num:
+        print('[dot_product_attention] ATTENTION NORM softpick: ReLU(e^x-1)/(sum|e^x-1|+eps), rows sum <= 1')
     if self.use_sink_logit and not layer_num:
       print('[dot_product_attention] ATTENTION SINK LOGIT enabled: +1 constant-0 logit per softmax row, '
             'dropped after normalisation (rows sum <= 1); zero params')
@@ -363,6 +393,9 @@ class DotProductAttention(torch.nn.Module):
     # i.e. a near-identity, input-independent start (same pattern as lambda_proj);
     # channels close only where gradients ask for it.
     self.use_gated_attn_out = int(os.environ.get('CERES_GATED_ATTENTION_OUTPUT', '0') or 0) > 0
+    self.gated_attn_out_headwise = int(os.environ.get('CERES_GATED_ATTENTION_OUTPUT_HEADWISE', '0') or 0) > 0
+    if self.gated_attn_out_headwise and not self.use_gated_attn_out:
+      raise ValueError('GatedAttentionOutputHeadwise requires GatedAttentionOutput (would be a silent no-op)')
     if self.use_gated_attn_out:
       # Bias init (config GatedAttentionOutputBiasInit, bridged to env): 4.0 keeps
       # the historical near-identity start; 0.0 is the Qwen/NeurIPS-25 form where
@@ -370,12 +403,15 @@ class DotProductAttention(torch.nn.Module):
       # emerge — the mechanism the paper credits for the gain and the higher-LR
       # tolerance. Zero weight either way (input-independent at step 0).
       _gate_bias = float(os.environ.get('CERES_GATED_ATTENTION_OUTPUT_BIAS', '4.0') or 4.0)
-      self.attn_out_gate = torch.nn.Linear(self.d_model, self.d_model * self.attention_multiplier, bias=True)
+      # Headwise (config GatedAttentionOutputHeadwise, 2026-10-08): one gate per (square, head), applied to the head
+      # output before the concat (like the EGT row-scale door) -- d_model x H params instead of d_model x d_model.
+      _gate_out = self.num_heads if self.gated_attn_out_headwise else self.d_model * self.attention_multiplier
+      self.attn_out_gate = torch.nn.Linear(self.d_model, _gate_out, bias=True)
       torch.nn.init.zeros_(self.attn_out_gate.weight)
       torch.nn.init.constant_(self.attn_out_gate.bias, _gate_bias)
       if not self.layer_num:  # print once (layer 0 or None), not per layer
-        print(f'[dot_product_attention] GATED ATTENTION OUTPUT enabled: elementwise sigmoid '
-              f'gate [{self.d_model} -> {self.d_model * self.attention_multiplier}] per layer, '
+        print(f'[dot_product_attention] GATED ATTENTION OUTPUT enabled: '
+              f'{"headwise" if self.gated_attn_out_headwise else "elementwise"} sigmoid gate [{self.d_model} -> {_gate_out}] per layer, '
               f'zero-init weight / bias {_gate_bias} (gate~{1/(1+__import__("math").exp(-_gate_bias)):.3f} at step 0)')
 
     # Visibility edge-bias B/C content gates (Kovax visibility program,
@@ -925,7 +961,7 @@ class DotProductAttention(torch.nn.Module):
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False, vis_edge: torch.Tensor = None,
-              edge_scales = None) -> torch.Tensor:
+              edge_scales = None, edge_gate = None) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -991,6 +1027,11 @@ class DotProductAttention(torch.nn.Module):
       assert not isinstance(Q, tuple), 'EGT edge stream: standard (non-diff) attention only'
       Q = Q * edge_scales[0].unsqueeze(-1).to(Q.dtype)
       K = K * edge_scales[1].unsqueeze(-1).to(K.dtype)
+    if edge_gate is not None:
+      # EGT content gates (egt_edge.edge_gate_bias): additive, joins the per-head bias like smolgen / vis gates
+      _gb = edge_gate_bias(Q, K, edge_gate)
+      if _gb is not None:
+        piece_relation_bias = _gb if piece_relation_bias is None else piece_relation_bias + _gb.to(piece_relation_bias.dtype)
 
     # RPE-from-embedding experiment: project the layer-0 embedding through THIS
     # layer's own qkv weights and route the results into the RPE einsums only
@@ -1127,12 +1168,16 @@ class DotProductAttention(torch.nn.Module):
     if edge_scales is not None:
       H_cat = H_cat * edge_scales[2].unsqueeze(-1).to(H_cat.dtype)
 
+    if self.use_gated_attn_out and self.gated_attn_out_headwise:
+      # headwise G1 gate: [B,64,H] -> [B,H,64,1] on the per-head output
+      H_cat = H_cat * torch.sigmoid(self.attn_out_gate(qkv_x)).transpose(1, 2).unsqueeze(-1).to(H_cat.dtype)
+
     # Put all the heads back together by concat (with heads moved back to the right)
     H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)
 
     # Gated attention output (see __init__): per-channel sigmoid gate from the
     # attention input scales head outputs before the final projection.
-    if self.use_gated_attn_out:
+    if self.use_gated_attn_out and not self.gated_attn_out_headwise:
       H_cat = H_cat * torch.sigmoid(self.attn_out_gate(qkv_x))
 
     # Final linear layer

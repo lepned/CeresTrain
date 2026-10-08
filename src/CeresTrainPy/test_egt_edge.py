@@ -19,6 +19,8 @@ os.environ.setdefault('CERES_AUX_FEATURES_PER_SQUARE', '0')
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -103,7 +105,60 @@ def run_loss(m, batch, sq):
                         qdl, qdu, unc_pol, None, None, None, action_out, None, 0, 0, 0, False)
 
 
-def main():
+def block_gate_oracle():
+  """Block-scope gates (EGTEdgeRead p_gq/p_gk) vs an explicit broadcast sum."""
+  from egt_edge import EGTEdgeRead, _rms_last
+  torch.manual_seed(5)
+  r = EGTEdgeRead(16, 4, 'qk', 24)
+  with torch.no_grad():
+    for p in r.parameters():
+      p.copy_(torch.randn(p.shape) * 0.3)
+  e, x = torch.randn(2, 64, 64, 16), torch.randn(2, 64, 24)
+  bias = r(e, x)[0]
+  xn = _rms_last(x)
+  gq = (xn @ r.p_gq).view(2, 64, 16, 4)
+  gk = (xn @ r.p_gk).view(2, 64, 16, 4)
+  w = r.w_e * r.t_edge[None]
+  lin = ((e[..., None] * (w[None, None, None] + gq[:, :, None])).sum(3)        # [b,i,j,h] row gate (+ static read)
+         + (e[..., None] * gk[:, None]).sum(3)).permute(0, 3, 1, 2)            # column gate
+  ref = lin + F.logsigmoid(torch.einsum('bijc,ch->bhij', e, r.w_g) + r.b_g[None, :, None, None]) + math.log(2.0)
+  assert torch.allclose(bias, ref, atol=1e-4), float((bias - ref).abs().max())
+  print(f'OK block-scope gate oracle (max diff {float((bias - ref).abs().max()):.1e})')
+
+
+def layer_gate_oracle():
+  """Layer-scope edge_gate_bias vs explicit broadcast sums (q-only, k-only, qk)."""
+  from egt_edge import edge_gate_bias
+  torch.manual_seed(6)
+  B, H, dk, de = 2, 4, 8, 16
+  Q, K = torch.randn(B, H, 64, dk), torch.randn(B, H, 64, dk)
+  e = torch.randn(B, 64, 64, de)
+  Gq, Gk = torch.randn(H, de, dk), torch.randn(H, de, dk)
+  rq = (e[:, None] * torch.einsum('bhid,hcd->bhic', Q, Gq)[:, :, :, None]).sum(-1)      # e_ij . (Gq Q_i)
+  rk = (e[:, None] * torch.einsum('bhjd,hcd->bhjc', K, Gk)[:, :, None]).sum(-1)         # e_ij . (Gk K_j)
+  eT = e.transpose(1, 2)
+  for gq, gk, ref in ((Gq, None, rq), (None, Gk, rk), (Gq, Gk, rq + rk)):
+    out = edge_gate_bias(Q, K, (e, eT, gq, gk))
+    assert torch.allclose(out, ref, atol=1e-4), float((out - ref).abs().max())
+  print('OK layer-scope gate oracle (q, k, qk)')
+
+
+def gate_config_rejections():
+  for over, what in (({'EGTEdgeGates': 'qk', 'EGTEdgeGateScope': 'block'}, 'gates without EGTEdgeStream'),
+                     ({**EGT_ON, 'EGTEdgeGates': 'qk'}, 'gates without an explicit scope'),
+                     ({**EGT_ON, 'EGTEdgeGateScope': 'scale'}, 'scope without gates')):
+    try:
+      build(over, 'rejg')
+      raise SystemExit(f'FAIL: {what} accepted')
+    except ValueError:
+      pass
+  print('OK gate config rejections (no stream / no scope / scope without gates)')
+
+
+def main(gates='', scope=''):
+  global EGT_ON
+  EGT_ON = {**EGT_ON, 'EGTEdgeGates': gates, 'EGTEdgeGateScope': scope}
+  print(f'--- EGTEdgeGates={gates!r} scope={scope}')
   from wd_partition import partition_weight_decay
   B = 4
   sq, batch = boards(B), batch_for(B)
@@ -157,7 +212,10 @@ def main():
   assert torch.isfinite(loss), loss
   loss.backward()
   P = dict(egt.named_parameters())
-  for n in ('egt.reads.0.w_e', 'egt.reads.1.w_g', 'egt.reads.2.m_q', 'egt.reads.2.m_k', 'egt.reads.1.m_r',
+  _gp = {'layer': ('egt.gate_q', 'egt.gate_k'), 'block': ('egt.reads.1.p_gq', 'egt.reads.1.p_gk'),
+         'scale': ('egt.reads.1.p_sq', 'egt.reads.1.p_sk')}.get(scope, (None, None))
+  _gate_names = ((_gp[0],) if 'q' in gates else ()) + ((_gp[1],) if 'k' in gates else ())
+  for n in _gate_names + ('egt.reads.0.w_e', 'egt.reads.1.w_g', 'egt.reads.2.m_q', 'egt.reads.2.m_k', 'egt.reads.1.m_r',
             'egt.site_mods.0.o_e', 'egt.site_mods.0.tri_o', 'egt.site_mods.0.tri_v', 'egt.site_mods.0.ffn_out',
             'egt.p_in', 'egt.t_off'):
     assert P[n].grad is not None and torch.isfinite(P[n].grad).all() and P[n].grad.abs().sum() > 0, f'{n}: no gradient'
@@ -238,8 +296,8 @@ def check_readback(egt, sq, tag):
   last_att.sdp_and_smol_or_rpe = spy
   captured_logits = {}
   orig_raw = NestedBottleneckLayer._raw_logits
-  def raw_spy(layer, h, prb, sc):
-    s = orig_raw(layer, h, prb, sc)
+  def raw_spy(layer, h, prb, sc, eg=None):
+    s = orig_raw(layer, h, prb, sc, eg)
     captured_logits.setdefault('s', s)        # block 0 is the first site; block 2 comes later
     return s
   NestedBottleneckLayer._raw_logits = staticmethod(raw_spy)
@@ -250,11 +308,19 @@ def check_readback(egt, sq, tag):
     NestedBottleneckLayer._raw_logits = staticmethod(orig_raw)
     last_att.sdp_and_smol_or_rpe = orig
   A_used = captured['A'].float()
-  A_raw = torch.softmax(captured_logits['s'].float(), dim=-1)
+  A_raw = last_att.softmax(captured_logits['s'].float())        # the layer's own normalizer (softmax or softpick)
   assert torch.allclose(A_used, A_raw, atol=1e-5), (tag, float((A_used - A_raw).abs().max()))
   print(f'OK readback logits [{tag}]: softmax(raw logits) == attention probabilities used '
         f'(max diff {float((A_used - A_raw).abs().max()):.2e})')
 
 
 if __name__ == '__main__':
-  main()
+  block_gate_oracle()
+  layer_gate_oracle()
+  gate_config_rejections()
+  main('')
+  main('qk', 'layer')
+  main('q', 'layer')
+  main('qk', 'block')
+  main('k', 'block')
+  main('qk', 'scale')

@@ -48,8 +48,18 @@ def _offset_index():
 
 
 class EGTEdgeRead(nn.Module):
-  def __init__(self, d_e: int, heads: int):
+  def __init__(self, d_e: int, heads: int, gates: str = '', x_dim: int = 0, scale_gates: str = ''):
     super().__init__()
+    # SCALE-scope content gates (EGTEdgeGateScope 'scale', 2026-10-08): the separable q/k scales (qs, ks) also read the
+    # block input, qs_hi += x_i . S_q[:, h] (ks likewise): per-square, per-head score scaling, no new [B,H,64,64] tensor.
+    self.p_sq = nn.Parameter(torch.zeros(x_dim, heads)) if 'q' in scale_gates else None
+    self.p_sk = nn.Parameter(torch.zeros(x_dim, heads)) if 'k' in scale_gates else None
+    # BLOCK-scope content gates (EGTEdgeGateScope 'block', 2026-10-08): per-square read weights from the block input,
+    # bias_hij += e_ij . Gq(x_i)_h + e_ij . Gk(x_j)_h. Same batched einsum class as the static read, once per NBT block
+    # (the layer-scope gates materialize 24 Q/K-dependent biases and cost ~30 % EPS). Zero-init: step 0 unchanged.
+    self.d_e, self.heads = d_e, heads
+    self.p_gq = nn.Parameter(torch.zeros(x_dim, d_e * heads)) if 'q' in gates else None
+    self.p_gk = nn.Parameter(torch.zeros(x_dim, d_e * heads)) if 'k' in gates else None
     self.t_node = nn.Parameter(torch.ones(heads))
     self.t_edge = nn.Parameter(torch.ones(heads))
     self.w_e = nn.Parameter(torch.zeros(d_e, heads))
@@ -59,15 +69,33 @@ class EGTEdgeRead(nn.Module):
     self.m_k = nn.Parameter(torch.zeros(d_e, heads))
     self.m_r = nn.Parameter(torch.zeros(d_e, heads))
 
-  def forward(self, e):
-    """e [B,64,64,d_e] -> (bias [B,H,64,64], (qs [B,H,64], ks [B,H,64], rs [B,H,64]))."""
+  def forward(self, e, x=None):
+    """e [B,64,64,d_e] (+ block input x [B,64,D] for block-scope gates) -> (bias [B,H,64,64], (qs, ks, rs [B,H,64]))."""
     dt = e.dtype
-    bias = (self.t_edge.to(dt)[None, :, None, None] * torch.einsum('bijc,ch->bhij', e, self.w_e.to(dt))
+    w_e = self.w_e.to(dt) * self.t_edge.to(dt)[None, :]
+    xn = (_rms_last(x.to(dt)) if (self.p_gq is not None or self.p_gk is not None or self.p_sq is not None
+                                   or self.p_sk is not None) else None)
+    if self.p_gq is not None:
+      # static read and q gate fused: per-row read weights W_i = w_e * t_edge + Gq(x_i)
+      w_q = w_e[None, None] + (xn @ self.p_gq.to(dt)).view(x.shape[0], 64, self.d_e, self.heads)
+      e_read = torch.einsum('bijc,bich->bhij', e, w_q)
+    else:
+      e_read = torch.einsum('bijc,ch->bhij', e, w_e)
+    if self.p_gk is not None:
+      w_k = (xn @ self.p_gk.to(dt)).view(x.shape[0], 64, self.d_e, self.heads)
+      e_read = e_read + torch.einsum('bijc,bjch->bhij', e, w_k)
+    bias = (e_read
             + F.logsigmoid(torch.einsum('bijc,ch->bhij', e, self.w_g.to(dt)) + self.b_g.to(dt)[None, :, None, None])
             + math.log(2.0))
     rowm, colm = e.mean(dim=2), e.mean(dim=1)                                     # [B,64,d_e]: over j / over i
-    qs = (1.0 + torch.einsum('bic,ch->bhi', rowm, self.m_q.to(dt))) * self.t_node.to(dt)[None, :, None]
-    ks = 1.0 + torch.einsum('bjc,ch->bhj', colm, self.m_k.to(dt))
+    qa = torch.einsum('bic,ch->bhi', rowm, self.m_q.to(dt))
+    ka = torch.einsum('bjc,ch->bhj', colm, self.m_k.to(dt))
+    if self.p_sq is not None:
+      qa = qa + (xn @ self.p_sq.to(dt)).transpose(1, 2)
+    if self.p_sk is not None:
+      ka = ka + (xn @ self.p_sk.to(dt)).transpose(1, 2)
+    qs = (1.0 + qa) * self.t_node.to(dt)[None, :, None]
+    ks = 1.0 + ka
     rs = 2.0 * torch.sigmoid(torch.einsum('bic,ch->bhi', rowm, self.m_r.to(dt)))
     return bias, (qs, ks, rs)
 
@@ -106,9 +134,46 @@ class EGTEdgeSite(nn.Module):
     return _rms_last(e)
 
 
+def edge_gate_bias(Q, K, edge_gate):
+  """Content-dependent edge gates (Kovax' attack key/query gates, read from the EGT edge state instead of the raw
+  attack channels): bias[b,h,i,j] = (q_i . G_q[h]) . e_ij + (k_j . G_k[h]) . e_ij.
+  Q, K [B,H,64,dk] (after the edge q/k scales); edge_gate = (e [B,64,64,d_e], eT = e with i<->j, G_q, G_k [H,d_e,dk] or
+  None). Two batched matmuls, additive -> the score path stays fusable."""
+  e, eT, Gq, Gk = edge_gate
+  dt = Q.dtype
+  out = None
+  if Gq is not None:
+    gq = torch.matmul(Q, Gq.transpose(-1, -2).to(dt))                       # [B,H,64(i),d_e]
+    out = torch.matmul(e.to(dt), gq.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)   # [B,H,i,j]
+  if Gk is not None:
+    gk = torch.matmul(K, Gk.transpose(-1, -2).to(dt))                       # [B,H,64(j),d_e]
+    t = torch.matmul(eT.to(dt), gk.permute(0, 2, 3, 1)).permute(0, 3, 2, 1)  # [B,H,i,j]
+    out = t if out is None else out + t
+  return out
+
+
 class EGTEdgeStream(nn.Module):
-  def __init__(self, num_channels: int, num_blocks: int, heads: int, d_e: int, sites, tri_heads: int, ffn_mult: int):
+  def __init__(self, num_channels: int, num_blocks: int, heads: int, d_e: int, sites, tri_heads: int, ffn_mult: int,
+               gates: str = '', inner_layers: int = 1, head_dim: int = 0, gate_scope: str = '', x_dim: int = 0):
     super().__init__()
+    # content-dependent edge gates (zero-init: step 0 unchanged); '' / 'q' / 'k' / 'qk'
+    #   scope 'layer': from each inner layer's Q/K (edge_gate_bias; 24 extra biases on a 1920 NBT -> ~0.69x EPS of EGT)
+    #   scope 'block': from the NBT block input, folded into the per-block read (EGTEdgeRead)
+    #   scope 'scale': from the NBT block input into the separable q/k scales only (cheapest)
+    self.gates = gates or ''
+    assert self.gates in ('', 'q', 'k', 'qk'), f'bad EGTEdgeGates {gates!r}'
+    assert gate_scope in ('', 'layer', 'block', 'scale'), f'bad EGTEdgeGateScope {gate_scope!r}'
+    assert not self.gates or gate_scope, 'EGTEdgeGates need an explicit EGTEdgeGateScope'
+    self.gate_scope = gate_scope
+    self.inner_layers = int(inner_layers)
+    n_gate = num_blocks * self.inner_layers
+    _lg = self.gates if gate_scope == 'layer' else ''
+    _bg = self.gates if gate_scope == 'block' else ''
+    _sg = self.gates if gate_scope == 'scale' else ''
+    assert not (_bg or _sg) or x_dim > 0, 'block/scale-scope EGT gates need x_dim'
+    assert not _lg or head_dim > 0, 'layer-scope EGT gates need head_dim'
+    self.gate_q = nn.Parameter(torch.zeros(n_gate, heads, d_e, head_dim)) if 'q' in _lg else None
+    self.gate_k = nn.Parameter(torch.zeros(n_gate, heads, d_e, head_dim)) if 'k' in _lg else None
     self.sites = tuple(int(s) for s in sites)
     # a site after the LAST block would produce an update nobody reads: its params never get a gradient (breaks DDP
     # without static_graph and wastes the triplet) -- refused (review 2026-10-07)
@@ -116,7 +181,7 @@ class EGTEdgeStream(nn.Module):
     self.p_in = nn.Parameter(torch.randn(num_channels, d_e) / math.sqrt(num_channels))
     self.t_off = nn.Parameter(torch.randn(225, d_e) * 0.5)
     self.register_buffer('off_idx', _offset_index(), persistent=False)
-    self.reads = nn.ModuleList([EGTEdgeRead(d_e, heads) for _ in range(num_blocks)])
+    self.reads = nn.ModuleList([EGTEdgeRead(d_e, heads, _bg, x_dim, _sg) for _ in range(num_blocks)])
     self.site_mods = nn.ModuleDict({str(s): EGTEdgeSite(d_e, heads, tri_heads, ffn_mult) for s in self.sites})
 
   def init_state(self, E):
@@ -124,11 +189,20 @@ class EGTEdgeStream(nn.Module):
     dt = E.dtype
     return _rms_last(E @ self.p_in.to(dt) + self.t_off[self.off_idx].to(dt)[None])
 
-  def read(self, block: int, e):
-    return self.reads[block](e)
+  def read(self, block: int, e, x=None):
+    return self.reads[block](e, x)
 
   def is_site(self, block: int) -> bool:
     return block in self.sites
 
   def update(self, block: int, e, logits):
     return self.site_mods[str(block)](e, logits)
+
+  def gate_args(self, block: int, e):
+    """Per inner layer (e, eT, G_q, G_k) for edge_gate_bias, or None when gates are off."""
+    if not self.gates or self.gate_scope != 'layer':
+      return None
+    eT = e.transpose(1, 2)
+    base = block * self.inner_layers
+    return [(e, eT, None if self.gate_q is None else self.gate_q[base + j],
+             None if self.gate_k is None else self.gate_k[base + j]) for j in range(self.inner_layers)]

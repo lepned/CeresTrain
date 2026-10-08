@@ -50,6 +50,8 @@ BOOTSTRAP_ENV_MAP = {
     # Gate-bias-init (2026-09-02): 4.0 = naer-identitet (dagens default); 0.0 =
     # Qwen-formen (gate starter paa 0.5, sparsitet/sink-fjerning kan oppstaa).
     'GatedAttentionOutputBiasInit': 'CERES_GATED_ATTENTION_OUTPUT_BIAS',
+    # Headwise G1 gate (2026-10-08): one sigmoid per (square, head) instead of per channel (the paper's cheap form).
+    'GatedAttentionOutputHeadwise': 'CERES_GATED_ATTENTION_OUTPUT_HEADWISE',
     # Sink logit (2026-09-02): +1 constant-0 logit per softmax row (heads may attend nowhere).
     'AttentionSinkLogit': 'CERES_ATTENTION_SINK_LOGIT',
     # Policy head form (2026-09-02): 'mlp' (default) or 'fromto' = the from-to bilinear

@@ -55,6 +55,7 @@ class EncoderLayer(torch.nn.Module):
                 softmin_heads : int = 0,
                 softmax_agg_heads : int = 0,
                 use_head_logit_temp : bool = False,
+                attention_norm : str = 'softmax',
                 pre_norm : bool = False):
     super().__init__()
 
@@ -89,6 +90,7 @@ class EncoderLayer(torch.nn.Module):
                                          softmin_heads=softmin_heads,
                                          softmax_agg_heads=softmax_agg_heads,
                                          use_head_logit_temp=use_head_logit_temp,
+                                         attention_norm=attention_norm,
                                          smol_basis_k=smol_basis_k, smol_basis_bank=smol_basis_bank,
                                          smol_static_mode=smol_static_mode, smol_static_bank=smol_static_bank,
                                          smol_rel_bins=smol_rel_bins)
@@ -142,15 +144,15 @@ class EncoderLayer(torch.nn.Module):
               rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
-              edge_scales = None) -> Tuple[torch.Tensor, torch.Tensor]:
+              edge_scales = None, edge_gate = None) -> Tuple[torch.Tensor, torch.Tensor]:
     # Pre-norm vs post-norm differ ONLY in WHERE the norm sits relative to the
     # residual. NormType (LayerNorm/RMSNorm/Derf) is orthogonal — applies the
     # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
     if self.pre_norm:
       attn_input = self.ln1(x)
-      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales)
+      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate)
     else:
-      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales)
+      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate)
 
     if (self.dropout_rate > 0):
       attn_output = self.dropout_attn(attn_output)
