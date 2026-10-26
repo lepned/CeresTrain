@@ -84,8 +84,12 @@ class EGTEdgeRead(nn.Module):
     if self.p_gk is not None:
       w_k = (xn @ self.p_gk.to(dt)).view(x.shape[0], 64, self.d_e, self.heads)
       e_read = e_read + torch.einsum('bijc,bjch->bhij', e, w_k)
+    # Clamp the log-gate at -30 (2026-10-26): the export lowers logsigmoid to Log(Sigmoid(z)) and in FP16 sigmoid
+    # underflows for z <~ -17 -> -inf, which TRT's fused attention turns into NaN (6800M, gate logits to -22.8).
+    # exp(-30) ~ 1e-13 is already a hard mask, so this is a no-op in fp32 for trained weights.
     bias = (e_read
             + F.logsigmoid(torch.einsum('bijc,ch->bhij', e, self.w_g.to(dt)) + self.b_g.to(dt)[None, :, None, None])
+              .clamp_min(-30.0)
             + math.log(2.0))
     rowm, colm = e.mean(dim=2), e.mean(dim=1)                                     # [B,64,d_e]: over j / over i
     qa = torch.einsum('bic,ch->bhi', rowm, self.m_q.to(dt))
