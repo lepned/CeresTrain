@@ -51,6 +51,10 @@ def loader_tests():
   assert bo['squares'].shape[1:] == (64, 137) or bo['squares'].shape[1] == 64
   assert torch.isfinite(bo['wdl_q']).all()
   print(f'  fast-forward OK: {first} resumed at position {OFF} (next span {bo["tpg_file_pos"]}..{bo["tpg_file_pos_end"]})')
+  # resume state is first-pass only: consumed once, never re-applied on a later pass
+  assert first not in ds_o.start_offsets, 'start offset must be consumed on use (else every pass re-fast-forwards)'
+  assert not ds_x.exclude_files, 'exclude_files must be cleared after the first pass list is built'
+  print('  first-pass-only OK: offset consumed, exclude list cleared')
   # exclusivity guard
   try:
     TPGDataset(TPG, B, 0.0, 0, 1, 0, 1, 0, False, exclude_files={first}, num_files_to_skip_after_shuffle=4)

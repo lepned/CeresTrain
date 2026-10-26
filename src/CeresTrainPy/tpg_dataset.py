@@ -527,6 +527,12 @@ class TPGDataset(Dataset):
       rank_files = self._discover_files()
       my_files = [file for index, file in enumerate(rank_files)
                   if self.num_workers == 0 or (index % self.num_workers == self.worker_id)]
+      # Data-stream resume state is FIRST-PASS ONLY (bugfix 2026-10-27): re-applying exclude_files on later passes
+      # kept the stream on the resumed remainder, and re-applying start_offsets made a worker whose only shard was
+      # nearly consumed re-decompress that whole shard every pass for a handful of positions (7000M resume: one
+      # rank's T91 worker looped on a 62M-position fast-forward, starving the rank and stalling DDP). From the
+      # second pass on the stream is the normal full-corpus one.
+      self.exclude_files = set()
       if len(my_files) != self._last_seen_count:
         print(f'DATASET WORKER {self.worker_id} re-enumerated {self.root_dir}: '
               f'now has {len(my_files)} files (was {self._last_seen_count})')
@@ -610,7 +616,7 @@ class TPGDataset(Dataset):
           # Positions of this shard already emitted as batches (+ any resume fast-forward).
           # Tagged onto every batch so the trainer can record exactly where each worker is.
           _file_pos = 0
-          _skip_pos = self.start_offsets.get(file_name, 0)
+          _skip_pos = self.start_offsets.pop(file_name, 0)  # once per shard (first pass only)
           if _skip_pos > 0:
             _skip_bytes = _skip_pos * BYTES_PER_POS
             _rem = _skip_bytes
