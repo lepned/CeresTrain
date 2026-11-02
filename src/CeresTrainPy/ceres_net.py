@@ -1468,7 +1468,8 @@ class CeresNet(nn.Module):
                                  _k, config.NetDef_NormType, EPS,
                                  proj_activation=config.NetDef_NBTProjActivation,
                                  proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i,
-                                 shared_smolgen=_make_shared_sm() if _shared_sm else None)
+                                 shared_smolgen=_make_shared_sm() if _shared_sm else None,
+                                 proj_activation_shift=config.NetDef_NBTProjActivationShift)
            for i in range(self.NUM_DISTINCT_LAYERS)])
       if _shared_sm:
         print(f'[ceres_net] NBT SHARED SMOLGEN: one generator per block on the {self.EMBEDDING_DIM}-wide block input '
@@ -1476,7 +1477,7 @@ class CeresNet(nn.Module):
       print(f'[ceres_net] NBT trunk: {self.NUM_DISTINCT_LAYERS} blocks x {_k} inner layers at {self.NBT_MID_DIM} '
             f'(ModelDim {self.EMBEDDING_DIM}), {_nbt_heads} inner heads (dim {self.NBT_MID_DIM // _nbt_heads}), '
             f'inner {"pre" if _nbt_prenorm else "post"}-norm, projections {config.NetDef_NBTProjNorm} -> '
-            f'{config.NetDef_NBTProjActivation} -> Linear, down init scale {_down_scale:.3f}, zero-init up projections')
+            f'{config.NetDef_NBTProjActivation}{" (mean-shift)" if config.NetDef_NBTProjActivationShift else ""} -> Linear, down init scale {_down_scale:.3f}, zero-init up projections')
     else:
       self.transformer_layer = torch.nn.Sequential(
          *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])

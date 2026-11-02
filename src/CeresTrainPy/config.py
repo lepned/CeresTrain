@@ -1108,6 +1108,13 @@ class Configuration:
     # (1/sqrt(num blocks))^(1/(1+NBTInnerLayers)); their trained transformer nets use
     # fixscaleonenorm instead (KataGoMethods.md: fixup "NOT used any more").
     self.NetDef_NBTProjNorm = config_net_def.get('NBTProjNorm', 'Norm') or 'Norm'
+    # NBTProjActivationShift (arXiv 2610.14500 "adaptive shift"): subtract each token's mean over
+    # channels from the projection activation output, so the down/up linears see zero-mean inputs
+    # (Swish has a positive mean; RMSNorm never removes it). Per token, no statistics => identical
+    # in training and inference. Requires a non-None NBTProjActivation.
+    self.NetDef_NBTProjActivationShift = bool(config_net_def.get('NBTProjActivationShift', False))
+    if self.NetDef_NBTProjActivationShift and self.NetDef_NBTProjActivation == 'None':
+      raise ValueError('NBTProjActivationShift requires NBTProjActivation != None')
     if self.NetDef_NBTProjNorm not in ('Norm', 'Affine'):
       raise ValueError(f"NBTProjNorm must be Norm or Affine (was {self.NetDef_NBTProjNorm!r})")
     self.NetDef_NBTFixupInit = bool(config_net_def.get('NBTFixupInit', False))
@@ -1167,9 +1174,9 @@ class Configuration:
         raise ValueError('NBTSharedSmolgenDim requires NBTSharedSmolgen: true')
     elif (_nbt_heads_raw or _nbt_prenorm_raw is not None or self.NetDef_NBTProjActivation != 'None'
           or self.NetDef_NBTProjNorm != 'Norm' or self.NetDef_NBTFixupInit or self.NetDef_NBTSharedSmolgen
-          or self.NetDef_NBTSharedSmolgenDim):
+          or self.NetDef_NBTSharedSmolgenDim or self.NetDef_NBTProjActivationShift):
       # Refuse a silent no-op: these knobs only exist inside NBT blocks.
-      raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation / NBTProjNorm / NBTFixupInit / NBTSharedSmolgen(Dim) require NBTInnerLayers > 0")
+      raise ValueError("NBTInnerHeads / NBTInnerPreNorm / NBTProjActivation(Shift) / NBTProjNorm / NBTFixupInit / NBTSharedSmolgen(Dim) require NBTInnerLayers > 0")
     # NBT TRUNK GROW on resume (2026-09-29): the checkpoint has NumLayers - len(list) blocks; a fresh block
     # (zero-init up projection = exact identity) is inserted after each listed CHECKPOINT block index
     # (-1 = before block 0; repeats insert several). The grown net is function-identical at the switch.

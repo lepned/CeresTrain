@@ -49,6 +49,31 @@ def test_katago_style_options():
   assert 'NBTInnerHeads' in rejected, rejected
 
 
+def test_proj_activation_shift():
+  # NBTProjActivationShift: the down/up linears see the activation minus its per-token channel mean.
+  torch.manual_seed(0)
+  blk = NestedBottleneckLayer(128, 64, lambda j: _make(64, j, 2, True), 2, 'RMSNorm', 1e-6,
+                              proj_activation='Swish', proj_activation_shift=True)
+  x = torch.randn(3, 64, 128)
+  assert torch.equal(blk(x), x), 'still an exact identity at init'
+  with torch.no_grad():
+    blk.up.weight.normal_(0, 0.05)
+    def c(a):
+      return a - a.mean(dim=-1, keepdim=True)
+    a_in = torch.nn.functional.silu(blk.norm_in(x))
+    assert a_in.mean().item() > 0.1, 'Swish output has a positive mean (the bias being removed)'
+    h = blk.down(c(a_in))
+    for l in blk.inner:
+      h = l(h)
+    ref = x + blk.up(c(torch.nn.functional.silu(blk.norm_out(h))))
+    assert torch.allclose(blk(x), ref, atol=1e-6), 'shift must sit between activation and projection'
+    assert blk._shift(a_in).mean(dim=-1).abs().max().item() < 1e-5
+  # The shift matters: the same weights without it give a different output.
+  blk.proj_activation_shift = False
+  with torch.no_grad():
+    assert not torch.allclose(blk(x), ref, atol=1e-4)
+
+
 def test_affine_proj_norm_and_fixup_init():
   from rms_norm import ChannelAffine, NORM_MODULE_TYPES
   torch.manual_seed(2)
@@ -275,6 +300,7 @@ if __name__ == '__main__':
   test_katago_style_options()
   test_affine_proj_norm_and_fixup_init()
   test_shared_smolgen()
+  test_proj_activation_shift()
   if len(sys.argv) >= 3:
     real(sys.argv[1], sys.argv[2])
   print('test_nbt_layer: OK')

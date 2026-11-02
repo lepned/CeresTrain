@@ -131,7 +131,7 @@ class NestedBottleneckLayer(torch.nn.Module):
   def __init__(self, model_dim: int, mid_dim: int, make_inner_layer: Callable[[int], torch.nn.Module],
                num_inner_layers: int, norm_type: str, layernorm_eps: float, proj_activation: str = 'None',
                proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
-               shared_smolgen: torch.nn.Module = None):
+               shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
     # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
@@ -158,11 +158,17 @@ class NestedBottleneckLayer(torch.nn.Module):
     # vocabulary as FFNActivationType; 'None' gives an identity).
     self.act_in = to_activation(proj_activation)
     self.act_out = to_activation(proj_activation)
+    # NBTProjActivationShift: per-token mean over channels subtracted after the activation.
+    self.proj_activation_shift = proj_activation_shift
     self.inner_heads = self.inner[0].num_attention_heads
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
         'NBTSharedSmolgen: inner layers must be built without their own smolgen')
+
+
+  def _shift(self, a: torch.Tensor) -> torch.Tensor:
+    return a - a.mean(dim=-1, keepdim=True) if self.proj_activation_shift else a
 
 
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None,
@@ -184,7 +190,7 @@ class NestedBottleneckLayer(torch.nn.Module):
       # Block-level content bias, summed with any incoming per-head bias (piece-relation etc.).
       sb = self.shared_smolgen(h0)
       piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
-    h = self.down(self.act_in(h0))
+    h = self.down(self._shift(self.act_in(h0)))
     logits = None
     for j, layer in enumerate(self.inner):
       _eg = None if edge_gates is None else edge_gates[j]
@@ -192,7 +198,7 @@ class NestedBottleneckLayer(torch.nn.Module):
         logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales, _eg)
       h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
                 edge_scales=edge_scales, edge_gate=_eg)
-    out = self.up(self.act_out(self.norm_out(h)))
+    out = self.up(self._shift(self.act_out(self.norm_out(h))))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output
     # before `out1 + mlp`. Like there, a learned beta lands on the un-normalized stream
