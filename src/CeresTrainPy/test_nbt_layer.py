@@ -68,6 +68,13 @@ def test_proj_activation_shift():
     ref = x + blk.up(c(torch.nn.functional.silu(blk.norm_out(h))))
     assert torch.allclose(blk(x), ref, atol=1e-6), 'shift must sit between activation and projection'
     assert blk._shift(a_in).mean(dim=-1).abs().max().item() < 1e-5
+  # Export fold: centering the down/up weight rows reproduces the shifted block without the shift op.
+  import copy
+  folded = copy.deepcopy(blk)
+  assert folded.fold_activation_shift_() and not folded.proj_activation_shift
+  with torch.no_grad():
+    assert torch.allclose(folded(x), ref, atol=1e-5), 'folded export block must match the shifted block'
+  assert not folded.fold_activation_shift_(), 'second fold is a no-op'
   # The shift matters: the same weights without it give a different output.
   blk.proj_activation_shift = False
   with torch.no_grad():

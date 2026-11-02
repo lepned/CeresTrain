@@ -182,6 +182,15 @@ def save_model(NAME : str,
       if not any(_fc.values()):
         raise ValueError(f'ExportFolds={_fold_s!r} but nothing was foldable in this model (silent no-op refused)')
       print(f'INFO: EXPORT_FOLD applied: {_fc} (training model untouched)')
+    # NBTProjActivationShift (nbt_layer.py): always folded into the down/up Linears for export.
+    # Unfolded, the ReduceMean/Sub pairs cost EB -6 % FP16 / -8 % INT8 on 2048 15x2 (11-02).
+    _shift_core = getattr(model_nocompile, 'core', model_nocompile)
+    if any(getattr(m, 'proj_activation_shift', False) for m in _shift_core.modules()):
+      if not (_mt_cap > 0 or _fold):
+        model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+        _shift_core = getattr(model_nocompile, 'core', model_nocompile)
+      _n_shift = sum(m.fold_activation_shift_() for m in _shift_core.modules() if hasattr(m, 'fold_activation_shift_'))
+      print(f'INFO: NBT activation shift folded into {_n_shift} blocks (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
     # NB folds deliberately do NOT tag the filename: ExportFolds is a property of the RUN's
     # config, so every export of that run is folded and there is nothing to disambiguate —

@@ -171,6 +171,19 @@ class NestedBottleneckLayer(torch.nn.Module):
     return a - a.mean(dim=-1, keepdim=True) if self.proj_activation_shift else a
 
 
+  def fold_activation_shift_(self) -> bool:
+    """Export-time fold of the shift into the consuming Linears (in place, for an export copy):
+    W (a - mean_c(a)) = (W - W.mean(dim=1)) a, so the graph needs no ReduceMean/Sub."""
+    if not self.proj_activation_shift:
+      return False
+    with torch.no_grad():
+      for lin in (self.down, self.up):
+        w = lin.weight.float()
+        lin.weight.copy_((w - w.mean(dim=1, keepdim=True)).to(lin.weight.dtype))
+    self.proj_activation_shift = False
+    return True
+
+
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None,
               film: Tuple[torch.Tensor, torch.Tensor] = None,
               rpe_src: torch.Tensor = None,
