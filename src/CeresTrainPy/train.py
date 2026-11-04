@@ -371,7 +371,8 @@ def get_most_extreme_weight_value(model):
         extreme_value = param_min
   return extreme_value
 
-# Storage for previous parameters for calc_weight_update_ratio
+# Storage for previous parameters for calc_weight_update_ratio, in CPU memory (2026-11-04: on the GPU
+# this full parameter copy held ~1 GB on rank 0 for the whole run; each tensor is moved back per use).
 previous_params = {}
 
 def calc_weight_update_ratio(model, logger):
@@ -384,14 +385,14 @@ def calc_weight_update_ratio(model, logger):
     for name, param in model.named_parameters():
       if param.requires_grad:
         if name in previous_params:
-          delta = param - previous_params[name]
+          delta = param - previous_params[name].to(param.device)
           update_norm = torch.norm(delta).item()
           weight_norm = torch.norm(param).item()
 
           total_update_norm += update_norm
           total_weight_norm += weight_norm
 
-        previous_params[name] = param.clone().detach()
+        previous_params[name] = param.detach().to('cpu', copy=True)
 
   if total_weight_norm > 0:
     return total_update_norm / total_weight_norm
@@ -405,7 +406,7 @@ def on_before_optimizer_step(writer, model, optimizer, pos_num):
     global last_logged_pos_num
 
     # Only rank 0 logs grad/weight diagnostics. (calc_weight_update_ratio also
-    # retains a full extra copy of the params — no reason to pay that on 3 ranks.)
+    # retains a full extra copy of the params, in CPU memory — no reason to pay that on 3 ranks.)
     if not IS_MASTER:
       return
 
@@ -420,7 +421,7 @@ def on_before_optimizer_step(writer, model, optimizer, pos_num):
       last_logged_pos_num = pos_num
 
     # log ratio of average absolute weight update to average absolute weight
-    # note that this does retain an extra copy of the model parameters and increase GPU memory usage
+    # note that this retains an extra copy of the model parameters (in CPU memory)
     weight_ratio = calc_weight_update_ratio(model, writer)
     writer.add_scalar("update_weight_ratio", weight_ratio, pos_num)
 
@@ -1624,10 +1625,12 @@ def Train():
           + ' (2 extra backwards per probe step; diagnostic only, training unaffected)', flush=True)
 
   # EMA / SWA shadow weights (config: EMAPeriodSteps/EMAMaxN — see config.py).
-  # Shadow copies of all floating-point state tensors live on the model's
-  # device; updated every EMAPeriodSteps optimizer steps with the lc0 capped
-  # running average. Deliberately NOT persisted across resume: re-initialized
-  # from the live weights at boot (n=0) and re-warmed within ~EMAMaxN periods.
+  # Shadow copies of all floating-point state tensors live in CPU memory (2026-11-04:
+  # on the GPU they cost rank 0 a full fp32 model copy and the 12x3 run OOM'd on GPU0;
+  # one model-sized GPU->CPU read per update is negligible at EMAPeriodSteps ~2000);
+  # updated every EMAPeriodSteps optimizer steps with the lc0 capped running average.
+  # Deliberately NOT persisted across resume: re-initialized from the live weights at
+  # boot (n=0) and re-warmed within ~EMAMaxN periods.
   EMA_PERIOD = int(getattr(config, 'Opt_EMAPeriodSteps', 0) or 0)
   _ema_maxn_cfg = getattr(config, 'Opt_EMAMaxN', None)
   EMA_MAX_N = 10 if _ema_maxn_cfg is None else int(_ema_maxn_cfg)  # runde-3: 'or 10' slukte eksplisitt 0
@@ -1668,7 +1671,7 @@ def Train():
     # Shadow kept in fp32 regardless of model precision: under BFloat16Pure a
     # bf16 shadow's ~8-bit mantissa would swallow the w/(n+1) increments late
     # in training, exactly when averaging matters most. copy_ casts on export.
-    _ema_sd = {k: v.detach().clone().float() for k, v in model_nocompile.state_dict().items()
+    _ema_sd = {k: v.detach().to('cpu', torch.float32, copy=True) for k, v in model_nocompile.state_dict().items()
                if torch.is_floating_point(v)}
     print(f'[train] EMA weight averaging enabled: period={EMA_PERIOD} opt-steps, '
           f'max_n={EMA_MAX_N} ({len(_ema_sd)} tensors; dual export <ckpt>ema.onnx)')
@@ -3231,7 +3234,7 @@ def Train():
             _a = _ema_n / (_ema_n + 1.0)
             _b = 1.0 / (_ema_n + 1.0)
             for _k, _ev in _ema_sd.items():
-              _ev.mul_(_a).add_(_msd[_k], alpha=_b)
+              _ev.mul_(_a).add_(_msd[_k].detach().to('cpu', torch.float32), alpha=_b)
           _ema_n = min(_ema_n + 1, EMA_MAX_N)
 
     batch_accumulation_counter = batch_accumulation_counter + 1
@@ -3283,7 +3286,7 @@ def Train():
         if _ema_sd is not None and _ema_n > 0:
           with torch.no_grad():
             _msd = model_nocompile.state_dict()
-            _raw_backup = {_k: _msd[_k].detach().clone() for _k in _ema_sd}
+            _raw_backup = {_k: _msd[_k].detach().to('cpu', copy=True) for _k in _ema_sd}
             for _k, _ev in _ema_sd.items():
               _msd[_k].copy_(_ev)
           try:
@@ -3292,6 +3295,9 @@ def Train():
             with torch.no_grad():
               for _k, _bv in _raw_backup.items():
                 _msd[_k].copy_(_bv)
+            # The backup used to sit on the GPU and outlive the restore until the next checkpoint.
+            del _raw_backup
+        torch.cuda.empty_cache()
       last_save_model_pos = num_pos
 
     current_time = datetime.datetime.now()
@@ -3393,7 +3399,7 @@ def Train():
       if _ema_sd is not None and _ema_n > 0:
         with torch.no_grad():
           _msd = model_nocompile.state_dict()
-          _raw_backup = {_k: _msd[_k].detach().clone() for _k in _ema_sd}
+          _raw_backup = {_k: _msd[_k].detach().to('cpu', copy=True) for _k in _ema_sd}
           for _k, _ev in _ema_sd.items():
             _msd[_k].copy_(_ev)
         try:
