@@ -19,6 +19,7 @@ import socket
 import datetime
 import math
 import contextlib
+import gc
 import json as _bootstrap_json
 
 # ---- Config -> env bootstrap (BEFORE the heavy imports) -------------------
@@ -2356,7 +2357,12 @@ def Train():
     # tidligste data re-trenes. Det gamle NUM_POS_TO_SKIP-maskineriet var doedt
     # (aldri lest) og er fjernet; A/B mellom resumed og kontinuerlig kjoering
     # maa ta hoyde for replay av tidlige shards.
+    # Drop every alias of the checkpoint tensors too (2026-11-04): _ckpt_model_sd (new_state_dict on LoRA) kept the model state dict
+    # on the GPU after `del loaded` (~1 GB per rank), and the resumed 12x3 OOM'd on GPU0 at its first ckpt export.
+    _ckpt_model_sd = _ckpt_emb_w = new_state_dict = loaded_optimizer_state = None
     del loaded
+    gc.collect()
+    torch.cuda.empty_cache()
 
   # ----------------------------------------------------------------------
   # KL-anchor reference model (optional, RLHF-style fine-tuning regularizer).
