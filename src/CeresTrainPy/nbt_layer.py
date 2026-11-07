@@ -127,12 +127,17 @@ class SharedSmolgen(torch.nn.Module):
   def prep_layer(self):
     return self._prep.linear
 
-  def forward(self, x: torch.Tensor, token_idx: torch.Tensor = None, fill: torch.Tensor = None) -> torch.Tensor:
+  def forward(self, x: torch.Tensor, token_idx: torch.Tensor = None, fill: torch.Tensor = None,
+              num_registers: int = 0) -> torch.Tensor:
     """x: [B, 64, model_dim] (block input, normalized) -> [B, heads, 64, 64] logit bias.
     Piece tokens: x is [B, K, model_dim] at squares token_idx [B, K]; sm1 is scattered back to its squares (zeros
     elsewhere = 'no token') so sm2 sees the fixed square layout, and the bias is returned at the K tokens [B, heads, K, K].
     fill [B, 64, model_dim] (PieceTokenSmolgenFill 'stale'): the non-token squares take sm1 of this (normalized) 64-square
-    state instead of zeros -- what a converted 64-square net's smolgen was trained on."""
+    state instead of zeros -- what a converted 64-square net's smolgen was trained on.
+    num_registers (RegisterTokens): the last num_registers tokens of x are registers; the generator reads only the
+    squares and the bias is zero-padded on the register rows/columns ([B, heads, T+R, T+R])."""
+    if num_registers:
+      x = x[:, :x.shape[1] - num_registers]
     s = self.sm1(x)
     if token_idx is not None:
       # one-hot matmul, not ScatterElements into zeros: the zeros' ConstantOfShape stays fp32 through the fp16
@@ -146,7 +151,11 @@ class SharedSmolgen(torch.nn.Module):
     s = self.ln2(self.act(self.sm3(s)))
     s = s.reshape(-1, self.num_heads, self.prep_in_dim)
     bias = self.prep_layer(s).reshape(-1, self.num_heads, self.num_tokens, self.num_tokens)
-    return bias if token_idx is None else gather_pair_bias(bias, token_idx)
+    if token_idx is not None:
+      bias = gather_pair_bias(bias, token_idx)
+    if num_registers:
+      bias = torch.nn.functional.pad(bias, (0, num_registers, 0, num_registers))
+    return bias
 
 
 def _make_proj_norm(proj_norm: str, norm_type: str, d: int, eps: float, fixed_scale: float) -> torch.nn.Module:
@@ -230,7 +239,7 @@ class NestedBottleneckLayer(torch.nn.Module):
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
               edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
-              token_fill: torch.Tensor = None):
+              token_fill: torch.Tensor = None, num_registers: int = 0):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -243,10 +252,13 @@ class NestedBottleneckLayer(torch.nn.Module):
     assert token_idx is None or self.mod_capacity == 0, 'NBT: piece tokens and MoD routing do not combine'
     assert not ((token_idx is not None or self.mod_capacity > 0) and (want_logits or edge_scales is not None or edge_gates is not None
                 or piece_relation_bias is not None or vis_edge is not None)),       'NBT piece tokens / MoD: no EGT, edge or incoming per-head square-pair bias (they are 64x64)'
+    # num_registers: the last num_registers tokens of x are register tokens (ceres_net RegisterTokens)
+    assert not (num_registers and (self.mod_capacity > 0 or want_logits or edge_scales is not None or edge_gates is not None
+                or piece_relation_bias is not None or vis_edge is not None)),       'NBT register tokens: no MoD, EGT, edge or incoming per-head square-pair bias (they are 64x64)'
     h0 = self.norm_in(x)
     if self.shared_smolgen is not None:
       # Block-level content bias, summed with any incoming per-head bias (piece-relation etc.).
-      sb = self.shared_smolgen(h0, token_idx, None if token_fill is None else self.norm_in(token_fill))
+      sb = self.shared_smolgen(h0, token_idx, None if token_fill is None else self.norm_in(token_fill), num_registers)
       piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
     mod_idx = None
     if self.mod_capacity > 0:

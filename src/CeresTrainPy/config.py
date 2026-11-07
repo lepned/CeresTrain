@@ -1132,6 +1132,12 @@ class Configuration:
     # PieceTokensFromBlock: hybrid -- blocks before it run on all 64 squares (they build the empty-square state the
     # decompression later starts from), the rest on the piece tokens. 64 tokens = all squares (equivalence check).
     self.NetDef_PieceTokensFromBlock = int(config_net_def.get('PieceTokensFromBlock', 0) or 0)
+    # PieceTokensToBlock: tail hybrid -- blocks [PieceTokensFromBlock, PieceTokensToBlock) run on the piece tokens; there
+    # the token states are scattered back onto the 64 squares (through the decompression cross-attention, which seeds the
+    # empties) and blocks [PieceTokensToBlock, NumLayers) run on all 64 squares again, so the move targets (mostly empty
+    # squares) get real trunk computation on the final piece states. 0 = piece tokens to the end. A resume from a
+    # checkpoint without it is not function-identical (the tail blocks then see 64 squares).
+    self.NetDef_PieceTokensToBlock = int(config_net_def.get('PieceTokensToBlock', 0) or 0)
     if not (self.NetDef_PieceTokens == 0 or 1 <= self.NetDef_PieceTokens <= 64):
       raise ValueError(f"PieceTokens must be 0 (off) or in [1, 64] (was {self.NetDef_PieceTokens})")
     # PieceTokenSmolgenFill: what the shared smolgen sees at non-token squares -- 'zero' (default) or 'stale' (sm1 of
@@ -1143,6 +1149,11 @@ class Configuration:
       raise ValueError('PieceTokenSmolgenFill set but PieceTokens is off (silent no-op refused)')
     if self.NetDef_PieceTokensFromBlock and not self.NetDef_PieceTokens:
       raise ValueError('PieceTokensFromBlock set but PieceTokens is off (silent no-op refused)')
+    if self.NetDef_PieceTokensToBlock and not self.NetDef_PieceTokens:
+      raise ValueError('PieceTokensToBlock set but PieceTokens is off (silent no-op refused)')
+    if self.NetDef_PieceTokensToBlock and not (self.NetDef_PieceTokensFromBlock < self.NetDef_PieceTokensToBlock < self.NetDef_NumLayers):
+      raise ValueError(f'PieceTokensToBlock must be in (PieceTokensFromBlock, NumLayers) (was {self.NetDef_PieceTokensToBlock}; '
+                       f'0 = piece tokens to the end)')
     if self.NetDef_PieceTokens and self.NetDef_PieceTokens < 32:
       raise ValueError(f"PieceTokens < 32 would drop pieces (max 32 on the board), was {self.NetDef_PieceTokens}")
     # NBT MIXTURE-OF-DEPTHS (2026-11-07, Raposo et al. 2024): in the blocks listed in NBTMoDBlocks (empty = all), a
@@ -1161,6 +1172,18 @@ class Configuration:
       raise ValueError('NBTMoDBlocks set but NBTMoDCapacity is 0 (silent no-op refused)')
     if self.NetDef_NBTMoDCapacity and self.NetDef_PieceTokens:
       raise ValueError('NBTMoDCapacity and PieceTokens are alternatives, not combinable')
+    # REGISTER TOKENS (2026-11-07, Darcet et al. 2023 "Vision Transformers Need Registers"; NBT trunks): RegisterTokens
+    # learned tokens join the 64 squares (or the piece tokens) in the trunk as global scratch memory -- the shared
+    # smolgen bias is 0 on their rows/columns -- and are dropped before the heads. RegisterTokensToValue: the final
+    # registers also feed the value/value2 hidden pre-activation (zero-init inject, the ValueHeadMinMaxPool pattern).
+    self.NetDef_RegisterTokens = int(config_net_def.get('RegisterTokens', 0) or 0)
+    self.NetDef_RegisterTokensToValue = bool(config_net_def.get('RegisterTokensToValue', False))
+    if not (0 <= self.NetDef_RegisterTokens <= 32):
+      raise ValueError(f"RegisterTokens must be in [0, 32] (was {self.NetDef_RegisterTokens})")
+    if self.NetDef_RegisterTokensToValue and not self.NetDef_RegisterTokens:
+      raise ValueError('RegisterTokensToValue set but RegisterTokens is 0 (silent no-op refused)')
+    if self.NetDef_RegisterTokens and self.NetDef_NBTMoDCapacity:
+      raise ValueError('RegisterTokens and NBTMoDCapacity do not combine (the router would route the registers)')
     # EGT EDGE STREAM in TRT-servable form (2026-10-07, egt_edge.py; NBT trunks only): a learned edge state read once per
     # NBT block (additive bias + log-door, separable q/k premult, row-scale door) and updated (readback, path triplet,
     # edge FFN) after the blocks listed in EGTEdgeSites. Zero-init readers: step 0 == the net without it.

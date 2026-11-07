@@ -587,7 +587,10 @@ def Train():
                         or "kdist_proj" in name or "spe_proj" in name or "cbk_" in name
                         # Move-token action head: a NEW module when warm-started from a head-less
                         # checkpoint — without this it froze at its init and exported a dead head.
-                        or "move_tokens.act." in name)
+                        or "move_tokens.act." in name
+                        # Register tokens + their value injects (NetDef RegisterTokens): NEW modules (random /
+                        # zero init) -- frozen they would stay at init, a silent dead feature.
+                        or "register_" in name)
       if not keep_trainable:
         param.requires_grad = False
 
@@ -760,6 +763,8 @@ def Train():
       if n.replace('_orig_mod.', '').startswith('egt.'): return False      # EGT edge stream (torch.compile adds _orig_mod.): zero-init readers + lookup tables (review 2026-10-07), AdamW
       if 'move_tokens.rq_head.' in n: return False   # reply-q readout [1, dk]: training-only 1-row final layer, AdamW
       if 'mod_router' in n: return False         # NBT MoD router [1, D]: 1-row scorer, same class as vord, AdamW
+      if 'register_tokens' in n: return False    # learned register tokens [R, D]: embedding-like rows, AdamW
+      if 'register_value' in n: return False     # zero-init register -> value injects: coupling class (see the decoder rule), AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -2059,6 +2064,8 @@ def Train():
     # Piece-token decompression (NetDef PieceTokens) switched on at resume: zero-init output, fresh q/kv. NOT function-
     # identical (the trunk then sees 32 squares) -- the conversion fine-tune of a 64-square net (2026-11-07).
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('pt_decompress.',)
+    # Register -> value injectors (NetDef RegisterTokensToValue): top-level, zero-init.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('register_value_inject.', 'register_value2_inject.')
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.

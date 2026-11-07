@@ -157,7 +157,8 @@ def _real(cfg_dir, cfg_id):
       # Conversion: a trained 64-square net's weights load into a piece-token net (only pt_decompress is new); with
       # PieceTokens 64 the function is identical (permutation equivariance + zero-init decompression), also hybrid.
       for over in (dict(PieceTokens=64), dict(PieceTokens=64, PieceTokensFromBlock=2),
-                   dict(PieceTokens=64, PieceTokensFromBlock=2, PieceTokenSmolgenFill='stale')):
+                   dict(PieceTokens=64, PieceTokensFromBlock=2, PieceTokenSmolgenFill='stale'),
+                   dict(PieceTokens=64, PieceTokensToBlock=2), dict(PieceTokens=64, PieceTokensFromBlock=1, PieceTokensToBlock=3)):
         net = build(**over)
         missing, unexpected = net.load_state_dict(base_net.state_dict(), strict=False)
         assert not unexpected and missing and all(k.startswith('pt_decompress.') for k in missing), (missing, unexpected)
@@ -169,7 +170,14 @@ def _real(cfg_dir, cfg_id):
       for name, over in (('PieceTokens 32', dict(PieceTokens=32)), ('MoD 32 all blocks', dict(NBTMoDCapacity=32)),
                          ('MoD 32 blocks 2,3', dict(NBTMoDCapacity=32, NBTMoDBlocks=[2, 3])),
                          ('PieceTokens 32 from block 2', dict(PieceTokens=32, PieceTokensFromBlock=2)),
-                         ('PieceTokens 32 stale smolgen fill', dict(PieceTokens=32, PieceTokenSmolgenFill='stale'))):
+                         ('PieceTokens 32 stale smolgen fill', dict(PieceTokens=32, PieceTokenSmolgenFill='stale')),
+                         ('PieceTokens 32 to block 2 (tail on 64 squares)', dict(PieceTokens=32, PieceTokensToBlock=2)),
+                         ('PieceTokens 32 blocks [1, 3) + registers 4 + value read',
+                          dict(PieceTokens=32, PieceTokensFromBlock=1, PieceTokensToBlock=3, RegisterTokens=4, RegisterTokensToValue=True)),
+                         ('Registers 8', dict(RegisterTokens=8)),
+                         ('Registers 8 + value read', dict(RegisterTokens=8, RegisterTokensToValue=True)),
+                         ('PieceTokens 32 from block 2 + registers 4 + value read',
+                          dict(PieceTokens=32, PieceTokensFromBlock=2, RegisterTokens=4, RegisterTokensToValue=True))):
         net = build(**over)
         out = net(sq, None)
         assert len(out) == len(ref)
@@ -178,8 +186,55 @@ def _real(cfg_dir, cfg_id):
             assert a.shape == r.shape and torch.isfinite(a).all(), name
         n = sum(p.numel() for p in net.parameters())
         print(f'  real net OK: {name}, {n:,} params, outputs match the base net in shape')
+      # registers are built in a forked RNG: every other parameter initializes exactly as in the base net
+      reg_net = build(RegisterTokens=8, RegisterTokensToValue=True)
+      bsd = base_net.state_dict()
+      extra = [k for k in reg_net.state_dict() if k not in bsd]
+      assert sorted(extra) == ['register_tokens', 'register_value_inject.weight'], extra
+      for k, v in bsd.items():
+        assert torch.equal(v, reg_net.state_dict()[k]), f'init differs with registers: {k}'
+      print('  registers: other parameters init bit-identical to the base net')
+    # gradients reach the registers through attention (training mode, depth probes on if the config has them); the
+    # zero-init NBT up projections make that gradient exactly 0 at step 0, so give them (and the value read) weights first
+    with torch.no_grad():
+      for n, p in reg_net.named_parameters():
+        if n.endswith('.up.weight') or n.startswith('register_value_inject.'):
+          p.normal_(0, 0.02)
+    reg_net.train()
+    out = reg_net(sq, None)
+    sum(o.float().square().mean() for o in out if isinstance(o, torch.Tensor) and o.is_floating_point()).backward()
+    g = reg_net.register_tokens.grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, 'no gradient into register_tokens'
+    print(f'  registers: gradient into register_tokens |g|={float(g.abs().mean()):.2e}')
+    # tail hybrid: step-0 input of the first 64-square block = the K token states at their squares, the switch state
+    # elsewhere; gradients reach the decompression and the tail blocks
+    th = build(PieceTokens=32, PieceTokensToBlock=2)
+    seen = {}
+    th.transformer_layer[1].register_forward_hook(lambda m, a, o: seen.__setitem__('tok', o))
+    th.transformer_layer[2].register_forward_pre_hook(lambda m, a: seen.__setitem__('in', a[0]))
+    with torch.no_grad():
+      th(sq, None)
+    from piece_tokens import select_piece_tokens
+    from nbt_layer import gather_tokens
+    idx = select_piece_tokens(sq, 32)
+    assert seen['in'].shape[1] == 64 and torch.equal(gather_tokens(seen['in'], idx), seen['tok']), 'tail input at tokens != token states'
+    with torch.no_grad():
+      for n, p in th.named_parameters():
+        if n.endswith('.up.weight') or n == 'pt_decompress.out.weight':
+          p.normal_(0, 0.02)
+    th.train()
+    out = th(sq, None)
+    sum(o.float().square().mean() for o in out if isinstance(o, torch.Tensor) and o.is_floating_point()).backward()
+    for n in ('pt_decompress.q.weight', 'transformer_layer.3.down.weight'):
+      g = dict(th.named_parameters())[n].grad
+      assert g is not None and float(g.abs().sum()) > 0, f'no gradient into {n}'
+    print('  tail hybrid: step-0 scatter semantics + gradients into decompression and tail blocks OK')
     for over in (dict(PieceTokens=16), dict(PieceTokens=32, NBTMoDCapacity=32), dict(NBTMoDCapacity=64),
-                 dict(PieceTokenDecompressDim=640), dict(NBTMoDBlocks=[1]), dict(PieceTokensFromBlock=1), dict(PieceTokenSmolgenFill='stale'), dict(PieceTokens=32, PieceTokensFromBlock=4), dict(NBTMoDCapacity=32, NBTSharedSmolgen=False)):
+                 dict(PieceTokenDecompressDim=640), dict(NBTMoDBlocks=[1]), dict(PieceTokensFromBlock=1), dict(PieceTokenSmolgenFill='stale'), dict(PieceTokens=32, PieceTokensFromBlock=4), dict(NBTMoDCapacity=32, NBTSharedSmolgen=False),
+                 dict(RegisterTokensToValue=True), dict(RegisterTokens=8, NBTMoDCapacity=32), dict(RegisterTokens=33),
+                 dict(RegisterTokens=8, NBTSharedSmolgen=False),
+                 dict(PieceTokensToBlock=2), dict(PieceTokens=32, PieceTokensToBlock=4),
+                 dict(PieceTokens=32, PieceTokensFromBlock=2, PieceTokensToBlock=2), dict(PieceTokens=32, PieceTokensToBlock=5)):
       refused = False
       try:
         build(**over)

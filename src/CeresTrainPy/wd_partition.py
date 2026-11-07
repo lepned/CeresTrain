@@ -100,6 +100,8 @@ def partition_weight_decay(model):
               decay.add(fpn)
           elif "vda_query" in fpn: # depth-attention pseudo-query (bare 1-D vector, bias-like)
               no_decay.add(fpn)
+          elif fpn.endswith("register_tokens"): # learned register tokens [R, D] (RegisterTokens): embedding-like, no decay
+              no_decay.add(fpn)
           elif "rc_btype" in fpn or "rc_u" in fpn or "rc_v" in fpn or "rc_w" in fpn: # ray-context bare vectors (bias-like)
               no_decay.add(fpn)
           elif "rc_W" in fpn: # ray-context projections (plain Linear weights)

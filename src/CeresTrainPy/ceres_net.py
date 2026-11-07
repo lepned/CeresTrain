@@ -1496,19 +1496,48 @@ class CeresNet(nn.Module):
     # cross-attention rebuilds the 64 square states before the heads.
     self.piece_tokens = int(getattr(config, 'NetDef_PieceTokens', 0) or 0)
     self.pt_from_block = int(getattr(config, 'NetDef_PieceTokensFromBlock', 0) or 0)
+    self.pt_to_block = int(getattr(config, 'NetDef_PieceTokensToBlock', 0) or 0) or self.NUM_DISTINCT_LAYERS
     self.pt_smolgen_stale = (getattr(config, 'NetDef_PieceTokenSmolgenFill', 'zero') == 'stale')
     self.pt_decompress = None
     if self.piece_tokens:
-      assert 0 <= self.pt_from_block < self.NUM_DISTINCT_LAYERS, f'PieceTokensFromBlock {self.pt_from_block} out of range'
+      assert 0 <= self.pt_from_block < self.pt_to_block <= self.NUM_DISTINCT_LAYERS,         f'PieceTokens blocks [{self.pt_from_block}, {self.pt_to_block}) out of range'
       assert self.NBT_INNER_LAYERS > 0 and self.LOOP_COUNT == 1 and not self.denseformer,         'PieceTokens: NBT trunk, LoopCount 1, no DenseFormer'
       assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),         'PieceTokens: per-layer smolgen is 64-token (use NBTSharedSmolgen or smolgen off)'
       assert not (config.NetDef_UseRPE or config.NetDef_UseRoPE or getattr(config, 'NetDef_EGTEdgeStream', False)),         'PieceTokens: RPE / RoPE / EGT are square-pair (64x64) features'
       from piece_tokens import PieceTokenDecompress
       _pt_d = int(getattr(config, 'NetDef_PieceTokenDecompressDim', 0) or 0) or self.NBT_MID_DIM
       self.pt_decompress = PieceTokenDecompress(self.EMBEDDING_DIM, _pt_d, config.NetDef_NBTInnerHeads, config.NetDef_NormType, EPS)
-      print(f'[ceres_net] PIECE TOKENS: trunk from block {self.pt_from_block} on {self.piece_tokens}/64 squares (pieces, then previous-board pieces, '
-            f'then empties), decompress cross-attention {_pt_d} wide x {config.NetDef_NBTInnerHeads} heads, '
+      print(f'[ceres_net] PIECE TOKENS: trunk blocks [{self.pt_from_block}, {self.pt_to_block}) on {self.piece_tokens}/64 squares (pieces, then previous-board pieces, '
+            f'then empties){", blocks [" + str(self.pt_to_block) + ", " + str(self.NUM_DISTINCT_LAYERS) + ") on all 64 squares" if self.pt_to_block < self.NUM_DISTINCT_LAYERS else ""}, decompress cross-attention {_pt_d} wide x {config.NetDef_NBTInnerHeads} heads, '
             f'{sum(p.numel() for p in self.pt_decompress.parameters()) / 1e6:.2f}M params')
+
+    # Register tokens (config RegisterTokens; Darcet et al. 2023): learned tokens appended to the trunk's squares (or
+    # piece tokens) as global scratch memory, dropped before the heads; optionally read by the value family
+    # (RegisterTokensToValue). Built in a forked RNG so every other parameter initializes as without them.
+    self.num_registers = int(getattr(config, 'NetDef_RegisterTokens', 0) or 0)
+    self.register_tokens = None
+    self.register_value_inject = None
+    self.register_value2_inject = None
+    if self.num_registers:
+      assert self.NBT_INNER_LAYERS > 0 and not self.denseformer, 'RegisterTokens: NBT trunk, no DenseFormer'
+      assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),         'RegisterTokens: per-layer smolgen is 64-token (use NBTSharedSmolgen or smolgen off)'
+      assert not (config.NetDef_UseRPE or config.NetDef_UseRoPE or getattr(config, 'NetDef_EGTEdgeStream', False)
+                  or self.use_vis_edge_bias or self.vis_edge_gate_mode or self.use_graph_route),         'RegisterTokens: RPE / RoPE / EGT / vis-edge bias / vis-edge gates / graph route are square-pair (64x64) features'
+      _R, _D = self.num_registers, self.EMBEDDING_DIM
+      _hm = config.NetDef_HeadWidthMultiplier
+      with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0x4E6)
+        # unit-variance entries: the scale of the normalized square embedding they sit next to
+        self.register_tokens = nn.Parameter(torch.randn(_R, _D))
+        if config.NetDef_RegisterTokensToValue:
+          self.register_value_inject = nn.Linear(_R * _D, 64 * _hm, bias=False)
+          nn.init.zeros_(self.register_value_inject.weight)
+          if self.value2_loss_weight > 0:
+            self.register_value2_inject = nn.Linear(_R * _D, 64 * _hm, bias=False)
+            nn.init.zeros_(self.register_value2_inject.weight)
+      _n_rv = sum(m.weight.numel() for m in (self.register_value_inject, self.register_value2_inject) if m is not None)
+      print(f'[ceres_net] REGISTER TOKENS: {_R} learned tokens in the trunk (smolgen bias 0 on their rows/columns), '
+            f'dropped before the heads; value read {"ON (zero-init inject, " + format(_n_rv, ",") + " params)" if _n_rv else "off"}')
 
     # EGT edge stream (egt_edge.py; config EGTEdgeStream). Built in a forked RNG under a fixed seed so every other
     # parameter initializes bit-identically with and without it; its readers are zero-init (step 0 == without it).
@@ -2103,6 +2132,10 @@ class CeresNet(nn.Module):
       vda_states = [flow]  # post-embedding state
     rpe_src_tensor = flow if (self.rpe_from_embedding and not self.rpe_genphase) else None  # post-embedding, pre-layer-1
     rpe_gen_biases = self._rpe_genphase_biases(flow) if (self.rpe_from_embedding and self.rpe_genphase) else None
+    # Register tokens ride at the end of the token axis through the trunk; the depth states exclude them.
+    _R = self.num_registers
+    if _R:
+      flow = torch.cat([flow, self.register_tokens.to(flow.dtype).unsqueeze(0).expand(flow.shape[0], -1, -1)], dim=1)
 
     # Main transformer body (stack of encoder layers).
     # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
@@ -2122,8 +2155,18 @@ class CeresNet(nn.Module):
       for i in range(self.NUM_DISTINCT_LAYERS):
         if pt_idx is not None and i == self.pt_from_block:
           # piece tokens from here on; flow64 = the 64-square state the decompression starts from
-          flow64 = flow
-          flow = torch.gather(flow, 1, pt_idx.unsqueeze(-1).expand(-1, -1, flow.shape[-1]))
+          _regs = flow[:, 64:] if _R else None
+          flow64 = flow[:, :64] if _R else flow
+          flow = torch.gather(flow64, 1, pt_idx.unsqueeze(-1).expand(-1, -1, flow64.shape[-1]))
+          if _regs is not None:
+            flow = torch.cat([flow, _regs], dim=1)
+        if pt_idx is not None and i == self.pt_to_block:
+          # tail hybrid: back to 64 squares -- token states scattered onto the switch state, empties seeded by the
+          # decompression cross-attention (zero-init out: at step 0 a plain scatter)
+          _regs = flow[:, flow.shape[1] - _R:] if _R else None
+          flow = self.pt_decompress(flow64, flow[:, :flow.shape[1] - _R] if _R else flow, pt_idx)
+          if _regs is not None:
+            flow = torch.cat([flow, _regs], dim=1)
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
           _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]
@@ -2145,7 +2188,8 @@ class CeresNet(nn.Module):
                                          rpe_precomputed=rpe_gen_biases is not None,
                                          vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None,
                                          **_egt_kw, **({'token_idx': pt_idx, 'token_fill': flow64 if self.pt_smolgen_stale else None}
-                                                     if (pt_idx is not None and i >= self.pt_from_block) else {}))
+                                                     if (pt_idx is not None and self.pt_from_block <= i < self.pt_to_block) else {}),
+                                         **({'num_registers': _R} if _R else {}))
         if _egt_site:
           flow, _egt_logits = flow
           _egt_e = self.egt.update(i, _egt_e, _egt_logits)
@@ -2154,14 +2198,21 @@ class CeresNet(nn.Module):
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
         if _collect_states:
-          vda_states.append(flow)  # post-layer (post-DWA if denseformer)
+          vda_states.append(flow[:, :flow.shape[1] - _R] if _R else flow)  # post-layer (post-DWA if denseformer)
 
-    if pt_idx is not None:
+    _reg_out = None
+    if _R:
+      _reg_out = flow[:, flow.shape[1] - _R:]
+      flow = flow[:, :flow.shape[1] - _R]
+
+    if pt_idx is not None and self.pt_to_block == self.NUM_DISTINCT_LAYERS:
       flow = self.pt_decompress(flow64, flow, pt_idx)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
     if self.trunk_end_norm is not None:
       flow = self.trunk_end_norm(flow)
+      if _reg_out is not None:
+        _reg_out = self.trunk_end_norm(_reg_out)
 
     # Iterated tactic refiner (see __init__): residual add of the weight-shared
     # iterated block. Runs BEFORE GTAB/vda/heads so every consumer reads the
@@ -2335,6 +2386,16 @@ class CeresNet(nn.Module):
       if self.value2_loss_weight > 0:
         _v2p = self.value2_pool_inject(_pool)
         _v2_inject = _v2p if _v2_inject is None else _v2_inject + _v2p
+
+    # REGISTER TOKENS -> value (RegisterTokensToValue): the normalized final registers, flattened, into the value
+    # family's hidden pre-activation (zero-init, so step 0 reads nothing from them).
+    if self.register_value_inject is not None:
+      _rflat = _reg_out.reshape(-1, self.num_registers * self.EMBEDDING_DIM)
+      _rv = self.register_value_inject(_rflat)
+      _v_inject = _rv if _v_inject is None else _v_inject + _rv
+      if self.register_value2_inject is not None:
+        _rv2 = self.register_value2_inject(_rflat)
+        _v2_inject = _rv2 if _v2_inject is None else _v2_inject + _rv2
 
     # Depth-attending value context (see __init__). Non-in-place adds create NEW
     # tensors, so fS_others (often the same object as fS_value) is untouched —
