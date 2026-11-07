@@ -1452,6 +1452,9 @@ class CeresNet(nn.Module):
       # (their trained transformer nets use fixscaleonenorm, not fixup -- off by default).
       _down_scale = math.pow(1.0 / math.sqrt(self.NUM_DISTINCT_LAYERS), 1.0 / (1.0 + _k)) if config.NetDef_NBTFixupInit else 1.0
       _shared_sm = bool(getattr(config, 'NetDef_NBTSharedSmolgen', False))
+      _mod_cap = int(getattr(config, 'NetDef_NBTMoDCapacity', 0) or 0)
+      _mod_blocks = list(getattr(config, 'NetDef_NBTMoDBlocks', []) or [])
+      assert all(0 <= b < self.NUM_DISTINCT_LAYERS for b in _mod_blocks), f'NBTMoDBlocks {_mod_blocks} out of range'
       if _shared_sm:
         assert self.smolgenPrepLayer is not None, 'NBTSharedSmolgen needs the global smolgen prep layer (smolgen on)'
         from nbt_layer import SharedSmolgen
@@ -1469,8 +1472,14 @@ class CeresNet(nn.Module):
                                  proj_activation=config.NetDef_NBTProjActivation,
                                  proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i,
                                  shared_smolgen=_make_shared_sm() if _shared_sm else None,
-                                 proj_activation_shift=config.NetDef_NBTProjActivationShift)
+                                 proj_activation_shift=config.NetDef_NBTProjActivationShift,
+                                 mod_capacity=_mod_cap if (not _mod_blocks or i in _mod_blocks) else 0)
            for i in range(self.NUM_DISTINCT_LAYERS)])
+      if _mod_cap:
+        assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),           'NBTMoDCapacity: per-layer smolgen is 64-token (use NBTSharedSmolgen or smolgen off)'
+        assert not (config.NetDef_UseRPE or config.NetDef_UseRoPE or getattr(config, 'NetDef_EGTEdgeStream', False)),           'NBTMoDCapacity: RPE / RoPE / EGT are square-pair (64x64) features'
+        print(f'[ceres_net] NBT MIXTURE-OF-DEPTHS: capacity {_mod_cap}/64 squares in blocks '
+              f'{_mod_blocks if _mod_blocks else "all"} (router 2*sigmoid gate, identity for unrouted squares)')
       if _shared_sm:
         print(f'[ceres_net] NBT SHARED SMOLGEN: one generator per block on the {self.EMBEDDING_DIM}-wide block input '
               f'(sm2 width {_sm_hidden}), inner layers without smolgen')
@@ -1479,8 +1488,27 @@ class CeresNet(nn.Module):
             f'inner {"pre" if _nbt_prenorm else "post"}-norm, projections {config.NetDef_NBTProjNorm} -> '
             f'{config.NetDef_NBTProjActivation}{" (mean-shift)" if config.NetDef_NBTProjActivationShift else ""} -> Linear, down init scale {_down_scale:.3f}, zero-init up projections')
     else:
+      assert not int(getattr(config, 'NetDef_NBTMoDCapacity', 0) or 0), 'NBTMoDCapacity needs an NBT trunk'
       self.transformer_layer = torch.nn.Sequential(
          *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])
+
+    # Piece tokens (piece_tokens.py; config PieceTokens): the trunk runs on PieceTokens of the 64 squares and a narrow
+    # cross-attention rebuilds the 64 square states before the heads.
+    self.piece_tokens = int(getattr(config, 'NetDef_PieceTokens', 0) or 0)
+    self.pt_from_block = int(getattr(config, 'NetDef_PieceTokensFromBlock', 0) or 0)
+    self.pt_smolgen_stale = (getattr(config, 'NetDef_PieceTokenSmolgenFill', 'zero') == 'stale')
+    self.pt_decompress = None
+    if self.piece_tokens:
+      assert 0 <= self.pt_from_block < self.NUM_DISTINCT_LAYERS, f'PieceTokensFromBlock {self.pt_from_block} out of range'
+      assert self.NBT_INNER_LAYERS > 0 and self.LOOP_COUNT == 1 and not self.denseformer,         'PieceTokens: NBT trunk, LoopCount 1, no DenseFormer'
+      assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),         'PieceTokens: per-layer smolgen is 64-token (use NBTSharedSmolgen or smolgen off)'
+      assert not (config.NetDef_UseRPE or config.NetDef_UseRoPE or getattr(config, 'NetDef_EGTEdgeStream', False)),         'PieceTokens: RPE / RoPE / EGT are square-pair (64x64) features'
+      from piece_tokens import PieceTokenDecompress
+      _pt_d = int(getattr(config, 'NetDef_PieceTokenDecompressDim', 0) or 0) or self.NBT_MID_DIM
+      self.pt_decompress = PieceTokenDecompress(self.EMBEDDING_DIM, _pt_d, config.NetDef_NBTInnerHeads, config.NetDef_NormType, EPS)
+      print(f'[ceres_net] PIECE TOKENS: trunk from block {self.pt_from_block} on {self.piece_tokens}/64 squares (pieces, then previous-board pieces, '
+            f'then empties), decompress cross-attention {_pt_d} wide x {config.NetDef_NBTInnerHeads} heads, '
+            f'{sum(p.numel() for p in self.pt_decompress.parameters()) / 1e6:.2f}M params')
 
     # EGT edge stream (egt_edge.py; config EGTEdgeStream). Built in a forked RNG under a fixed seed so every other
     # parameter initializes bit-identically with and without it; its readers are zero-init (step 0 == without it).
@@ -2056,6 +2084,12 @@ class CeresNet(nn.Module):
     if self.denseformer:
       all_previous_x = [flow]
 
+    # Piece tokens: the trunk runs on the selected squares only (piece_tokens.py); flow64 is rebuilt after the trunk.
+    pt_idx = None
+    if self.piece_tokens:
+      from piece_tokens import select_piece_tokens
+      pt_idx = select_piece_tokens(squares, self.piece_tokens)
+
     # Depth-attention state collection: RAW references for ALL modes (deferred
     # pooling — zero ops in the trunk, all compute at the tail; activations are
     # alive for backward anyway so collection is free).
@@ -2063,6 +2097,8 @@ class CeresNet(nn.Module):
     # state after effective layer k (0 = post-embedding), for every LoopCount.
     _collect_states = (self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training)
                        or bool(self.mt_mix_layers))
+    # depth probes mean-pool each state over its tokens, so 32-token states are fine; the others index 64 squares
+    assert not (pt_idx is not None and (self.use_value_depth_attention or self.pda_mode or self.mt_mix_layers)),       'PieceTokens: depth states for vda / pda / MoveTokenTrunkMix are 64-token; turn them off'
     if _collect_states:
       vda_states = [flow]  # post-embedding state
     rpe_src_tensor = flow if (self.rpe_from_embedding and not self.rpe_genphase) else None  # post-embedding, pre-layer-1
@@ -2084,6 +2120,10 @@ class CeresNet(nn.Module):
       _egt_e = self.egt.init_state(_egt_E.to(flow.dtype))   # [B, 64, 64, d_e]
     for loop_iter in range(self.LOOP_COUNT):
       for i in range(self.NUM_DISTINCT_LAYERS):
+        if pt_idx is not None and i == self.pt_from_block:
+          # piece tokens from here on; flow64 = the 64-square state the decompression starts from
+          flow64 = flow
+          flow = torch.gather(flow, 1, pt_idx.unsqueeze(-1).expand(-1, -1, flow.shape[-1]))
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
           _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]
@@ -2104,7 +2144,8 @@ class CeresNet(nn.Module):
                                          rpe_src=rpe_src_tensor,
                                          rpe_precomputed=rpe_gen_biases is not None,
                                          vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None,
-                                         **_egt_kw)
+                                         **_egt_kw, **({'token_idx': pt_idx, 'token_fill': flow64 if self.pt_smolgen_stale else None}
+                                                     if (pt_idx is not None and i >= self.pt_from_block) else {}))
         if _egt_site:
           flow, _egt_logits = flow
           _egt_e = self.egt.update(i, _egt_e, _egt_logits)
@@ -2114,6 +2155,9 @@ class CeresNet(nn.Module):
           flow = self.dwa_modules[eff_idx](all_previous_x)
         if _collect_states:
           vda_states.append(flow)  # post-layer (post-DWA if denseformer)
+
+    if pt_idx is not None:
+      flow = self.pt_decompress(flow64, flow, pt_idx)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
     if self.trunk_end_norm is not None:

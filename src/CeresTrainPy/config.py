@@ -1123,6 +1123,44 @@ class Configuration:
     # their own. NBTSharedSmolgenDim = its sm2 width (0 = SmolgenDim). Needs smolgen on.
     self.NetDef_NBTSharedSmolgen = bool(config_net_def.get('NBTSharedSmolgen', False))
     self.NetDef_NBTSharedSmolgenDim = int(config_net_def.get('NBTSharedSmolgenDim', 0) or 0)
+    # PIECE TOKENS (2026-11-07, piece_tokens.py; NBT trunks only): the trunk runs on PieceTokens (32) of the 64 squares,
+    # chosen inside the graph (occupied now > occupied on the previous board > square index), and a narrow
+    # cross-attention (PieceTokenDecompressDim wide, 0 = NBTMidDim) rebuilds the 64 square states before the heads.
+    # 0 = off. Cuts the trunk's per-token GEMM work by 64/PieceTokens.
+    self.NetDef_PieceTokens = int(config_net_def.get('PieceTokens', 0) or 0)
+    self.NetDef_PieceTokenDecompressDim = int(config_net_def.get('PieceTokenDecompressDim', 0) or 0)
+    # PieceTokensFromBlock: hybrid -- blocks before it run on all 64 squares (they build the empty-square state the
+    # decompression later starts from), the rest on the piece tokens. 64 tokens = all squares (equivalence check).
+    self.NetDef_PieceTokensFromBlock = int(config_net_def.get('PieceTokensFromBlock', 0) or 0)
+    if not (self.NetDef_PieceTokens == 0 or 1 <= self.NetDef_PieceTokens <= 64):
+      raise ValueError(f"PieceTokens must be 0 (off) or in [1, 64] (was {self.NetDef_PieceTokens})")
+    # PieceTokenSmolgenFill: what the shared smolgen sees at non-token squares -- 'zero' (default) or 'stale' (sm1 of
+    # the 64-square state at the switch to piece tokens; for converting a net trained on all 64 squares).
+    self.NetDef_PieceTokenSmolgenFill = config_net_def.get('PieceTokenSmolgenFill', 'zero') or 'zero'
+    if self.NetDef_PieceTokenSmolgenFill not in ('zero', 'stale'):
+      raise ValueError(f"PieceTokenSmolgenFill must be zero or stale (was {self.NetDef_PieceTokenSmolgenFill!r})")
+    if self.NetDef_PieceTokenSmolgenFill != 'zero' and not self.NetDef_PieceTokens:
+      raise ValueError('PieceTokenSmolgenFill set but PieceTokens is off (silent no-op refused)')
+    if self.NetDef_PieceTokensFromBlock and not self.NetDef_PieceTokens:
+      raise ValueError('PieceTokensFromBlock set but PieceTokens is off (silent no-op refused)')
+    if self.NetDef_PieceTokens and self.NetDef_PieceTokens < 32:
+      raise ValueError(f"PieceTokens < 32 would drop pieces (max 32 on the board), was {self.NetDef_PieceTokens}")
+    # NBT MIXTURE-OF-DEPTHS (2026-11-07, Raposo et al. 2024): in the blocks listed in NBTMoDBlocks (empty = all), a
+    # learned router picks NBTMoDCapacity of the 64 squares; only those run the block (output scaled by 2*sigmoid(router
+    # score), which also trains the router), the others pass through unchanged on the residual. 0 = off.
+    self.NetDef_NBTMoDCapacity = int(config_net_def.get('NBTMoDCapacity', 0) or 0)
+    _mod_blocks = config_net_def.get('NBTMoDBlocks', []) or []
+    if isinstance(_mod_blocks, str):
+      _mod_blocks = [int(t) for t in _mod_blocks.split(',') if t.strip()]
+    self.NetDef_NBTMoDBlocks = [int(t) for t in _mod_blocks]
+    if not (0 <= self.NetDef_NBTMoDCapacity < 64):
+      raise ValueError(f"NBTMoDCapacity must be in [0, 63] (was {self.NetDef_NBTMoDCapacity})")
+    if self.NetDef_PieceTokenDecompressDim and not self.NetDef_PieceTokens:
+      raise ValueError('PieceTokenDecompressDim set but PieceTokens is off (silent no-op refused)')
+    if self.NetDef_NBTMoDBlocks and not self.NetDef_NBTMoDCapacity:
+      raise ValueError('NBTMoDBlocks set but NBTMoDCapacity is 0 (silent no-op refused)')
+    if self.NetDef_NBTMoDCapacity and self.NetDef_PieceTokens:
+      raise ValueError('NBTMoDCapacity and PieceTokens are alternatives, not combinable')
     # EGT EDGE STREAM in TRT-servable form (2026-10-07, egt_edge.py; NBT trunks only): a learned edge state read once per
     # NBT block (additive bias + log-door, separable q/k premult, row-scale door) and updated (readback, path triplet,
     # edge FFN) after the blocks listed in EGTEdgeSites. Zero-init readers: step 0 == the net without it.

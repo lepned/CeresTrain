@@ -759,6 +759,7 @@ def Train():
       if ('cq_abs_head.' in n or 'cq_gap_head.' in n) and (n.endswith('w_bins') or n.endswith('pos_w')): return False  # zero-init child-q readout tables (review 2026-10-07), AdamW
       if n.replace('_orig_mod.', '').startswith('egt.'): return False      # EGT edge stream (torch.compile adds _orig_mod.): zero-init readers + lookup tables (review 2026-10-07), AdamW
       if 'move_tokens.rq_head.' in n: return False   # reply-q readout [1, dk]: training-only 1-row final layer, AdamW
+      if 'mod_router' in n: return False         # NBT MoD router [1, D]: 1-row scorer, same class as vord, AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -766,8 +767,10 @@ def Train():
       # ndim == 2 (not >= 2): Muon's ctor asserts exactly-2-D, so any >=3-D
       # trunk param (e.g. the [H, C, d_k] vis edge-bias gate tensors) must go
       # to the internal AdamW group — same rule the 'final-only' scope applies.
-      return (p.ndim == 2 and 'embedding' not in n and 'transformer_layer' in n
-              and 'lora' not in n.lower())
+      # The piece-token decompression (pt_decompress) is the trunk's way out to the 64 squares: trunk class, like
+      # the NBT down/up projections (its zero-init out included, as NBT up). The MoD router [1, D] is a 1-row scorer: AdamW.
+      return (p.ndim == 2 and 'embedding' not in n and ('transformer_layer' in n or 'pt_decompress.' in n)
+              and 'mod_router' not in n and 'lora' not in n.lower())
     def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
       # AdamW substituted for NAdam by design — the load-bearing choice is
@@ -2053,6 +2056,9 @@ def Train():
     # Value min/max pool injectors (NetDef ValueHeadMinMaxPool): top-level,
     # zero-init — fresh-initializing on warm start reproduces the base net.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('value_pool_inject.', 'value2_pool_inject.')
+    # Piece-token decompression (NetDef PieceTokens) switched on at resume: zero-init output, fresh q/kv. NOT function-
+    # identical (the trunk then sees 32 squares) -- the conversion fine-tune of a 64-square net (2026-11-07).
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('pt_decompress.',)
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.

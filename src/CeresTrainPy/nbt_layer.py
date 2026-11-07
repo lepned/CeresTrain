@@ -68,6 +68,24 @@ from dot_product_attention import LinearWrapper
 from egt_edge import edge_gate_bias
 
 
+def gather_tokens(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+  """x [B, 64, C], idx [B, K] square indices -> [B, K, C]."""
+  return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+
+def scatter_tokens(base: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+  """Out-of-place: base [B, 64, C] with rows idx [B, K] replaced by src [B, K, C] (indices are distinct)."""
+  return torch.scatter(base, 1, idx.unsqueeze(-1).expand(-1, -1, base.shape[-1]), src.to(base.dtype))
+
+
+def gather_pair_bias(bias: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+  """Per-head square-pair bias [B, H, 64, 64] -> [B, H, K, K] at (idx_i, idx_j): rows, then columns."""
+  B, H, T, _ = bias.shape
+  K = idx.shape[1]
+  rows = torch.gather(bias, 2, idx.reshape(B, 1, K, 1).expand(-1, H, -1, T))
+  return torch.gather(rows, 3, idx.reshape(B, 1, 1, K).expand(-1, H, K, -1))
+
+
 class SharedSmolgen(torch.nn.Module):
   """One smolgen generator per NBT block (config NBTSharedSmolgen), shared by its K inner layers.
 
@@ -109,13 +127,26 @@ class SharedSmolgen(torch.nn.Module):
   def prep_layer(self):
     return self._prep.linear
 
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
-    """x: [B, 64, model_dim] (block input, normalized) -> [B, heads, 64, 64] logit bias."""
-    s = self.sm1(x).reshape(-1, self.num_tokens * self.per_square_dim)
+  def forward(self, x: torch.Tensor, token_idx: torch.Tensor = None, fill: torch.Tensor = None) -> torch.Tensor:
+    """x: [B, 64, model_dim] (block input, normalized) -> [B, heads, 64, 64] logit bias.
+    Piece tokens: x is [B, K, model_dim] at squares token_idx [B, K]; sm1 is scattered back to its squares (zeros
+    elsewhere = 'no token') so sm2 sees the fixed square layout, and the bias is returned at the K tokens [B, heads, K, K].
+    fill [B, 64, model_dim] (PieceTokenSmolgenFill 'stale'): the non-token squares take sm1 of this (normalized) 64-square
+    state instead of zeros -- what a converted 64-square net's smolgen was trained on."""
+    s = self.sm1(x)
+    if token_idx is not None:
+      # one-hot matmul, not ScatterElements into zeros: the zeros' ConstantOfShape stays fp32 through the fp16
+      # export conversion and TRT then rejects the mixed-type scatter (11-07); [B,64,K] @ [B,K,S] is as cheap.
+      onehot = (token_idx.unsqueeze(1) == torch.arange(self.num_tokens, device=s.device).reshape(1, -1, 1)).to(s.dtype)
+      s = torch.matmul(onehot, s)
+      if fill is not None:
+        s = s + self.sm1(fill) * (1.0 - onehot.sum(dim=-1, keepdim=True))
+    s = s.reshape(-1, self.num_tokens * self.per_square_dim)
     s = self.ln1(self.act(self.sm2(s)))
     s = self.ln2(self.act(self.sm3(s)))
     s = s.reshape(-1, self.num_heads, self.prep_in_dim)
-    return self.prep_layer(s).reshape(-1, self.num_heads, self.num_tokens, self.num_tokens)
+    bias = self.prep_layer(s).reshape(-1, self.num_heads, self.num_tokens, self.num_tokens)
+    return bias if token_idx is None else gather_pair_bias(bias, token_idx)
 
 
 def _make_proj_norm(proj_norm: str, norm_type: str, d: int, eps: float, fixed_scale: float) -> torch.nn.Module:
@@ -131,7 +162,7 @@ class NestedBottleneckLayer(torch.nn.Module):
   def __init__(self, model_dim: int, mid_dim: int, make_inner_layer: Callable[[int], torch.nn.Module],
                num_inner_layers: int, norm_type: str, layernorm_eps: float, proj_activation: str = 'None',
                proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
-               shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False):
+               shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False, mod_capacity: int = 0):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
     # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
@@ -161,6 +192,15 @@ class NestedBottleneckLayer(torch.nn.Module):
     # NBTProjActivationShift: per-token mean over channels subtracted after the activation.
     self.proj_activation_shift = proj_activation_shift
     self.inner_heads = self.inner[0].num_attention_heads
+    # NBTMoDCapacity (Mixture-of-Depths): a router on the normalized block input picks mod_capacity squares; only
+    # they run the block, scaled by 2*sigmoid(score) (1 at a zero score; the gradient path that trains the router).
+    # Init std 0.02: scores ~N(0, ~0.9) on the normalized input, i.e. random routing and gates ~0.5-1.5 at step 0
+    # (harmless: the block's up projection is zero-init).
+    self.mod_capacity = mod_capacity
+    if mod_capacity > 0:
+      self.mod_router = torch.nn.Linear(model_dim, 1)
+      torch.nn.init.normal_(self.mod_router.weight, std=0.02)
+      torch.nn.init.zeros_(self.mod_router.bias)
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
@@ -189,7 +229,8 @@ class NestedBottleneckLayer(torch.nn.Module):
               rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
-              edge_scales = None, want_logits: bool = False, edge_gates = None):
+              edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
+              token_fill: torch.Tensor = None):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -198,11 +239,23 @@ class NestedBottleneckLayer(torch.nn.Module):
     # A per-head bias is built with the trunk head count; it only fits inner layers that use it.
     assert piece_relation_bias is None or piece_relation_bias.shape[1] == self.inner_heads, \
       f'NBT: per-head attention bias has {piece_relation_bias.shape[1]} heads, inner layers use {self.inner_heads} (NBTInnerHeads)'
+    # token_idx: piece tokens (ceres_net) -- x holds the K selected squares; only the smolgen needs their squares.
+    assert token_idx is None or self.mod_capacity == 0, 'NBT: piece tokens and MoD routing do not combine'
+    assert not ((token_idx is not None or self.mod_capacity > 0) and (want_logits or edge_scales is not None or edge_gates is not None
+                or piece_relation_bias is not None or vis_edge is not None)),       'NBT piece tokens / MoD: no EGT, edge or incoming per-head square-pair bias (they are 64x64)'
     h0 = self.norm_in(x)
     if self.shared_smolgen is not None:
       # Block-level content bias, summed with any incoming per-head bias (piece-relation etc.).
-      sb = self.shared_smolgen(h0)
+      sb = self.shared_smolgen(h0, token_idx, None if token_fill is None else self.norm_in(token_fill))
       piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
+    mod_idx = None
+    if self.mod_capacity > 0:
+      score = self.mod_router(h0).squeeze(-1)                                     # [B, 64]
+      mod_idx = torch.topk(score.float(), k=self.mod_capacity, dim=1).indices     # [B, C]
+      mod_gate = 2.0 * torch.sigmoid(torch.gather(score, 1, mod_idx)).unsqueeze(-1)   # [B, C, 1]
+      h0 = gather_tokens(h0, mod_idx)
+      if piece_relation_bias is not None:
+        piece_relation_bias = gather_pair_bias(piece_relation_bias, mod_idx)
     h = self.down(self._shift(self.act_in(h0)))
     logits = None
     for j, layer in enumerate(self.inner):
@@ -218,6 +271,9 @@ class NestedBottleneckLayer(torch.nn.Module):
     # (it is zero-init, so the block stays an identity at step 0).
     if film is not None:
       out = out * (1.0 + film[0]) + film[1]
+    if mod_idx is not None:
+      # unrouted squares: identity; routed: x + gate * block output
+      return x + scatter_tokens(torch.zeros_like(x), mod_idx, out * mod_gate.to(out.dtype))
     if want_logits:
       return x + out, logits
     return x + out
