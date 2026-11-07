@@ -371,28 +371,35 @@ def get_most_extreme_weight_value(model):
         extreme_value = param_min
   return extreme_value
 
-# Storage for previous parameters for calc_weight_update_ratio, in CPU memory (2026-11-04: on the GPU
+# Snapshot of the parameters for calc_weight_update_ratio, in CPU memory (2026-11-04: on the GPU
 # this full parameter copy held ~1 GB on rank 0 for the whole run; each tensor is moved back per use).
+# The model-sized GPU<->CPU round trip stalls every rank (~1 % throughput at every 100K positions), so
+# (2026-11-05) the snapshot is taken only every WEIGHT_RATIO_EVERY_N_POSITIONS, compared at the next
+# regular log (so the ratio still spans one log interval) and then dropped.
+WEIGHT_RATIO_EVERY_N_POSITIONS = 1_000_000
 previous_params = {}
+last_weight_ratio_snapshot_pos = 0
+
+def snapshot_params_for_weight_ratio(model):
+  with torch.no_grad():
+    for name, param in model.named_parameters():
+      if param.requires_grad:
+        previous_params[name] = param.detach().to('cpu', copy=True)
 
 def calc_weight_update_ratio(model, logger):
-  global previous_params
-
   total_update_norm = 0
   total_weight_norm = 0
 
   with torch.no_grad():
     for name, param in model.named_parameters():
-      if param.requires_grad:
-        if name in previous_params:
-          delta = param - previous_params[name].to(param.device)
-          update_norm = torch.norm(delta).item()
-          weight_norm = torch.norm(param).item()
+      if param.requires_grad and name in previous_params:
+        delta = param - previous_params[name].to(param.device)
+        update_norm = torch.norm(delta).item()
+        weight_norm = torch.norm(param).item()
 
-          total_update_norm += update_norm
-          total_weight_norm += weight_norm
-
-        previous_params[name] = param.detach().to('cpu', copy=True)
+        total_update_norm += update_norm
+        total_weight_norm += weight_norm
+  previous_params.clear()
 
   if total_weight_norm > 0:
     return total_update_norm / total_weight_norm
@@ -403,10 +410,10 @@ def calc_weight_update_ratio(model, logger):
 last_logged_pos_num = 0
 
 def on_before_optimizer_step(writer, model, optimizer, pos_num):
-    global last_logged_pos_num
+    global last_logged_pos_num, last_weight_ratio_snapshot_pos
 
-    # Only rank 0 logs grad/weight diagnostics. (calc_weight_update_ratio also
-    # retains a full extra copy of the params, in CPU memory — no reason to pay that on 3 ranks.)
+    # Only rank 0 logs grad/weight diagnostics. (The weight-ratio snapshot is a full extra copy
+    # of the params in CPU memory — no reason to pay that on 3 ranks.)
     if not IS_MASTER:
       return
 
@@ -420,10 +427,14 @@ def on_before_optimizer_step(writer, model, optimizer, pos_num):
     else:
       last_logged_pos_num = pos_num
 
-    # log ratio of average absolute weight update to average absolute weight
-    # note that this retains an extra copy of the model parameters (in CPU memory)
-    weight_ratio = calc_weight_update_ratio(model, writer)
-    writer.add_scalar("update_weight_ratio", weight_ratio, pos_num)
+    # log ratio of average absolute weight update to average absolute weight (over one log interval,
+    # sampled every WEIGHT_RATIO_EVERY_N_POSITIONS; the snapshot is an extra parameter copy in CPU memory)
+    if previous_params:
+      weight_ratio = calc_weight_update_ratio(model, writer)
+      writer.add_scalar("update_weight_ratio", weight_ratio, pos_num)
+    elif pos_num - last_weight_ratio_snapshot_pos >= WEIGHT_RATIO_EVERY_N_POSITIONS:
+      last_weight_ratio_snapshot_pos = pos_num
+      snapshot_params_for_weight_ratio(model)
 
     norms = _grad_norm(model, norm_type=2)
 
