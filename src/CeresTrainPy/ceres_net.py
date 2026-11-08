@@ -2182,6 +2182,8 @@ class CeresNet(nn.Module):
     _hc = self.hyper_conn
     if _hc is not None:
       flow = flow.repeat(1, 1, self.hyper_conn_n)
+      from hyper_conn import res_matrices
+      _hc_res = res_matrices(_hc)   # every block's H_res in one batched Sinkhorn
     # NBT value residual: the trunk's first inner layer's V, handed to every later inner layer
     _v_first = None
 
@@ -2252,7 +2254,7 @@ class CeresNet(nn.Module):
           flow, _egt_logits = flow
           _egt_e = self.egt.update(i, _egt_e, _egt_logits)
         if _hc is not None:
-          flow = _hc[i].write(_hc_streams, flow, _hc_beta)          # flow was the block's branch
+          flow = _hc[i].write(_hc_streams, flow, _hc_beta, _hc_res[i])   # flow was the block's branch
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)

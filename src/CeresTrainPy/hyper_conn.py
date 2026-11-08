@@ -13,7 +13,7 @@ H_res stays static (an in-graph Sinkhorn per token would be ~4 x iters tiny kern
 only, and save_model bakes it into an [n, n] buffer on the export copy (bake_res_matrix_), so the graph carries a constant
 whatever the exporter folds.
 
-The stream math runs in the stream dtype (bf16 under autocast; matmul accumulates in fp32): an fp32 upcast of the n*D
+The stream math runs in the stream dtype (bf16 under autocast; the unrolled mixes are computed in fp32 inside the fused kernels): an fp32 upcast of the n*D
 stream would be saved for backward in every block (review 11-08: ~54 GB at 1920/3, B=1024). The write is computed as
 H + (H_res - I) H + beta (x) branch: at init the rows of H are identical and the rows of H_res - I sum to ~0, so the
 correction is far below half an ulp of H and the plain residual is reproduced bit for bit.
@@ -33,12 +33,33 @@ RES_INIT_LOGIT = 5.0   # H_res = Sinkhorn(5 I): ~0.98 on the diagonal at init
 
 
 def sinkhorn(logits: torch.Tensor, iters: int) -> torch.Tensor:
-  """[.., n, n] logits -> doubly-stochastic matrix (fp32); rows normalized last, so rows sum to 1 exactly."""
+  """[.., n, n] logits -> doubly-stochastic matrix (fp32); rows normalized last, so rows sum to 1 exactly.
+
+  The row/column sums are unrolled over n (slices added one by one) instead of .sum(dim): every iteration is then
+  pointwise and torch.compile fuses the whole loop into a few kernels. With .sum it emitted a reduction kernel per
+  normalization, ~40 forward + ~100 backward tiny kernels per block per step (11-08 profile: +2355 kernels/step at
+  384x12, n=4, ~10 ms of launch overhead)."""
   K = torch.exp(logits - logits.amax(dim=(-2, -1), keepdim=True))
   for _ in range(iters):
-    K = K / K.sum(dim=-2, keepdim=True)
-    K = K / K.sum(dim=-1, keepdim=True)
+    K = K / _unrolled_sum(K, -2)
+    K = K / _unrolled_sum(K, -1)
   return K
+
+
+def _unrolled_sum(K: torch.Tensor, dim: int) -> torch.Tensor:
+  """K.sum(dim, keepdim=True) as a chain of slice adds (n <= 8: pointwise for torch.compile)."""
+  s = K.narrow(dim, 0, 1)
+  for j in range(1, K.shape[dim]):
+    s = s + K.narrow(dim, j, 1)
+  return s
+
+
+def res_matrices(hcs) -> list:
+  """H_res of every block, one batched Sinkhorn over the stacked logits (one fused chain instead of one per block);
+  modules with a baked constant (export copy) return it."""
+  if any(getattr(hc, 'res_baked', None) is not None for hc in hcs):
+    return [hc.res_matrix() for hc in hcs]
+  return list(sinkhorn(torch.stack([hc.res_logits.float() for hc in hcs]), hcs[0].iters).unbind(0))
 
 
 class HyperConnection(nn.Module):
@@ -77,18 +98,36 @@ class HyperConnection(nn.Module):
   def read(self, x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """x [B, T, n*D] -> [B, T, D]: the combination of the streams the block reads."""
     B, T, _ = x.shape
-    xv = x.reshape(B, T, self.n, self.d)
-    a = (alpha.reshape(1, 1, 1, self.n) if alpha.dim() == 1 else alpha.unsqueeze(-2)).to(x.dtype)
-    return torch.matmul(a, xv).reshape(B, T, self.d)
+    return _combine(x.reshape(B, T, self.n, self.d), _coeff_list(alpha, self.n, x.dtype))
 
-  def write(self, x: torch.Tensor, branch: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-    """x [B, T, n*D], branch [B, T, D] -> H + (H_res - I) H + beta (x) branch, [B, T, n*D], in the stream dtype."""
+  def write(self, x: torch.Tensor, branch: torch.Tensor, beta: torch.Tensor, res: torch.Tensor = None) -> torch.Tensor:
+    """x [B, T, n*D], branch [B, T, D] -> H + (H_res - I) H + beta (x) branch, [B, T, n*D], in the stream dtype.
+    res: this block's H_res from res_matrices() (batched over the blocks); computed here when None."""
     B, T, _ = x.shape
     xv = x.reshape(B, T, self.n, self.d)
-    b = (beta.reshape(1, 1, self.n, 1) if beta.dim() == 1 else beta.unsqueeze(-1)).to(x.dtype)
-    delta = (self.res_matrix() - torch.eye(self.n, device=x.device)).to(x.dtype)
-    out = xv + torch.matmul(delta, xv) + b * branch.to(x.dtype).unsqueeze(-2)
-    return out.reshape(B, T, self.n * self.d)
+    b = _coeff_list(beta, self.n, x.dtype)
+    delta = ((self.res_matrix() if res is None else res) - torch.eye(self.n, device=x.device)).to(x.dtype)
+    br = branch.to(x.dtype)
+    rows = [xv[..., i, :] + _combine(xv, [delta[i, j] for j in range(self.n)]) + b[i] * br for i in range(self.n)]
+    return torch.stack(rows, dim=-2).reshape(B, T, self.n * self.d)
+
+
+# The stream mixes are unrolled over n (<= 8) as scalar-times-slice sums instead of torch.matmul: a matmul of
+# [.., 1, n] or [n, n] against [B, T, n, D] runs as B*T tiny batched GEMMs/GEMVs that torch.compile cannot fuse
+# (11-08 profile at 384x12: ~26 ms of the ~40 ms per-step overhead of n=2 static); the unrolled form is pointwise and
+# fuses into the neighbouring kernels (computed in fp32 inside the fused kernel, one rounding at the store).
+def _coeff_list(w: torch.Tensor, n: int, dtype):
+  """[n] (static) or [B, T, n] (dynamic) -> n coefficients, scalar or [B, T, 1], in dtype."""
+  w = w.to(dtype)
+  return [w[i] for i in range(n)] if w.dim() == 1 else [w[..., i:i + 1] for i in range(n)]
+
+
+def _combine(xv: torch.Tensor, coeffs) -> torch.Tensor:
+  """xv [B, T, n, D], n coefficients -> sum_i c_i xv[..., i, :], [B, T, D]."""
+  out = coeffs[0] * xv[..., 0, :]
+  for i in range(1, len(coeffs)):
+    out = out + coeffs[i] * xv[..., i, :]
+  return out
 
 
 class HyperConnReadout(nn.Module):
@@ -100,5 +139,4 @@ class HyperConnReadout(nn.Module):
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     B, T, _ = x.shape
-    xv = x.reshape(B, T, self.n, self.d)
-    return torch.matmul(self.alpha.to(x.dtype).reshape(1, 1, 1, self.n), xv).reshape(B, T, self.d)
+    return _combine(x.reshape(B, T, self.n, self.d), _coeff_list(self.alpha, self.n, x.dtype))
