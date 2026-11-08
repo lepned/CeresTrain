@@ -592,7 +592,9 @@ def Train():
                         # zero init) -- frozen they would stay at init, a silent dead feature.
                         or "register_" in name
                         # NBT hyper-connections / head mixing / value residual (2026-11-08): NEW identity-init params.
-                        or "hyper_conn" in name or "head_mix" in name or "vr_lambda" in name)
+                        or "hyper_conn" in name or "head_mix" in name or "vr_lambda" in name
+                        # NBT carry (2026-11-08): zero-init gate + norm, NEW params
+                        or ".carry_gate" in name or ".carry_norm" in name)
       if not keep_trainable:
         param.requires_grad = False
 
@@ -2077,6 +2079,7 @@ def Train():
       # '.head_mix' / '.vr_lambda' (2026-11-08): NBT head mixing / value residual, identity init (nested in every inner attention)
       return (k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
               or k.endswith('.head_mix') or k.endswith('.vr_lambda') or '.hyper_conn_inner' in k
+              or k.endswith('.carry_gate') or '.carry_norm.' in k
               or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
     # ReinitParamsOnResume (2026-10-05): keep the construction-time init of the listed params so it

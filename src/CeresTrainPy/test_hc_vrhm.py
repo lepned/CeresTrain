@@ -65,6 +65,9 @@ def _real(cfg_dir, cfg_id):
           ('HC inner 2 static', dict(NBTHyperConnInner=2)),
           ('HC inner 2 prepost', dict(NBTHyperConnInner=2, NBTHyperConnInnerDynamic='prepost')),
           ('HC inner 2 + outer 2 + VR', dict(NBTHyperConnInner=2, NBTHyperConn=2, NBTValueResidual=True)),
+          ('carry', dict(NBTCarry=True)),
+          ('carry + inner 2 + outer 2 + VR + HM', dict(NBTCarry=True, NBTHyperConnInner=2, NBTHyperConn=2,
+                                                       NBTValueResidual=True, NBTHeadMix=True)),
           ('HC 4 + MoD 32', dict(NBTHyperConn=4, NBTMoDCapacity=32)),
           ('value residual', dict(NBTValueResidual=True)),
           ('head mix all', dict(NBTHeadMix=True)),
@@ -190,10 +193,35 @@ def _real(cfg_dir, cfg_id):
     blk.bake_res_matrix_()
     assert torch.equal(blk.res_matrix(), m0)
     print('  inner HC: gradients reach every param, beta grads differ across streams, H_res bake OK')
+    # carry: block 0 has no gate (it only starts the channel); every later gate gets a gradient at its zero init, and
+    # once a gate is open the carry content (norm gain) gets one too
+    cn = build(NBTCarry=True)
+    named = dict(cn.named_parameters())
+    assert 'transformer_layer.0.carry_gate' not in named and 'transformer_layer.1.carry_gate' in named
+    with torch.no_grad():
+      for n, p in cn.named_parameters():
+        if n.endswith('.up.weight'):
+          p.normal_(0, 0.02)
+    cn.train()
+    out = cn(sq, None)
+    sum(o.float().square().mean() for o in out if isinstance(o, torch.Tensor) and o.is_floating_point()).backward()
+    for b in range(1, len(cn.transformer_layer)):
+      g = named[f'transformer_layer.{b}.carry_gate'].grad
+      assert g is not None and float(g.abs().sum()) > 0, f'no gradient into carry gate of block {b}'
+    cn.zero_grad(set_to_none=True)
+    with torch.no_grad():
+      for b in range(1, len(cn.transformer_layer)):
+        named[f'transformer_layer.{b}.carry_gate'].fill_(0.5)
+    out = cn(sq, None)
+    sum(o.float().square().mean() for o in out if isinstance(o, torch.Tensor) and o.is_floating_point()).backward()
+    g = named['transformer_layer.2.carry_norm.scale'].grad
+    assert g is not None and float(g.abs().sum()) > 0, 'no gradient into the carry norm with an open gate'
+    print('  carry: gates get gradients at zero init (blocks 1..), carry content trains once a gate is open')
     for over in (dict(NBTHyperConn=3), dict(NBTHyperConnDynamic='prepost'), dict(NBTHyperConnSinkhornIters=5),
                  dict(NBTHyperConn=4, PieceTokens=32), dict(NBTValueResidual=True, PieceTokens=32),
                  dict(NBTHyperConnInner=3), dict(NBTHyperConnInnerDynamic='prepost'), dict(NBTHyperConnInner=4), dict(NBTHyperConnInner=2, NBTMoDCapacity=32),
                  dict(NBTHyperConnInner=2, NBTInnerPreNorm=False),
+                 dict(NBTCarry=True, PieceTokens=32), dict(NBTCarry=True, NBTMoDCapacity=32), dict(NBTCarry=True, NumLayers=1),
                  dict(NBTValueResidual=True, NBTMoDCapacity=32), dict(NBTHeadMix=True, NBTHeadMixGroup=3),
                  dict(NBTHeadMixGroup=2), dict(NBTHeadMix=True, NBTHeadMixGroup=16), dict(NBTHeadMix=True, EGTEdgeStream=True),
                  dict(NBTHeadMix=True, NBTInnerHeads=8, NBTWidthDivisor=1, NBTHeadMixGroup=0)):

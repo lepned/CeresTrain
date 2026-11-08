@@ -172,7 +172,8 @@ class NestedBottleneckLayer(torch.nn.Module):
                num_inner_layers: int, norm_type: str, layernorm_eps: float, proj_activation: str = 'None',
                proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
                shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False, mod_capacity: int = 0,
-               hc_inner_n: int = 0, hc_inner_dynamic: str = 'none', hc_sinkhorn_iters: int = 20):
+               hc_inner_n: int = 0, hc_inner_dynamic: str = 'none', hc_sinkhorn_iters: int = 20,
+               carry: bool = False, carry_receive: bool = False):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
     # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
@@ -226,6 +227,17 @@ class NestedBottleneckLayer(torch.nn.Module):
       self.hyper_conn_inner = torch.nn.ModuleList([HyperConnection(hc_inner_n, mid_dim, j, hc_inner_dynamic, hc_sinkhorn_iters,
                                                                    norm_type, layernorm_eps) for j in range(num_inner_layers)])
       self.hyper_conn_inner_out = HyperConnReadout(hc_inner_n, mid_dim)
+    # NBTCarry (2026-11-08, design reviewed on Fable): a mid-width side channel through the trunk. Every block emits
+    # carry_out = carry_in + (h_exit - h_entry), i.e. the running sum of all inner branches so far; a receiving block
+    # (every block but the first) adds g * norm(carry_in) to its down-projected entry state, g a zero-init scalar gate
+    # (exact identity at step 0; the norm keeps the read scale independent of the ~sqrt(#writes) carry growth).
+    self.carry = carry
+    self.carry_receive = carry and carry_receive
+    if self.carry:
+      assert mod_capacity == 0, 'NBTCarry: no MoD'
+    if self.carry_receive:
+      self.carry_norm = make_norm(norm_type, mid_dim, eps=layernorm_eps)
+      self.carry_gate = torch.nn.Parameter(torch.zeros(1))
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
@@ -256,7 +268,7 @@ class NestedBottleneckLayer(torch.nn.Module):
               vis_edge: torch.Tensor = None,
               edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
               token_fill: torch.Tensor = None, num_registers: int = 0, v_first: torch.Tensor = None,
-              want_v_first: bool = False, return_branch: bool = False, hc_inner_res=None):
+              want_v_first: bool = False, return_branch: bool = False, hc_inner_res=None, carry_in: torch.Tensor = None):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -286,6 +298,11 @@ class NestedBottleneckLayer(torch.nn.Module):
       if piece_relation_bias is not None:
         piece_relation_bias = gather_pair_bias(piece_relation_bias, mod_idx)
     h = self.down(self._shift(self.act_in(h0)))
+    if self.carry:
+      assert token_idx is None, 'NBTCarry: no piece tokens (the token count changes between blocks)'
+      if self.carry_receive and carry_in is not None:
+        h = h + self.carry_gate.to(h.dtype) * self.carry_norm(carry_in).to(h.dtype)
+      h_entry = h
     logits = None
     # NBTValueResidual: the trunk's first inner layer returns its V (want_v_first), every later one mixes it in
     assert not ((v_first is not None or want_v_first) and mod_idx is not None), 'NBT value residual: no MoD'
@@ -314,6 +331,11 @@ class NestedBottleneckLayer(torch.nn.Module):
         h = hc[j].write(streams, h, hc_b, hc_res[j])   # h was the layer's branch
     if hc is not None:
       h = self.hyper_conn_inner_out(h)
+    if self.carry:
+      # fp32 running sum (review 11-08): bf16 accumulation over the blocks adds ~0.5-1 % rms noise on top of the
+      # h - h_entry cancellation; sub/add save nothing for backward, the only consumer is the (casting) norm at the read
+      _d = h.float() - h_entry.float()
+      carry_out = _d if carry_in is None else carry_in.float() + _d
     out = self.up(self._shift(self.act_out(self.norm_out(h))))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output
@@ -328,7 +350,8 @@ class NestedBottleneckLayer(torch.nn.Module):
     res = out if return_branch else x + out
     if want_logits:
       res = (res, logits)
-    return (res, v_first) if want_v_first else res
+    res = (res, v_first) if want_v_first else res
+    return (res, carry_out) if self.carry else res
 
   @staticmethod
   def _raw_logits(layer, h, piece_relation_bias, edge_scales, edge_gate=None):

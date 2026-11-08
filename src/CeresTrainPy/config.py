@@ -1219,6 +1219,15 @@ class Configuration:
       raise ValueError('NBTHyperConnInner needs pre-norm inner layers (NBTInnerPreNorm)')
     if 'NBTHyperConnSinkhornIters' in config_net_def and not (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner):
       raise ValueError('NBTHyperConnSinkhornIters set but NBTHyperConn and NBTHyperConnInner are 0 (silent no-op refused)')
+    # NBTCarry (2026-11-08, nbt_layer.py): mid-width side channel through the NBT trunk (running sum of the inner
+    # branches, read by every later block through a zero-init gate). Not with PieceTokens (token count changes) or MoD.
+    self.NetDef_NBTCarry = bool(config_net_def.get('NBTCarry', False))
+    if self.NetDef_NBTCarry and self.NetDef_NBTInnerLayers < 1:
+      raise ValueError('NBTCarry needs an NBT trunk (NBTInnerLayers >= 1)')
+    if self.NetDef_NBTCarry and self.NetDef_NumLayers // max(1, int(config_net_def.get('LoopCount', 1) or 1)) < 2:
+      raise ValueError('NBTCarry needs >= 2 distinct blocks (no block would read the carry: silent no-op refused)')
+    if self.NetDef_NBTCarry and (config_net_def.get('PieceTokens', 0) or config_net_def.get('NBTMoDCapacity', 0)):
+      raise ValueError('NBTCarry does not combine with PieceTokens or NBTMoDCapacity (the token set changes between blocks)')
     if (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner) and self.NetDef_NBTHyperConnSinkhornIters < 1:
       raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
     if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:

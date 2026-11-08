@@ -1476,8 +1476,14 @@ class CeresNet(nn.Module):
                                  mod_capacity=_mod_cap if (not _mod_blocks or i in _mod_blocks) else 0,
                                  hc_inner_n=config.NetDef_NBTHyperConnInner,
                                  hc_inner_dynamic=config.NetDef_NBTHyperConnInnerDynamic,
-                                 hc_sinkhorn_iters=config.NetDef_NBTHyperConnSinkhornIters)
+                                 hc_sinkhorn_iters=config.NetDef_NBTHyperConnSinkhornIters,
+                                 carry=config.NetDef_NBTCarry, carry_receive=i > 0)
            for i in range(self.NUM_DISTINCT_LAYERS)])
+      self.nbt_carry = config.NetDef_NBTCarry
+      if self.nbt_carry:
+        print(f'[ceres_net] NBT CARRY: mid-width ({self.NBT_MID_DIM}) side channel = running sum of the inner branches, '
+              f'blocks 1..{self.NUM_DISTINCT_LAYERS - 1} add g_b * norm(carry) to their entry state (g_b zero-init: step 0 == '
+              f'the plain trunk); restarts every LoopCount pass')
       self.hc_inner_n = config.NetDef_NBTHyperConnInner
       if config.NetDef_NBTHyperConnInner:
         _n_hci = sum(p.numel() for blk in self.transformer_layer for m in (blk.hyper_conn_inner, blk.hyper_conn_inner_out)
@@ -2241,6 +2247,8 @@ class CeresNet(nn.Module):
         if vis_edge_biases is not None:
           _vb = vis_edge_biases[i]  # [B, H, 64, 64], precomputed above
           _prb_l = _vb if _prb_l is None else _prb_l + _vb
+        if i == 0:
+          _carry = None   # NBTCarry: block 0 starts the side channel (also on every LoopCount pass)
         _hc_beta = None
         if _hc is not None:
           _hc_alpha, _hc_beta = _hc[i].coeffs(flow)
@@ -2265,8 +2273,11 @@ class CeresNet(nn.Module):
                                          **({'num_registers': _R} if _R else {}),
                                          **({'return_branch': True} if _hc is not None else {}),
                                          **({'hc_inner_res': _hci_res[i]} if _hci_res is not None else {}),
+                                         **({'carry_in': _carry} if getattr(self, 'nbt_carry', False) else {}),
                                          **({'want_v_first': True} if _vr_want else
                                             ({'v_first': _v_first} if self.nbt_value_residual else {})))
+        if getattr(self, 'nbt_carry', False):
+          flow, _carry = flow
         if _vr_want:
           flow, _v_first = flow
         if _egt_site:
