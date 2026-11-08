@@ -62,6 +62,9 @@ def _real(cfg_dir, cfg_id):
   ARMS = (('HC 4 static', dict(NBTHyperConn=4)),
           ('HC 4 prepost', dict(NBTHyperConn=4, NBTHyperConnDynamic='prepost')),
           ('HC 2', dict(NBTHyperConn=2)),
+          ('HC inner 2 static', dict(NBTHyperConnInner=2)),
+          ('HC inner 2 prepost', dict(NBTHyperConnInner=2, NBTHyperConnInnerDynamic='prepost')),
+          ('HC inner 2 + outer 2 + VR', dict(NBTHyperConnInner=2, NBTHyperConn=2, NBTValueResidual=True)),
           ('HC 4 + MoD 32', dict(NBTHyperConn=4, NBTMoDCapacity=32)),
           ('value residual', dict(NBTValueResidual=True)),
           ('head mix all', dict(NBTHeadMix=True)),
@@ -160,8 +163,37 @@ def _real(cfg_dir, cfg_id):
     assert float((gb - gb.mean()).abs().max()) > 0, 'HC beta gradients identical across streams (no symmetry breaking)'
     assert 'transformer_layer.0.inner.0.attention.vr_lambda' not in named, 'first inner layer must not have a lambda'
     print('  gradients reach HC / VR / HM params; HC beta gradients differ across streams')
+    # inner hyper-connections: gradients into every inner-HC param, beta symmetry broken, bake reproduces H_res
+    inn = build(NBTHyperConnInner=2, NBTHyperConnInnerDynamic='prepost')
+    with torch.no_grad():
+      for n, p in inn.named_parameters():
+        if n.endswith('.up.weight'):
+          p.normal_(0, 0.02)
+        # identical streams at init give H_res an exactly zero gradient (any doubly-stochastic mix of equal rows is a
+        # no-op); one optimizer step on beta separates them -- mimic it so the res_logits gradient check is meaningful
+        if '.hyper_conn_inner.' in n and n.endswith('.beta'):
+          p.add_(torch.randn_like(p) * 0.1)
+    inn.train()
+    out = inn(sq, None)
+    sum(o.float().square().mean() for o in out if isinstance(o, torch.Tensor) and o.is_floating_point()).backward()
+    named = dict(inn.named_parameters())
+    for k in ('transformer_layer.1.hyper_conn_inner.1.beta', 'transformer_layer.1.hyper_conn_inner.1.alpha',
+              'transformer_layer.1.hyper_conn_inner.1.res_logits', 'transformer_layer.1.hyper_conn_inner.1.dyn_w',
+              'transformer_layer.1.hyper_conn_inner_out.alpha'):
+      g = named[k].grad
+      assert g is not None and float(g.abs().sum()) > 0, f'no gradient into {k}'
+    gb = named['transformer_layer.1.hyper_conn_inner.0.beta'].grad
+    assert float((gb - gb.mean()).abs().max()) > 0, 'inner HC beta gradients identical across streams'
+    inn.eval()
+    blk = inn.transformer_layer[1].hyper_conn_inner[0]
+    m0 = blk.res_matrix()
+    blk.bake_res_matrix_()
+    assert torch.equal(blk.res_matrix(), m0)
+    print('  inner HC: gradients reach every param, beta grads differ across streams, H_res bake OK')
     for over in (dict(NBTHyperConn=3), dict(NBTHyperConnDynamic='prepost'), dict(NBTHyperConnSinkhornIters=5),
                  dict(NBTHyperConn=4, PieceTokens=32), dict(NBTValueResidual=True, PieceTokens=32),
+                 dict(NBTHyperConnInner=3), dict(NBTHyperConnInnerDynamic='prepost'), dict(NBTHyperConnInner=4), dict(NBTHyperConnInner=2, NBTMoDCapacity=32),
+                 dict(NBTHyperConnInner=2, NBTInnerPreNorm=False),
                  dict(NBTValueResidual=True, NBTMoDCapacity=32), dict(NBTHeadMix=True, NBTHeadMixGroup=3),
                  dict(NBTHeadMixGroup=2), dict(NBTHeadMix=True, NBTHeadMixGroup=16), dict(NBTHeadMix=True, EGTEdgeStream=True),
                  dict(NBTHeadMix=True, NBTInnerHeads=8, NBTWidthDivisor=1, NBTHeadMixGroup=0)):

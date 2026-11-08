@@ -145,7 +145,11 @@ class EncoderLayer(torch.nn.Module):
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
               edge_scales = None, edge_gate = None, v_first: torch.Tensor = None,
-              return_v: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+              return_v: bool = False, return_branch: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    # return_branch (NBTHyperConnInner, nbt_layer.py): return the layer's residual branch attn + ffn instead of x + branch,
+    # so the caller can add it to its own residual streams. Pre-norm, alpha 1 only (the branch is then well defined:
+    # y = x + attn(ln1 x) + ffn(ln2(x + attn(ln1 x)))); the FFN still reads x + attn exactly as in the plain layer.
+    assert not return_branch or (self.pre_norm and self.alpha == 1), 'return_branch: pre-norm inner layers, alpha 1 (no DeepNorm)'
     # Pre-norm vs post-norm differ ONLY in WHERE the norm sits relative to the
     # residual. NormType (LayerNorm/RMSNorm/Derf) is orthogonal — applies the
     # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
@@ -208,5 +212,8 @@ class EncoderLayer(torch.nn.Module):
     else:
       out2 = out1
 
+    if return_branch:
+      br = attn_output + mlp_output if self.ffn_hidden_size > 0 else attn_output
+      return (br, v_out) if return_v else br
     return (out2, v_out) if return_v else out2
 

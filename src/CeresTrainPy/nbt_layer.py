@@ -171,7 +171,8 @@ class NestedBottleneckLayer(torch.nn.Module):
   def __init__(self, model_dim: int, mid_dim: int, make_inner_layer: Callable[[int], torch.nn.Module],
                num_inner_layers: int, norm_type: str, layernorm_eps: float, proj_activation: str = 'None',
                proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
-               shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False, mod_capacity: int = 0):
+               shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False, mod_capacity: int = 0,
+               hc_inner_n: int = 0, hc_inner_dynamic: str = 'none', hc_sinkhorn_iters: int = 20):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
     # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
@@ -210,6 +211,21 @@ class NestedBottleneckLayer(torch.nn.Module):
       self.mod_router = torch.nn.Linear(model_dim, 1)
       torch.nn.init.normal_(self.mod_router.weight, std=0.02)
       torch.nn.init.zeros_(self.mod_router.bias)
+    # NBTHyperConnInner (hyper_conn.py, 2026-11-08): n residual streams of mid_dim on the INNER residual of the block.
+    # Entry: the down projection's output copied to n streams; inner layer j reads a mix of them (stream j % n at init),
+    # its branch attn + ffn is written to all of them (EncoderLayer return_branch) and the streams are mixed by H_res;
+    # exit: the mean of the streams goes to the up projection. Streams live inside one block (rebuilt every block).
+    # Step 0 == the plain block up to the rounding order of the residual adds: x + (attn + ffn) vs (x + attn) + ffn.
+    self.hc_inner_n = hc_inner_n
+    self.hyper_conn_inner = None
+    self.hyper_conn_inner_out = None
+    if hc_inner_n:
+      from hyper_conn import HyperConnection, HyperConnReadout
+      assert mod_capacity == 0, 'NBTHyperConnInner: no MoD'
+      assert all(l.pre_norm and l.alpha == 1 for l in self.inner), 'NBTHyperConnInner: pre-norm inner layers, alpha 1 (no DeepNorm)'
+      self.hyper_conn_inner = torch.nn.ModuleList([HyperConnection(hc_inner_n, mid_dim, j, hc_inner_dynamic, hc_sinkhorn_iters,
+                                                                   norm_type, layernorm_eps) for j in range(num_inner_layers)])
+      self.hyper_conn_inner_out = HyperConnReadout(hc_inner_n, mid_dim)
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
@@ -240,7 +256,7 @@ class NestedBottleneckLayer(torch.nn.Module):
               vis_edge: torch.Tensor = None,
               edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
               token_fill: torch.Tensor = None, num_registers: int = 0, v_first: torch.Tensor = None,
-              want_v_first: bool = False, return_branch: bool = False):
+              want_v_first: bool = False, return_branch: bool = False, hc_inner_res=None):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -273,16 +289,31 @@ class NestedBottleneckLayer(torch.nn.Module):
     logits = None
     # NBTValueResidual: the trunk's first inner layer returns its V (want_v_first), every later one mixes it in
     assert not ((v_first is not None or want_v_first) and mod_idx is not None), 'NBT value residual: no MoD'
+    hc = self.hyper_conn_inner
+    if hc is not None:
+      # hc_inner_res: this block's inner H_res list from ceres_net (one batched Sinkhorn over every block's inner layers)
+      if hc_inner_res is None:
+        from hyper_conn import res_matrices
+        hc_inner_res = res_matrices(hc)
+      hc_res = hc_inner_res
+      h = h.repeat(1, 1, self.hc_inner_n)    # [B, T, n * mid_dim]
     for j, layer in enumerate(self.inner):
       _eg = None if edge_gates is None else edge_gates[j]
+      if hc is not None:
+        hc_a, hc_b = hc[j].coeffs(h)
+        streams, h = h, hc[j].read(h, hc_a)  # the layer sees one mid_dim-wide input
       if want_logits and j == len(self.inner) - 1:
         logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales, _eg)
       if want_v_first and j == 0:
         h, v_first = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
-                           edge_scales=edge_scales, edge_gate=_eg, return_v=True)
+                           edge_scales=edge_scales, edge_gate=_eg, return_v=True, return_branch=hc is not None)
       else:
         h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
-                  edge_scales=edge_scales, edge_gate=_eg, v_first=v_first)
+                  edge_scales=edge_scales, edge_gate=_eg, v_first=v_first, return_branch=hc is not None)
+      if hc is not None:
+        h = hc[j].write(streams, h, hc_b, hc_res[j])   # h was the layer's branch
+    if hc is not None:
+      h = self.hyper_conn_inner_out(h)
     out = self.up(self._shift(self.act_out(self.norm_out(h))))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output

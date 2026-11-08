@@ -1197,9 +1197,29 @@ class Configuration:
       raise ValueError(f"NBTHyperConnDynamic must be none or prepost (was {self.NetDef_NBTHyperConnDynamic!r})")
     if self.NetDef_NBTHyperConnDynamic != 'none' and not self.NetDef_NBTHyperConn:
       raise ValueError('NBTHyperConnDynamic set but NBTHyperConn is 0 (silent no-op refused)')
-    if 'NBTHyperConnSinkhornIters' in config_net_def and not self.NetDef_NBTHyperConn:
-      raise ValueError('NBTHyperConnSinkhornIters set but NBTHyperConn is 0 (silent no-op refused)')
-    if self.NetDef_NBTHyperConn and self.NetDef_NBTHyperConnSinkhornIters < 1:
+    # NBTHyperConnInner (2026-11-08): the same n streams on the INNER residual of every NBT block (n x NBT mid width,
+    # rebuilt per block; inner layers read/write through them). NBTHyperConnInnerDynamic as NBTHyperConnDynamic.
+    # Shares NBTHyperConnSinkhornIters. Needs pre-norm inner layers (NBTInnerPreNorm) and no DeepNorm, no MoD.
+    self.NetDef_NBTHyperConnInner = int(config_net_def.get('NBTHyperConnInner', 0) or 0)
+    self.NetDef_NBTHyperConnInnerDynamic = config_net_def.get('NBTHyperConnInnerDynamic', 'none') or 'none'
+    if self.NetDef_NBTHyperConnInner not in (0, 2, 4, 8):
+      raise ValueError(f"NBTHyperConnInner must be 0 (off), 2, 4 or 8 (was {self.NetDef_NBTHyperConnInner})")
+    if self.NetDef_NBTHyperConnInnerDynamic not in ('none', 'prepost'):
+      raise ValueError(f"NBTHyperConnInnerDynamic must be none or prepost (was {self.NetDef_NBTHyperConnInnerDynamic!r})")
+    if self.NetDef_NBTHyperConnInnerDynamic != 'none' and not self.NetDef_NBTHyperConnInner:
+      raise ValueError('NBTHyperConnInnerDynamic set but NBTHyperConnInner is 0 (silent no-op refused)')
+    if self.NetDef_NBTHyperConnInner and self.NetDef_NBTInnerLayers < 1:
+      raise ValueError('NBTHyperConnInner needs an NBT trunk (NBTInnerLayers >= 1)')
+    # inner layer j reads stream j % n at init: with n > NBTInnerLayers some streams are never read and stay exact twins
+    # of another (identical gradients forever; review 11-08: n=4 and n=8 at 3 inner layers are both 3 effective streams)
+    if self.NetDef_NBTHyperConnInner > max(1, self.NetDef_NBTInnerLayers):
+      raise ValueError(f'NBTHyperConnInner {self.NetDef_NBTHyperConnInner} > NBTInnerLayers {self.NetDef_NBTInnerLayers}: '
+                       'unread streams would be exact twins (effective n = NBTInnerLayers)')
+    if self.NetDef_NBTHyperConnInner and not self.NetDef_NBTInnerPreNorm:
+      raise ValueError('NBTHyperConnInner needs pre-norm inner layers (NBTInnerPreNorm)')
+    if 'NBTHyperConnSinkhornIters' in config_net_def and not (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner):
+      raise ValueError('NBTHyperConnSinkhornIters set but NBTHyperConn and NBTHyperConnInner are 0 (silent no-op refused)')
+    if (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner) and self.NetDef_NBTHyperConnSinkhornIters < 1:
       raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
     if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:
       raise ValueError('NBTHyperConn and PieceTokens do not combine (the token gather/decompression is single-stream)')

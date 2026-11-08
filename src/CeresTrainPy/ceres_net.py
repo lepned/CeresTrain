@@ -1473,8 +1473,19 @@ class CeresNet(nn.Module):
                                  proj_norm=config.NetDef_NBTProjNorm, down_init_scale=_down_scale, block_index=i,
                                  shared_smolgen=_make_shared_sm() if _shared_sm else None,
                                  proj_activation_shift=config.NetDef_NBTProjActivationShift,
-                                 mod_capacity=_mod_cap if (not _mod_blocks or i in _mod_blocks) else 0)
+                                 mod_capacity=_mod_cap if (not _mod_blocks or i in _mod_blocks) else 0,
+                                 hc_inner_n=config.NetDef_NBTHyperConnInner,
+                                 hc_inner_dynamic=config.NetDef_NBTHyperConnInnerDynamic,
+                                 hc_sinkhorn_iters=config.NetDef_NBTHyperConnSinkhornIters)
            for i in range(self.NUM_DISTINCT_LAYERS)])
+      self.hc_inner_n = config.NetDef_NBTHyperConnInner
+      if config.NetDef_NBTHyperConnInner:
+        _n_hci = sum(p.numel() for blk in self.transformer_layer for m in (blk.hyper_conn_inner, blk.hyper_conn_inner_out)
+                     for p in m.parameters())
+        print(f'[ceres_net] NBT INNER HYPER-CONNECTIONS: {config.NetDef_NBTHyperConnInner} streams x {self.NBT_MID_DIM} on the inner '
+              f'residual of every block ({_k} inner layers read/write through them, mean at the block exit), H_res = '
+              f'Sinkhorn({config.NetDef_NBTHyperConnSinkhornIters}); dynamic {config.NetDef_NBTHyperConnInnerDynamic}; '
+              f'{_n_hci:,} params (step 0 == the plain block up to residual-add rounding order)')
       if _mod_cap:
         assert not any(getattr(l.attention, 'use_smolgen', False) for blk in self.transformer_layer for l in blk.inner),           'NBTMoDCapacity: per-layer smolgen is 64-token (use NBTSharedSmolgen or smolgen off)'
         assert not (config.NetDef_UseRPE or config.NetDef_UseRoPE or getattr(config, 'NetDef_EGTEdgeStream', False)),           'NBTMoDCapacity: RPE / RoPE / EGT are square-pair (64x64) features'
@@ -2184,6 +2195,13 @@ class CeresNet(nn.Module):
       flow = flow.repeat(1, 1, self.hyper_conn_n)
       from hyper_conn import res_matrices
       _hc_res = res_matrices(_hc)   # every block's H_res in one batched Sinkhorn
+    # NBT inner hyper-connections: every block's inner H_res in ONE batched Sinkhorn (12 per-block chains cost launch overhead)
+    _hci_res = None
+    if getattr(self, 'hc_inner_n', 0):
+      from hyper_conn import res_matrices
+      _hci_all = res_matrices([hc for blk in self.transformer_layer for hc in blk.hyper_conn_inner])
+      _hci_k = len(self.transformer_layer[0].hyper_conn_inner)
+      _hci_res = [_hci_all[b * _hci_k:(b + 1) * _hci_k] for b in range(len(self.transformer_layer))]
     # NBT value residual: the trunk's first inner layer's V, handed to every later inner layer
     _v_first = None
 
@@ -2246,6 +2264,7 @@ class CeresNet(nn.Module):
                                                      if (pt_idx is not None and self.pt_from_block <= i < self.pt_to_block) else {}),
                                          **({'num_registers': _R} if _R else {}),
                                          **({'return_branch': True} if _hc is not None else {}),
+                                         **({'hc_inner_res': _hci_res[i]} if _hci_res is not None else {}),
                                          **({'want_v_first': True} if _vr_want else
                                             ({'v_first': _v_first} if self.nbt_value_residual else {})))
         if _vr_want:
