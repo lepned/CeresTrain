@@ -69,6 +69,7 @@ class HyperConnection(nn.Module):
     assert dynamic in ('none', 'prepost'), dynamic
     self.n, self.d, self.iters = n, model_dim, sinkhorn_iters
     self.dynamic = dynamic == 'prepost'
+    self.matmul_form = False   # export copy: torch.matmul mixes (TensorRT runs them faster than the unrolled form)
     self.alpha = nn.Parameter(nn.functional.one_hot(torch.tensor(block_index % n), n).float())   # H_pre
     self.beta = nn.Parameter(torch.ones(n))                                                          # H_post
     self.res_logits = nn.Parameter(RES_INIT_LOGIT * torch.eye(n))                                    # H_res logits
@@ -85,6 +86,7 @@ class HyperConnection(nn.Module):
   def bake_res_matrix_(self) -> bool:
     """Export copy only: H_res as a constant buffer (no Sinkhorn subgraph in the exported graph)."""
     self.register_buffer('res_baked', sinkhorn(self.res_logits.float(), self.iters).clone(), persistent=False)
+    self.matmul_form = export_matmul_form(self.n)
     return True
 
   def coeffs(self, x: torch.Tensor):
@@ -98,16 +100,23 @@ class HyperConnection(nn.Module):
   def read(self, x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """x [B, T, n*D] -> [B, T, D]: the combination of the streams the block reads."""
     B, T, _ = x.shape
-    return _combine(x.reshape(B, T, self.n, self.d), _coeff_list(alpha, self.n, x.dtype))
+    xv = x.reshape(B, T, self.n, self.d)
+    if self.matmul_form:
+      a = (alpha.reshape(1, 1, 1, self.n) if alpha.dim() == 1 else alpha.unsqueeze(-2)).to(x.dtype)
+      return torch.matmul(a, xv).reshape(B, T, self.d)
+    return _combine(xv, _coeff_list(alpha, self.n, x.dtype))
 
   def write(self, x: torch.Tensor, branch: torch.Tensor, beta: torch.Tensor, res: torch.Tensor = None) -> torch.Tensor:
     """x [B, T, n*D], branch [B, T, D] -> H + (H_res - I) H + beta (x) branch, [B, T, n*D], in the stream dtype.
     res: this block's H_res from res_matrices() (batched over the blocks); computed here when None."""
     B, T, _ = x.shape
     xv = x.reshape(B, T, self.n, self.d)
-    b = _coeff_list(beta, self.n, x.dtype)
     delta = ((self.res_matrix() if res is None else res) - torch.eye(self.n, device=x.device)).to(x.dtype)
     br = branch.to(x.dtype)
+    if self.matmul_form:
+      bb = (beta.reshape(1, 1, self.n, 1) if beta.dim() == 1 else beta.unsqueeze(-1)).to(x.dtype)
+      return (xv + torch.matmul(delta, xv) + bb * br.unsqueeze(-2)).reshape(B, T, self.n * self.d)
+    b = _coeff_list(beta, self.n, x.dtype)
     rows = [xv[..., i, :] + _combine(xv, [delta[i, j] for j in range(self.n)]) + b[i] * br for i in range(self.n)]
     return torch.stack(rows, dim=-2).reshape(B, T, self.n * self.d)
 
@@ -116,6 +125,12 @@ class HyperConnection(nn.Module):
 # [.., 1, n] or [n, n] against [B, T, n, D] runs as B*T tiny batched GEMMs/GEMVs that torch.compile cannot fuse
 # (11-08 profile at 384x12: ~26 ms of the ~40 ms per-step overhead of n=2 static); the unrolled form is pointwise and
 # fuses into the neighbouring kernels (computed in fp32 inside the fused kernel, one rounding at the store).
+# The export copy switches back to torch.matmul for n >= 3 (matmul_form, set when H_res is baked): under TensorRT the
+# unrolled form serves SLOWER there (11-08, 384x12 n=4 prepost: 20.7K vs 28.4K EPS; base 38.0K). At n=2 the unrolled
+# form is as fast or faster (n2st head-to-head 37.2K vs 36.3K, 37.1K vs 35.9K; n2pp 33.2K vs 33.4K), so it stays.
+def export_matmul_form(n: int) -> bool:
+  return n >= 3
+
 def _coeff_list(w: torch.Tensor, n: int, dtype):
   """[n] (static) or [B, T, n] (dynamic) -> n coefficients, scalar or [B, T, 1], in dtype."""
   w = w.to(dtype)
@@ -136,7 +151,11 @@ class HyperConnReadout(nn.Module):
     super().__init__()
     self.n, self.d = n, model_dim
     self.alpha = nn.Parameter(torch.full((n,), 1.0 / n))
+    self.matmul_form = False   # set on the export copy by save_model (see HyperConnection.matmul_form)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     B, T, _ = x.shape
-    return _combine(x.reshape(B, T, self.n, self.d), _coeff_list(self.alpha, self.n, x.dtype))
+    xv = x.reshape(B, T, self.n, self.d)
+    if self.matmul_form:
+      return torch.matmul(self.alpha.to(x.dtype).reshape(1, 1, 1, self.n), xv).reshape(B, T, self.d)
+    return _combine(xv, _coeff_list(self.alpha, self.n, x.dtype))

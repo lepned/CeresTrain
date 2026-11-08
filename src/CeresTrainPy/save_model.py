@@ -200,7 +200,11 @@ def save_model(NAME : str,
         model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
         _hc_core = getattr(model_nocompile, 'core', model_nocompile)
       _n_hc = sum(m.bake_res_matrix_() for m in _hc_core.modules() if hasattr(m, 'bake_res_matrix_'))
-      print(f'INFO: NBT hyper-connection H_res baked as constants in {_n_hc} blocks (training model untouched)')
+      from hyper_conn import export_matmul_form
+      for m in _hc_core.modules():   # readout too: torch.matmul stream mixes in the exported graph (faster under TRT)
+        if hasattr(m, 'matmul_form'):
+          m.matmul_form = export_matmul_form(m.n)
+      print(f'INFO: NBT hyper-connection H_res baked as constants in {_n_hc} blocks, matmul-form mixes for n >= 3 (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
     # NB folds deliberately do NOT tag the filename: ExportFolds is a property of the RUN's
     # config, so every export of that run is folded and there is nothing to disambiguate —
