@@ -103,6 +103,7 @@ def save_model(NAME : str,
 
   # Resolve dtype/device from the model's parameters. (LightningModule used to
   # provide model.dtype / model.device; plain nn.Module does not.)
+  _model_in = model_nocompile   # the live training model: export-only mutations must go to a copy
   _first_param = next(model_nocompile.parameters())
   _model_dtype = _first_param.dtype
   _model_device = _first_param.device
@@ -191,6 +192,15 @@ def save_model(NAME : str,
         _shift_core = getattr(model_nocompile, 'core', model_nocompile)
       _n_shift = sum(m.fold_activation_shift_() for m in _shift_core.modules() if hasattr(m, 'fold_activation_shift_'))
       print(f'INFO: NBT activation shift folded into {_n_shift} blocks (training model untouched)')
+    # NBT hyper-connections (hyper_conn.py): bake the Sinkhorn H_res into constant buffers on the export copy, so the
+    # graph never carries the ~85-op Sinkhorn subgraph per block (the TorchScript exporter does not fold it; review 11-08).
+    _hc_core = getattr(model_nocompile, 'core', model_nocompile)
+    if any(hasattr(m, 'bake_res_matrix_') for m in _hc_core.modules()):
+      if model_nocompile is _model_in:
+        model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+        _hc_core = getattr(model_nocompile, 'core', model_nocompile)
+      _n_hc = sum(m.bake_res_matrix_() for m in _hc_core.modules() if hasattr(m, 'bake_res_matrix_'))
+      print(f'INFO: NBT hyper-connection H_res baked as constants in {_n_hc} blocks (training model untouched)')
     # Distinct file tag so a capped re-export never overwrites the full-M net.
     # NB folds deliberately do NOT tag the filename: ExportFolds is a property of the RUN's
     # config, so every export of that run is folded and there is nothing to disambiguate —

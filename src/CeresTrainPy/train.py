@@ -590,7 +590,9 @@ def Train():
                         or "move_tokens.act." in name
                         # Register tokens + their value injects (NetDef RegisterTokens): NEW modules (random /
                         # zero init) -- frozen they would stay at init, a silent dead feature.
-                        or "register_" in name)
+                        or "register_" in name
+                        # NBT hyper-connections / head mixing / value residual (2026-11-08): NEW identity-init params.
+                        or "hyper_conn" in name or "head_mix" in name or "vr_lambda" in name)
       if not keep_trainable:
         param.requires_grad = False
 
@@ -765,6 +767,7 @@ def Train():
       if 'mod_router' in n: return False         # NBT MoD router [1, D]: 1-row scorer, same class as vord, AdamW
       if 'register_tokens' in n: return False    # learned register tokens [R, D]: embedding-like rows, AdamW
       if 'register_value' in n: return False     # zero-init register -> value injects: coupling class (see the decoder rule), AdamW
+      if 'head_mix' in n or n.replace('_orig_mod.', '').startswith('hyper_conn'): return False   # NBT head-mix [G,c,c] / mHC mixing params: AdamW
       if 'lora' in n.lower(): return False      # low-rank adapters: orthogonalized updates unsuitable
       return True
     def _use_muon_all_non_trunk(n, p):
@@ -775,7 +778,7 @@ def Train():
       # The piece-token decompression (pt_decompress) is the trunk's way out to the 64 squares: trunk class, like
       # the NBT down/up projections (its zero-init out included, as NBT up). The MoD router [1, D] is a 1-row scorer: AdamW.
       return (p.ndim == 2 and 'embedding' not in n and ('transformer_layer' in n or 'pt_decompress.' in n)
-              and 'mod_router' not in n and 'lora' not in n.lower())
+              and 'mod_router' not in n and 'head_mix' not in n and 'lora' not in n.lower())
     def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
       # AdamW substituted for NAdam by design — the load-bearing choice is
@@ -2066,10 +2069,14 @@ def Train():
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('pt_decompress.',)
     # Register -> value injectors (NetDef RegisterTokensToValue): top-level, zero-init.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('register_value_inject.', 'register_value2_inject.')
+    # NBT hyper-connections (NetDef NBTHyperConn): identity at init, so fresh params on a warm start reproduce the base net.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('hyper_conn.', 'hyper_conn_out.')
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.
+      # '.head_mix' / '.vr_lambda' (2026-11-08): NBT head mixing / value residual, identity init (nested in every inner attention)
       return (k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
+              or k.endswith('.head_mix') or k.endswith('.vr_lambda')
               or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
     # ReinitParamsOnResume (2026-10-05): keep the construction-time init of the listed params so it

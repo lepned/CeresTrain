@@ -512,6 +512,11 @@ class DotProductAttention(torch.nn.Module):
     # Same ARCH-key semantics as SoftMinHeads (not a zero-init no-op).
     self.softmin_heads = softmin_heads
     self.softmax_agg_heads = softmax_agg_heads
+    # NBTValueResidual / NBTHeadMix (enabled after construction by ceres_net, see enable_value_residual / enable_head_mix)
+    self.value_residual = False
+    self.vr_first = False
+    self.head_mix = None
+    self.head_mix_c = 0
     if softmin_heads > 0 or softmax_agg_heads > 0:
       assert not use_diff_attention, \
           'soft-agg heads unsupported with DiffAttention (differential A can be negative — log undefined)'
@@ -607,6 +612,44 @@ class DotProductAttention(torch.nn.Module):
       )
 
 
+
+  # VALUE RESIDUAL (2026-11-08, NetDef NBTValueResidual; Zhou et al. 2024, arXiv 2410.17897): V_l = lambda_l * V_l +
+  # (1 - lambda_l) * V_first, V_first = the V of the trunk's first inner layer (passed down by ceres_net / nbt_layer).
+  # lambda init 1 => exact identity at step 0. Elementwise on V: the score path and the AV MatMul stay unchanged.
+  def enable_value_residual(self, first: bool):
+    assert self.use_qkv and not self.use_nonlinear_attention and not self.use_diff_attention,       'NBTValueResidual: standard QKV attention only'
+    self.value_residual = True
+    self.vr_first = first
+    if not first:
+      self.vr_lambda = torch.nn.Parameter(torch.ones(1))
+
+  # HEAD MIXING (2026-11-08, NetDef NBTHeadMix; Multi-Token Attention, Golovneva et al. 2025, arXiv 2504.00927): within
+  # groups of c heads, the content logits of head g become sum_h' M[g,h'] Q_h' K_h'^T (pre-softmax, before 1/sqrt(dk);
+  # biases, temperature and softcap stay per head), so softmax(S_1 + S_2) ~ p_1 * p_2 -- an AND across heads. Computed as
+  # one ordinary QK^T with c-times-wider heads (Q~_g = concat_h' M[g,h'] Q_h', K~_g = concat_h' K_h', elementwise ops in
+  # front of the score MatMul), identical in training and export. M = I per group => exact identity at step 0.
+  def enable_head_mix(self, group: int):
+    c = group or self.num_heads
+    assert self.num_heads % c == 0, f'NBTHeadMixGroup {c} must divide the {self.num_heads} heads'
+    # the mixed heads are c times wider (Q/K activations c x, QK^T GEMM c x); TensorRT's fused MHA takes head sizes
+    # <= 256, so c * d_k > 256 would also unfuse every inner attention at serving (review 11-08)
+    assert c * self.d_k * self.attention_multiplier <= 256, (
+      f'NBTHeadMix: group {c} x head dim {self.d_k * self.attention_multiplier} = {c * self.d_k * self.attention_multiplier} > 256 '
+      f'(set NBTHeadMixGroup to a smaller divisor of {self.num_heads}; NBTHeadMixGroup 0 = all heads)')
+    assert self.use_qkv and not self.use_nonlinear_attention and not self.use_diff_attention and not self.use_rpe       and self.softmin_heads == 0 and self.softmax_agg_heads == 0,       'NBTHeadMix: standard QKV attention without RPE / diff / nonlinear / soft-aggregation heads only'
+    self.head_mix_c = c
+    self.head_mix = torch.nn.Parameter(torch.eye(c).repeat(self.num_heads // c, 1, 1))   # [G, c, c]
+
+  def _head_mix_qk(self, Q, K):
+    B, H, T, d = Q.shape
+    c = self.head_mix_c
+    G = H // c
+    M = self.head_mix.to(Q.dtype).reshape(1, G, c, 1, c, 1)
+    Qg = Q.reshape(B, G, c, T, d).permute(0, 1, 3, 2, 4).unsqueeze(2)                 # [B, G, 1, T, c, d]
+    Qm = (M * Qg).reshape(B, H, T, c * d)                                             # head g: [M[g,h'] Q_h']_h'
+    Kg = K.reshape(B, G, c, T, d).permute(0, 1, 3, 2, 4).reshape(B, G, 1, T, c * d)
+    Km = Kg.expand(B, G, c, T, c * d).reshape(B, H, T, c * d)                          # group's K, concatenated
+    return Qm, Km
 
   @property
   def smolgenPrepLayer(self):
@@ -849,7 +892,7 @@ class DotProductAttention(torch.nn.Module):
     # logit for the weight-level clip applied after the optimizer step (train.py).
     # Training-only attribute stash (placement-head pattern) — contributes NOTHING
     # to the eval/export graph, which is the whole point of weight-level clipping.
-    if self.training and getattr(self, 'qk_clip_monitor', False):
+    if self.training and getattr(self, 'qk_clip_monitor', False) and self.head_mix is None:
       _mx = scores.detach().amax(dim=(0, 2, 3))  # [num_heads]
       _prev = getattr(self, '_last_max_logit', None)
       # Max over alle mikro-batcher i vinduet (jf. kommentaren i smolref-stien).
@@ -961,7 +1004,7 @@ class DotProductAttention(torch.nn.Module):
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False, vis_edge: torch.Tensor = None,
-              edge_scales = None, edge_gate = None) -> torch.Tensor:
+              edge_scales = None, edge_gate = None, v_first: torch.Tensor = None, return_v: bool = False) -> torch.Tensor:
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -1010,6 +1053,16 @@ class DotProductAttention(torch.nn.Module):
         Q = self.q2(q).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
         K = self.k2(k).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
         V = self.v2(v).reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier).permute(0, 2, 1, 3)
+
+    # Value residual (see enable_value_residual): the first layer hands its raw V down, later layers mix it in.
+    v_out = None
+    if self.value_residual:
+      if self.vr_first:
+        v_out = V
+      else:
+        assert v_first is not None, 'NBTValueResidual: v_first missing (trunk did not pass the first layer V)'
+        lam = self.vr_lambda.to(V.dtype)
+        V = lam * V + (1.0 - lam) * v_first.to(V.dtype)
 
     if self.use_qk_norm:
       # Diff-attention baerer Q som tuple (Q1, Q2) — normer begge grenene med
@@ -1126,6 +1179,16 @@ class DotProductAttention(torch.nn.Module):
       _lam = torch.tanh(self.graph_route_gate).reshape(1, self.num_heads, 1, 1)
       _graph_route = (_A_hard, _lam)
 
+    if self.head_mix is not None:
+      if self.training and getattr(self, 'qk_clip_monitor', False):
+        # QK-clip with head mixing (review 11-08): apply_qk_clip shrinks head h's own Q/K rows, so it must see head h's
+        # OWN (unmixed) content logits; the mixed scores' max may come from a neighbour's term that the clip cannot reach.
+        with torch.no_grad():
+          _mx = (torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.d_k * self.attention_multiplier)).amax(dim=(0, 2, 3))
+        _prev = getattr(self, '_last_max_logit', None)
+        self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
+      Q, K = self._head_mix_qk(Q, K)
+
     if self.use_smolgen:
       smolgen = self.calc_smolgen(x)
       if self.use_diff_attention:
@@ -1183,7 +1246,7 @@ class DotProductAttention(torch.nn.Module):
     # Final linear layer
     H = self.W_h(H_cat)
 
-    return H
+    return (H, v_out) if return_v else H
 
 
 

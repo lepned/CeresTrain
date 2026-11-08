@@ -239,7 +239,8 @@ class NestedBottleneckLayer(torch.nn.Module):
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
               edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
-              token_fill: torch.Tensor = None, num_registers: int = 0):
+              token_fill: torch.Tensor = None, num_registers: int = 0, v_first: torch.Tensor = None,
+              want_v_first: bool = False, return_branch: bool = False):
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -270,12 +271,18 @@ class NestedBottleneckLayer(torch.nn.Module):
         piece_relation_bias = gather_pair_bias(piece_relation_bias, mod_idx)
     h = self.down(self._shift(self.act_in(h0)))
     logits = None
+    # NBTValueResidual: the trunk's first inner layer returns its V (want_v_first), every later one mixes it in
+    assert not ((v_first is not None or want_v_first) and mod_idx is not None), 'NBT value residual: no MoD'
     for j, layer in enumerate(self.inner):
       _eg = None if edge_gates is None else edge_gates[j]
       if want_logits and j == len(self.inner) - 1:
         logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales, _eg)
-      h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
-                edge_scales=edge_scales, edge_gate=_eg)
+      if want_v_first and j == 0:
+        h, v_first = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
+                           edge_scales=edge_scales, edge_gate=_eg, return_v=True)
+      else:
+        h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
+                  edge_scales=edge_scales, edge_gate=_eg, v_first=v_first)
     out = self.up(self._shift(self.act_out(self.norm_out(h))))
     # Phase-FiLM is [B, 1, model_dim]: applied to the block's full-width branch output
     # before the residual add -- as a pre-norm plain layer applies it to its FFN output
@@ -285,10 +292,12 @@ class NestedBottleneckLayer(torch.nn.Module):
       out = out * (1.0 + film[0]) + film[1]
     if mod_idx is not None:
       # unrouted squares: identity; routed: x + gate * block output
-      return x + scatter_tokens(torch.zeros_like(x), mod_idx, out * mod_gate.to(out.dtype))
+      out = scatter_tokens(torch.zeros_like(x), mod_idx, out * mod_gate.to(out.dtype))
+    # return_branch (NBTHyperConn): the caller adds the branch to its own residual streams
+    res = out if return_branch else x + out
     if want_logits:
-      return x + out, logits
-    return x + out
+      res = (res, logits)
+    return (res, v_first) if want_v_first else res
 
   @staticmethod
   def _raw_logits(layer, h, piece_relation_bias, edge_scales, edge_gate=None):

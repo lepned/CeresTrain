@@ -1184,6 +1184,39 @@ class Configuration:
       raise ValueError('RegisterTokensToValue set but RegisterTokens is 0 (silent no-op refused)')
     if self.NetDef_RegisterTokens and self.NetDef_NBTMoDCapacity:
       raise ValueError('RegisterTokens and NBTMoDCapacity do not combine (the router would route the registers)')
+    # NBT HYPER-CONNECTIONS (2026-11-08, hyper_conn.py; mHC, DeepSeek arXiv 2512.24880): NBTHyperConn n (0 = off; 2, 4
+    # or 8) parallel residual streams of width ModelDim on the outer NBT residual; block l reads stream l % n, writes to
+    # all, streams mixed by a doubly-stochastic (Sinkhorn, NBTHyperConnSinkhornIters) static matrix; trunk end reads the
+    # mean. NBTHyperConnDynamic 'prepost' adds input-dependent read/write weights (zero-init). Step 0 == the plain trunk.
+    self.NetDef_NBTHyperConn = int(config_net_def.get('NBTHyperConn', 0) or 0)
+    self.NetDef_NBTHyperConnDynamic = config_net_def.get('NBTHyperConnDynamic', 'none') or 'none'
+    self.NetDef_NBTHyperConnSinkhornIters = int(config_net_def.get('NBTHyperConnSinkhornIters', 20) or 0)
+    if self.NetDef_NBTHyperConn not in (0, 2, 4, 8):
+      raise ValueError(f"NBTHyperConn must be 0 (off), 2, 4 or 8 (was {self.NetDef_NBTHyperConn})")
+    if self.NetDef_NBTHyperConnDynamic not in ('none', 'prepost'):
+      raise ValueError(f"NBTHyperConnDynamic must be none or prepost (was {self.NetDef_NBTHyperConnDynamic!r})")
+    if self.NetDef_NBTHyperConnDynamic != 'none' and not self.NetDef_NBTHyperConn:
+      raise ValueError('NBTHyperConnDynamic set but NBTHyperConn is 0 (silent no-op refused)')
+    if 'NBTHyperConnSinkhornIters' in config_net_def and not self.NetDef_NBTHyperConn:
+      raise ValueError('NBTHyperConnSinkhornIters set but NBTHyperConn is 0 (silent no-op refused)')
+    if self.NetDef_NBTHyperConn and self.NetDef_NBTHyperConnSinkhornIters < 1:
+      raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
+    if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:
+      raise ValueError('NBTHyperConn and PieceTokens do not combine (the token gather/decompression is single-stream)')
+    # NBT VALUE RESIDUAL (2026-11-08; arXiv 2410.17897): every inner attention layer after the trunk's first mixes in
+    # the first layer's V, V_l = lambda_l V_l + (1 - lambda_l) V_first, lambda init 1 (step 0 == the plain trunk).
+    self.NetDef_NBTValueResidual = bool(config_net_def.get('NBTValueResidual', False))
+    if self.NetDef_NBTValueResidual and (self.NetDef_PieceTokens or self.NetDef_NBTMoDCapacity):
+      raise ValueError('NBTValueResidual: no PieceTokens / NBTMoDCapacity (the token set changes along the trunk)')
+    # NBT HEAD MIXING (2026-11-08; Multi-Token Attention arXiv 2504.00927): pre-softmax mixing of the QK^T content logits
+    # within groups of NBTHeadMixGroup inner heads (0 = all heads), identity init. Not with EGT (its readback recomputes
+    # the unmixed logits) or RPE.
+    self.NetDef_NBTHeadMix = bool(config_net_def.get('NBTHeadMix', False))
+    self.NetDef_NBTHeadMixGroup = int(config_net_def.get('NBTHeadMixGroup', 0) or 0)
+    if self.NetDef_NBTHeadMixGroup and not self.NetDef_NBTHeadMix:
+      raise ValueError('NBTHeadMixGroup set but NBTHeadMix is off (silent no-op refused)')
+    if self.NetDef_NBTHeadMixGroup > 8:
+      raise ValueError(f'NBTHeadMixGroup {self.NetDef_NBTHeadMixGroup} > 8: the mixed heads are group-times wider')
     # EGT EDGE STREAM in TRT-servable form (2026-10-07, egt_edge.py; NBT trunks only): a learned edge state read once per
     # NBT block (additive bias + log-door, separable q/k premult, row-scale door) and updated (readback, path triplet,
     # edge FFN) after the blocks listed in EGTEdgeSites. Zero-init readers: step 0 == the net without it.

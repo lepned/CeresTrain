@@ -1539,6 +1539,48 @@ class CeresNet(nn.Module):
       print(f'[ceres_net] REGISTER TOKENS: {_R} learned tokens in the trunk (smolgen bias 0 on their rows/columns), '
             f'dropped before the heads; value read {"ON (zero-init inject, " + format(_n_rv, ",") + " params)" if _n_rv else "off"}')
 
+    # NBT value residual / head mixing (config NBTValueResidual / NBTHeadMix; dot_product_attention.enable_*): enabled on
+    # the inner attention layers after construction. RNG-free inits (ones / identity): every other parameter is unchanged.
+    self.nbt_value_residual = bool(getattr(config, 'NetDef_NBTValueResidual', False))
+    self.nbt_head_mix = bool(getattr(config, 'NetDef_NBTHeadMix', False))
+    if self.nbt_value_residual or self.nbt_head_mix:
+      assert self.NBT_INNER_LAYERS > 0 and self.LOOP_COUNT == 1 and not self.denseformer,         'NBTValueResidual / NBTHeadMix: NBT trunk, LoopCount 1, no DenseFormer'
+      _inner_atts = [l.attention for blk in self.transformer_layer for l in blk.inner]
+      if self.nbt_value_residual:
+        assert not self.piece_tokens and not int(getattr(config, 'NetDef_NBTMoDCapacity', 0) or 0), 'NBTValueResidual: no PieceTokens / MoD'
+        for k, att in enumerate(_inner_atts):
+          att.enable_value_residual(first=(k == 0))
+        print(f'[ceres_net] NBT VALUE RESIDUAL: V_l = lambda_l*V_l + (1-lambda_l)*V_first (trunk inner layer 0) in the other '
+              f'{len(_inner_atts) - 1} inner layers, lambda init 1.0 (step 0 == the plain trunk)')
+      if self.nbt_head_mix:
+        assert not getattr(config, 'NetDef_EGTEdgeStream', False), 'NBTHeadMix: not with EGTEdgeStream (its readback recomputes unmixed logits)'
+        _c = int(getattr(config, 'NetDef_NBTHeadMixGroup', 0) or 0)
+        for att in _inner_atts:
+          att.enable_head_mix(_c)
+        _c = _inner_atts[0].head_mix_c
+        print(f'[ceres_net] NBT HEAD MIXING (MTA): pre-softmax mixing of the QK^T content logits in groups of {_c} of the '
+              f'{_inner_atts[0].num_heads} inner heads (bias/temperature/softcap per head), identity init, '
+              f'{sum(a.head_mix.numel() for a in _inner_atts)} params; QK^T heads {_c}x wider')
+
+    # NBT hyper-connections (hyper_conn.py; config NBTHyperConn): n residual streams on the outer NBT residual.
+    self.hyper_conn_n = int(getattr(config, 'NetDef_NBTHyperConn', 0) or 0)
+    self.hyper_conn = None
+    self.hyper_conn_out = None
+    if self.hyper_conn_n:
+      assert self.NBT_INNER_LAYERS > 0 and self.LOOP_COUNT == 1 and not self.denseformer and not self.piece_tokens,         'NBTHyperConn: NBT trunk, LoopCount 1, no DenseFormer, no PieceTokens'
+      assert not getattr(config, 'Opt_TrunkGrowInsertAfter', None), 'NBTHyperConn: TrunkGrowInsertAfter is not wired'
+      from hyper_conn import HyperConnection, HyperConnReadout
+      _n, _dyn = self.hyper_conn_n, config.NetDef_NBTHyperConnDynamic
+      with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0x48C)
+        self.hyper_conn = nn.ModuleList([HyperConnection(_n, self.EMBEDDING_DIM, i, _dyn, config.NetDef_NBTHyperConnSinkhornIters,
+                                                         config.NetDef_NormType) for i in range(self.NUM_DISTINCT_LAYERS)])
+        self.hyper_conn_out = HyperConnReadout(_n, self.EMBEDDING_DIM)
+      _n_hc = sum(p.numel() for p in self.hyper_conn.parameters()) + _n
+      print(f'[ceres_net] NBT HYPER-CONNECTIONS (mHC): {_n} streams x {self.EMBEDDING_DIM}; block l reads stream l%{_n}, '
+            f'writes to all, H_res = Sinkhorn({config.NetDef_NBTHyperConnSinkhornIters}) of static logits; dynamic {_dyn}; '
+            f'trunk end / depth states read the mean; {_n_hc:,} params (step 0 == the plain trunk)')
+
     # EGT edge stream (egt_edge.py; config EGTEdgeStream). Built in a forked RNG under a fixed seed so every other
     # parameter initializes bit-identically with and without it; its readers are zero-init (step 0 == without it).
     self.egt = None
@@ -2136,6 +2178,12 @@ class CeresNet(nn.Module):
     _R = self.num_registers
     if _R:
       flow = torch.cat([flow, self.register_tokens.to(flow.dtype).unsqueeze(0).expand(flow.shape[0], -1, -1)], dim=1)
+    # NBT hyper-connections: n copies of the stream side by side, [B, T, n*D]; blocks read/write through hyper_conn[i]
+    _hc = self.hyper_conn
+    if _hc is not None:
+      flow = flow.repeat(1, 1, self.hyper_conn_n)
+    # NBT value residual: the trunk's first inner layer's V, handed to every later inner layer
+    _v_first = None
 
     # Main transformer body (stack of encoder layers).
     # Looped transformer: apply NUM_DISTINCT_LAYERS modules LOOP_COUNT times,
@@ -2173,6 +2221,11 @@ class CeresNet(nn.Module):
         if vis_edge_biases is not None:
           _vb = vis_edge_biases[i]  # [B, H, 64, 64], precomputed above
           _prb_l = _vb if _prb_l is None else _prb_l + _vb
+        _hc_beta = None
+        if _hc is not None:
+          _hc_alpha, _hc_beta = _hc[i].coeffs(flow)
+          _hc_streams, flow = flow, _hc[i].read(flow, _hc_alpha)   # the block sees one D-wide input
+        _vr_want = self.nbt_value_residual and i == 0 and loop_iter == 0
         _egt_kw = {}
         _egt_site = False
         if _egt_e is not None:
@@ -2189,17 +2242,27 @@ class CeresNet(nn.Module):
                                          vis_edge=vis_edge_E if (self.vis_edge_gate_mode or self.use_graph_route) else None,
                                          **_egt_kw, **({'token_idx': pt_idx, 'token_fill': flow64 if self.pt_smolgen_stale else None}
                                                      if (pt_idx is not None and self.pt_from_block <= i < self.pt_to_block) else {}),
-                                         **({'num_registers': _R} if _R else {}))
+                                         **({'num_registers': _R} if _R else {}),
+                                         **({'return_branch': True} if _hc is not None else {}),
+                                         **({'want_v_first': True} if _vr_want else
+                                            ({'v_first': _v_first} if self.nbt_value_residual else {})))
+        if _vr_want:
+          flow, _v_first = flow
         if _egt_site:
           flow, _egt_logits = flow
           _egt_e = self.egt.update(i, _egt_e, _egt_logits)
+        if _hc is not None:
+          flow = _hc[i].write(_hc_streams, flow, _hc_beta)          # flow was the block's branch
         if self.denseformer:
           eff_idx = loop_iter * self.NUM_DISTINCT_LAYERS + i
           all_previous_x.append(flow)
           flow = self.dwa_modules[eff_idx](all_previous_x)
         if _collect_states:
-          vda_states.append(flow[:, :flow.shape[1] - _R] if _R else flow)  # post-layer (post-DWA if denseformer)
+          _st = self.hyper_conn_out(flow) if _hc is not None else flow   # mean of the streams (== the plain state at init)
+          vda_states.append(_st[:, :_st.shape[1] - _R] if _R else _st)  # post-layer (post-DWA if denseformer)
 
+    if _hc is not None:
+      flow = self.hyper_conn_out(flow)
     _reg_out = None
     if _R:
       _reg_out = flow[:, flow.shape[1] - _R:]
