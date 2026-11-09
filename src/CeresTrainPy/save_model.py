@@ -192,6 +192,14 @@ def save_model(NAME : str,
         _shift_core = getattr(model_nocompile, 'core', model_nocompile)
       _n_shift = sum(m.fold_activation_shift_() for m in _shift_core.modules() if hasattr(m, 'fold_activation_shift_'))
       print(f'INFO: NBT activation shift folded into {_n_shift} blocks (training model untouched)')
+    # NBTReRead (nbt_layer.py): fold the scalar re-read gate into down2's rows on the export copy (no Mul per block).
+    _rr_core = getattr(model_nocompile, 'core', model_nocompile)
+    if any(getattr(m, 'reread', 0) and not getattr(m, 'reread_gate_folded', False) for m in _rr_core.modules()):
+      if model_nocompile is _model_in:
+        model_nocompile = _deepcopy_model_for_export(model_nocompile).eval()
+        _rr_core = getattr(model_nocompile, 'core', model_nocompile)
+      _n_rr = sum(m.fold_reread_gate_() for m in _rr_core.modules() if hasattr(m, 'fold_reread_gate_'))
+      print(f'INFO: NBT re-read gate folded into down2 in {_n_rr} blocks (training model untouched)')
     # NBT hyper-connections (hyper_conn.py): bake the Sinkhorn H_res into constant buffers on the export copy, so the
     # graph never carries the ~85-op Sinkhorn subgraph per block (the TorchScript exporter does not fold it; review 11-08).
     _hc_core = getattr(model_nocompile, 'core', model_nocompile)

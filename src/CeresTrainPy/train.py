@@ -596,7 +596,9 @@ def Train():
                         # NBT carry (2026-11-08): zero-init gate + norm, NEW params
                         or ".carry_gate" in name or ".carry_norm" in name
                         # Mid-depth decoder policy gains (2026-11-09): NEW ones-init params
-                        or "mid_dec_gain" in name)
+                        or "mid_dec_gain" in name
+                        # NBT re-read (2026-11-09): NEW second down projection + zero-init gate
+                        or ".down2." in name or ".reread_gate" in name)
       if not keep_trainable:
         param.requires_grad = False
 
@@ -2084,6 +2086,7 @@ def Train():
       return (k.startswith(_AUX_HEAD_PREFIXES) or '.attack_gate_' in k or '.graph_route_' in k or '.attn_out_gate.' in k
               or k.endswith('.head_mix') or k.endswith('.vr_lambda') or '.hyper_conn_inner' in k
               or k.endswith('.carry_gate') or '.carry_norm.' in k
+              or k.endswith('.reread_gate') or '.down2.' in k
               or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
     # ReinitParamsOnResume (2026-10-05): keep the construction-time init of the listed params so it

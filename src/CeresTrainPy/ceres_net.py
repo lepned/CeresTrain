@@ -1491,9 +1491,15 @@ class CeresNet(nn.Module):
                                  hc_inner_n=config.NetDef_NBTHyperConnInner,
                                  hc_inner_dynamic=config.NetDef_NBTHyperConnInnerDynamic,
                                  hc_sinkhorn_iters=config.NetDef_NBTHyperConnSinkhornIters,
-                                 carry=config.NetDef_NBTCarry, carry_receive=i > 0)
+                                 carry=config.NetDef_NBTCarry, carry_receive=i > 0,
+                                 reread=config.NetDef_NBTReRead)
            for i in range(self.NUM_DISTINCT_LAYERS)])
       self.nbt_carry = config.NetDef_NBTCarry
+      if config.NetDef_NBTReRead:
+        _n_rr = sum(p.numel() for blk in self.transformer_layer for p in (blk.down2.weight, blk.reread_gate))
+        print(f'[ceres_net] NBT RE-READ: second down projection per block ({self.EMBEDDING_DIM}->{self.NBT_MID_DIM}) on '
+              f'the same block input, added before inner layer {config.NetDef_NBTReRead} via a zero-init scalar gate '
+              f'(step 0 == the plain block); {_n_rr:,} params')
       if self.nbt_carry:
         print(f'[ceres_net] NBT CARRY: mid-width ({self.NBT_MID_DIM}) side channel = running sum of the inner branches, '
               f'blocks 1..{self.NUM_DISTINCT_LAYERS - 1} add g_b * norm(carry) to their entry state (g_b zero-init: step 0 == '

@@ -173,7 +173,7 @@ class NestedBottleneckLayer(torch.nn.Module):
                proj_norm: str = 'Norm', down_init_scale: float = 1.0, block_index: int = 0,
                shared_smolgen: torch.nn.Module = None, proj_activation_shift: bool = False, mod_capacity: int = 0,
                hc_inner_n: int = 0, hc_inner_dynamic: str = 'none', hc_sinkhorn_iters: int = 20,
-               carry: bool = False, carry_receive: bool = False):
+               carry: bool = False, carry_receive: bool = False, reread: int = 0):
     super().__init__()
     assert num_inner_layers >= 1, num_inner_layers
     # NBTSharedSmolgen: one generator per block on the (normalized) block input; the inner
@@ -238,6 +238,19 @@ class NestedBottleneckLayer(torch.nn.Module):
     if self.carry_receive:
       self.carry_norm = make_norm(norm_type, mid_dim, eps=layernorm_eps)
       self.carry_gate = torch.nn.Parameter(torch.zeros(1))
+    # NBTReRead (2026-11-09): a second read of the block input with its own rows. down2 (same shape/init as down)
+    # reads the SAME u = shift(act_in(norm_in(x))) -- the trunk is unchanged inside the block -- and g * down2(u) is
+    # added to the inner residual just before inner layer `reread`; g is a zero-init scalar gate (exact identity at
+    # step 0). Widens the block's read from mid to 2*mid trunk directions without a second up projection.
+    self.reread = int(reread)
+    if self.reread:
+      assert 1 <= self.reread <= num_inner_layers - 1, f'NBTReRead: inner-layer index in [1, {num_inner_layers - 1}]'
+      self.down2 = torch.nn.Linear(model_dim, mid_dim, bias=False)
+      if down_init_scale != 1.0:
+        with torch.no_grad():
+          self.down2.weight.mul_(down_init_scale)
+      self.reread_gate = torch.nn.Parameter(torch.zeros(1))
+    self.reread_gate_folded = False
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
@@ -248,13 +261,24 @@ class NestedBottleneckLayer(torch.nn.Module):
     return a - a.mean(dim=-1, keepdim=True) if self.proj_activation_shift else a
 
 
+  def fold_reread_gate_(self) -> bool:
+    """Export-time fold of the NBTReRead scalar gate into down2's weights (in place, for an export copy):
+    g * (W2 u) = (g W2) u, so the graph carries no extra Mul per block (review 11-09)."""
+    if not self.reread or self.reread_gate_folded:
+      return False
+    with torch.no_grad():
+      self.down2.weight.mul_(self.reread_gate.to(self.down2.weight.dtype))
+    self.reread_gate_folded = True
+    return True
+
+
   def fold_activation_shift_(self) -> bool:
     """Export-time fold of the shift into the consuming Linears (in place, for an export copy):
     W (a - mean_c(a)) = (W - W.mean(dim=1)) a, so the graph needs no ReduceMean/Sub."""
     if not self.proj_activation_shift:
       return False
     with torch.no_grad():
-      for lin in (self.down, self.up):
+      for lin in (self.down, self.up) + ((self.down2,) if self.reread else ()):
         w = lin.weight.float()
         lin.weight.copy_((w - w.mean(dim=1, keepdim=True)).to(lin.weight.dtype))
     self.proj_activation_shift = False
@@ -297,7 +321,8 @@ class NestedBottleneckLayer(torch.nn.Module):
       h0 = gather_tokens(h0, mod_idx)
       if piece_relation_bias is not None:
         piece_relation_bias = gather_pair_bias(piece_relation_bias, mod_idx)
-    h = self.down(self._shift(self.act_in(h0)))
+    u = self._shift(self.act_in(h0))
+    h = self.down(u)
     if self.carry:
       assert token_idx is None, 'NBTCarry: no piece tokens (the token count changes between blocks)'
       if self.carry_receive and carry_in is not None:
@@ -315,6 +340,14 @@ class NestedBottleneckLayer(torch.nn.Module):
       hc_res = hc_inner_res
       h = h.repeat(1, 1, self.hc_inner_n)    # [B, T, n * mid_dim]
     for j, layer in enumerate(self.inner):
+      if self.reread and j == self.reread:
+        _rr = self.down2(u).to(h.dtype)
+        if not self.reread_gate_folded:   # export folds the gate into down2's rows (fold_reread_gate_)
+          _rr = self.reread_gate.to(h.dtype) * _rr
+        # with inner hyper-connections h holds n streams: the read enters every stream (as the entry read does)
+        h = h + (_rr.repeat(1, 1, self.hc_inner_n) if hc is not None else _rr)
+        if self.carry:
+          h_entry = h_entry + _rr   # carry = running sum of the inner BRANCHES: a trunk read is not one (review 11-09)
       _eg = None if edge_gates is None else edge_gates[j]
       if hc is not None:
         hc_a, hc_b = hc[j].coeffs(h)

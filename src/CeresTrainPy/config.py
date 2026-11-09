@@ -1254,6 +1254,17 @@ class Configuration:
       raise ValueError('NBTCarry needs >= 2 distinct blocks (no block would read the carry: silent no-op refused)')
     if self.NetDef_NBTCarry and (config_net_def.get('PieceTokens', 0) or config_net_def.get('NBTMoDCapacity', 0)):
       raise ValueError('NBTCarry does not combine with PieceTokens or NBTMoDCapacity (the token set changes between blocks)')
+    # NBTReRead (2026-11-09, nbt_layer.py): a second down projection per block (down2: D -> mid) reading the SAME
+    # block input u = act(norm_in(x)) with its own rows, added before inner layer k as g * down2(u), g a zero-init
+    # scalar gate (exact identity at step 0). Value = k, the inner-layer index (1 .. NBTInnerLayers-1); 0 = off.
+    # Motivation: each block's 640-row read captures only ~55 % of the trunk input variance (12x3 analysis 11-09).
+    self.NetDef_NBTReRead = int(config_net_def.get('NBTReRead', 0) or 0)
+    if self.NetDef_NBTReRead:
+      if self.NetDef_NBTInnerLayers < 2:
+        raise ValueError('NBTReRead needs an NBT trunk with NBTInnerLayers >= 2')
+      if not (1 <= self.NetDef_NBTReRead <= self.NetDef_NBTInnerLayers - 1):
+        raise ValueError(f'NBTReRead must be an inner-layer index in [1, {self.NetDef_NBTInnerLayers - 1}] '
+                         f'(0 = off; index 0 would duplicate the block entry read), got {self.NetDef_NBTReRead}')
     if (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner) and self.NetDef_NBTHyperConnSinkhornIters < 1:
       raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
     if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:

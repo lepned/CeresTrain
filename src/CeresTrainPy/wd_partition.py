@@ -92,7 +92,7 @@ def partition_weight_decay(model):
               # (Flyttet HIT 2026-08-28 — bugfunn: grenen laa ETTER catch-all-en
               # og var doed, stikk i strid med sin egen 2026-08-20#6-kommentar.)
               no_decay.add(fpn)
-          elif fpn.endswith('head_mix') or fpn.endswith('vr_lambda') or fpn.endswith('carry_gate') or 'mid_dec_gain' in fpn                 or (fpn.replace('_orig_mod.', '').startswith('hyper_conn') or '.hyper_conn_inner' in fpn):
+          elif fpn.endswith('head_mix') or fpn.endswith('vr_lambda') or fpn.endswith('carry_gate') or fpn.endswith('reread_gate') or 'mid_dec_gain' in fpn                 or (fpn.replace('_orig_mod.', '').startswith('hyper_conn') or '.hyper_conn_inner' in fpn):
               # NBT head-mixing matrices / value-residual lambdas (inside transformer_layer, so above the catch-all) and
               # the hyper-connection read/write/mixing params (2026-11-08): mixing coefficients, never decayed.
               no_decay.add(fpn)
