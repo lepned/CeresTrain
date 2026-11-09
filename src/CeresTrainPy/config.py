@@ -1402,6 +1402,9 @@ class Configuration:
     self.NetDef_HeadSharedLinearDiv = int(config_net_def.get('HeadSharedLinearDiv', 4) or 4)
     if self.NetDef_HeadSharedLinearDiv < 1:
       raise ValueError(f"HeadSharedLinearDiv must be >= 1, got {self.NetDef_HeadSharedLinearDiv}")
+    # HeadFrontActivation: HeadsActivationType after headPremap and after headSharedLinear (default off = the plain
+    # net: three linear maps in a row in front of each head's activation). No new parameters; see ceres_net.
+    self.NetDef_HeadFrontActivation = bool(config_net_def.get('HeadFrontActivation', False))
     self.NetDef_UseRPE = config_net_def.get('UseRPE', False)
     self.NetDef_UseRPE_V = config_net_def.get('UseRPE_V', True)
     # UseRelBias SLETTET 2026-08-29 (runde 3): modusen refererte self.rpe_factor

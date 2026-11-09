@@ -149,6 +149,21 @@ class CeresNet(nn.Module):
             f'-> HEAD_IN_SIZE {self.HEAD_IN_SIZE} (default div 4 would give '
             f'{64 * (self.HEAD_PREMAP_PER_SQUARE // 4)})')
     self.headSharedLinear = nn.Linear(64 * self.HEAD_PREMAP_PER_SQUARE, self.HEAD_IN_SIZE)
+    # HeadFrontActivation (2026-11-09): the shared head front-end is headPremap (per square) -> flatten ->
+    # headSharedLinear, and every head then starts with its own Linear: three linear maps in a row, so e.g. the value
+    # head is ONE hidden layer (64 * HeadWidthMultiplier units) on a linear read of the trunk. With this key the heads'
+    # activation follows headPremap and headSharedLinear (three hidden layers, no new parameters). Read by every head
+    # that takes the shared vector; the move-token decoder's policy does not. Same parameters as the plain net
+    # but a different function: a warm start across the toggle is a conversion, not a resume.
+    self.head_front_act = bool(getattr(config, 'NetDef_HeadFrontActivation', False))
+    if self.head_front_act:
+      # same weights, different function: a marker buffer puts the setting into the state dict, so the strict
+      # checkpoint loads (resume, recover_export, reconvert_onnx) refuse a checkpoint/config mismatch (review 11-09)
+      self.register_buffer('head_front_act_marker', torch.ones(1))
+      if isinstance(self.Activation, nn.Identity):
+        raise ValueError('HeadFrontActivation with HeadsActivationType None is a silent no-op (refused)')
+      print(f'[ceres_net] HEAD FRONT ACTIVATION enabled: {config.NetDef_HeadsActivationType} after headPremap '
+            f'({self.HEAD_PREMAP_PER_SQUARE}/square) and after headSharedLinear ({self.HEAD_IN_SIZE})')
 
     # PRIVATE VALUE FRONT-END (config ValueHeadChannels; see config.py): the
     # value family gets its own per-square projection D -> C, flattened to
@@ -162,6 +177,9 @@ class CeresNet(nn.Module):
     # bit-identical to it at step 0. See config.py for the full rationale.
     self.value_priv_replace = self.value_head_channels > 0 and self.value_head_channels_mode == 'replace'
     self.value_priv_inject_mode = self.value_head_channels > 0 and self.value_head_channels_mode == 'inject'
+    if self.head_front_act and self.value_priv_replace:
+      raise ValueError("HeadFrontActivation with ValueHeadChannels in 'replace' mode: the value family bypasses the shared "
+                       "head front-end, so the activations would not reach it (silent no-op for value refused)")
     if self.value_head_channels > 0:
       # LoRA head-front adapters wrap only headPremap/headSharedLinear, which the
       # value family BYPASSES in 'replace' mode — a head-front fine-tune would
@@ -2033,6 +2051,15 @@ class CeresNet(nn.Module):
                          x * _a + _xd * (1.0 - _a))
     return x
 
+  def _head_front(self, flow: torch.Tensor) -> torch.Tensor:
+    """Shared head front-end: [B, 64, D] trunk state -> [B, HEAD_IN_SIZE] (see HeadFrontActivation in __init__)."""
+    h = self.headPremap(flow)
+    if self.head_front_act:
+      h = self.Activation(h)
+    h = self.headSharedLinear(h.reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+    return self.Activation(h) if self.head_front_act else h
+
+
   def forward(self, squares: torch.Tensor, prior_state:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(squares, list):
       # when saving/restoring from ONNX the input will appear as a list instead of sequence of arguments
@@ -2341,8 +2368,7 @@ class CeresNet(nn.Module):
       if _rf_collect and _rf_inter:
         _rf_aux = []
         for _rf_d in _rf_inter:
-          _rf_fS = self.headSharedLinear(self.headPremap(flow + _rf_d)
-                                         .reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+          _rf_fS = self._head_front(flow + _rf_d)
           _rf_aux.append(self.policy_head(_rf_fS))
         self._last_refiner_policy = torch.stack(_rf_aux, dim=1)   # [B, T-1, 1858]
       flow = flow + _rf_final
@@ -2407,14 +2433,14 @@ class CeresNet(nn.Module):
         # Compute two head front-end paths.
         flow_value  = flow + g_x * flow_aux                  # value-side: with adapter
         flow_others = flow                                   # other-heads: orig body output
-        fS_value  = self.headSharedLinear(self.headPremap(flow_value).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
-        fS_others = self.headSharedLinear(self.headPremap(flow_others).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+        fS_value  = self._head_front(flow_value)
+        fS_others = self._head_front(flow_others)
       else:
         flow = flow + g_x * flow_aux
-        fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+        fS_others = self._head_front(flow)
         fS_value  = fS_others
     else:
-      fS_others = self.headSharedLinear(self.headPremap(flow).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      fS_others = self._head_front(flow)
       fS_value  = fS_others
 
     # PRIVATE VALUE FRONT-END (see __init__): the value family gets its own
@@ -2557,7 +2583,7 @@ class CeresNet(nn.Module):
       # bit-identical values at init. In gtab_value_only mode this recompute
       # replaces the fS_value computed above (redundant pass, rare mode, harmless).
       _flow_v = (flow_value if (self.use_gtab and self.gtab_value_only) else flow) + self.vda_proj(_ctx)
-      _fS_aug = self.headSharedLinear(self.headPremap(_flow_v).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      _fS_aug = self._head_front(_flow_v)
       if self.vda_mode != 4:
         fS_value = _fS_aug   # modes 2/3: the served value head reads the augmented path
       if self.vda_mode in (3, 4):
@@ -2603,7 +2629,7 @@ class CeresNet(nn.Module):
       for _i in range(1, len(_hn_shared)):
         _pctx = _pctx + _pda_alpha[..., _i:_i + 1] * _hn_shared[_i]        # [B, 64, D]
       _flow_p = flow + self.vda_proj_p(_pctx)
-      fS_policy = self.headSharedLinear(self.headPremap(_flow_p).reshape(-1, 64 * self.HEAD_PREMAP_PER_SQUARE))
+      fS_policy = self._head_front(_flow_p)
       if self.training:
         self._last_pda_alpha = _pda_alpha.detach().mean(dim=1).unsqueeze(-1)
 
