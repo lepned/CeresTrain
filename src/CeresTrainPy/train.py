@@ -594,7 +594,9 @@ def Train():
                         # NBT hyper-connections / head mixing / value residual (2026-11-08): NEW identity-init params.
                         or "hyper_conn" in name or "head_mix" in name or "vr_lambda" in name
                         # NBT carry (2026-11-08): zero-init gate + norm, NEW params
-                        or ".carry_gate" in name or ".carry_norm" in name)
+                        or ".carry_gate" in name or ".carry_norm" in name
+                        # Mid-depth decoder policy gains (2026-11-09): NEW ones-init params
+                        or "mid_dec_gain" in name)
       if not keep_trainable:
         param.requires_grad = False
 
@@ -2073,6 +2075,8 @@ def Train():
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('register_value_inject.', 'register_value2_inject.')
     # NBT hyper-connections (NetDef NBTHyperConn): identity at init, so fresh params on a warm start reproduce the base net.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('hyper_conn.', 'hyper_conn_out.')
+    # Mid-depth decoder policy gains (opt MidDecoderPolicyWeight, 2026-11-09): ones-init, training-only path.
+    _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('mid_dec_gain.',)
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.

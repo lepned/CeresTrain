@@ -1032,6 +1032,32 @@ class Configuration:
     self.Opt_DepthProbeValueWeight = float(config_opt.get('DepthProbeValueWeight', 0) or 0)
     if self.Opt_DepthProbePolicyWeight < 0 or self.Opt_DepthProbeValueWeight < 0:
       raise ValueError('DepthProbePolicyWeight / DepthProbeValueWeight must be >= 0')
+    # MID-DEPTH DECODER POLICY (deep supervision through the REAL policy path, training-only; ceres_net): the
+    # move-token decoder (shared weights) is also run on the trunk state after each listed block (after the shared
+    # trunk-end norm) and its policy logits get a policy-target CE at weight MidDecoderPolicyWeight (mean over the
+    # listed blocks). Unlike the pooled depth probe this keeps the move information per square, where the decoder
+    # reads it. Block indices are 0-based effective trunk layers; the last block is excluded (== the main path).
+    self.Opt_MidDecoderPolicyWeight = float(config_opt.get('MidDecoderPolicyWeight', 0) or 0)
+    _mdb = config_opt.get('MidDecoderPolicyBlocks', None)
+    self.Opt_MidDecoderPolicyBlocks = [int(b) for b in _mdb] if _mdb else []
+    if self.Opt_MidDecoderPolicyWeight < 0:
+      raise ValueError('MidDecoderPolicyWeight must be >= 0')
+    if self.Opt_MidDecoderPolicyWeight > 0:
+      if not self.NetDef_UseMoveTokens:
+        raise ValueError('MidDecoderPolicyWeight > 0 needs the move-token decoder (UseMoveTokens)')
+      if not self.Opt_MidDecoderPolicyBlocks:
+        raise ValueError('MidDecoderPolicyWeight > 0 needs MidDecoderPolicyBlocks (e.g. [5] for a 12-block trunk)')
+      _n_eff = int(self.NetDef_NumLayers)
+      if len(set(self.Opt_MidDecoderPolicyBlocks)) != len(self.Opt_MidDecoderPolicyBlocks) \
+         or any(b < 0 or b >= _n_eff - 1 for b in self.Opt_MidDecoderPolicyBlocks):
+        raise ValueError(f'MidDecoderPolicyBlocks must be unique block indices in [0, {_n_eff - 1}) '
+                         f'(the last block is the main policy path), got {self.Opt_MidDecoderPolicyBlocks}')
+      if self.NetDef_MoveTokenTrunkMix or bool(config_net_def.get('MoveTokenEdgeInput', False)) \
+         or int(config_net_def.get('PieceTokens', 0) or 0):
+        raise ValueError('MidDecoderPolicyWeight: not combinable with MoveTokenTrunkMix / MoveTokenEdgeInput / '
+                         'PieceTokens (their decoder inputs are defined only at the final depth)')
+    elif self.Opt_MidDecoderPolicyBlocks:
+      raise ValueError('MidDecoderPolicyBlocks set but MidDecoderPolicyWeight is 0 (silent no-op refused)')
     if self.Opt_LossSTValueMultiplier < 0:
       raise ValueError('LossSTValueMultiplier must be >= 0')
     if self.NetDef_MoveTokenActionHead and (float(self.Opt_LossActionMultiplier or 0) > 0

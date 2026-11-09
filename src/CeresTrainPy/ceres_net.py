@@ -417,6 +417,20 @@ class CeresNet(nn.Module):
     #   depth_ctl_policy / depth_ctl_value: identical-shape heads reading ONLY the
     #     final state through a DETACHED input — pure measurement apparatus for
     #     paired in-process reads (they train themselves, never shape the trunk).
+    # Mid-depth decoder policy (opt MidDecoderPolicyWeight / MidDecoderPolicyBlocks; validated in config.py):
+    # training-only deep supervision THROUGH the real policy path — the move-token decoder (shared weights) re-run on
+    # the trunk-end-normed state after each listed block; the only new params are the per-depth gains below. Export
+    # graph unchanged (the gains are unused at inference but stay in the state dict).
+    self.mid_dec_w = float(getattr(config, 'Opt_MidDecoderPolicyWeight', 0) or 0)
+    self.mid_dec_blocks = list(getattr(config, 'Opt_MidDecoderPolicyBlocks', []) or []) if self.mid_dec_w > 0 else []
+    if self.mid_dec_blocks:
+      # Per-depth channel gain after the shared trunk-end norm (ones-init => the plain shared norm at step 0): lets the
+      # mid state match the decoder's per-channel scale without rotating out of the shared read basis (Fable review
+      # 2026-11-09). 1-D params => AdamW, no weight decay. Used only on the training-only mid path.
+      self.mid_dec_gain = nn.ParameterList([nn.Parameter(torch.ones(self.EMBEDDING_DIM)) for _ in self.mid_dec_blocks])
+      print(f'[ceres_net] MID-DEPTH DECODER POLICY: decoder re-run on the trunk state after block(s) '
+            f'{self.mid_dec_blocks} (shared weights, trunk-end norm x per-depth gain), policy CE weight '
+            f'{self.mid_dec_w}, training-only')
     _dpw_p = float(getattr(config, 'Opt_DepthProbePolicyWeight', 0) or 0)
     _dpw_v = float(getattr(config, 'Opt_DepthProbeValueWeight', 0) or 0)
     self.depth_probes_enabled = (_dpw_p > 0 or _dpw_v > 0)       # config only (opt DepthProbe*Weight), 2026-10-07
@@ -2184,7 +2198,7 @@ class CeresNet(nn.Module):
     # The move-token trunk-layer mix (MoveTokenTrunkMix) reads the same list: vda_states[k] is the
     # state after effective layer k (0 = post-embedding), for every LoopCount.
     _collect_states = (self.use_value_depth_attention or self.pda_mode or (self.depth_probes_enabled and self.training)
-                       or bool(self.mt_mix_layers))
+                       or bool(self.mt_mix_layers) or (bool(self.mid_dec_blocks) and self.training))
     # depth probes mean-pool each state over its tokens, so 32-token states are fine; the others index 64 squares
     assert not (pt_idx is not None and (self.use_value_depth_attention or self.pda_mode or self.mt_mix_layers)),       'PieceTokens: depth states for vda / pda / MoveTokenTrunkMix are 64-token; turn them off'
     if _collect_states:
@@ -2363,6 +2377,16 @@ class CeresNet(nn.Module):
     # MOVE TOKENS run here, BEFORE the head front-end, so the (optional) square write-back
     # can add to `flow` ahead of headPremap; the policy/inject readout happens further down.
     _mt_out = None
+    # Mid-depth decoder policy (training-only, see __init__). Runs BEFORE the main decoder call so the decoder's own
+    # training stashes (vord / minimax / reply / action) are overwritten by the main (final-depth) call.
+    if self.mid_dec_blocks and self.training:
+      _md_sq13 = squares[:, :, 0:13].to(flow.dtype)
+      _md_pol = []
+      for _j, _b in enumerate(self.mid_dec_blocks):
+        _md_x = self.trunk_end_norm(vda_states[_b + 1]) if self.trunk_end_norm is not None else vda_states[_b + 1]
+        _md_x = (_md_x * self.mid_dec_gain[_j].to(_md_x.dtype)).to(flow.dtype)
+        _md_pol.append(self.move_tokens(_md_sq13, _md_x)[0])
+      self._last_mid_dec_policy = torch.stack(_md_pol, dim=1)                             # [B, n_mid, 1858]
     if getattr(self, 'use_move_tokens', False):
       _mt_out = self.move_tokens(squares[:, :, 0:13].to(flow.dtype), flow,
                                  mix_states=[vda_states[k] for k in self.mt_mix_layers] if self.mt_mix_layers else None,
@@ -3650,6 +3674,19 @@ class CeresNet(nn.Module):
       refiner_ploss = loss_calc.ce_loss.forward(
           _rfp_m.reshape(-1, _rfp.shape[-1]).float(), _rf_pt) - _rf_ent
 
+    # Mid-depth decoder policy CE (see __init__/forward): mean over the listed blocks, same legality masking and
+    # consume-and-clear / skip-on-gradnorm conventions as the refiner deep-sup above.
+    mid_dec_ploss = 0
+    _mdp = getattr(self, '_last_mid_dec_policy', None)
+    if _mdp is not None and policy_out is not None and not gradient_norm_logging_mode:
+      self._last_mid_dec_policy = None
+      _md_T = _mdp.shape[1]
+      _md_legal = policy_target.greater(0)
+      _md_ent = loss_calc.entropy(policy_target) if SUBTRACT_ENTROPY else 0.0
+      _mdp_m = torch.where(_md_legal.unsqueeze(1), _mdp, torch.full_like(_mdp, loss_calc.MASK_POLICY_VALUE))
+      _md_pt = policy_target.unsqueeze(1).expand(-1, _md_T, -1).reshape(-1, policy_target.shape[-1])
+      mid_dec_ploss = loss_calc.ce_loss.forward(_mdp_m.reshape(-1, _mdp.shape[-1]).float(), _md_pt) - _md_ent
+
     _pv_out = getattr(self, '_last_placement_value_out', None)
     if self.placement_value_weight > 0 and _pv_out is not None and value_out is not None:
       # Consume-and-clear only on the REAL pass: the grad-norm diagnostic pass
@@ -3775,6 +3812,7 @@ class CeresNet(nn.Module):
         + (self.mt_rep_w * mt_rep_loss if not isinstance(mt_rep_loss, int) else 0)
         + (self.mt_repq_w * mt_repq_loss if not isinstance(mt_repq_loss, int) else 0)
         + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
+        + (self.mid_dec_w * mid_dec_ploss if not isinstance(mid_dec_ploss, int) else 0)
         + (self.dp_eaux_pi_w * dpe_pi_loss if not isinstance(dpe_pi_loss, int) else 0)
         + (self.dp_eaux_rel_w * dpe_rel_loss if not isinstance(dpe_rel_loss, int) else 0)
         + (self.cq_abs_weight * cq_abs_loss if not isinstance(cq_abs_loss, int) else 0)
@@ -3816,6 +3854,7 @@ class CeresNet(nn.Module):
           # Refiner deep-sup is pure policy-target CE, so it belongs to the
           # policy family (unlike the depth probes, which span both).
           + (self.refiner_deep_sup_weight * refiner_ploss if not isinstance(refiner_ploss, int) else 0)
+          + (self.mid_dec_w * mid_dec_ploss if not isinstance(mid_dec_ploss, int) else 0)
           + (self.grill_aux_weight * grill_aux_loss if not isinstance(grill_aux_loss, int) else 0))
       self._gc_value_loss = (self.value_loss_weight * v_loss
           + self.value2_loss_weight * v2_loss
@@ -3942,6 +3981,8 @@ class CeresNet(nn.Module):
         self._log("depth_probe_value_loss" + stat_suffix, depth_probe_vloss, step=num_pos)
         self._log("depth_ctl_policy_loss" + stat_suffix, depth_ctl_ploss, step=num_pos)
         self._log("depth_ctl_value_loss" + stat_suffix, depth_ctl_vloss, step=num_pos)
+      if not isinstance(mid_dec_ploss, int):
+        self._log("mid_dec_policy_loss" + stat_suffix, mid_dec_ploss, step=num_pos)
       if not isinstance(value_rank_loss, int):
         self._log("value_rank_loss" + stat_suffix, value_rank_loss, step=num_pos)
       if not isinstance(policy_margin_loss, int):
