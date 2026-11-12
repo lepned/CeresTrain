@@ -325,7 +325,7 @@ class MoveTokenDecoder(nn.Module):
                value_inject_dim: int = 0, value2: bool = False, pol_bias: bool = True,
                rich_features: bool = False, value_pool: str = 'meanmax',
                value_pool_detach: bool = True, post_move: bool = False, post_move_blocks=None,
-               value_query: bool = False, value_order: bool = False,
+               value_query: bool = False, value_order: bool = False, soft_policy: bool = False,
                opp_max: int = 0, opp_pool: bool = False, write_back: bool = False,
                expected_value: bool = False, square_update: bool = False, trunk_mix: int = 0,
                minimax: bool = False,
@@ -391,6 +391,10 @@ class MoveTokenDecoder(nn.Module):
     # graph is unchanged, so nets with/without it are bit-paired at serving.
     self.value_order = bool(value_order)
     self._last_vord = None
+    # soft_policy: training-only second 4-slot readout (`spol` + its own per-move bias), trained toward the
+    # temperature-flattened policy target (config Opt_LossMoveTokenSoftPolicyMultiplier). Never exported.
+    self.soft_policy = bool(soft_policy)
+    self._last_spol = None
     # 2026-09-02 evening knobs (X-program items 1 and 3):
     #  rich_features: +17 per-token inputs derived in-graph from the board and the
     #    visibility maps - mover one-hot (6), captured one-hot (6), promotion-rank flag
@@ -555,6 +559,14 @@ class MoveTokenDecoder(nn.Module):
       self.ev_head = nn.Linear(dm, 1, bias=False)
       with torch.no_grad():
         self.ev_head.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0D))
+    if self.soft_policy:
+      # The global RNG state is restored so that switching the readout on leaves every other init unchanged.
+      _rng = torch.get_rng_state()
+      self.spol = nn.Linear(dm, 4, bias=False)
+      torch.set_rng_state(_rng)
+      with torch.no_grad():
+        self.spol.weight.uniform_(-0.02, 0.02, generator=torch.Generator().manual_seed(0x0B0E))
+      self.mt_spol_bias = nn.Parameter(torch.zeros(1858))
     # Per-move bias table (1858). pol_bias=False keeps it as a frozen zero BUFFER so the
     # graph/diagnostics are unchanged and the token features must carry the whole logit.
     if pol_bias:
@@ -854,6 +866,14 @@ class MoveTokenDecoder(nn.Module):
     buf = torch.full((B, 4096, 4), MT_FLOOR, device=tok.device, dtype=tok.dtype)
     buf = buf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, 4), tok)
     pol = buf.reshape(B, 16384).index_select(1, self.mv_pair_slot) + self.mt_pol_bias.to(tok.dtype)
+    if self.soft_policy and not self.training:
+      self._last_spol = None   # never leave a stale training stash for an eval-mode loss (e.g. after a gradnorm pass)
+    if self.soft_policy and self.training:
+      # Same token -> [B,1858] layout as `pol`; stashed for the loss (consumed in ceres_net). Not traced at export.
+      stok = torch.where(valid.unsqueeze(-1), self.spol(xo), torch.full_like(tok, MT_FLOOR))
+      sbuf = torch.full((B, 4096, 4), MT_FLOOR, device=tok.device, dtype=tok.dtype)
+      sbuf = sbuf.scatter(1, sel.unsqueeze(-1).expand(-1, -1, 4), stok)
+      self._last_spol = sbuf.reshape(B, 16384).index_select(1, self.mv_pair_slot) + self.mt_spol_bias.to(tok.dtype)
     act = None
     if self.action_head:
       act_tok = self.act(xo)                                                 # [B,M,3] WDL logits (child frame)

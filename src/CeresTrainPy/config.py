@@ -850,6 +850,23 @@ class Configuration:
     self.Opt_MoveTokenValueOrderMinVisits = float(config_opt.get('MoveTokenValueOrderMinVisits', 0) or 0)
     if self.Opt_MoveTokenValueOrderMinVisits > 0 and not self.Opt_MoveTokenValueOrderUseChildQ:
       raise ValueError('MoveTokenValueOrderMinVisits needs MoveTokenValueOrderUseChildQ (silent no-op refused)')
+    # SOFT-POLICY READOUT ON THE MOVE TOKENS (2026-11-12): a second, training-only 4-slot readout on the decoder's
+    # output tokens, trained by CE toward the temperature-flattened policy target (p^(1/T), renormalized; the
+    # KataGo / Lc0-BT4 auxiliary soft policy, weight 8 and T 4 there). Unlike SoftPolicyWeight (a flat MLP head on
+    # the shared head front-end, which a move-token net's policy never reads) this puts the dense move-ordering
+    # gradient into the decoder and the trunk states the real policy readout uses. Never exported.
+    # MoveTokenSoftPolicyMinProb: targets at or below it count as UNVISITED (soft target 0, still unmasked): the
+    # loaders floor every legal move at 0.0005, which p^(1/4) would otherwise lift to ~0.15 of the top move's
+    # weight per legal move. 0.00075 sits between the floor and one visit of 800 (0.00125).
+    self.Opt_LossMoveTokenSoftPolicyMultiplier = float(config_opt.get('LossMoveTokenSoftPolicyMultiplier', 0) or 0)
+    self.Opt_MoveTokenSoftPolicyTemp = float(config_opt.get('MoveTokenSoftPolicyTemp', 4))
+    self.Opt_MoveTokenSoftPolicyMinProb = float(config_opt.get('MoveTokenSoftPolicyMinProb', 0.00075))
+    if self.Opt_LossMoveTokenSoftPolicyMultiplier < 0 or self.Opt_MoveTokenSoftPolicyTemp < 1 or self.Opt_MoveTokenSoftPolicyMinProb < 0:
+      raise ValueError('LossMoveTokenSoftPolicyMultiplier must be >= 0, MoveTokenSoftPolicyTemp >= 1, MoveTokenSoftPolicyMinProb >= 0')
+    if self.Opt_LossMoveTokenSoftPolicyMultiplier > 0 and not self.NetDef_UseMoveTokens:
+      raise ValueError('LossMoveTokenSoftPolicyMultiplier > 0 but UseMoveTokens is off (silent no-op refused)')
+    if ('MoveTokenSoftPolicyTemp' in config_opt or 'MoveTokenSoftPolicyMinProb' in config_opt) and self.Opt_LossMoveTokenSoftPolicyMultiplier <= 0:
+      raise ValueError('MoveTokenSoftPolicyTemp/MinProb is set but LossMoveTokenSoftPolicyMultiplier is 0 (silent no-op refused)')
     # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
     # logit (architecture, not an aux readout). NetDef because it changes the graph.
     self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))

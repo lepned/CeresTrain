@@ -1906,6 +1906,9 @@ class CeresNet(nn.Module):
       self.mt_vord_child_q = bool(getattr(config, 'Opt_MoveTokenValueOrderUseChildQ', False))
       self.mt_vord_min_visits = float(getattr(config, 'Opt_MoveTokenValueOrderMinVisits', 0) or 0)
       self.mt_qreg_w = float(getattr(config, 'Opt_LossMoveTokenQRegressionMultiplier', 0) or 0)
+      self.mt_spol_w = float(getattr(config, 'Opt_LossMoveTokenSoftPolicyMultiplier', 0) or 0)
+      self.mt_spol_temp = float(getattr(config, 'Opt_MoveTokenSoftPolicyTemp', 4))
+      self.mt_spol_min_prob = float(getattr(config, 'Opt_MoveTokenSoftPolicyMinProb', 0.00075))
       self.mt_minimax = bool(getattr(config, 'NetDef_MoveTokenMinimax', False))
       self.mt_mm_w = float(getattr(config, 'Opt_LossMoveTokenMinimaxMultiplier', 0) or 0)
       self.mt_reply = bool(getattr(config, 'NetDef_MoveTokenReplySup', False))
@@ -1949,7 +1952,7 @@ class CeresNet(nn.Module):
           value2=self.value2_loss_weight > 0, pol_bias=_mt_pb,
           rich_features=_mt_rich, value_pool=_mt_vpool, value_pool_detach=_mt_vpd,
           post_move=_mt_pm, post_move_blocks=getattr(config, 'NetDef_MoveTokenPostMoveBlocks', None),
-          value_query=_mt_vq, value_order=(self.mt_vord_w > 0 or self.mt_qreg_w > 0),
+          value_query=_mt_vq, value_order=(self.mt_vord_w > 0 or self.mt_qreg_w > 0), soft_policy=self.mt_spol_w > 0,
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
           expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel,
           minimax=self.mt_minimax, action_head=self.mt_action, reply_sup=self.mt_reply,
@@ -3200,6 +3203,23 @@ class CeresNet(nn.Module):
             min_mass=self.policy_rank_min_mass, child=_vo_child,
             min_visits=getattr(self, 'mt_vord_min_visits', 0.0))
 
+    # Move-token SOFT-POLICY aux (see config Opt_LossMoveTokenSoftPolicyMultiplier): CE of the decoder's second
+    # readout toward p^(1/T) over the VISITED moves (targets <= min_prob are the loaders' legality floor: soft
+    # target 0), renormalized; same legality masking as the main policy loss. Rows with no visited move (never
+    # expected) get a zero target and contribute only the participation term. Consume-and-clear.
+    mt_spol_loss = 0
+    if getattr(self, 'use_move_tokens', False) and getattr(self, 'mt_spol_w', 0) > 0 and not gradient_norm_logging_mode:
+      _sq = getattr(self.move_tokens, '_last_spol', None)
+      if _sq is not None:
+        self.move_tokens._last_spol = None
+        _sq_legal = policy_target > 0
+        _sq_t = torch.where(policy_target > self.mt_spol_min_prob, policy_target.float(),
+                            torch.zeros_like(policy_target, dtype=torch.float32)).pow(1.0 / self.mt_spol_temp)
+        _sq_t = _sq_t / _sq_t.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        _sq_m = torch.where(_sq_legal, _sq, torch.full_like(_sq, loss_calc.MASK_POLICY_VALUE))
+        mt_spol_loss = loss_calc.ce_loss.forward(_sq_m.float(), _sq_t) \
+            - (loss_calc.entropy(_sq_t) if SUBTRACT_ENTROPY else 0.0)
+
     # q-REGRESSION: the same stashed per-token scalar, regressed onto child q instead
     # of ranked. Config refuses both losses at once (one scalar, one question).
     mt_mm_loss = 0
@@ -3838,6 +3858,7 @@ class CeresNet(nn.Module):
         + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
         + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
         + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
+        + (self.mt_spol_w * mt_spol_loss if not isinstance(mt_spol_loss, int) else 0)
         + (self.mt_qreg_w * mt_qreg_loss if not isinstance(mt_qreg_loss, int) else 0)
         + (self.mt_mm_w * mt_mm_loss if not isinstance(mt_mm_loss, int) else 0)
         + (self.mt_act_w * mt_act_loss if not isinstance(mt_act_loss, int) else 0)
@@ -3879,6 +3900,7 @@ class CeresNet(nn.Module):
           + (self.soft_policy_weight * soft_policy_loss if not isinstance(soft_policy_loss, int) else 0)
           + (self.mt_aux_mlp_w * mt_aux_loss if not isinstance(mt_aux_loss, int) else 0)
           + (self.mt_vord_w * mt_vord_loss if not isinstance(mt_vord_loss, int) else 0)
+          + (self.mt_spol_w * mt_spol_loss if not isinstance(mt_spol_loss, int) else 0)
           + (self.mt_qreg_w * mt_qreg_loss if not isinstance(mt_qreg_loss, int) else 0)
           + (self.mt_mm_w * mt_mm_loss if not isinstance(mt_mm_loss, int) else 0)
           # pi-edge is a policy-target CE (rel-aux is neither family: kept out).
@@ -4045,6 +4067,8 @@ class CeresNet(nn.Module):
         self._log("soft_policy_loss" + stat_suffix, soft_policy_loss, step=num_pos)
       if not isinstance(mt_aux_loss, int):
         self._log("mt_aux_mlp_policy_loss" + stat_suffix, mt_aux_loss, step=num_pos)
+      if not isinstance(mt_spol_loss, int):
+        self._log("mt_soft_policy_loss" + stat_suffix, mt_spol_loss, step=num_pos)
       if not isinstance(mt_vord_loss, int):
         self._log("mt_vord_loss" + stat_suffix, mt_vord_loss, step=num_pos)
         for _k, _v in _vo_log.items():

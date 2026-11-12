@@ -765,6 +765,7 @@ def Train():
       if 'dp_eaux_' in n: return False           # edge-aux readout [T, C] (boelge 13): a training-only final layer, AdamW
       if 'move_tokens.pol' in n: return False    # move-token policy readout [4, dm]: the final policy layer, AdamW
       if 'move_tokens.vord' in n: return False   # value-order scalar [1, dm]: a training-only readout, AdamW
+      if 'move_tokens.spol' in n: return False   # soft-policy readout [4, dm]: a training-only final layer like pol, AdamW
       if 'move_tokens.mm_v' in n or 'move_tokens.mm_r' in n: return False  # minimax readouts [1, dm]: same class as vord -- training-only 1-row final layers, AdamW
       if 'move_tokens.act.' in n: return False   # action WDL readout [3, dm]: a final layer like pol, AdamW
       if ('cq_abs_head.' in n or 'cq_gap_head.' in n) and (n.endswith('w_bins') or n.endswith('pos_w')): return False  # zero-init child-q readout tables (review 2026-10-07), AdamW
@@ -890,6 +891,8 @@ def Train():
                     # LearningRateDecoderRatio, which starved the value inject at 25M when applied whole).
                     'move_tokens.pol.', 'move_tokens.mt_pol_bias', 'move_tokens.v_inject.',
                     'move_tokens.v2_inject.', 'move_tokens.vord.', 'move_tokens.ev_head.', 'mt_ev_dir',
+                    # 2026-11-12: the training-only soft-policy readout is a final layer of the same class as pol.
+                    'move_tokens.spol.', 'move_tokens.mt_spol_bias',
                     # 2026-09-11 review: the trunk-layer-mix gains are zero-init couplings of the same class as
                     # the injects (readers, not decoder body) -> same family, so a heads ratio treats them alike.
                     'move_tokens.mix_gain.',
@@ -1388,6 +1391,9 @@ def Train():
   # come from env fallback, so read the resolved value off the core module.
   if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'soft_policy_weight', 0) or 0) > 0:
     SECONDARY_WEIGHT_OVERRIDES['soft_policy_weight'] = SECONDARY_POLICY_MULT * float(core.soft_policy_weight)
+  # The move-token soft-policy readout is policy-family as well (same scaled-multiplier convention).
+  if SECONDARY_POLICY_MULT is not None and float(getattr(core, 'mt_spol_w', 0) or 0) > 0:
+    SECONDARY_WEIGHT_OVERRIDES['mt_spol_w'] = SECONDARY_POLICY_MULT * float(core.mt_spol_w)
   if SECONDARY_VALUE2_MULT    is not None: SECONDARY_WEIGHT_OVERRIDES['value2_loss_weight']  = SECONDARY_VALUE2_MULT
   # Runde-3 (2026-08-29): value_rank er value-familie, policy_margin/refiner-
   # deep-sup er policy-familie, dp_surv foelger survival-multen — alle lakk
@@ -1754,6 +1760,7 @@ def Train():
       # move-token stash-only losses (review 2026-09-04 finding 2): value-order head, aux MLP CE
       or getattr(core, 'mt_vord_w', 0) > 0
       or getattr(core, 'mt_aux_mlp_w', 0) > 0
+      or getattr(core, 'mt_spol_w', 0) > 0
       # child-q distribution heads + Grill aux head (2026-10-07)
       or getattr(core, 'cq_abs_weight', 0) > 0 or getattr(core, 'cq_gap_weight', 0) > 0
       or getattr(core, 'grill_aux_weight', 0) > 0) and WORLD_SIZE > 1 and not MANUAL_GRAD_SYNC:
