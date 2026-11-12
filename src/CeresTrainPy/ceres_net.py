@@ -66,6 +66,22 @@ class Head(nn.Module):
     return flow
 
 
+def soft_policy_target(policy_target: torch.Tensor, temp: float) -> torch.Tensor:
+  """[B,1858] policy target -> p^(1/temp) over the VISITED moves, renormalized (float32; all-zero rows stay zero).
+
+  The loaders floor every legal move (see config Opt_LossMoveTokenSoftPolicyMultiplier), so "unvisited" is not 0 in the
+  data: entries at the row minimum (within 2 %) are taken as the floor when at least two moves share it and it is not
+  the whole row. A single entry at the minimum is kept (a genuine least-visited move), as is a row of equal entries."""
+  pt = policy_target.float()
+  legal = pt > 0
+  row_min = torch.where(legal, pt, torch.full_like(pt, float('inf'))).amin(dim=-1, keepdim=True)
+  at_floor = legal & (pt <= row_min * 1.02)
+  n_floor = at_floor.sum(dim=-1, keepdim=True)
+  drop = at_floor & (n_floor >= 2) & (n_floor < legal.sum(dim=-1, keepdim=True))
+  t = torch.where(legal & ~drop, pt, torch.zeros_like(pt)).pow(1.0 / temp)
+  return t / t.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+
+
 class CeresNet(nn.Module):
   def __init__(
     self,
@@ -1908,7 +1924,6 @@ class CeresNet(nn.Module):
       self.mt_qreg_w = float(getattr(config, 'Opt_LossMoveTokenQRegressionMultiplier', 0) or 0)
       self.mt_spol_w = float(getattr(config, 'Opt_LossMoveTokenSoftPolicyMultiplier', 0) or 0)
       self.mt_spol_temp = float(getattr(config, 'Opt_MoveTokenSoftPolicyTemp', 4))
-      self.mt_spol_min_prob = float(getattr(config, 'Opt_MoveTokenSoftPolicyMinProb', 0.00075))
       self.mt_minimax = bool(getattr(config, 'NetDef_MoveTokenMinimax', False))
       self.mt_mm_w = float(getattr(config, 'Opt_LossMoveTokenMinimaxMultiplier', 0) or 0)
       self.mt_reply = bool(getattr(config, 'NetDef_MoveTokenReplySup', False))
@@ -3204,18 +3219,15 @@ class CeresNet(nn.Module):
             min_visits=getattr(self, 'mt_vord_min_visits', 0.0))
 
     # Move-token SOFT-POLICY aux (see config Opt_LossMoveTokenSoftPolicyMultiplier): CE of the decoder's second
-    # readout toward p^(1/T) over the VISITED moves (targets <= min_prob are the loaders' legality floor: soft
-    # target 0), renormalized; same legality masking as the main policy loss. Rows with no visited move (never
-    # expected) get a zero target and contribute only the participation term. Consume-and-clear.
+    # readout toward p^(1/T) over the VISITED moves (soft_policy_target: the loaders' per-row legality floor gets
+    # soft target 0), renormalized; same legality masking as the main policy loss. Consume-and-clear.
     mt_spol_loss = 0
     if getattr(self, 'use_move_tokens', False) and getattr(self, 'mt_spol_w', 0) > 0 and not gradient_norm_logging_mode:
       _sq = getattr(self.move_tokens, '_last_spol', None)
       if _sq is not None:
         self.move_tokens._last_spol = None
         _sq_legal = policy_target > 0
-        _sq_t = torch.where(policy_target > self.mt_spol_min_prob, policy_target.float(),
-                            torch.zeros_like(policy_target, dtype=torch.float32)).pow(1.0 / self.mt_spol_temp)
-        _sq_t = _sq_t / _sq_t.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        _sq_t = soft_policy_target(policy_target, self.mt_spol_temp)
         _sq_m = torch.where(_sq_legal, _sq, torch.full_like(_sq, loss_calc.MASK_POLICY_VALUE))
         mt_spol_loss = loss_calc.ce_loss.forward(_sq_m.float(), _sq_t) \
             - (loss_calc.entropy(_sq_t) if SUBTRACT_ENTROPY else 0.0)

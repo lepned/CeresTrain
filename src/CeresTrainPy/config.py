@@ -855,18 +855,20 @@ class Configuration:
     # KataGo / Lc0-BT4 auxiliary soft policy, weight 8 and T 4 there). Unlike SoftPolicyWeight (a flat MLP head on
     # the shared head front-end, which a move-token net's policy never reads) this puts the dense move-ordering
     # gradient into the decoder and the trunk states the real policy readout uses. Never exported.
-    # MoveTokenSoftPolicyMinProb: targets at or below it count as UNVISITED (soft target 0, still unmasked): the
-    # loaders floor every legal move at 0.0005, which p^(1/4) would otherwise lift to ~0.15 of the top move's
-    # weight per legal move. 0.00075 sits between the floor and one visit of 800 (0.00125).
+    # UNVISITED moves get soft target 0 (still unmasked), as in Lc0 where they are 0 in the data. Our targets floor
+    # every legal move instead: the TPG corpora at the row's one-visit unit (measured on T80_v2 11-12: ~0.0015-0.0025,
+    # 18 of 28 legal moves per row sit on it), the V6 loader at 0.0005. p^(1/4) would lift that floor to ~0.2 of the
+    # top move's weight PER legal move, i.e. a near-uniform target. Rule (ceres_net): entries at the row minimum
+    # (within 2 %) are the floor when at least two moves share it and it is not the whole row. Genuine one-visit
+    # moves in TPG data are indistinguishable from the floor and are dropped with it.
     self.Opt_LossMoveTokenSoftPolicyMultiplier = float(config_opt.get('LossMoveTokenSoftPolicyMultiplier', 0) or 0)
     self.Opt_MoveTokenSoftPolicyTemp = float(config_opt.get('MoveTokenSoftPolicyTemp', 4))
-    self.Opt_MoveTokenSoftPolicyMinProb = float(config_opt.get('MoveTokenSoftPolicyMinProb', 0.00075))
-    if self.Opt_LossMoveTokenSoftPolicyMultiplier < 0 or self.Opt_MoveTokenSoftPolicyTemp < 1 or self.Opt_MoveTokenSoftPolicyMinProb < 0:
-      raise ValueError('LossMoveTokenSoftPolicyMultiplier must be >= 0, MoveTokenSoftPolicyTemp >= 1, MoveTokenSoftPolicyMinProb >= 0')
+    if self.Opt_LossMoveTokenSoftPolicyMultiplier < 0 or self.Opt_MoveTokenSoftPolicyTemp < 1:
+      raise ValueError('LossMoveTokenSoftPolicyMultiplier must be >= 0 and MoveTokenSoftPolicyTemp >= 1')
     if self.Opt_LossMoveTokenSoftPolicyMultiplier > 0 and not self.NetDef_UseMoveTokens:
       raise ValueError('LossMoveTokenSoftPolicyMultiplier > 0 but UseMoveTokens is off (silent no-op refused)')
-    if ('MoveTokenSoftPolicyTemp' in config_opt or 'MoveTokenSoftPolicyMinProb' in config_opt) and self.Opt_LossMoveTokenSoftPolicyMultiplier <= 0:
-      raise ValueError('MoveTokenSoftPolicyTemp/MinProb is set but LossMoveTokenSoftPolicyMultiplier is 0 (silent no-op refused)')
+    if 'MoveTokenSoftPolicyTemp' in config_opt and self.Opt_LossMoveTokenSoftPolicyMultiplier <= 0:
+      raise ValueError('MoveTokenSoftPolicyTemp is set but LossMoveTokenSoftPolicyMultiplier is 0 (silent no-op refused)')
     # MINIMAX READOUT: per-move value and value-after-reply heads folded into the policy
     # logit (architecture, not an aux readout). NetDef because it changes the graph.
     self.NetDef_MoveTokenMinimax = bool(config_net_def.get('MoveTokenMinimax', False))

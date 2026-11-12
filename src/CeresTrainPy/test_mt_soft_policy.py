@@ -40,7 +40,20 @@ def main(cfg_dir, cfg_id):
     sq = _squares(4)
     base, soft = build(), build(LossMoveTokenSoftPolicyMultiplier=8, MoveTokenSoftPolicyTemp=4)
     assert base.use_move_tokens and not base.move_tokens.soft_policy and soft.move_tokens.soft_policy
-    assert soft.mt_spol_w == 8 and soft.mt_spol_temp == 4 and soft.mt_spol_min_prob == 0.00075
+    assert soft.mt_spol_w == 8 and soft.mt_spol_temp == 4
+    # 0) the soft target: the per-row floor (>= 2 entries at the row minimum) is dropped, the rest is p^(1/T)
+    from ceres_net import soft_policy_target
+    raw = torch.zeros(5, 1858)
+    raw[0, :6] = torch.tensor([0.90, 0.06, 0.02, 0.0067, 0.0067, 0.0067])          # TPG-style: floor = one-visit unit
+    raw[1, :4] = torch.tensor([0.70, 0.2995, 0.0005, 0.0005]).half().float()         # V6-style fixed floor (fp16 values)
+    raw[2, :3] = torch.tensor([0.60, 0.30, 0.10])                                   # all visited: unique minimum is kept
+    raw[3, :2] = torch.tensor([0.50, 0.50])                                         # all equal: nothing dropped
+    st = soft_policy_target(raw, 4.0)                                               # row 4: no legal move (value-only row)
+    assert torch.isfinite(st).all() and torch.allclose(st[:4].sum(-1), torch.ones(4), atol=1e-5) and st[4].sum() == 0
+    assert (st[0, 3:6] == 0).all() and (st[0, :3] > 0).all() and (st[1, 2:4] == 0).all() and (st[1, :2] > 0).all()
+    assert (st[2, :3] > 0).all() and torch.allclose(st[3, :2], torch.tensor([0.5, 0.5]))
+    exp0 = torch.tensor([0.90, 0.06, 0.02]).pow(0.25); assert torch.allclose(st[0, :3], exp0 / exp0.sum(), atol=1e-6)
+    assert torch.equal(soft_policy_target(raw.half(), 4.0) > 0, st > 0), 'fp16 targets select a different floor'
     # 1) the only new state is the readout + its bias; every other init is bit-identical (RNG state restored)
     sb, ss = base.state_dict(), soft.state_dict()
     new = {'move_tokens.spol.weight', 'move_tokens.mt_spol_bias'}
@@ -59,15 +72,14 @@ def main(cfg_dir, cfg_id):
     assert sp is not None and sp.shape == out[0].shape == (4, 1858)
     assert torch.equal(sp.float() < MT_FLOOR / 2, out[0].float() < MT_FLOOR / 2), 'absent-move layout differs from pol'
     # 4) the loss: gradient reaches the readout, its bias, the decoder body and the trunk; and with T=1 and no
-    #    floor cut it is the plain policy CE formula on the soft logits
+    #    main policy readout
     present = (out[0].float() > MT_FLOOR / 2)
     tgt = torch.rand(4, 1858) * present
-    tgt[:, :] = torch.where(present, tgt.clamp(min=0.0005), torch.zeros_like(tgt))
+    tgt[:, :] = torch.where(present, tgt.clamp(min=0.3), torch.zeros_like(tgt))     # a shared floor on ~30 % of the moves
     tgt = tgt / tgt.sum(-1, keepdim=True)
     legal = tgt > 0
-    t = torch.where(tgt > soft.mt_spol_min_prob, tgt, torch.zeros_like(tgt)).pow(0.25)
-    t = t / t.sum(-1, keepdim=True)
-    assert (t[tgt <= soft.mt_spol_min_prob] == 0).all() and (t[tgt > soft.mt_spol_min_prob] > 0).all()
+    t = soft_policy_target(tgt, soft.mt_spol_temp)
+    assert ((t > 0) <= legal).all() and (t > 0).sum() < legal.sum(), 'floor entries were not dropped'
     logp = torch.log_softmax(torch.where(legal, sp.float(), torch.full_like(sp.float(), -1e9)), dim=-1)
     ref = -(t * logp).sum(-1).mean() + (t * torch.log(t.clamp(min=1e-30))).sum(-1).mean()   # CE minus target entropy
     ref.backward()
@@ -83,7 +95,7 @@ def main(cfg_dir, cfg_id):
       soft.eval()(sq, None)
     assert soft.move_tokens._last_spol is None, 'stale soft-policy stash survived an eval forward'
     # 5) guards
-    for over in (dict(MoveTokenSoftPolicyTemp=4), dict(MoveTokenSoftPolicyMinProb=0.001),
+    for over in (dict(MoveTokenSoftPolicyTemp=4),
                  dict(LossMoveTokenSoftPolicyMultiplier=8, MoveTokenSoftPolicyTemp=0.5),
                  dict(LossMoveTokenSoftPolicyMultiplier=8, MoveTokenSoftPolicyTemp=0),
                  dict(LossMoveTokenSoftPolicyMultiplier=-1)):
