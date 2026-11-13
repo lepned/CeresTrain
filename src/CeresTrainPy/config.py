@@ -106,6 +106,14 @@ class Configuration:
     self.Data_NumTPGFilesToSkipAfterShuffle = int(config_data.get('NumTPGFilesToSkipAfterShuffle', 0) or 0)
     self.Data_FractionQ = config_data.get('FractionQ', 0.0)
     self.Data_WDLLabelSmoothing = config_data.get('WDLLabelSmoothing', 0.0)
+    # SquareBytesUnsigned (2026-11-13): read the TPG square bytes as UNSIGNED (byte / 100), as both engines feed
+    # them. Default False = the loader's historical signed view (bytes above 127 become negative: the rule-50
+    # channel 116 for counts >= 64), so existing configs and checkpoints are unaffected. Applies to TPGDataset
+    # (primary and secondary). The DirectFromV6 loader builds its floats itself and has always produced the
+    # unsigned value for rule-50 (min(count, 100) / 50), so it is unaffected by this key -- with False a TPG run and
+    # a V6 run therefore differ on that channel, with True they agree. A net must be SERVED with the conversion it
+    # was trained with (the lc0ex builder front end converts signed today and needs the matching switch).
+    self.Data_SquareBytesUnsigned = bool(config_data.get('SquareBytesUnsigned', False))
     # Optional secondary TPG dir for mixed-corpus training. When set, batches are
     # interleaved with the primary at the configured ratio (e.g. 19 → 19 primary
     # batches per 1 secondary). Default: None / 0 = single-source (legacy behaviour).
@@ -1132,6 +1140,15 @@ class Configuration:
       if _div < 1 or self.NetDef_ModelDim % _div != 0:
         raise ValueError(f"NBTWidthDivisor ({_div}) must be >= 1 and divide ModelDim ({self.NetDef_ModelDim})")
       self.NetDef_NBTMidDim = self.NetDef_ModelDim // _div
+      # NBTInnerWidth (2026-11-13): an explicit inner width for widths ModelDim / integer cannot express
+      # (e.g. 2048 outer / 896 inner = 28 heads x 32). 0 / absent = ModelDim // NBTWidthDivisor as before.
+      _inner_w = int(config_net_def.get('NBTInnerWidth', 0) or 0)
+      if _inner_w:
+        if not (8 <= _inner_w <= self.NetDef_ModelDim):
+          raise ValueError(f"NBTInnerWidth ({_inner_w}) must be in [8, ModelDim {self.NetDef_ModelDim}]")
+        self.NetDef_NBTMidDim = _inner_w
+    elif int(config_net_def.get('NBTInnerWidth', 0) or 0):
+      raise ValueError('NBTInnerWidth set but NBTInnerLayers is 0 (silent no-op refused)')
     # KataGo-style knobs (their nbt transformers: head dim 32 at the inner width, pure pre-norm
     # inner stream, norm -> activation -> 1x1 on both projections). Defaults keep the first port.
     # NBTInnerHeads: attention heads in the inner layers (0 = NumHeads). NBTProjActivation uses
@@ -1533,6 +1550,137 @@ class Configuration:
     self.NetDef_TSB_FFNMultiplier = tsb_config.get('FFNMultiplier', 1)
     self.NetDef_TSB_GateBiasInit = tsb_config.get('GateBiasInit', -4.0)
     self.NetDef_TSB_GateMLPHiddenDivisor = tsb_config.get('GateMLPHiddenDivisor', 8)
+
+    # NBT-BT6 HYBRID (2026-11-13, bt6_hybrid.py / bt6_net.py; BT6_INTEGRATION_NOTES.txt). An NBT trunk whose inner
+    # layers are Lc0 BT6 layers (LayerNorm eps 1e-3, QKVG with the 2*sigmoid output gate, sigmoid GLU with hidden =
+    # inner width, per-layer relation terms C1/Pk/Pq, pair-stream read C2, edge read / door / post-softmax gate), the
+    # static pair stream and edge state built from the 34 BT6 relation channels of OUR record, edge sites after the
+    # last inner layer of the blocks in BT6EdgeSites, BT6's attention policy head on the trunk-end state, our value
+    # heads. No smolgen, no move-token decoder. The BT6 parts are the classes verified against the real BT6 program.
+    self.NetDef_BT6Hybrid = bool(config_net_def.get('BT6Hybrid', False))
+    _bt6_sites = config_net_def.get('BT6EdgeSites', None)
+    if isinstance(_bt6_sites, str):
+      _bt6_sites = [int(t) for t in _bt6_sites.split(',') if t.strip()]
+    if _bt6_sites is None:
+      # default: BT6 has five sites over its 24 layers (after layers 4, 8, 12, 16, 20). 10 blocks (the 1536 / 768
+      # 10 x 3 target): every second block boundary, after blocks 0, 2, 4, 6, 8 -- five sites as BT6, regular.
+      # 8 blocks: BT6's positions moved to the nearest boundaries (0, 2, 3, 4, 6). Otherwise every boundary.
+      _nb = int(self.NetDef_NumLayers) // max(1, int(self.NetDef_LoopCount))
+      _bt6_sites = {10: [0, 2, 4, 6, 8], 8: [0, 2, 3, 4, 6]}.get(_nb, list(range(max(0, _nb - 1))))
+    self.NetDef_BT6EdgeSites = [int(t) for t in _bt6_sites]
+    self.NetDef_BT6EdgeDim = int(config_net_def.get('BT6EdgeDim', 16) or 16)
+    self.NetDef_BT6PairChannels = int(config_net_def.get('BT6PairChannels', 16) or 16)
+    self.NetDef_BT6SiteHidden = int(config_net_def.get('BT6SiteHidden', 64) or 64)
+    self.NetDef_BT6TripletHeads = int(config_net_def.get('BT6TripletHeads', 4) or 4)
+    self.NetDef_BT6RevEdge = bool(config_net_def.get('BT6RevEdge', True))
+    self.NetDef_BT6GateCap = bool(config_net_def.get('BT6GateCap', False))
+    self.NetDef_BT6OutputGateScale = float(config_net_def.get('BT6OutputGateScale', 2.0))
+    self.NetDef_BT6InnerNormEps = float(config_net_def.get('BT6InnerNormEps', 1e-3))
+    # BT6LogitAssembly (2026-11-13, speed work): precision of the attention LOGIT ASSEMBLY of the BT6 inner layers
+    # under bf16 autocast -- q.k, relation / pair terms, edge read, door product. 'autocast' = the autocast dtype
+    # (bf16 compute, as BT6 is trained); 'float32' = float32 (about 2x the memory traffic of the pairwise tensors).
+    # Softmax, the post-softmax gate, the output gate and every rms are float32 in both; H is cast to float32 before
+    # the softmax. Same function either way; without autocast (CPU, export) everything is float32.
+    self.NetDef_BT6LogitAssembly = str(config_net_def.get('BT6LogitAssembly', 'autocast') or 'autocast')
+    if self.NetDef_BT6LogitAssembly not in ('autocast', 'float32'):
+      raise ValueError(f"BT6LogitAssembly must be 'autocast' or 'float32' (got {self.NetDef_BT6LogitAssembly!r})")
+    # ---- CONFIG LEVERS for training speed (2026-11-13). All default OFF = exact BT6 inner layers. Each one changes
+    # the net's function or its training numerics; REPORT_hybrid_speed.txt has the measured table.
+    # BT6TermsInnerLayers: inner-layer positions (0-based, within each block) that carry the relation / pair / edge
+    #   terms (C1, Pk, Pq, C2, edge read, door, post-softmax gate). The other inner layers are plain QKVG attention
+    #   with the output gate, LayerNorm and sigmoid GLU (= a BT6 layer with zero tables; exported as such; they hold
+    #   no reader parameters). None = all positions (BT6). An edge site reads the logits of the block's LAST inner
+    #   layer; when that layer has no terms the site reads its q.k / sqrt(head_dim).
+    _bt6_terms = config_net_def.get('BT6TermsInnerLayers', None)
+    if isinstance(_bt6_terms, str):
+      _bt6_terms = [int(t) for t in _bt6_terms.strip('[]').split(',') if t.strip()]
+    self.NetDef_BT6TermsInnerLayers = None if _bt6_terms is None else [int(t) for t in _bt6_terms]
+    # BT6ShareReadersPerBlock: ONE set of reader parameters per block (t_node, t_edge, C1, C2, We, Wm, Wg, bg),
+    #   used by all its inner layers that carry terms; the tensors that depend only on E, Z0 and the edge state are
+    #   computed once per block. Pk / Pq stay per layer.
+    self.NetDef_BT6ShareReadersPerBlock = bool(config_net_def.get('BT6ShareReadersPerBlock', False))
+    # BT6StackReadsPerBlock: function-PRESERVING arrangement switch: the K per-layer read / door / gate matmuls of
+    #   a block run as one stacked matmul (same parameters, same outputs up to rounding).
+    self.NetDef_BT6StackReadsPerBlock = bool(config_net_def.get('BT6StackReadsPerBlock', False))
+    # BT6PairDtype: 'float32' (BT6: softmax and post-softmax gate in float32) | 'autocast' (training numerics only:
+    #   under autocast the door product, softmax and gate stay in the autocast dtype). Needs BT6LogitAssembly autocast.
+    self.NetDef_BT6PairDtype = str(config_net_def.get('BT6PairDtype', 'float32') or 'float32')
+    if self.NetDef_BT6PairDtype not in ('float32', 'autocast'):
+      raise ValueError(f"BT6PairDtype must be 'float32' or 'autocast' (got {self.NetDef_BT6PairDtype!r})")
+    self.NetDef_BT6PolicyWidth = int(config_net_def.get('BT6PolicyWidth', 1024) or 1024)
+    # Soft-policy auxiliary head on the SHARED policy embedding (own Q / K at this width; training-only, never
+    # exported). Built only when Opt SoftPolicyWeight > 0; target = ceres_net.soft_policy_target(policy, SoftPolicyTemp).
+    self.NetDef_BT6SoftPolicyWidth = int(config_net_def.get('BT6SoftPolicyWidth', 256) or 256)
+    # 'bt6' = BT6's embedding form on our bytes (whole-board dense on the 12 current piece bytes -> 64 x
+    # BT6EmbeddingDense, concatenated with the per-square record, Mish, LayerNorm, multiplicative gate + positional
+    # table, GLU FFN of hidden BT6EmbeddingFFNHidden (0 = ModelDim), LayerNorm); 'linear' = our Linear + norm.
+    self.NetDef_BT6Embedding = str(config_net_def.get('BT6Embedding', 'bt6') or 'bt6')
+    self.NetDef_BT6EmbeddingDense = int(config_net_def.get('BT6EmbeddingDense', 512) or 512)
+    self.NetDef_BT6EmbeddingFFNHidden = int(config_net_def.get('BT6EmbeddingFFNHidden', 0) or 0)
+    # Gradient checkpoint per NBT block (training only): the block (its K inner layers and its edge site) is
+    # recomputed in backward, so only block-boundary tensors stay alive. Needed for the 8 x 3 target at forward
+    # batch 1536 (the pairwise float32 tensors of one BT6 layer are ~6 GiB there). Same outputs with it on or off.
+    self.NetDef_BT6CheckpointBlocks = bool(config_net_def.get('BT6CheckpointBlocks', False))
+    _bt6_keys = [k for k in config_net_def if k.startswith('BT6') and k != 'BT6Hybrid']
+    if not self.NetDef_BT6Hybrid:
+      if _bt6_keys:
+        raise ValueError(f'{_bt6_keys} set but BT6Hybrid is off (silent no-op refused)')
+    else:
+      def _bt6_refuse(cond, what):
+        if cond:
+          raise ValueError(f'BT6Hybrid: {what}')
+      _bt6_refuse(self.NetDef_NBTInnerLayers < 1, 'needs an NBT trunk (NBTInnerLayers >= 1): the BT6 layers are the inner layers')
+      _bt6_refuse(self.NetDef_LoopCount != 1, 'requires LoopCount 1')
+      _nb = int(self.NetDef_NumLayers)
+      _bt6_refuse(self.NetDef_NBTMidDim % int(self.NetDef_NBTInnerHeads) != 0, 'NBTInnerHeads must divide the inner width')
+      _bt6_refuse(sorted(set(self.NetDef_BT6EdgeSites)) != sorted(self.NetDef_BT6EdgeSites)
+                  or any(not (0 <= s < _nb - 1) for s in self.NetDef_BT6EdgeSites),
+                  f'BT6EdgeSites {self.NetDef_BT6EdgeSites} must be distinct block indices in 0..{_nb - 2} '
+                  '(a site after the last block has no reader: the policy head reads only the static pair stream)')
+      _bt6_refuse(self.NetDef_BT6EdgeDim % self.NetDef_BT6TripletHeads != 0, 'BT6EdgeDim must be divisible by BT6TripletHeads')
+      _bt6_tl = self.NetDef_BT6TermsInnerLayers
+      _bt6_refuse(_bt6_tl is not None and (len(set(_bt6_tl)) != len(_bt6_tl)
+                                           or any(not (0 <= t < self.NetDef_NBTInnerLayers) for t in _bt6_tl)),
+                  f'BT6TermsInnerLayers {_bt6_tl} must be distinct inner-layer positions in 0..{self.NetDef_NBTInnerLayers - 1}')
+      _bt6_refuse(self.NetDef_BT6PairDtype == 'autocast' and self.NetDef_BT6LogitAssembly != 'autocast',
+                  "BT6PairDtype 'autocast' needs BT6LogitAssembly 'autocast'")
+      _bt6_refuse(self.NetDef_BT6ShareReadersPerBlock and _bt6_tl is not None and len(_bt6_tl) == 0,
+                  'BT6ShareReadersPerBlock with an empty BT6TermsInnerLayers: there are no readers to share')
+      _bt6_refuse(self.NetDef_BT6Embedding not in ('bt6', 'linear'), f"BT6Embedding must be 'bt6' or 'linear' (got {self.NetDef_BT6Embedding!r})")
+      _bt6_refuse(self.NetDef_BT6PolicyWidth < 8 or self.NetDef_BT6SoftPolicyWidth < 8, 'policy widths must be >= 8')
+      # --- the decoder is absent: every decoder-bound key is refused, not ignored
+      _bt6_refuse(self.NetDef_UseMoveTokens, 'UseMoveTokens must be off: the first hybrid uses BT6\'s attention policy head '
+                  '(the move-token decoder and its value inject are absent)')
+      _mt_net = sorted(k for k in config_net_def if k.startswith('MoveToken'))
+      _bt6_refuse(bool(_mt_net), f'decoder-bound net keys {_mt_net} are set but there is no move-token decoder in this net; remove them')
+      _mt_opt = sorted(k for k in config_opt if ('MoveToken' in k) or k in ('LearningRateDecoderRatio', 'TrainOnlyActionHead'))
+      _mt_opt = [k for k in _mt_opt if config_opt.get(k) not in (None, 0, 0.0, False, '', [])]
+      _bt6_refuse(bool(_mt_opt), f'decoder-bound optimisation keys {_mt_opt} are set but there is no move-token decoder in this '
+                  'net (the decoder soft-policy, Plackett-Luce / value-order, minimax, q-regression, action and reply '
+                  'losses read decoder tokens). Use SoftPolicyWeight / SoftPolicyTemp for the BT6 soft-policy head.')
+      _bt6_refuse(str(getattr(self, 'Opt_MuonAdamWScope', '') or '') == 'all-non-trunk+decoder',
+                  "MuonAdamWScope 'all-non-trunk+decoder' needs a decoder; use 'all-non-trunk' or 'ffn-only'")
+      # --- trunk options that assume ordinary encoder layers or a per-head 64x64 bias of ours
+      _smolgen_on = int(self.NetDef_SmolgenDimPerSquare or 0) > 0 and int(config_net_def.get('SmolgenDim', 0) or 0) > 0
+      for _cond, _what in (
+          (_smolgen_on or self.NetDef_NBTSharedSmolgen, 'no smolgen (set SmolgenDimPerSquare 0 and SmolgenDim 0, NBTSharedSmolgen off)'),
+          (self.NetDef_UseRPE or self.NetDef_UseRoPE, 'no RPE / RoPE'),
+          (self.NetDef_EGTEdgeStream, 'EGTEdgeStream must be off (BT6\'s own edge stream replaces it)'),
+          (bool(self.NetDef_UsePieceRelationBias), 'UsePieceRelationBias must be off'),
+          (bool(self.NetDef_UseDualPlane), 'UseDualPlane must be off'),
+          (self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0 or self.NetDef_NBTMoDCapacity > 0,
+           'no piece tokens / register tokens / MoD routing (the relation tensors are 64 x 64)'),
+          (self.NetDef_NBTHyperConn > 0 or self.NetDef_NBTHyperConnInner > 0, 'no hyper-connections'),
+          (self.NetDef_NBTCarry or self.NetDef_NBTReRead > 0, 'NBTCarry / NBTReRead are not wired for BT6 inner layers'),
+          (self.NetDef_NBTValueResidual or self.NetDef_NBTHeadMix, 'NBTValueResidual / NBTHeadMix must be off'),
+          (bool(self.NetDef_DenseFormer), 'DenseFormer must be off'),
+          (int(self.NetDef_RefinerIters or 0) > 0, 'RefinerIters must be 0 (it reads the flat policy head)'),
+          (int(self.NetDef_PriorStateDim or 0) > 0, 'PriorStateDim must be 0'),
+          (self.NetDef_NBTProjNorm != 'Norm', "NBTProjNorm must be 'Norm' (real norms around the inner stream)"),
+          (bool(self.NetDef_TSB_Enabled), 'TSB must be off'),
+          (float(getattr(self, 'Opt_SoftPolicyServeBlend', 0) or 0) != 0, 'SoftPolicyServeBlend must be 0'),
+      ):
+        _bt6_refuse(_cond, _what)
 
 
   def pretty_print(self):

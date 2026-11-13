@@ -318,9 +318,18 @@ class TPGDataset(Dataset):
                file_mirror_prob : float = None,
                num_files_to_skip_after_shuffle : int = 0,
                exclude_files = None,
-               start_offsets = None):
+               start_offsets = None,
+               square_bytes_unsigned : bool = False):
 
     self.root_dir = root_dir
+    # Data config SquareBytesUnsigned (2026-11-13). The square bytes of a TPG record are UNSIGNED in the writer and
+    # in both engines (value = byte / 100). This loader has always viewed them as SIGNED int8, which turns every
+    # byte above 127 negative: in practice the rule-50 byte (channel 116 = 2 * min(count, 100), so counts >= 64
+    # read as (2 * count - 256) / 100 instead of 2 * count / 100; ~2.7 % of positions). False keeps that historical
+    # behaviour (existing nets were trained with it); True reads byte / 100 as the engines do.
+    self.square_bytes_unsigned = bool(square_bytes_unsigned)
+    if self.square_bytes_unsigned:
+      print(f'[tpg_dataset] {root_dir}: square bytes read UNSIGNED (byte / 100), as the engines feed them')
     self.batch_size = batch_size
     self.wdl_smoothing = wdl_smoothing
     self.num_workers = num_workers
@@ -806,7 +815,8 @@ class TPGDataset(Dataset):
               # 137 for upstream V2 shards (per-dataset self.square_bytes). For
               # 137-channel models reading V3 shards, the aux tail is sliced below.
               SIZE_SQUARE = self.square_bytes
-              squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(dtype=np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
+              squares = np.ascontiguousarray(this_batch[:, offset : offset + 64 * SIZE_SQUARE * 1]).view(
+                  dtype=np.uint8 if self.square_bytes_unsigned else np.byte).reshape(-1, 64, SIZE_SQUARE).astype(DTYPE)
               DIVISOR = 100
               squares = np.divide(squares, DIVISOR).astype(DTYPE)
               offset+= 64 * SIZE_SQUARE

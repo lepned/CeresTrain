@@ -754,8 +754,17 @@ def Train():
     # Note for resumes: an NBT checkpoint saved with `up` in AdamW has a different Muon
     # partition, so resuming it here takes the 'partition differs' path and restarts the
     # optimizer moments (only the 09-28 v8nbt2f smoke was saved that way).
+    # NBT-BT6 hybrid (2026-11-13, bt6_hybrid.py): excluded from Muon in EVERY scope --
+    #   * the relation / pair / edge reader tables of a BT6 inner layer (C1, C2, We, Wm, Wg are 2-D and sit inside
+    #     transformer_layer; mostly zero-init lookup-like tables, the class the "egt." rule below keeps out),
+    #   * the zero-init attention output-gate projection `g` (must start neutral: 2*sigmoid(0) = 1; Kovax trains
+    #     it with NAdam),
+    #   * everything in the container bt6h.* (prologue tables, edge-site maps, policy heads, record embedding):
+    #     Kovax's partition has Muon ONLY on the encoder FFN kernels.
+    from bt6_hybrid import bt6_muon_excluded as _bt6_no_muon, bt6_is_ffn_kernel as _bt6_ffn
     def _use_muon_final_only(n, p):
       if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
+      if _bt6_no_muon(n): return False          # BT6 hybrid reader tables / output gate / bt6h.* container: AdamW
       if 'embedding' in n: return False         # lookup-table-like: AdamW
       if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
       if 'smol_basis_bank' in n or 'smol_static_bank' in n: return False  # raa logit-tabeller, ikke vektmatriser (review-funn 3)
@@ -785,7 +794,8 @@ def Train():
       # The piece-token decompression (pt_decompress) is the trunk's way out to the 64 squares: trunk class, like
       # the NBT down/up projections (its zero-init out included, as NBT up). The MoD router [1, D] is a 1-row scorer: AdamW.
       return (p.ndim == 2 and 'embedding' not in n and ('transformer_layer' in n or 'pt_decompress.' in n)
-              and 'mod_router' not in n and 'head_mix' not in n and 'hyper_conn' not in n and 'lora' not in n.lower())
+              and 'mod_router' not in n and 'head_mix' not in n and 'hyper_conn' not in n and 'lora' not in n.lower()
+              and not _bt6_no_muon(n))
     def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",
       # AdamW substituted for NAdam by design — the load-bearing choice is
@@ -793,8 +803,9 @@ def Train():
       # suits square FFN GEMMs but may fight the spectral sensitivity of
       # QK^T products): Muon = 2-D FFN linears only; attention qkv/proj and
       # smolgen go to the internal AdamW group at base lr.
+      # BT6 inner layers (NBT-BT6 hybrid): the GLU kernels are ffn.gate / ffn.up / ffn.down
       return (_use_muon_all_non_trunk(n, p)
-              and ('mlp.linear' in n or 'tactical_ffn' in n))
+              and ('mlp.linear' in n or 'tactical_ffn' in n or _bt6_ffn(n)))
     def _use_muon_all_non_trunk_decoder(n, p):
       # 2026-09-04 ideation T1-1: the move-token decoder BODY joins Muon. Excluded on purpose:
       # move_tokens.pol (final policy layer), v_inject/v2_inject and wb.wo (zero-init couplings:
@@ -902,7 +913,10 @@ def Train():
                     # trains at half that -- an unintended 2x on one side of the same sum.
                     'move_tokens.mm_',
                     # 2026-09-17: the action WDL readout is a final layer of the same class as pol/vord.
-                    'move_tokens.act.', 'move_tokens.rq_head.')
+                    'move_tokens.act.', 'move_tokens.rq_head.',
+                    # 2026-11-13 NBT-BT6 hybrid: the policy is BT6's attention head (embedding, Q, K, promotion, pair
+                    # read) and its training-only soft-policy twin; the flat policy_head is not built there.
+                    'bt6h.policy.', 'bt6h.soft_policy.')
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
@@ -1319,6 +1333,7 @@ def Train():
                                  BOARDS_PER_BATCH, config.Data_NumTPGFilesToSkip, config.Exec_TestFlag,
                                  file_mirror_prob=_MIRROR_PRIMARY,
                                  num_files_to_skip_after_shuffle=getattr(config, 'Data_NumTPGFilesToSkipAfterShuffle', 0),
+                                 square_bytes_unsigned=getattr(config, 'Data_SquareBytesUnsigned', False),
                                  **_ds_args(TPG_TRAIN_DIR))
 
   # Optional secondary corpus (e.g. puzzle TPG mixed with T80 self-play).
@@ -1350,6 +1365,7 @@ def Train():
                                    # puzzle-sekundaer skal ikke drepe kjoeringen.
                                    v7x_mode='auto' if os.environ.get('CERES_TPG_V7X_SIDECAR', '0') in ('1', 'required') else None,
                                    file_mirror_prob=_MIRROR_SECONDARY,
+                                   square_bytes_unsigned=getattr(config, 'Data_SquareBytesUnsigned', False),
                                    **_ds_args(config.Data_TrainingFilesDirectory2))
     print(f'[mixed-dataset] primary={TPG_TRAIN_DIR}')
     print(f'[mixed-dataset] secondary={config.Data_TrainingFilesDirectory2}')

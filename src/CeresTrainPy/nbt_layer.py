@@ -386,6 +386,39 @@ class NestedBottleneckLayer(torch.nn.Module):
     res = (res, v_first) if want_v_first else res
     return (res, carry_out) if self.carry else res
 
+  def forward_bt6(self, x: torch.Tensor, E: torch.Tensor, S: torch.Tensor, e: torch.Tensor, prologue, read_state=None):
+    """BT6-hybrid block (NetDef BT6Hybrid; bt6_hybrid.py): the inner layers are bt6_net.BT6Layer and read the
+    relation tensor E, the pair normaliser S and the edge state e themselves, each with its own parameters.
+        x + up(shift(act(norm_out(  BT6Layer_K(... BT6Layer_1(down(shift(act(norm_in(x))))) ...)  ))))
+    Returns (x_out, H): H [B, heads, 64, 64] is the post-door, pre-softmax logits of the LAST inner layer (what an
+    edge site after this block reads back; the layer returns it, nothing is recomputed). The block-level options
+    that assume ordinary encoder layers (shared smolgen, MoD, hyper-connections, carry, re-read, FiLM, piece /
+    register tokens) are refused in config.py for this net."""
+    h = self.down(self._shift(self.act_in(self.norm_in(x))))
+    H = None
+    count = len(self.inner)
+    reads = [None] * count
+    if getattr(self, 'bt6_stack', False) and read_state is not None:
+      # Config levers BT6ShareReadersPerBlock / BT6StackReadsPerBlock: what depends only on E, Z0, the edge state
+      # (constant inside a block) and the reader tables is computed once here, in one matmul: for the block's one
+      # shared reader set (every layer reuses the same tensors), or for the K per-layer sets stacked.
+      from bt6_net import stacked_reads
+      term = [j for j in range(count) if self.inner[j].terms]
+      if self.bt6_readers is not None:
+        shared = stacked_reads([self.bt6_readers], self.inner[term[0]].cfg, e, read_state)[0]
+        for j in term:
+          reads[j] = shared
+      else:
+        each = stacked_reads([self.inner[j] for j in term], self.inner[term[0]].cfg, e, read_state)
+        for n, j in enumerate(term):
+          reads[j] = each[n]
+    for j, layer in enumerate(self.inner):
+      # H is used only from the last inner layer (an edge site after the block reads it)
+      h, H = layer(h, E, S, e, prologue, read_state, reads[j], j == count - 1)
+    out = self.up(self._shift(self.act_out(self.norm_out(h))))
+    return x + out.to(x.dtype), H
+
+
   @staticmethod
   def _raw_logits(layer, h, piece_relation_bias, edge_scales, edge_gate=None):
     """Pre-softmax scores [B,H,64,64] of one inner layer, for the EGT edge-stream readback (egt_edge.py). Recomputes

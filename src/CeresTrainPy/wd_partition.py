@@ -41,6 +41,7 @@ import torch
 from rms_norm import NORM_MODULE_TYPES
 from soft_moe_batched_dual import SoftMoEBatchedDual
 from multi_expert import MultiExpertLayer
+from bt6_hybrid import is_bt6_layer_reader as _is_bt6_layer_reader, is_bt6_hybrid_param as _is_bt6_hybrid_param
 
 WHITELIST_WEIGHT_MODULES = (torch.nn.Linear, SoftMoEBatchedDual, MultiExpertLayer)
 # Embedding only: norm types are claimed by ownership (norm_owned_param_names)
@@ -76,6 +77,25 @@ def partition_weight_decay(model):
           fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
           if pn.endswith('bias') or fpn in norm_owned:
               no_decay.add(fpn)
+          elif _is_bt6_layer_reader(fpn):
+              # NBT-BT6 hybrid (2026-11-13, bt6_hybrid.py): the relation / pair / edge READER tables and scales of
+              # a BT6 inner layer (t_node, t_edge, C1, Pk, Pq, C2, We, Wm, Wg, bg): raw nn.Parameters inside
+              # transformer_layer, mostly zero-init. Never decayed, as Kovax trains them (his decay selector is
+              # Linear kernels only). Must sit above the "transformer_layer" catch-all.
+              no_decay.add(fpn)
+          elif _is_bt6_hybrid_param(fpn):
+              # The hybrid container bt6h.*: prologue tables (D, T, Pin, Toff), edge-site channel maps, the policy
+              # heads' pair-stream reads (mix) and the record embedding's per-square gate / position tables are raw
+              # parameters -> no_decay; its nn.Linear kernels (policy embedding / Q / K / promotion, the embedding's
+              # dense layers and GLU) are ordinary weight matrices -> decay. (Biases and norm gains were taken above.
+              # Without this rule the name-based "embedding" branch below would put the policy embedding kernel and
+              # the 25 M whole-board dense in no_decay.)
+              if isinstance(m, torch.nn.Linear) and pn == 'weight':
+                  decay.add(fpn)
+              elif isinstance(m, (torch.nn.Linear, torch.nn.LayerNorm)):
+                  pass   # reached through the owning module's own iteration
+              elif '.' not in pn:
+                  no_decay.add(fpn)
           elif fpn.endswith('.rope.freqs'):
               # Learnable 2D RoPE frequencies (rope.LearnableRope2D, 2026-09-30): a 3-D
               # (H, pairs, 2) table of rotation rates, not a weight matrix. KataGo trains
