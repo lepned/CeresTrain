@@ -500,7 +500,8 @@ def Train():
 
   # Plain-PyTorch device + tensorboard setup. Replaces Lightning Fabric.
   if IS_DISTRIBUTED:
-    device = torch.device(f"cuda:{DDP_LOCAL_GPU}")
+    # DeviceType 'cpu' under torchrun (CERES_DDP_BACKEND=gloo): CPU ranks, for tests of the DDP paths without a GPU
+    device = torch.device(f"cuda:{DDP_LOCAL_GPU}" if accelerator != 'cpu' else 'cpu')
   else:
     # ExportOnly collapses `devices` to a bare int (line ~131, Fabric-era convention).
     _dev0 = devices[0] if isinstance(devices, (list, tuple)) else devices
@@ -2102,6 +2103,11 @@ def Train():
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('hyper_conn.', 'hyper_conn_out.')
     # Mid-depth decoder policy gains (opt MidDecoderPolicyWeight, 2026-11-09): ones-init, training-only path.
     _AUX_HEAD_PREFIXES = _AUX_HEAD_PREFIXES + ('mid_dec_gain.',)
+    # CheckpointResumeAllowNewParameters (2026-11-13, resume_new_params.py): parameters that a newly enabled NBT-BT6
+    # hybrid switch adds (inner-layer readers, shared smolgen) count as known-new on resume; identity at insertion.
+    import resume_new_params as _rnp
+    _allow_new_params = bool(getattr(config, 'Opt_CheckpointResumeAllowNewParameters', False))
+    _resume_new_names = []     # state_dict keys that are new on this resume (kept optimizer state for all others)
     def _is_aux_key(k):
       # '.attn_out_gate.' (2026-09-14): gated attention output enabled on warm start — nested in every layer's
       # attention; NOT a zero-effect init (gate = sigmoid(bias) != 1), so the fold below makes it exact.
@@ -2110,6 +2116,7 @@ def Train():
               or k.endswith('.head_mix') or k.endswith('.vr_lambda') or '.hyper_conn_inner' in k
               or k.endswith('.carry_gate') or '.carry_norm.' in k
               or k.endswith('.reread_gate') or '.down2.' in k
+              or (_allow_new_params and _rnp.is_switch_parameter(k, config))
               or (bool(_grown_trunk_prefixes) and k.startswith(_grown_trunk_prefixes)))
 
     # ReinitParamsOnResume (2026-10-05): keep the construction-time init of the listed params so it
@@ -2134,6 +2141,10 @@ def Train():
       # exist on exactly one side of a resume. Handle both directions LOUDLY
       # here instead of dying in the strict load.
       _ckpt_model_sd = loaded["model"]
+      if _allow_new_params:
+        # every difference other than "the checkpoint lacks parameters of a newly enabled switch" is refused here,
+        # with the full lists (keys only in the checkpoint, changed shapes, unexplained missing keys)
+        _resume_new_names = _rnp.check_state_dict(model_nocompile.state_dict(), _ckpt_model_sd, _is_aux_key)
       _model_has_placement = any(_is_aux_key(k) for k in model_nocompile.state_dict())
       _ckpt_placement_keys = [k for k in _ckpt_model_sd if _is_aux_key(k)]
       _model_aux_keys = {k for k in model_nocompile.state_dict() if _is_aux_key(k)}
@@ -2158,6 +2169,11 @@ def Train():
         _missing_other = [k for k in _pl_res.missing_keys if not _is_aux_key(k)]
         if _missing_other or _pl_res.unexpected_keys:
           raise RuntimeError(f"Resume mismatch beyond aux heads: missing={_missing_other} unexpected={_pl_res.unexpected_keys}")
+        if _allow_new_params:
+          _rnp_counts = _rnp.check_identity(model_nocompile, _fresh)
+          if IS_MASTER:
+            print(f"INFO: CheckpointResumeAllowNewParameters: {len(_fresh)} tensors are new on this resume ({_rnp_counts}); "
+                  f"they hold their identity init => {_ident}; optimizer state of the existing parameters is kept", flush=True)
         # vda mode-3 -> mode-4 warm start: the aux value head sees exactly the
         # augmented input the checkpoint's value_head was trained on, so inherit
         # those weights instead of fresh-initializing (the SERVED value_head also
@@ -2268,6 +2284,15 @@ def Train():
     #     and load only the 'state' portion (fresh if empty).
     loaded_optimizer_state = loaded["optimizer"]
     current_param_groups = optimizer.param_groups
+    if _allow_new_params and _resume_new_names:
+      # Keep the state of every existing parameter, none for the new ones: the checkpoint's positional state is
+      # re-keyed by name onto this run's (larger) parameter list; refused if its layout cannot be reproduced.
+      loaded_optimizer_state, _n_kept, _n_fresh = _rnp.remap_optimizer_state(optimizer, loaded_optimizer_state,
+                                                                             model_nocompile, _resume_new_names)
+      if IS_MASTER:
+        print(f"[checkpoint-resume] new parameters on resume: optimizer state KEPT for {_n_kept} existing parameters "
+              f"(re-keyed by name), {_n_fresh} new parameters start without state (momentum / moments / step created "
+              f"on their first step)", flush=True)
     loaded_param_groups = loaded_optimizer_state.get("param_groups", [])
 
     groups_match = (len(current_param_groups) == len(loaded_param_groups)
@@ -2411,6 +2436,13 @@ def Train():
             g[_k] = _v
 
     num_pos = int(loaded["num_pos"]) # N.B. be sure to use a multiple of the batch size
+    if os.environ.get('CERES_RESUME_DUMP') and IS_MASTER:
+      # test hook (test_bt6_hybrid_resume.py): the model and optimizer state exactly as resumed, before the first step
+      _id2n = {id(_p): _n for _n, _p in model_nocompile.named_parameters()}
+      torch.save({'model': {k: v.detach().cpu().clone() for k, v in model_nocompile.state_dict().items()},
+                  'optimizer': optimizer.state_dict(), 'num_pos': num_pos,
+                  'optimizer_names': [_id2n[id(_p)] for _g in optimizer.param_groups for _p in _g['params']]},
+                 os.environ['CERES_RESUME_DUMP'])
     print("INFO: LOAD_CHECKPOINT", config.Opt_CheckpointResumeFromFileName, num_pos)
     if config.Opt_LRRewarmPositions > 0:
       _rw_end = config.Opt_LRRewarmStartPos + config.Opt_LRRewarmPositions

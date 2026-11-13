@@ -171,6 +171,15 @@ class Configuration:
     self.Opt_BatchSizeBackwardPass = config_opt.get('BatchSizeBackwardPass', 2048)
     self.Opt_Optimizer = config_opt.get('Optimizer', 'AdamW')
     self.Opt_CheckpointResumeFromFileName = config_opt.get('CheckpointResumeFromFileName')
+    # CheckpointResumeAllowNewParameters (2026-11-13, resume_new_params.py): allow CheckpointResumeFromFileName to load
+    # a checkpoint that LACKS exactly the parameters a newly enabled net switch adds (NBT-BT6 hybrid: reader
+    # parameters of inner layers that gain the relation / pair / edge terms, the shared smolgen). Those start at
+    # their from-scratch init, which is an exact identity (checked); every other mismatch is refused. The optimiser
+    # state of all existing parameters is kept, the new ones start without state. Default false = strict load.
+    # Leaving it true on later resumes of the same run is harmless (nothing is new then).
+    self.Opt_CheckpointResumeAllowNewParameters = bool(config_opt.get('CheckpointResumeAllowNewParameters', False))
+    if self.Opt_CheckpointResumeAllowNewParameters and not self.Opt_CheckpointResumeFromFileName:
+      raise ValueError('CheckpointResumeAllowNewParameters needs CheckpointResumeFromFileName')
     self.Opt_CheckpointFrequencyNumPositions = config_opt.get('CheckpointFrequencyNumPositions', 200_000_000)
     self.Opt_PyTorchCompileMode = config_opt.get('PyTorchCompileMode', "max-autotune")
     self.Opt_WeightDecay = config_opt.get('WeightDecay', 0.01)
