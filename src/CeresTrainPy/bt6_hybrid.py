@@ -91,6 +91,8 @@ def parameter_group_table(model, scope: str = "all-non-trunk"):
       return "inner layer: output-gate projection g"
     if bt6_is_ffn_kernel(name):
       return "inner layer: GLU kernels (gate, up, down)"
+    if ".shared_smolgen." in name or name.startswith("smolgenPrepLayer."):
+      return "shared smolgen: per-block generators (sm1, sm2, sm3, norms) and the shared prep layer"
     if ".inner." in name:
       if name.endswith(("q.weight", "k.weight", "v.weight", "out.weight")):
         return "inner layer: attention kernels (q, k, v, out)"
@@ -254,6 +256,30 @@ class BT6Hybrid(nn.Module):
         layer.share_readers(block.bt6_readers)
     block.bt6_stack = bool(term_layers) and (self.share_readers or self.stack_reads)
 
+  @staticmethod
+  def add_shared_smolgen(net, hidden_dim: int, per_square_dim: int, head_dim: int, activation: str, norm_type: str,
+                         eps: float) -> int:
+    """Config BT6SharedSmolgen: one nbt_layer.SharedSmolgen per NBT block (block.shared_smolgen) reading the
+    normalised block input, all sharing ONE prep layer net.smolgenPrepLayer = Linear(head_dim -> 64 * 64) whose
+    weight and bias are ZERO: the bias is exactly 0 until the prep layer has been trained, so a net loaded from a
+    checkpoint without smolgen computes bit-identical outputs. The modules are built with the global RNG state
+    saved and restored: every other parameter of the net gets the same initial value with the switch on or off.
+    Returns the number of parameters added."""
+    from nbt_layer import SharedSmolgen
+    blocks = list(net.transformer_layer)
+    heads = blocks[0].inner[0].cfg.heads
+    rng = torch.get_rng_state()
+    net.smolgenPrepLayer = nn.Linear(head_dim, 64 * 64)
+    nn.init.zeros_(net.smolgenPrepLayer.weight)
+    nn.init.zeros_(net.smolgenPrepLayer.bias)
+    for block in blocks:
+      assert any(not layer.terms for layer in block.inner), "BT6SharedSmolgen needs a term-free inner layer in the block"
+      block.shared_smolgen = SharedSmolgen(block.down.in_features, heads, per_square_dim, hidden_dim, head_dim,
+                                           net.smolgenPrepLayer, activation, norm_type, eps, 64)
+    torch.set_rng_state(rng)
+    return (sum(p.numel() for p in net.smolgenPrepLayer.parameters())
+            + sum(p.numel() for block in blocks for p in block.shared_smolgen.parameters()))
+
   def start(self, squares: torch.Tensor):
     """squares [B, 64, >= 26] -> (RelationContext (its .E: float32 [B, 34, 64, 64], no gradient), S [B, 64, 64],
     e0 [B, d_e, 64, 64])."""
@@ -334,6 +360,15 @@ def export_served_hybrid(net) -> dict:
     dense(f"/nbt{b}/down", block.down)
     norm(f"/nbt{b}/norm_out", block.norm_out)
     dense(f"/nbt{b}/up", block.up)
+    smolgen = getattr(block, "shared_smolgen", None)
+    if smolgen is not None:          # BT6SharedSmolgen: the block's generator (bias for its term-free layers)
+      dense(f"/nbt{b}/smolgen/compress", smolgen.sm1)
+      dense(f"/nbt{b}/smolgen/dense1", smolgen.sm2)
+      norm(f"/nbt{b}/smolgen/ln1", smolgen.ln1)
+      dense(f"/nbt{b}/smolgen/dense2", smolgen.sm3)
+      norm(f"/nbt{b}/smolgen/ln2", smolgen.ln2)
+  if getattr(blocks[0], "shared_smolgen", None) is not None:
+    dense("/smolgen/prep", net.smolgenPrepLayer)            # shared by all blocks: [head_dim, 4096]
   norm("/trunk/final_norm", net.trunk_end_norm)
   if hybrid.embed is not None:
     emb = hybrid.embed
@@ -379,6 +414,9 @@ def served_meta(net) -> dict:
     "heads_activation": config.NetDef_HeadsActivationType, "head_front_act": bool(net.head_front_act),
     "premap_per_square": net.HEAD_PREMAP_PER_SQUARE, "value2": net.value2_loss_weight > 0,
     "mlh": net.moves_left_loss_weight > 0,
+    "terms_inner_layers": tuple(hybrid.terms_inner_layers),
+    "smolgen": getattr(blocks[0], "shared_smolgen", None) is not None,
+    "smolgen_activation": getattr(config, "NetDef_BT6SmolgenActivation", "Swish"),
   }
 
 
@@ -432,11 +470,24 @@ def forward_served_hybrid(t: dict, squares: torch.Tensor, meta: dict) -> dict:
     return y + t[f"{prefix}/b"] if f"{prefix}/b" in t else y
 
   K = meta["inner_layers"]
+  terms = meta.get("terms_inner_layers", tuple(range(K)))
+
+  def smolgen_bias(n, b):
+    # the block's shared smolgen on the normalised block input n [B, 64, D] -> [B, heads, 64, 64]
+    act = to_activation(meta["smolgen_activation"])
+    p = f"/nbt{b}/smolgen"
+    s = _dense(n, t, f"{p}/compress").reshape(batch, -1)
+    s = norm(act(_dense(s, t, f"{p}/dense1")), f"{p}/ln1", meta["outer_norm"], meta["outer_norm_eps"])
+    s = norm(act(_dense(s, t, f"{p}/dense2")), f"{p}/ln2", meta["outer_norm"], meta["outer_norm_eps"])
+    return _dense(s.reshape(batch, cfg.heads, -1), t, "/smolgen/prep").reshape(batch, cfg.heads, 64, 64)
+
   for b in range(meta["blocks"]):
-    h = nbt_proj(project(norm(x, f"/nbt{b}/norm_in", meta["outer_norm"], meta["outer_norm_eps"])), f"/nbt{b}/down")
+    n_in = norm(x, f"/nbt{b}/norm_in", meta["outer_norm"], meta["outer_norm_eps"])
+    bias = smolgen_bias(n_in, b) if meta.get("smolgen") else None
+    h = nbt_proj(project(n_in), f"/nbt{b}/down")
     H = None
     for j in range(K):
-      h, H = served_layer(t, b * K + j, h, E, S, e, cfg)
+      h, H = served_layer(t, b * K + j, h, E, S, e, cfg, bias=None if j in terms else bias)
     x = x + nbt_proj(project(norm(h, f"/nbt{b}/norm_out", meta["outer_norm"], meta["outer_norm_eps"])), f"/nbt{b}/up")
     if b in meta["site_blocks"]:
       e = served_site(t, b * K + K - 1, e, H, cfg)

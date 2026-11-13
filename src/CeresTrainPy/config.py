@@ -1607,6 +1607,19 @@ class Configuration:
     self.NetDef_BT6PairDtype = str(config_net_def.get('BT6PairDtype', 'float32') or 'float32')
     if self.NetDef_BT6PairDtype not in ('float32', 'autocast'):
       raise ValueError(f"BT6PairDtype must be 'float32' or 'autocast' (got {self.NetDef_BT6PairDtype!r})")
+    # BT6SharedSmolgen (2026-11-13; default off = unchanged net; can be added to a trained net as an identity): one
+    #   nbt_layer.SharedSmolgen per NBT block on the normalised block input; its [B, heads, 64, 64] bias is added to
+    #   the attention logits (before the softmax) of the TERM-FREE inner layers only (needs BT6TermsInnerLayers that
+    #   leaves at least one such layer); the term layers are untouched. The one prep layer (net.smolgenPrepLayer,
+    #   Linear(BT6SmolgenHeadDim -> 4096), shared by all blocks) is zero-initialised: exact identity at insertion.
+    #   An edge site reading a term-free layer reads q.k / sqrt(head_dim) + bias (as _raw_logits did).
+    #   BT6SharedSmolgenDim = the generator's hidden width (sm2), BT6SmolgenPerSquareDim = sm1 width per square,
+    #   BT6SmolgenHeadDim = per-head width into the prep layer (our old nets: SmolgenDim 256 / divisor 4 = 64).
+    self.NetDef_BT6SharedSmolgen = bool(config_net_def.get('BT6SharedSmolgen', False))
+    self.NetDef_BT6SharedSmolgenDim = int(config_net_def.get('BT6SharedSmolgenDim', 512) or 512)
+    self.NetDef_BT6SmolgenPerSquareDim = int(config_net_def.get('BT6SmolgenPerSquareDim', 32) or 32)
+    self.NetDef_BT6SmolgenHeadDim = int(config_net_def.get('BT6SmolgenHeadDim', 64) or 64)
+    self.NetDef_BT6SmolgenActivation = str(config_net_def.get('BT6SmolgenActivation', 'Swish') or 'Swish')
     self.NetDef_BT6PolicyWidth = int(config_net_def.get('BT6PolicyWidth', 1024) or 1024)
     # Soft-policy auxiliary head on the SHARED policy embedding (own Q / K at this width; training-only, never
     # exported). Built only when Opt SoftPolicyWeight > 0; target = ceres_net.soft_policy_target(policy, SoftPolicyTemp).
@@ -1644,6 +1657,9 @@ class Configuration:
                   f'BT6TermsInnerLayers {_bt6_tl} must be distinct inner-layer positions in 0..{self.NetDef_NBTInnerLayers - 1}')
       _bt6_refuse(self.NetDef_BT6PairDtype == 'autocast' and self.NetDef_BT6LogitAssembly != 'autocast',
                   "BT6PairDtype 'autocast' needs BT6LogitAssembly 'autocast'")
+      _bt6_refuse(self.NetDef_BT6SharedSmolgen and (_bt6_tl is None or len(set(_bt6_tl)) >= self.NetDef_NBTInnerLayers),
+                  'BT6SharedSmolgen needs term-free inner layers (its bias goes to their logits): set BT6TermsInnerLayers '
+                  'to fewer positions than NBTInnerLayers')
       _bt6_refuse(self.NetDef_BT6ShareReadersPerBlock and _bt6_tl is not None and len(_bt6_tl) == 0,
                   'BT6ShareReadersPerBlock with an empty BT6TermsInnerLayers: there are no readers to share')
       _bt6_refuse(self.NetDef_BT6Embedding not in ('bt6', 'linear'), f"BT6Embedding must be 'bt6' or 'linear' (got {self.NetDef_BT6Embedding!r})")

@@ -265,7 +265,8 @@ def _identity(value):
   return value
 
 
-def served_layer(t: dict, index: int, x, E, S, e, cfg: BT6Config, r=_identity, dense=None, glu=None, tap=None):
+def served_layer(t: dict, index: int, x, E, S, e, cfg: BT6Config, r=_identity, dense=None, glu=None, tap=None,
+                 bias=None):
   """One encoder layer from the served tensors /encoder{index}/... (kernels: layer_norm, the packed [q|k|v|g] GEMM,
   attention_egt, the residual GEMMs, the GLU). x [B, 64, d], E float [B, 34, 64, 64], S [B, 64, 64],
   e [B, d_e, 64, 64] -> (x, H). `r` rounds what the FP16 program stores; `dense` / `glu` default to plain FP32."""
@@ -285,6 +286,10 @@ def served_layer(t: dict, index: int, x, E, S, e, cfg: BT6Config, r=_identity, d
   column = torch.einsum("bjhd,hcd->bhjc", k, t[f"{g}/key"])
   scores = scores + torch.einsum("bhic,bcij->bhij", row, E) + torch.einsum("bhjc,bcij->bhij", column, E)
   scores = scores + S[:, None] * (torch.einsum("hc,bcij->bhij", t[f"{g}/scaled_coefficients"], E) + t[f"{g}/constant_bias"])
+  if bias is not None:
+    # per-position logit bias [B, heads, 64, 64] (NBT hybrid, shared smolgen; only given to term-free layers, whose
+    # read and door are zero): H = q.k * qk_scale + bias
+    scores = scores + bias
   read = torch.einsum("hc,bcij->bhij", t[f"{g}/edge_read/w"], e_read)
   door = torch.einsum("hc,bcij->bhij", t[f"{g}/door/w"], e_read)
   gate = torch.einsum("hc,bcij->bhij", t[f"{g}/gate/w"], e_read) + t[f"{g}/gate/b"].view(1, heads, 1, 1)
@@ -740,9 +745,12 @@ class BT6Layer(nn.Module):
     R = self.readers
     return {**{name: getattr(R, name) for name in READER_NAMES}, "Pk": self.Pk, "Pq": self.Pq}
 
-  def _forward_plain(self, x, want_H: bool):
-    """The layer without relation / pair / edge terms: softmax_j(q_i.k_j / sqrt(hd)) v_j with the output gate.
-    H (computed only when asked for: an edge site reads it) is q_i.k_j / sqrt(hd), [B, heads, 64, 64]."""
+  def _forward_plain(self, x, want_H: bool, bias=None):
+    """The layer without relation / pair / edge terms: softmax_j(H[i, j]) v_j with the output gate, where
+        H[h, i, j] = q_i.k_j / sqrt(hd) + bias[h, i, j]
+    `bias` [B, heads, 64, 64] (None = no bias) is the block's shared-smolgen logit bias (config BT6SharedSmolgen): it
+    enters the logits before the softmax, in the dtype of q / k; the output gate is unchanged. H (computed only when
+    asked for: an edge site reads it) INCLUDES the bias, as nbt_layer._raw_logits did for our earlier nets."""
     cfg = self.cfg
     batch, heads, hd = x.shape[0], cfg.heads, cfg.head_dim
     projections = [self.q, self.k, self.v] + ([self.g] if self.g is not None else [])
@@ -751,12 +759,15 @@ class BT6Layer(nn.Module):
     H = None
     if self.training:
       # training: the fused attention primitive (softmax in the compute dtype, as every plain layer of this trainer)
-      attended = F.scaled_dot_product_attention(lanes[:, 0], lanes[:, 1], lanes[:, 2])
+      mask = None if bias is None else bias.to(lanes.dtype)       # a float attn_mask is ADDED to the logits
+      attended = F.scaled_dot_product_attention(lanes[:, 0], lanes[:, 1], lanes[:, 2], attn_mask=mask)
       if want_H:
         H = torch.matmul(lanes[:, 0], lanes[:, 1].transpose(-1, -2)) / math.sqrt(hd)
+        H = H if mask is None else H + mask
     else:
       # eval / export: the explicit statements with a float32 softmax (ONNX gets MatMul / Softmax, no Attention op)
       H = torch.matmul(lanes[:, 0], lanes[:, 1].transpose(-1, -2)) / math.sqrt(hd)
+      H = H if bias is None else H + bias.to(H.dtype)
       attended = torch.matmul(torch.softmax(H.float(), dim=-1).to(lanes.dtype), lanes[:, 2])
       H = H if want_H else None
     if self.g is not None:
@@ -767,12 +778,13 @@ class BT6Layer(nn.Module):
     return x, H
 
   def forward(self, x, E, S, e, prologue: BT6Prologue, read_state: torch.Tensor | None = None, reads=None,
-              want_H: bool = True):
+              want_H: bool = True, bias=None):
     """x [B, 64, D], E = RelationContext (or the float relation tensor [B, 34, 64, 64]), S [B, 64, 64],
     e [B, S, 64, 64] -> (x, H [B, heads, 64, 64] in the assembly dtype). `read_state` = ctx.read_state(e, dtype),
     when the caller has built it for all layers that read this state (else it is built here). `reads` = this
     layer's (read, door, gate_logits) from `stacked_reads`, when the block computed them for its layers.
-    `want_H` matters only for a layer without terms (its H costs an extra matmul).
+    `want_H` matters only for a layer without terms (its H costs an extra matmul). `bias`: the block's
+    shared-smolgen logit bias, used ONLY by a layer without terms (`_forward_plain`); a term layer ignores it.
 
     The same function as `forward_reference` (the literal einsum form), arranged for speed, close to the
     formulation of the original JAX training code (dense contractions, materialised pair stream, bf16 assembly):
@@ -791,7 +803,7 @@ class BT6Layer(nn.Module):
     cfg.assembly_autocast is set and autocast is on (bf16 compute, as BT6 is trained), else in float32; H is cast
     to float32 before the softmax either way. Without autocast everything is float32."""
     if not self.terms:
-      return self._forward_plain(x, want_H)
+      return self._forward_plain(x, want_H, bias)
     cfg = self.cfg
     R = self.readers
     batch, heads, hd = x.shape[0], cfg.heads, cfg.head_dim

@@ -394,7 +394,11 @@ class NestedBottleneckLayer(torch.nn.Module):
     edge site after this block reads back; the layer returns it, nothing is recomputed). The block-level options
     that assume ordinary encoder layers (shared smolgen, MoD, hyper-connections, carry, re-read, FiLM, piece /
     register tokens) are refused in config.py for this net."""
-    h = self.down(self._shift(self.act_in(self.norm_in(x))))
+    n = self.norm_in(x)
+    # Config BT6SharedSmolgen: one generator per block on the NORMALISED block input (as our pre-BT6 NBT nets); its
+    # [B, heads, 64, 64] bias goes to the logits of the term-free inner layers only. None when the switch is off.
+    smolgen_bias = self.shared_smolgen(n) if self.shared_smolgen is not None else None
+    h = self.down(self._shift(self.act_in(n)))
     H = None
     count = len(self.inner)
     reads = [None] * count
@@ -414,7 +418,7 @@ class NestedBottleneckLayer(torch.nn.Module):
           reads[j] = each[n]
     for j, layer in enumerate(self.inner):
       # H is used only from the last inner layer (an edge site after the block reads it)
-      h, H = layer(h, E, S, e, prologue, read_state, reads[j], j == count - 1)
+      h, H = layer(h, E, S, e, prologue, read_state, reads[j], j == count - 1, None if layer.terms else smolgen_bias)
     out = self.up(self._shift(self.act_out(self.norm_out(h))))
     return x + out.to(x.dtype), H
 

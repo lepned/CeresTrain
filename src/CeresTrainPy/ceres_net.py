@@ -1578,6 +1578,15 @@ class CeresNet(nn.Module):
       if self.bt6h is not None:
         for _bt6_blk in self.transformer_layer:
           self.bt6h.finish_block(_bt6_blk)      # shared / stacked reader arrangement of the block (config levers)
+        if config.NetDef_BT6SharedSmolgen:
+          # one SharedSmolgen per block for its term-free inner layers; zero-init shared prep layer => exact identity
+          _n_sg = self.bt6h.add_shared_smolgen(self, config.NetDef_BT6SharedSmolgenDim, config.NetDef_BT6SmolgenPerSquareDim,
+                                               config.NetDef_BT6SmolgenHeadDim, config.NetDef_BT6SmolgenActivation,
+                                               config.NetDef_NormType, EPS)
+          print(f'[ceres_net] BT6 SHARED SMOLGEN: one generator per block on the normalised block input ({self.EMBEDDING_DIM} -> '
+                f'{config.NetDef_BT6SmolgenPerSquareDim}/square -> {config.NetDef_BT6SharedSmolgenDim} -> {_nbt_heads} x '
+                f'{config.NetDef_BT6SmolgenHeadDim} -> shared zero-init prep -> [{_nbt_heads}, 64, 64]), bias added to the '
+                f'logits of the term-free inner layers; {_n_sg:,} params; identity at init')
       if self.bt6h is not None:
         _bc = self.bt6h.parameter_counts()
         _n_inner = sum(p.numel() for blk in self.transformer_layer for l in blk.inner for p in l.parameters())
