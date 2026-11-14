@@ -644,12 +644,13 @@ def Train():
   _qk_clip_sync = None              # cross-rank stash reduction (DDP only); None = single-GPU
   if QK_CLIP_TAU > 0:
     from dot_product_attention import DotProductAttention
+    from bt6_net import BT6Layer   # the inner layers of the NBT-BT6 hybrid (same monitor / apply_qk_clip interface)
     for _mod in model.modules():
-      if isinstance(_mod, DotProductAttention):
+      if isinstance(_mod, (DotProductAttention, BT6Layer)):
         _mod.qk_clip_monitor = True
         _qk_clip_mods.append(_mod)
     if not _qk_clip_mods:
-      raise ValueError('QKClipTau set but no DotProductAttention modules found')
+      raise ValueError('QKClipTau set but no DotProductAttention / BT6Layer modules found')
     if IS_DISTRIBUTED:
       # Each rank observes the per-head max logit over ITS OWN microbatch. Clipping on
       # those independently would rescale different heads by different factors on each

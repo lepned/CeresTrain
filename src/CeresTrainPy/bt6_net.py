@@ -717,6 +717,49 @@ class BT6Layer(nn.Module):
       _linear_init(linear)
     if self.g is not None:
       _linear_init(self.g, zero=True)
+    # QK-clip (config QKClipTau; armed by train.py before torch.compile): a plain Python flag, so the training-only
+    # stash branch specializes into the compiled graph; nothing of it reaches eval / export.
+    self.qk_clip_monitor = False
+    self._last_max_logit = None
+
+  # ------------------------------------------------------------------ QK-clip (MuonClip-style, weight level)
+  @property
+  def num_heads(self) -> int:
+    return self.cfg.heads
+
+  def _stash_max_logit(self, H: torch.Tensor) -> None:
+    """Per-head max of the logits that enter the softmax (training only), max-accumulated over the micro-batches
+    of one optimizer step; `apply_qk_clip` reads and resets it. Term layer: H = (q.k + relation terms + read)
+    (1 + door); plain layer: q.k / sqrt(hd) (+ the shared-smolgen bias)."""
+    mx = H.detach().amax(dim=(0, 2, 3)).float()
+    prev = self._last_max_logit
+    self._last_max_logit = mx if prev is None else torch.maximum(mx, prev)
+
+  @torch.no_grad()
+  def apply_qk_clip(self, tau: float) -> int:
+    """After the optimizer step: every head whose max logit exceeded `tau` gets gamma = tau / max and
+    the q and k projections (weights AND biases) of that head scaled by sqrt(gamma); in a term layer also Pq and
+    Pk, so the three q/k-dependent logit terms q.k, q.Pq E and k.Pk E all shrink by exactly gamma (C1, the
+    edge / pair-stream read and the door are not q/k-dependent and stay). Returns the number of heads clipped."""
+    m = self._last_max_logit
+    self._last_max_logit = None
+    if m is None:
+      return 0
+    gamma = (tau / m.clamp(min=1e-6)).clamp(max=1.0)
+    clipped = int((gamma < 0.9999).sum().item())
+    if clipped == 0:
+      return 0
+    s = gamma.sqrt()
+    hd = self.cfg.head_dim
+    rows = s.repeat_interleave(hd).to(self.q.weight.dtype)                  # [heads * hd], head-major as the packing
+    for lin in (self.q, self.k):
+      lin.weight.mul_(rows[:, None])
+      if lin.bias is not None:
+        lin.bias.mul_(rows)
+    if self.terms:
+      self.Pq.mul_(s.to(self.Pq.dtype)[:, None, None])
+      self.Pk.mul_(s.to(self.Pk.dtype)[:, None, None])
+    return clipped
 
   # ------------------------------------------------------------------ config levers (hybrid)
   @property
@@ -761,9 +804,12 @@ class BT6Layer(nn.Module):
       # training: the fused attention primitive (softmax in the compute dtype, as every plain layer of this trainer)
       mask = None if bias is None else bias.to(lanes.dtype)       # a float attn_mask is ADDED to the logits
       attended = F.scaled_dot_product_attention(lanes[:, 0], lanes[:, 1], lanes[:, 2], attn_mask=mask)
-      if want_H:
+      if want_H or self.qk_clip_monitor:
         H = torch.matmul(lanes[:, 0], lanes[:, 1].transpose(-1, -2)) / math.sqrt(hd)
         H = H if mask is None else H + mask
+        if self.qk_clip_monitor:
+          self._stash_max_logit(H)
+        H = H if want_H else None
     else:
       # eval / export: the explicit statements with a float32 softmax (ONNX gets MatMul / Softmax, no Attention op)
       H = torch.matmul(lanes[:, 0], lanes[:, 1].transpose(-1, -2)) / math.sqrt(hd)
@@ -853,6 +899,8 @@ class BT6Layer(nn.Module):
       attended, H = attention_core(Fr, door, gate_logits, lanes[:, 2],
                                    cfg.gate_cap, lanes[:, 3] if self.g is not None else None, cfg.output_gate_scale,
                                    low=cfg.pair_autocast and low)
+      if self.training and self.qk_clip_monitor:
+        self._stash_max_logit(H)
       attended = attended.permute(0, 2, 1, 3).reshape(batch, 64, cfg.d_model)
     if self._unit_alphas:                    # the constant residual scales are 1 under pre-norm: no multiply
       x = x + self.out(attended).to(x.dtype)
