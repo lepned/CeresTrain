@@ -1643,6 +1643,22 @@ class Configuration:
     # recomputed in backward, so only block-boundary tensors stay alive. Needed for the 8 x 3 target at forward
     # batch 1536 (the pairwise float32 tensors of one BT6 layer are ~6 GiB there). Same outputs with it on or off.
     self.NetDef_BT6CheckpointBlocks = bool(config_net_def.get('BT6CheckpointBlocks', False))
+    # BT6SiteDtype (2026-11-16, training speed): 'float32' (default: the whole edge site in float32, as served) |
+    #   'autocast' (under autocast the site's channel maps, triplet contractions and edge FFN run in the autocast
+    #   dtype; the edge state, every rms, softmax and sigmoid stay float32 -- "BF16 compute with f32 softmax / gates /
+    #   rms", as BT6 is trained). Training numerics only: no parameter changes, export unchanged.
+    self.NetDef_BT6SiteDtype = str(config_net_def.get('BT6SiteDtype', 'float32') or 'float32')
+    if self.NetDef_BT6SiteDtype not in ('float32', 'autocast'):
+      raise ValueError(f"BT6SiteDtype must be 'float32' or 'autocast' (got {self.NetDef_BT6SiteDtype!r})")
+    # BT6FFNMultiplier (2026-11-16; default 1 = BT6: GLU hidden = inner width): GLU hidden width of the inner layers
+    # as a multiple of the inner width. Changes the shapes of ffn.gate / ffn.up / ffn.down: not resumable across.
+    self.NetDef_BT6FFNMultiplier = float(config_net_def.get('BT6FFNMultiplier', 1) or 1)
+    # BT6NativeLayers (2026-11-16; bt6_native_terms.py): the inner layers stay OUR encoder layers (NormType norms,
+    # our FFN, NBTSharedSmolgen as in the plain NBT nets); the layers at BT6TermsInnerLayers get BT6's term reads on
+    # their attention logits (relation terms, pair-stream and edge read, door, post-softmax gate), and the edge
+    # sites read the logits of the block's last inner layer. Identity at initialisation. Prologue, sites, relation
+    # channels and (without UseMoveTokens) BT6's policy head are the hybrid's.
+    self.NetDef_BT6NativeLayers = bool(config_net_def.get('BT6NativeLayers', False))
     _bt6_keys = [k for k in config_net_def if k.startswith('BT6') and k != 'BT6Hybrid']
     if not self.NetDef_BT6Hybrid:
       if _bt6_keys:
@@ -1673,22 +1689,51 @@ class Configuration:
                   'BT6ShareReadersPerBlock with an empty BT6TermsInnerLayers: there are no readers to share')
       _bt6_refuse(self.NetDef_BT6Embedding not in ('bt6', 'linear'), f"BT6Embedding must be 'bt6' or 'linear' (got {self.NetDef_BT6Embedding!r})")
       _bt6_refuse(self.NetDef_BT6PolicyWidth < 8 or self.NetDef_BT6SoftPolicyWidth < 8, 'policy widths must be >= 8')
-      # --- the decoder is absent: every decoder-bound key is refused, not ignored
-      _bt6_refuse(self.NetDef_UseMoveTokens, 'UseMoveTokens must be off: the first hybrid uses BT6\'s attention policy head '
-                  '(the move-token decoder and its value inject are absent)')
-      _mt_net = sorted(k for k in config_net_def if k.startswith('MoveToken'))
-      _bt6_refuse(bool(_mt_net), f'decoder-bound net keys {_mt_net} are set but there is no move-token decoder in this net; remove them')
-      _mt_opt = sorted(k for k in config_opt if ('MoveToken' in k) or k in ('LearningRateDecoderRatio', 'TrainOnlyActionHead'))
-      _mt_opt = [k for k in _mt_opt if config_opt.get(k) not in (None, 0, 0.0, False, '', [])]
-      _bt6_refuse(bool(_mt_opt), f'decoder-bound optimisation keys {_mt_opt} are set but there is no move-token decoder in this '
-                  'net (the decoder soft-policy, Plackett-Luce / value-order, minimax, q-regression, action and reply '
-                  'losses read decoder tokens). Use SoftPolicyWeight / SoftPolicyTemp for the BT6 soft-policy head.')
-      _bt6_refuse(str(getattr(self, 'Opt_MuonAdamWScope', '') or '') == 'all-non-trunk+decoder',
-                  "MuonAdamWScope 'all-non-trunk+decoder' needs a decoder; use 'all-non-trunk' or 'ffn-only'")
+      _bt6_ffn_hidden = self.NetDef_BT6FFNMultiplier * self.NetDef_NBTMidDim
+      _bt6_refuse(self.NetDef_BT6FFNMultiplier <= 0 or _bt6_ffn_hidden != int(_bt6_ffn_hidden),
+                  f'BT6FFNMultiplier {self.NetDef_BT6FFNMultiplier} must give a whole GLU hidden width (inner width '
+                  f'{self.NetDef_NBTMidDim})')
+      if self.NetDef_UseMoveTokens:
+        # --- hybrid WITH the move-token decoder (2026-11-16): the decoder owns the policy and feeds the value heads
+        # exactly as in the plain NBT nets; BT6's attention policy head and its soft-policy twin are not built.
+        _bt6_refuse(float(config_opt.get('SoftPolicyWeight', 0) or 0) > 0,
+                    'SoftPolicyWeight is the BT6 soft-policy head, which reads the BT6 policy embedding; with the '
+                    'move-token decoder use LossMoveTokenSoftPolicyMultiplier')
+        _bt6_refuse(float(config_opt.get('LossMoveTokenAuxMLPMultiplier', 0) or 0) > 0,
+                    'LossMoveTokenAuxMLPMultiplier needs the flat policy MLP, which a hybrid net does not build')
+        _bt6_refuse(bool(self.NetDef_MoveTokenTrunkMix) or float(config_opt.get('MidDecoderPolicyWeight', 0) or 0) > 0,
+                    'MoveTokenTrunkMix / MidDecoderPolicyWeight are not wired for the hybrid trunk')
+      else:
+        # --- the decoder is absent: every decoder-bound key is refused, not ignored
+        _mt_net = sorted(k for k in config_net_def if k.startswith('MoveToken'))
+        _bt6_refuse(bool(_mt_net), f'decoder-bound net keys {_mt_net} are set but there is no move-token decoder in this net; remove them')
+        _mt_opt = sorted(k for k in config_opt if ('MoveToken' in k) or k in ('LearningRateDecoderRatio', 'TrainOnlyActionHead'))
+        _mt_opt = [k for k in _mt_opt if config_opt.get(k) not in (None, 0, 0.0, False, '', [])]
+        _bt6_refuse(bool(_mt_opt), f'decoder-bound optimisation keys {_mt_opt} are set but there is no move-token decoder in this '
+                    'net (the decoder soft-policy, Plackett-Luce / value-order, minimax, q-regression, action and reply '
+                    'losses read decoder tokens). Use SoftPolicyWeight / SoftPolicyTemp for the BT6 soft-policy head.')
+        _bt6_refuse(str(getattr(self, 'Opt_MuonAdamWScope', '') or '') == 'all-non-trunk+decoder',
+                    "MuonAdamWScope 'all-non-trunk+decoder' needs a decoder; use 'all-non-trunk' or 'ffn-only'")
       # --- trunk options that assume ordinary encoder layers or a per-head 64x64 bias of ours
       _smolgen_on = int(self.NetDef_SmolgenDimPerSquare or 0) > 0 and int(config_net_def.get('SmolgenDim', 0) or 0) > 0
+      _bt6_native = self.NetDef_BT6NativeLayers
+      if _bt6_native:
+        # our own inner layers: the switches that rearrange or replace BT6Layer internals have nothing to act on
+        for _cond, _what in (
+            (self.NetDef_BT6SharedSmolgen, 'BT6NativeLayers: use NBTSharedSmolgen (our own block smolgen), not BT6SharedSmolgen'),
+            (self.NetDef_BT6FFNMultiplier != 1, 'BT6NativeLayers: the FFN is our own (FFNMultiplier); BT6FFNMultiplier must be 1'),
+            (self.NetDef_BT6CheckpointBlocks or self.NetDef_BT6ShareReadersPerBlock or self.NetDef_BT6StackReadsPerBlock,
+             'BT6NativeLayers: BT6CheckpointBlocks / BT6ShareReadersPerBlock / BT6StackReadsPerBlock are not wired'),
+            (_smolgen_on and not self.NetDef_NBTSharedSmolgen,
+             'BT6NativeLayers: per-layer smolgen is not supported in a term layer; use NBTSharedSmolgen'),
+            (bool(self.NetDef_UseQKNorm) or bool(self.NetDef_UseDiffAttention) or float(self.NetDef_SoftCapCutoff or 0) > 0
+             or bool(self.NetDef_NonLinearAttention) or not bool(self.NetDef_UseQKV),
+             'BT6NativeLayers: plain QKV attention only (no QK-norm, diff attention, soft cap, nonlinear attention)'),
+        ):
+          _bt6_refuse(_cond, _what)
       for _cond, _what in (
-          (_smolgen_on or self.NetDef_NBTSharedSmolgen, 'no smolgen (set SmolgenDimPerSquare 0 and SmolgenDim 0, NBTSharedSmolgen off)'),
+          ((_smolgen_on or self.NetDef_NBTSharedSmolgen) and not _bt6_native,
+           'no smolgen (set SmolgenDimPerSquare 0 and SmolgenDim 0, NBTSharedSmolgen off)'),
           (self.NetDef_UseRPE or self.NetDef_UseRoPE, 'no RPE / RoPE'),
           (self.NetDef_EGTEdgeStream, 'EGTEdgeStream must be off (BT6\'s own edge stream replaces it)'),
           (bool(self.NetDef_UsePieceRelationBias), 'UsePieceRelationBias must be off'),

@@ -145,7 +145,7 @@ class EncoderLayer(torch.nn.Module):
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
               edge_scales = None, edge_gate = None, v_first: torch.Tensor = None,
-              return_v: bool = False, return_branch: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+              return_v: bool = False, return_branch: bool = False, bt6_terms = None) -> Tuple[torch.Tensor, torch.Tensor]:
     # return_branch (NBTHyperConnInner, nbt_layer.py): return the layer's residual branch attn + ffn instead of x + branch,
     # so the caller can add it to its own residual streams. Pre-norm, alpha 1 only (the branch is then well defined:
     # y = x + attn(ln1 x) + ffn(ln2(x + attn(ln1 x)))); the FFN still reads x + attn exactly as in the plain layer.
@@ -155,9 +155,9 @@ class EncoderLayer(torch.nn.Module):
     # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
     if self.pre_norm:
       attn_input = self.ln1(x)
-      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v)
+      attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     else:
-      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v)
+      attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     v_out = None
     if return_v:
       attn_output, v_out = attn_output

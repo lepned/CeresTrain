@@ -149,11 +149,15 @@ class CeresNet(nn.Module):
       from bt6_hybrid import BT6Hybrid
       _bt6_soft_w = (float(getattr(config, 'Opt_SoftPolicyWeight', 0) or 0)
                      or float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0))
+      # with the move-token decoder (UseMoveTokens) the decoder owns the policy: no BT6 policy / soft-policy head
+      _bt6_pol = not bool(getattr(config, 'NetDef_UseMoveTokens', False))
       self.bt6h = BT6Hybrid(
         self.EMBEDDING_DIM, config.NetDef_NBTMidDim, config.NetDef_NBTInnerHeads, self.NUM_DISTINCT_LAYERS,
         config.NetDef_NBTInnerLayers, config.NetDef_BT6EdgeSites, policy_width=config.NetDef_BT6PolicyWidth,
+        policy_head=_bt6_pol, site_autocast=getattr(config, 'NetDef_BT6SiteDtype', 'float32') == 'autocast',
+        ffn_hidden=int(round(float(getattr(config, 'NetDef_BT6FFNMultiplier', 1) or 1) * config.NetDef_NBTMidDim)),
         # the soft-policy head exists only when its loss is on: an unused head would get no gradient (DDP)
-        soft_policy_width=config.NetDef_BT6SoftPolicyWidth if _bt6_soft_w > 0 else 0,
+        soft_policy_width=config.NetDef_BT6SoftPolicyWidth if (_bt6_soft_w > 0 and _bt6_pol) else 0,
         pair_channels=config.NetDef_BT6PairChannels, edge_channels=config.NetDef_BT6EdgeDim,
         site_hidden=config.NetDef_BT6SiteHidden, triplet_heads=config.NetDef_BT6TripletHeads,
         rev_edge=config.NetDef_BT6RevEdge, gate_cap=config.NetDef_BT6GateCap,
@@ -164,6 +168,8 @@ class CeresNet(nn.Module):
         embedding=config.NetDef_BT6Embedding, embedding_features=TOTAL_INPUT_FEATURES_PER_SQUARE,
         embedding_dense=config.NetDef_BT6EmbeddingDense, embedding_ffn_hidden=config.NetDef_BT6EmbeddingFFNHidden)
       self.bt6_checkpoint_blocks = bool(config.NetDef_BT6CheckpointBlocks)
+    # BT6NativeLayers: our own inner layers, BT6's term reads attached to the term positions (bt6_native_terms.py)
+    self.bt6_native = self.bt6h is not None and bool(getattr(config, 'NetDef_BT6NativeLayers', False))
     if self.bt6h is not None and self.bt6h.embed is not None:
       # BT6-form embedding (bt6h.embed) replaces the Linear + norm; they are not built (no unused parameters)
       self.embedding_layer = None
@@ -1551,7 +1557,7 @@ class CeresNet(nn.Module):
                                                 SMOLGEN_INTERMEDIATE_DIM // config.NetDef_SmolgenToHeadDivisor,
                                                 self.smolgenPrepLayer, config.NetDef_SmolgenActivationType,
                                                 config.NetDef_NormType, EPS, NUM_TOKENS_NET)
-      if self.bt6h is not None:
+      if self.bt6h is not None and not self.bt6_native:
         # BT6 hybrid: every inner layer is a bt6_net.BT6Layer (its own relation / pair / edge-read parameters)
         _make_inner = lambda j, i=0: self.bt6h.make_layer(j)
       else:
@@ -1575,7 +1581,17 @@ class CeresNet(nn.Module):
                                  reread=config.NetDef_NBTReRead)
            for i in range(self.NUM_DISTINCT_LAYERS)])
       self.nbt_carry = config.NetDef_NBTCarry
-      if self.bt6h is not None:
+      if self.bt6_native:
+        # our own encoder layers; the term positions get BT6's reader tensors on their attention (identity at init)
+        from bt6_native_terms import BT6NativeTerms
+        _bt6_lc = self.bt6h.layer_config
+        for _bt6_blk in self.transformer_layer:
+          for _j in self.bt6h.terms_inner_layers:
+            _att = _bt6_blk.inner[_j].attention
+            assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim, \
+                'BT6NativeLayers: inner attention heads / head width do not match the hybrid layer config'
+            _att.bt6t = BT6NativeTerms(_bt6_lc)
+      elif self.bt6h is not None:
         for _bt6_blk in self.transformer_layer:
           self.bt6h.finish_block(_bt6_blk)      # shared / stacked reader arrangement of the block (config levers)
         if config.NetDef_BT6SharedSmolgen:
@@ -1587,16 +1603,29 @@ class CeresNet(nn.Module):
                 f'{config.NetDef_BT6SmolgenPerSquareDim}/square -> {config.NetDef_BT6SharedSmolgenDim} -> {_nbt_heads} x '
                 f'{config.NetDef_BT6SmolgenHeadDim} -> shared zero-init prep -> [{_nbt_heads}, 64, 64]), bias added to the '
                 f'logits of the term-free inner layers; {_n_sg:,} params; identity at init')
-      if self.bt6h is not None:
+      if self.bt6_native:
+        _bc = self.bt6h.parameter_counts()
+        _n_terms = sum(p.numel() for n, p in self.transformer_layer.named_parameters() if '.bt6t.' in n)
+        print(f'[ceres_net] BT6 TERM READS ON OUR OWN LAYERS (BT6NativeLayers): {self.NUM_DISTINCT_LAYERS} blocks x {_k} '
+              f'encoder layers at {self.NBT_MID_DIM} ({_nbt_heads} heads); relation / pair / edge terms, door and '
+              f'post-softmax gate on inner positions {list(self.bt6h.terms_inner_layers)} ({_n_terms:,} reader params, '
+              f'identity at init); 34 relation channels, pair stream {config.NetDef_BT6PairChannels} ch, edge state '
+              f'{config.NetDef_BT6EdgeDim} ch, sites after blocks {list(self.bt6h.site_blocks)}; policy = '
+              + (f'BT6 attention head width {config.NetDef_BT6PolicyWidth}' if self.bt6h.policy is not None
+                 else 'the move-token decoder')
+              + '; ' + ', '.join(f'{k} {v:,}' for k, v in _bc.items() if v))
+      elif self.bt6h is not None:
         _bc = self.bt6h.parameter_counts()
         _n_inner = sum(p.numel() for blk in self.transformer_layer for l in blk.inner for p in l.parameters())
         print(f'[ceres_net] NBT-BT6 HYBRID: {self.NUM_DISTINCT_LAYERS} blocks x {_k} BT6 inner layers at {self.NBT_MID_DIM} '
               f'({_nbt_heads} heads x {self.NBT_MID_DIM // _nbt_heads}; LayerNorm eps {config.NetDef_BT6InnerNormEps}, QKVG + '
-              f'{config.NetDef_BT6OutputGateScale}*sigmoid output gate, sigmoid GLU hidden {self.NBT_MID_DIM}), '
+              f'{config.NetDef_BT6OutputGateScale}*sigmoid output gate, sigmoid GLU hidden {self.bt6h.layer_config.ffn_hidden}), '
               f'{_n_inner:,} inner-layer params; 34 relation channels from the record, pair stream '
               f'{config.NetDef_BT6PairChannels} ch, edge state {config.NetDef_BT6EdgeDim} ch, sites after blocks '
-              f'{list(self.bt6h.site_blocks)}; policy = BT6 attention head width {config.NetDef_BT6PolicyWidth} on the '
-              f'trunk-end state; embedding {config.NetDef_BT6Embedding}; relation / pair / edge terms in inner '
+              f'{list(self.bt6h.site_blocks)}; policy = '
+              + (f'BT6 attention head width {config.NetDef_BT6PolicyWidth} on the trunk-end state'
+                 if self.bt6h.policy is not None else 'the move-token decoder (no BT6 policy head)')
+              + f'; embedding {config.NetDef_BT6Embedding}; relation / pair / edge terms in inner '
               f'positions {list(self.bt6h.terms_inner_layers)} of each block (the others are plain QKVG layers)'
               f'{", readers shared per block" if self.bt6h.share_readers else ""}'
               f'{", pair tensors in the autocast dtype" if self.bt6h.layer_config.pair_autocast else ""}; checkpoint per block '
@@ -2382,7 +2411,20 @@ class CeresNet(nn.Module):
         _bt6_pd = torch.float32
       _bt6_E.prepare(_bt6_pd)     # the relation layout, built outside the (possibly checkpointed) blocks
       _bt6_rs = None
-      for i in range(self.NUM_DISTINCT_LAYERS):
+      for i in range(self.NUM_DISTINCT_LAYERS if self.bt6_native else 0):
+        # BT6NativeLayers: our own NBT block; its term layers read (E, e, [e | Z0]); a site after the block reads the
+        # logits of the block's last inner layer (nbt_layer._raw_logits: q.k / sqrt(hd) + the block's smolgen bias)
+        if _bt6_rs is None:
+          _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
+        if self.bt6h.is_site(i):
+          flow, _bt6_H = self.transformer_layer[i](flow, bt6=(_bt6_E, _bt6_e, _bt6_rs), want_logits=True)
+          _bt6_e = self.bt6h.site(i, _bt6_e, _bt6_H)
+          _bt6_rs = None
+        else:
+          flow = self.transformer_layer[i](flow, bt6=(_bt6_E, _bt6_e, _bt6_rs))
+        if _collect_states:
+          vda_states.append(flow)
+      for i in range(0 if self.bt6_native else self.NUM_DISTINCT_LAYERS):
         if _bt6_rs is None:
           # [e | Z0] in the assembly dtype, once per state version: shared by every layer that reads this state
           _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
@@ -2807,11 +2849,13 @@ class CeresNet(nn.Module):
     # policy head; training-only stash.
     _bt6_policy = None
     if self.bt6h is not None:
-      # BT6 attention policy head on the trunk-end state `flow` (+ the soft-policy read-out on the same embedding)
-      _bt6_policy, _bt6_soft = self.bt6h.policy_forward(flow, _bt6_E, _bt6_S,
-                                                        want_soft=self.soft_policy_weight > 0 and self.training)
-      if _bt6_soft is not None:
-        self._last_sp_out = _bt6_soft
+      if self.bt6h.policy is not None:
+        # BT6 attention policy head on the trunk-end state `flow` (+ the soft-policy read-out on the same embedding)
+        _bt6_policy, _bt6_soft = self.bt6h.policy_forward(flow, _bt6_E, _bt6_S,
+                                                          want_soft=self.soft_policy_weight > 0 and self.training)
+        if _bt6_soft is not None:
+          self._last_sp_out = _bt6_soft
+      # else: hybrid with the move-token decoder; the decoder branch below owns the policy
     elif self.soft_policy_weight > 0 and self.training:
       self._last_sp_out = self.sp_head(fS_policy)
 

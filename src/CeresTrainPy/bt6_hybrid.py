@@ -204,8 +204,12 @@ class BT6Hybrid(nn.Module):
                embedding: str = "linear",
                embedding_features: int = 137, embedding_dense: int = 512, embedding_ffn_hidden: int = 0,
                terms_inner_layers=None, share_readers: bool = False, stack_reads: bool = False,
-               pair_autocast: bool = False) -> None:
+               pair_autocast: bool = False, ffn_hidden: int = 0, policy_head: bool = True,
+               site_autocast: bool = False) -> None:
     super().__init__()
+    # ffn_hidden: GLU hidden width of the inner layers (0 = the inner width, as BT6; config BT6FFNMultiplier).
+    # policy_head False: the move-token decoder owns the policy (config UseMoveTokens); BT6's attention policy head
+    # and its soft-policy twin are not built.
     # Config levers (all off = BT6 inner layers): see config.py BT6TermsInnerLayers / BT6ShareReadersPerBlock /
     # BT6StackReadsPerBlock / BT6PairDtype.
     self.terms_inner_layers = (tuple(range(inner_layers)) if terms_inner_layers is None
@@ -220,16 +224,18 @@ class BT6Hybrid(nn.Module):
     assert edge_channels % triplet_heads == 0, "BT6EdgeDim must be divisible by BT6TripletHeads"
     # The layer config: a BT6Config whose d_model is the INNER width. `layers` is only used for bookkeeping here.
     self.layer_config = BT6Config(
-      d_model=mid_dim, layers=num_blocks * inner_layers, heads=heads, ffn_hidden=mid_dim, pair_channels=pair_channels,
+      d_model=mid_dim, layers=num_blocks * inner_layers, heads=heads, ffn_hidden=int(ffn_hidden) or mid_dim,
+      pair_channels=pair_channels,
       edge_channels=edge_channels, edge_sites=(), site_hidden=site_hidden, triplet_heads=triplet_heads,
       triplet_dots=edge_channels // triplet_heads, rev_edge=rev_edge, gate_cap=gate_cap,
       output_gate_scale=output_gate_scale, policy_width=policy_width, norm_eps=inner_norm_eps, error_head=False,
-      assembly_autocast=assembly_autocast, pair_autocast=pair_autocast)
+      assembly_autocast=assembly_autocast, pair_autocast=pair_autocast, site_autocast=site_autocast)
     cfg = self.layer_config
     self.relations = BT6Relations()
     self.prologue = BT6Prologue(cfg)
     self.sites = nn.ModuleDict({str(block): BT6EdgeSite(cfg) for block in self.site_blocks})
-    self.policy = BT6PolicyHead(cfg, trunk_width=model_dim)
+    assert policy_head or soft_policy_width == 0, "the BT6 soft-policy head reads the BT6 policy embedding"
+    self.policy = BT6PolicyHead(cfg, trunk_width=model_dim) if policy_head else None
     self.soft_policy = BT6AuxPolicyHead(policy_width, soft_policy_width, pair_channels) if soft_policy_width > 0 else None
     self.embed = None
     if embedding == "bt6":
@@ -294,6 +300,7 @@ class BT6Hybrid(nn.Module):
 
   def policy_forward(self, flow, E, S, want_soft: bool):
     """Trunk-end state [B, 64, ModelDim] -> (policy logits [B, 1858] float32, soft-policy logits or None)."""
+    assert self.policy is not None, "no BT6 policy head in this net (the move-token decoder owns the policy)"
     embedded = self.policy.embed(flow)
     policy = self.policy(flow, E, S, self.prologue, embedded=embedded)
     soft = self.soft_policy(embedded, E, S, self.prologue) if (want_soft and self.soft_policy is not None) else None
@@ -324,6 +331,12 @@ def export_served_hybrid(net) -> dict:
   from bt6_net import BT6Net  # the per-part folds are BT6Net.export_served's; a shell BT6Net carries the parts
 
   hybrid = net.bt6h
+  if getattr(net, 'bt6_native', False):
+    raise NotImplementedError('export_served_hybrid: BT6NativeLayers (term reads on our own encoder layers) has no '
+                              'kernel-builder carrier yet; serve it through the ONNX export')
+  if hybrid.policy is None:
+    raise NotImplementedError('export_served_hybrid: the hybrid with the move-token decoder (UseMoveTokens) has no '
+                              'kernel-builder carrier yet; serve it through the ONNX export')
   cfg = hybrid.layer_config
   blocks = list(net.transformer_layer)
   K = len(blocks[0].inner)

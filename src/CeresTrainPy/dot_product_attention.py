@@ -720,6 +720,9 @@ class DotProductAttention(torch.nn.Module):
         base = h * per_head
         for j in range(self.qkv_multiplier - 1):  # every Q and K chunk, never V
           w[base + j * dkm: base + (j + 1) * dkm].mul_(s[h])
+      if getattr(self, 'bt6t', None) is not None:
+        # BT6 term reads (bt6_native_terms.py): the q/k-dependent relation terms shrink with the head's Q / K
+        self.bt6t.scale_heads(s)
     return clipped
 
   # Function to cap logit scores (as used in the grok and gemma models).
@@ -1004,7 +1007,10 @@ class DotProductAttention(torch.nn.Module):
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False, vis_edge: torch.Tensor = None,
-              edge_scales = None, edge_gate = None, v_first: torch.Tensor = None, return_v: bool = False) -> torch.Tensor:
+              edge_scales = None, edge_gate = None, v_first: torch.Tensor = None, return_v: bool = False,
+              bt6_terms = None) -> torch.Tensor:
+    # bt6_terms (config BT6NativeLayers; bt6_native_terms.py): (RelationContext, edge state, read state) for a layer
+    # that carries BT6's term reads (self.bt6t); None for every other layer.
     batch_size = query.size(0)
 
     qkv_x = query    
@@ -1189,7 +1195,22 @@ class DotProductAttention(torch.nn.Module):
         self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
       Q, K = self._head_mix_qk(Q, K)
 
-    if self.use_smolgen:
+    if bt6_terms is not None:
+      # BT6 term reads on this layer's own Q / K (bt6_native_terms.py): relation terms, pair-stream and edge read,
+      # door, post-softmax gate. `piece_relation_bias` (the block's shared smolgen, ...) joins L before the door.
+      # The options below reshape the score path in ways the term assembly does not model: refused, not ignored.
+      assert (self.use_qkv and not self.use_smolgen and not self.use_rpe and not self.use_rope
+              and not self.use_diff_attention and self.head_mix is None and self.softcap_cutoff == 0
+              and not self.use_head_logit_temp and self.softmin_heads == 0 and self.softmax_agg_heads == 0
+              and edge_scales is None and edge_gate is None and _graph_route is None and not self.value_residual
+              and not isinstance(Q, tuple)), 'BT6NativeLayers: plain QKV attention only in a term layer'
+      H_cat, _bt6_H = self.bt6t.attend(Q, K, V, piece_relation_bias, bt6_terms[0], bt6_terms[1], bt6_terms[2])
+      if self.training and getattr(self, 'qk_clip_monitor', False):
+        # QK-clip monitor: the logits that enter the softmax (post-door), as BT6Layer stashes them
+        _mx = _bt6_H.detach().amax(dim=(0, 2, 3)).float()
+        _prev = getattr(self, '_last_max_logit', None)
+        self._last_max_logit = _mx if _prev is None else torch.maximum(_mx, _prev)
+    elif self.use_smolgen:
       smolgen = self.calc_smolgen(x)
       if self.use_diff_attention:
         if getattr(self, 'diff_smolref', False):

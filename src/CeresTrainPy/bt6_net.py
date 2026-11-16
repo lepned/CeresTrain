@@ -76,6 +76,7 @@ class BT6Config:
   triplet_dots: int = 4                  # triplet_heads * triplet_dots == edge_channels
   triplet_contraction: str = "path"      # "path" or "ag"
   rev_edge: bool = True                  # the edge FFN also reads the reverse edge n[j, i]
+  site_autocast: bool = False            # training lever (BT6SiteDtype 'autocast'): site GEMMs in the autocast dtype
   gate_cap: bool = False                 # min(2 sigmoid(.), 1) on the post-softmax gate
   # Under autocast, run the logit ASSEMBLY (q.k, relation / pair terms, edge read, door product) in the autocast
   # dtype; softmax, gates and rms stay float32. False = float32 assembly. No effect without autocast.
@@ -969,6 +970,55 @@ class BT6EdgeSite(nn.Module):
     self.ffn_out = nn.Parameter(torch.zeros(states, hidden))                          # W2, zero init
 
   def forward(self, e: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    """The same function as `forward_reference` (the literal einsum form, BT6_SPEC), arranged for speed (2026-11-16):
+    the site works channels-LAST ([B, 64, 64, C]: every channel map is one dense GEMM on contiguous rows and every
+    rms reduces over the contiguous last axis); the value and gate maps of the triplet branch are ONE GEMM; the edge
+    FFN's forward and reverse-edge maps are ONE GEMM on [n | n^T] (one hidden tensor instead of three). Float32
+    throughout, as before; e in / out stays [B, C, 64, 64] (what the layers' stacked read contracts)."""
+    cfg = self.cfg
+    # cd: the dtype of the channel maps and contractions. float32 (the whole site float32, as served), or -- lever
+    # cfg.site_autocast, under autocast -- the compute dtype of the logits it reads (bf16: "BF16 compute with f32
+    # softmax / gates / rms", as BT6 is trained). The state, every rms, softmax and sigmoid stay float32 either way.
+    cd = H.dtype if (cfg.site_autocast and H.dtype in (torch.bfloat16, torch.float16)) else e.float().dtype
+    with _fp32(e):
+      x = e.float().permute(0, 2, 3, 1)                                      # [B, 64, 64, S]
+      e_hat = x + F.linear(H.to(cd).permute(0, 2, 3, 1), self.readback.to(cd)).float()
+      if cfg.triplet:
+        e_hat = e_hat + self._triplet_last(e_hat, cd)
+      n = rms(e_hat, -1, cfg.rms_eps).to(cd)
+      if cfg.rev_edge:
+        hidden = F.linear(torch.cat((n, n.transpose(1, 2)), dim=-1),
+                          torch.cat((self.ffn_in.to(cd), self.ffn_rev.to(cd)), dim=1), self.ffn_in_bias.to(cd))
+      else:
+        hidden = F.linear(n, self.ffn_in.to(cd), self.ffn_in_bias.to(cd))
+      out = rms(e_hat + F.linear(torch.relu(hidden), self.ffn_out.to(cd)).float(), -1, cfg.rms_eps)
+      return out.permute(0, 3, 1, 2).contiguous()
+
+  def _triplet_last(self, e_hat: torch.Tensor, cd=torch.float32) -> torch.Tensor:
+    """`_triplet` on a channels-last state [B, 64, 64, S]; returns W_o (va_in | va_out) channels-last, float32.
+    `cd`: dtype of the channel maps and the contractions (see forward); rms, softmax and sigmoid are float32."""
+    cfg = self.cfg
+    batch, states, heads, dots = e_hat.shape[0], cfg.edge_channels, cfg.triplet_heads, cfg.triplet_dots
+    n = rms(e_hat, -1, cfg.rms_eps).to(cd)
+    bias = torch.cat((self.triplet_gate_bias.new_zeros(2 * states), self.triplet_gate_bias)).to(cd)
+    veg = F.linear(n, torch.cat((self.triplet_value.to(cd), self.triplet_gate.to(cd)), dim=0), bias)
+    veg = veg.permute(0, 3, 1, 2)                                            # [B, 2S + 4 heads, 64, 64] (a view)
+    v_in = veg[:, :states].reshape(batch, heads, dots, 64, 64)               # channel = direction * S + head * dots + dot
+    v_out = veg[:, states:2 * states].reshape(batch, heads, dots, 64, 64)
+    e_in, g_in, e_out, g_out = veg[:, 2 * states:].float().split(heads, dim=1)   # each [B, heads, 64, 64], float32
+    a_in = (torch.softmax(e_in, dim=-1) * torch.sigmoid(g_in)).to(cd)[:, :, None]   # a_in[h, i, k]: softmax over the last axis
+    a_out = (torch.softmax(e_out, dim=-2) * torch.sigmoid(g_out)).to(cd)[:, :, None]  # a_out[h, k, i]: softmax over the ROW axis
+    if cfg.triplet_contraction == "path":
+      va_in = torch.matmul(a_in, v_in)                                       # sum_k a_in[i, k] v_in[d, k, j]
+      va_out = torch.matmul(v_out, a_out).transpose(-1, -2)                  # sum_k a_out[k, i] v_out[d, j, k]
+    else:  # "ag"
+      va_in = torch.matmul(a_in, v_in.transpose(-1, -2))                     # sum_k a_in[i, k] v_in[d, j, k]
+      va_out = torch.matmul(a_out.transpose(-1, -2), v_out)                  # sum_k a_out[k, i] v_out[d, k, j]
+    va = torch.cat((va_in.reshape(batch, states, 64, 64), va_out.reshape(batch, states, 64, 64)), dim=1)
+    return F.linear(va.permute(0, 2, 3, 1), self.triplet_out.to(cd)).float()
+
+  def forward_reference(self, e: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    """The literal einsum form (BT6_SPEC, term by term): the reference `forward` is tested against."""
     cfg = self.cfg
     with _fp32(e):                                                           # the whole site is float32
       e, H = e.float(), H.float()

@@ -408,7 +408,8 @@ def test_autocast():
 # --------------------------------------------------------------------------- 6. config refusals
 def test_config_refusals():
   cases = [
-    ({'UseMoveTokens': True}, {}, 'MoveTokens'),
+    # the decoder is allowed since 2026-11-16 (test_bt6_hybrid_decoder.py); with it the BT6 soft-policy head is refused
+    ({'UseMoveTokens': True}, {}, 'SoftPolicyWeight'),
     ({'MoveTokenDim': 96}, {}, 'MoveToken'),
     ({}, {'LossMoveTokenSoftPolicyMultiplier': 0.5}, 'MoveToken'),
     ({}, {'LossMoveTokenValueOrderMultiplier': 0.5}, 'MoveToken'),

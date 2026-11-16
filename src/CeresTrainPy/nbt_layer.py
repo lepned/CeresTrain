@@ -292,7 +292,10 @@ class NestedBottleneckLayer(torch.nn.Module):
               vis_edge: torch.Tensor = None,
               edge_scales = None, want_logits: bool = False, edge_gates = None, token_idx: torch.Tensor = None,
               token_fill: torch.Tensor = None, num_registers: int = 0, v_first: torch.Tensor = None,
-              want_v_first: bool = False, return_branch: bool = False, hc_inner_res=None, carry_in: torch.Tensor = None):
+              want_v_first: bool = False, return_branch: bool = False, hc_inner_res=None, carry_in: torch.Tensor = None,
+              bt6=None):
+    # bt6 (config BT6NativeLayers): (RelationContext, edge state, read state) handed to the inner layers that carry
+    # BT6's term reads (layer.attention.bt6t, bt6_native_terms.py); the other inner layers are untouched.
     # rpe_src is the full-width post-embedding state; the inner attentions project it with
     # their own d_mid-wide qkv, so it cannot be passed through (ceres_net rejects the
     # combination). piece_relation_bias is per head and width-independent: every inner
@@ -357,6 +360,8 @@ class NestedBottleneckLayer(torch.nn.Module):
       if want_v_first and j == 0:
         h, v_first = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
                            edge_scales=edge_scales, edge_gate=_eg, return_v=True, return_branch=hc is not None)
+      elif bt6 is not None and getattr(layer.attention, 'bt6t', None) is not None:
+        h = layer(h, piece_relation_bias=piece_relation_bias, bt6_terms=bt6)
       else:
         h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
                   edge_scales=edge_scales, edge_gate=_eg, v_first=v_first, return_branch=hc is not None)
