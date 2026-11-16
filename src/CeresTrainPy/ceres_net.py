@@ -160,6 +160,7 @@ class CeresNet(nn.Module):
         soft_policy_width=config.NetDef_BT6SoftPolicyWidth if (_bt6_soft_w > 0 and _bt6_pol) else 0,
         pair_channels=config.NetDef_BT6PairChannels, edge_channels=config.NetDef_BT6EdgeDim,
         site_hidden=config.NetDef_BT6SiteHidden, triplet_heads=config.NetDef_BT6TripletHeads,
+        triplet=bool(getattr(config, 'NetDef_BT6Triplet', True)),
         rev_edge=config.NetDef_BT6RevEdge, gate_cap=config.NetDef_BT6GateCap,
         output_gate_scale=config.NetDef_BT6OutputGateScale, inner_norm_eps=config.NetDef_BT6InnerNormEps,
         assembly_autocast=config.NetDef_BT6LogitAssembly == 'autocast',

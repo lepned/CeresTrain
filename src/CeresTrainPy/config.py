@@ -1581,6 +1581,9 @@ class Configuration:
     self.NetDef_BT6PairChannels = int(config_net_def.get('BT6PairChannels', 16) or 16)
     self.NetDef_BT6SiteHidden = int(config_net_def.get('BT6SiteHidden', 64) or 64)
     self.NetDef_BT6TripletHeads = int(config_net_def.get('BT6TripletHeads', 4) or 4)
+    # BT6Triplet (2026-11-16): false builds the edge sites WITHOUT the triplet branch (readback + edge FFN only).
+    # Knockout of the nt arm @100M: the triplet was the least used part of the sites. Default true (as BT6).
+    self.NetDef_BT6Triplet = bool(config_net_def.get('BT6Triplet', True))
     self.NetDef_BT6RevEdge = bool(config_net_def.get('BT6RevEdge', True))
     self.NetDef_BT6GateCap = bool(config_net_def.get('BT6GateCap', False))
     self.NetDef_BT6OutputGateScale = float(config_net_def.get('BT6OutputGateScale', 2.0))

@@ -200,6 +200,7 @@ class BT6Hybrid(nn.Module):
   def __init__(self, model_dim: int, mid_dim: int, heads: int, num_blocks: int, inner_layers: int, sites,
                policy_width: int = 1024, soft_policy_width: int = 0, pair_channels: int = 16, edge_channels: int = 16,
                site_hidden: int = 64, triplet_heads: int = 4, rev_edge: bool = True, gate_cap: bool = False,
+               triplet: bool = True,
                output_gate_scale: float = 2.0, inner_norm_eps: float = 1e-3, assembly_autocast: bool = True,
                embedding: str = "linear",
                embedding_features: int = 137, embedding_dense: int = 512, embedding_ffn_hidden: int = 0,
@@ -226,7 +227,8 @@ class BT6Hybrid(nn.Module):
     self.layer_config = BT6Config(
       d_model=mid_dim, layers=num_blocks * inner_layers, heads=heads, ffn_hidden=int(ffn_hidden) or mid_dim,
       pair_channels=pair_channels,
-      edge_channels=edge_channels, edge_sites=(), site_hidden=site_hidden, triplet_heads=triplet_heads,
+      edge_channels=edge_channels, edge_sites=(), site_hidden=site_hidden, triplet=bool(triplet),
+      triplet_heads=triplet_heads,
       triplet_dots=edge_channels // triplet_heads, rev_edge=rev_edge, gate_cap=gate_cap,
       output_gate_scale=output_gate_scale, policy_width=policy_width, norm_eps=inner_norm_eps, error_head=False,
       assembly_autocast=assembly_autocast, pair_autocast=pair_autocast, site_autocast=site_autocast)
