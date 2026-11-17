@@ -2058,6 +2058,10 @@ class CeresNet(nn.Module):
         raise ValueError('MoveTokenValueQuery with MoveTokenValueInject off is a silent no-op (the query feeds only the value inject)')
       if _mt_vpool != 'meanmax' and not _mt_vi:
         raise ValueError('MoveTokenValuePool != meanmax with MoveTokenValueInject off is a silent no-op (the pool feeds only the value inject)')
+      # edge input (MoveTokenEdgeInput): the EGT edge state, or the NBT-BT6 hybrid's (BT6EdgeDim channels)
+      _mt_edge_dim = 0
+      if config.NetDef_MoveTokenEdgeInput:
+        _mt_edge_dim = (config.NetDef_BT6EdgeDim if getattr(config, 'NetDef_BT6Hybrid', False) else config.NetDef_EGTEdgeDim)
       self.move_tokens = MoveTokenDecoder(
           s_dim=self.EMBEDDING_DIM, norm_type=config.NetDef_NormType,
           dm=int(getattr(config, 'NetDef_MoveTokenDim', 160) or 160),
@@ -2073,7 +2077,7 @@ class CeresNet(nn.Module):
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
           expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel,
           minimax=self.mt_minimax, action_head=self.mt_action, reply_sup=self.mt_reply,
-          edge_dim=config.NetDef_EGTEdgeDim if config.NetDef_MoveTokenEdgeInput else 0)
+          edge_dim=_mt_edge_dim)
       if _mt_ev:
         # ev [B] -> WDL logits through a zero-init 3-vector: exact step-0 no-op; the value
         # target then teaches both the direction and (through w_ev) the per-token scalars.
@@ -2085,7 +2089,7 @@ class CeresNet(nn.Module):
             f'(MLP policy head bypassed; its params stay in the ckpt, unused); '
             f'value inject {"on" if _mt_vi else "off"}; per-move bias {"on" if _mt_pb else "OFF (frozen zero)"}; '
             f'rich features {"ON (+17)" if _mt_rich else "off"}; '
-            f'edge input {("ON (d_e=" + str(config.NetDef_EGTEdgeDim) + ")") if config.NetDef_MoveTokenEdgeInput else "off"}; value pool {_mt_vpool}'
+            f'edge input {("ON (d_e=" + str(_mt_edge_dim) + ")") if config.NetDef_MoveTokenEdgeInput else "off"}; value pool {_mt_vpool}'
             f'{"" if _mt_vpool == "meanmax" else (" (detached)" if _mt_vpd else " (NOT detached)")}; '
             f'aux MLP policy CE {self.mt_aux_mlp_w}; post-move attn {("ON blocks %s" % sorted(self.move_tokens.pm_blocks)) if _mt_pm else "off"}; '
             f'value query {"ON" if _mt_vq else "off"}; '
@@ -2395,7 +2399,7 @@ class CeresNet(nn.Module):
       _egt_E = (vis_edge_E if (vis_edge_E is not None and self.vis_channels_module.families == self.egt_vis_module.families)
                 else self.egt_vis_module(squares[:, :, 0:13]))
       _egt_e = self.egt.init_state(_egt_E.to(flow.dtype))   # [B, 64, 64, d_e]
-    _bt6_E = _bt6_S = None
+    _bt6_E = _bt6_S = _bt6_e = None
     if self.bt6h is not None:
       # NBT-BT6 hybrid trunk (bt6_hybrid.py). E: 34 relation channels of the record (float32, no gradient); S: pair
       # normaliser; e: edge state, replaced at the sites. Each block runs its BT6 inner layers and, when a site
@@ -2591,7 +2595,10 @@ class CeresNet(nn.Module):
     if getattr(self, 'use_move_tokens', False):
       _mt_out = self.move_tokens(squares[:, :, 0:13].to(flow.dtype), flow,
                                  mix_states=[vda_states[k] for k in self.mt_mix_layers] if self.mt_mix_layers else None,
-                                 edge=_egt_e if self.move_tokens.w_edge is not None else None)
+                                 # EGT state [B, 64, 64, d_e], or the hybrid's BT6 edge state [B, d_e, 64, 64] (after
+                                 # its last site) turned channels-last: row = from-square, column = to-square
+                                 edge=((_egt_e if _egt_e is not None else _bt6_e.permute(0, 2, 3, 1))
+                                       if self.move_tokens.w_edge is not None else None))
       if _mt_out[5] is not None:
         flow = flow + _mt_out[5].to(flow.dtype)
     if self.use_gtab:

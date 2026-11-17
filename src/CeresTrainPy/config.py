@@ -1356,8 +1356,10 @@ class Configuration:
       raise ValueError(f"EGTEdgeGateScope {self.NetDef_EGTEdgeGateScope!r} without EGTEdgeGates would be a silent no-op")
     # Move-token decoder reads the final EGT edge state of each token's (from, to) pair (2026-10-08)
     self.NetDef_MoveTokenEdgeInput = bool(config_net_def.get('MoveTokenEdgeInput', False))
-    if self.NetDef_MoveTokenEdgeInput and not (self.NetDef_EGTEdgeStream and self.NetDef_UseMoveTokens):
-      raise ValueError('MoveTokenEdgeInput requires EGTEdgeStream and the move-token decoder')
+    # 2026-11-17: also with the NBT-BT6 hybrid's edge state (BT6Hybrid; the state after the last BT6 edge site).
+    if self.NetDef_MoveTokenEdgeInput and not ((self.NetDef_EGTEdgeStream or bool(config_net_def.get('BT6Hybrid', False)))
+                                               and self.NetDef_UseMoveTokens):
+      raise ValueError('MoveTokenEdgeInput requires an edge stream (EGTEdgeStream or BT6Hybrid) and the move-token decoder')
     if not self.NetDef_EGTEdgeStream and self.NetDef_EGTEdgeGates:
       raise ValueError('EGTEdgeGates requires EGTEdgeStream (the gates read the edge stream; would be a silent no-op)')
     if self.NetDef_EGTEdgeStream:

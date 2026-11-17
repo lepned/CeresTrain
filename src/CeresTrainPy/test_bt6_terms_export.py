@@ -8,6 +8,9 @@ Small nets, CPU, every zero-initialised table made non-trivial.
       inject from the served tensors moves the outputs by far more than the agreement
   (d) carrier round trip: bt6_carrier.write_carrier / read_carrier returns the same names, shapes, dtypes and bytes
   (e) the decoder's tokens: tokens_from_squares gives the trainer's own selection (valid tokens = candidates)
+  (f) variant nt with edge sites WITHOUT the triplet branch (BT6Triplet false): no triplet tensor in the export
+  (g) (f) plus MoveTokenEdgeInput (the decoder's tokens read the final BT6 edge state through w_edge, made live):
+      /mt/w_edge/w is exported, and dropping it moves the outputs
 
   python test_bt6_terms_export.py
 """
@@ -63,13 +66,16 @@ def served(net, sq, mutate=None):
   return out, tensors, tokens
 
 
-def check_variant(tag, net_over, opt_over):
+def check_variant(tag, net_over, opt_over, triplet=True, edge_input=False):
   net = build(net_over, opt_over)
   dead = live(net)
   assert not dead, f'{tag}: tensors still zero after live(): {dead}'
+  assert bool(net.bt6h.layer_config.triplet) == triplet and (net.move_tokens.w_edge is not None) == edge_input
   sq = records(12)
   policy, value, value2 = run(net, sq)
   out, tensors, tokens = served(net, sq)
+  assert any('/triplet/' in name for name in tensors) == triplet, f'{tag}: triplet tensors in the export'
+  assert ('/mt/w_edge/w' in tensors) == edge_input, f'{tag}: /mt/w_edge/w in the export'
   present = policy > -15.0
   d_pol = float((out['policy'] - policy).abs().max())
   d_val = float((out['value'] - value).abs().max())
@@ -98,8 +104,11 @@ def check_variant(tag, net_over, opt_over):
     for name in t:
       if '/edge_site/readback' in name:
         t[name] = torch.zeros_like(t[name])
+  def drop_edge_input(t):
+    t['/mt/w_edge/w'] = torch.zeros_like(t['/mt/w_edge/w'])
   controls = {}
-  for name, mutate in (('tables', drop_tables), ('smolgen', drop_smolgen), ('inject', drop_inject), ('sites', drop_sites)):
+  for name, mutate in (('tables', drop_tables), ('smolgen', drop_smolgen), ('inject', drop_inject), ('sites', drop_sites),
+                       *((('edge input', drop_edge_input),) if edge_input else ())):
     c, _, _ = served(net, sq, mutate)
     controls[name] = max(float((c['value'] - value).abs().max()), float((c['policy'] - policy)[present].abs().max()))
     assert controls[name] > 5 * max(d_pol, d_val), (tag, name, controls[name], d_pol, d_val)
@@ -133,5 +142,9 @@ def test_refused():
 if __name__ == '__main__':
   check_variant('(a) variant bt', NET_DEC, OPT_DEC)
   check_variant('(b) variant nt', {**NATIVE, **DECODER}, OPT_DEC)
+  check_variant('(f) variant nt, no triplet', {**NATIVE, **DECODER, 'BT6Triplet': False}, OPT_DEC, triplet=False)
+  check_variant('(g) variant nt, no triplet, edge input',
+                {**NATIVE, **DECODER, 'BT6Triplet': False, 'MoveTokenEdgeInput': True}, OPT_DEC,
+                triplet=False, edge_input=True)
   test_refused()
   print('test_bt6_terms_export: OK')

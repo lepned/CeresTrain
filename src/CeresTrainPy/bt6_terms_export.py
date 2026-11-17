@@ -37,6 +37,8 @@ NAME PLAN (dense weights [in, out] FP16; relation / edge tables FP32, as the hyb
   /head/premap/{w,b}, /head/shared/{w,b}, /head/{value,value2,unc}/{fc,out}/{w,b}    (value2/fc/w is [F + 2, hidden]:
                          the last two rows are the two blunder inputs)
   /const/one [1]                              1.0: the residual scale of the skip GEMMs
+  no-triplet sites (BT6Triplet false)         /encoder{i}/edge_site/ has readback and ffn tensors only (no triplet/*)
+  /mt/w_edge/w [d_e, dm] FP32                 only with MoveTokenEdgeInput: token input += rms(e_final[from, to]) @ w
   /mt/...                                     the move-token decoder, exactly the names, shapes and folds of the
                          kernel builder's Ceres front end (lczero_triton/ceres/_names.py plan_decoder_buffers,
                          carrier.py decoder_tensors_from_state_dict): w_in split into its from | to square blocks,
@@ -208,14 +210,15 @@ def export_served_terms(net) -> dict:
           put(f"{g}/door/w", terms.Wm, np.float32)
           put(f"{g}/gate/w", terms.Wg, np.float32)
           put(f"{g}/gate/b", terms.bg, np.float32)
-    assert cfg.triplet and cfg.rev_edge, "the edge-site export expects the triplet and the reverse edge"
+    assert cfg.rev_edge, "the edge-site export expects the reverse edge"
     for b in hybrid.site_blocks:
       site, s = hybrid.sites[str(b)], f"/encoder{b * K + K - 1}/edge_site"
       put(f"{s}/readback/w", site.readback, np.float32)
-      put(f"{s}/triplet/value/w", site.triplet_value, np.float32)
-      put(f"{s}/triplet/gate/w", site.triplet_gate, np.float32)
-      put(f"{s}/triplet/gate/b", site.triplet_gate_bias, np.float32)
-      put(f"{s}/triplet/out/w", site.triplet_out, np.float32)
+      if cfg.triplet:                          # BT6Triplet false: the site has no triplet branch and no such tensors
+        put(f"{s}/triplet/value/w", site.triplet_value, np.float32)
+        put(f"{s}/triplet/gate/w", site.triplet_gate, np.float32)
+        put(f"{s}/triplet/gate/b", site.triplet_gate_bias, np.float32)
+        put(f"{s}/triplet/out/w", site.triplet_out, np.float32)
       put(f"{s}/ffn/dense1/w", site.ffn_in, np.float32)
       put(f"{s}/ffn/dense1/b", site.ffn_in_bias, np.float32)
       put(f"{s}/ffn/dense1_rev/w", site.ffn_rev, np.float32)
@@ -235,7 +238,7 @@ def export_served_terms(net) -> dict:
   for flag in ("rich_features", "value_query", "write_back", "square_update", "rel_bias", "minimax", "action_head",
                "opp_pool", "expected_value", "reply_sup"):
     assert not getattr(mt, flag, False), f"export_served_terms: MoveToken option {flag} is not exported"
-  assert mt.M_opp == 0 and mt.trunk_mix == 0 and mt.w_edge is None and mt.post_move and mt.value_pool == "meanmax"
+  assert mt.M_opp == 0 and mt.trunk_mix == 0 and mt.post_move and mt.value_pool == "meanmax"
   d = net.embedding_layer.out_features
   dm = mt.w_in.out_features
   w_in = f64(mt.w_in.weight)
@@ -243,6 +246,10 @@ def export_served_terms(net) -> dict:
   put(f"{MT}/w_in/squares/w", torch.cat((w_in[:, :d].T, w_in[:, d:2 * d].T), dim=1))
   put(f"{MT}/w_in/rest/w", w_in[:, 2 * d:].T)
   put(f"{MT}/w_in/b", mt.w_in.bias)
+  if mt.w_edge is not None:
+    # MoveTokenEdgeInput: each token adds rms(e_final[:, from, to]) @ w_edge to its input embedding (FP32 table)
+    assert tuple(mt.w_edge.shape) == (cfg.edge_channels, dm), f"move_tokens.w_edge is {tuple(mt.w_edge.shape)}"
+    put(f"{MT}/w_edge/w", mt.w_edge, np.float32)
   put(f"{MT}/kv/norm/scale", torch.ones(d))
   cross, post = [], []
   for index, blk in enumerate(mt.blocks):
@@ -360,10 +367,12 @@ def served_native_layer(t: dict, index: int, x, E, S, e, cfg: BT6Config, bias, t
   return x, H
 
 
-def served_decoder(t: dict, x, tokens: torch.Tensor, meta: dict):
+def served_decoder(t: dict, x, tokens: torch.Tensor, meta: dict, edge=None):
   """The move-token decoder from /mt/... (the builder's ceres/network.py `_decoder`): trunk state after the trunk norm
   [B, 64, D] and the tokens uint8 [B, M, 4] -> (token logits [B, M, 4] incl. the per-move bias, -30 on invalid tokens;
-  pooled [B, 2 dm])."""
+  pooled [B, 2 dm]). `edge` [B, d_e, 64, 64] (row = from, column = to): the BT6 edge state after the last site, read
+  when the carrier has /mt/w_edge/w (MoveTokenEdgeInput; kernel `mt_edge_input`). A padding token reads the pair
+  (0, 0); it is masked everywhere downstream, as its whole embedding is."""
   B, M = tokens.shape[0], tokens.shape[1]
   layers, heads = meta["mt_layers"], meta["mt_heads"]
   tok = tokens.long()
@@ -375,6 +384,11 @@ def served_decoder(t: dict, x, tokens: torch.Tensor, meta: dict):
   P = x @ t[f"{MT}/w_in/squares/w"]                                           # [B, 64, 2 dm]
   take = lambda src, idx: torch.gather(src, 1, idx.unsqueeze(-1).expand(-1, -1, src.shape[-1]))
   h = take(P[..., :dm], fr) + take(P[..., dm:], to) + bits @ t[f"{MT}/w_in/rest/w"] + t[f"{MT}/w_in/b"]
+  if f"{MT}/w_edge/w" in t:
+    assert edge is not None, "the carrier has /mt/w_edge/w: the decoder needs the final edge state"
+    e_tok = take(edge.float().flatten(2).transpose(1, 2), fr * 64 + to)        # [B, M, d_e]
+    e_tok = e_tok * torch.rsqrt(e_tok.pow(2).mean(-1, keepdim=True) + 1e-6)
+    h = h + e_tok @ t[f"{MT}/w_edge/w"]
   n = _rms_norm(x, t[f"{MT}/kv/norm/scale"])
   KV = n @ t[f"{MT}/kv/w"]                                                    # [B, 64, 4 L dm]
   key_bias = (~valid).to(x.dtype).view(B, 1, 1, M) * -1e4
@@ -491,7 +505,7 @@ def forward_served_terms(t: dict, squares: torch.Tensor, meta: dict, tokens: tor
       e = keep(f"state{b}", served_site(t, b * K + K - 1, e, H, cfg))
   x = keep("trunk_norm", _rms_norm(x, t["/trunk/final_norm/scale"], eps))
 
-  token_logits, pooled = served_decoder(t, x, tokens, meta)
+  token_logits, pooled = served_decoder(t, x, tokens, meta, edge=e)
   keep("mt_pooled", pooled)
   out = {"policy_tokens": token_logits,
          "policy": policy_from_tokens(t, token_logits, tokens, meta["mv_pair_slot"])}
