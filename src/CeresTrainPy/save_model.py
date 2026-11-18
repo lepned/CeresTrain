@@ -488,6 +488,23 @@ def save_model(NAME : str,
                       f'fp32 islands; a strongly-typed build of this file runs the norms in fp16', flush=True)
             else:
               print('INFO: ONNX_FP32_ISLANDS none (every layer fp16 in a strongly-typed build)')
+            # TRT-11 GATE FIX (2026-11-18, trt_gate_fix.py): TensorRT 11.3 fuses Softmax -> Mul(gate) -> MatMul(V)
+            # of the gated BT6 term-read attentions into one kernel and computes it wrong; rewritten to the same
+            # math as s * (softmax(H + log g) @ V). Only graphs with that pattern change. Env
+            # CERES_EXPORT_TRT_GATE_FIX=0 switches it off (e.g. for an A/B export).
+            if os.environ.get('CERES_EXPORT_TRT_GATE_FIX', '1') != '0':
+              from trt_gate_fix import apply_gate_fix
+              import copy as _copy
+              _m_try = _copy.deepcopy(onnx_model_16)
+              try:
+                _ngf = apply_gate_fix(_m_try)
+                if _ngf:
+                  _onnx.checker.check_model(_m_try)
+                  onnx_model_16 = _m_try   # adopt only after the checker passed
+                  print(f'INFO: ONNX_TRT_GATE_FIX {_ngf} gated attention(s) rewritten')
+              except Exception as _e:
+                print(f'ERROR: ONNX_TRT_GATE_FIX FAILED ({type(_e).__name__}: {_e}) -- saving the graph WITHOUT the gate fix; '
+                      f'TensorRT 11 will compute its gated attentions wrong (rewrite the file with trt_gate_fix.py)', flush=True)
             # Embed weights inline in the .onnx file (same as production Ceres nets
             # like C3-768-30-pre3-I8.onnx). Our nets are well under the 2 GB protobuf
             # limit so no external data file is needed.
