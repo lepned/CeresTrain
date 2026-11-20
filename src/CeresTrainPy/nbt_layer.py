@@ -251,6 +251,12 @@ class NestedBottleneckLayer(torch.nn.Module):
           self.down2.weight.mul_(down_init_scale)
       self.reread_gate = torch.nn.Parameter(torch.zeros(1))
     self.reread_gate_folded = False
+    # AttnTemplates (attn_templates.py, 2026-11-20): per-square mixes of the net's shared 64x64 logit tables, added to
+    # the inner attentions' logits like the shared smolgen bias. Attached by ceres_net after construction:
+    # tmix = ModuleList of AttnTemplateMixer -- one per inner layer (tmix_block False: each on its layer's own
+    # pre-attention norm output) or a single one on the normalised block input (tmix_block True).
+    self.tmix = None
+    self.tmix_block = False
     if self.shared_smolgen is not None:
       assert self.shared_smolgen.num_heads == self.inner_heads, 'shared smolgen head count must equal the inner head count'
       assert not any(getattr(l.attention, 'use_smolgen', False) for l in self.inner), (
@@ -316,6 +322,12 @@ class NestedBottleneckLayer(torch.nn.Module):
       # Block-level content bias, summed with any incoming per-head bias (piece-relation etc.).
       sb = self.shared_smolgen(h0, token_idx, None if token_fill is None else self.norm_in(token_fill), num_registers)
       piece_relation_bias = sb if piece_relation_bias is None else piece_relation_bias + sb.to(piece_relation_bias.dtype)
+    if self.tmix is not None:
+      assert token_idx is None and self.mod_capacity == 0 and not num_registers and self.hyper_conn_inner is None, \
+        'AttnTemplates: 64 squares, no piece / register tokens, MoD or inner hyper-connections'
+      if self.tmix_block:
+        tb = self.tmix[0](h0)
+        piece_relation_bias = tb if piece_relation_bias is None else piece_relation_bias + tb.to(piece_relation_bias.dtype)
     mod_idx = None
     if self.mod_capacity > 0:
       score = self.mod_router(h0).squeeze(-1)                                     # [B, 64]
@@ -352,18 +364,23 @@ class NestedBottleneckLayer(torch.nn.Module):
         if self.carry:
           h_entry = h_entry + _rr   # carry = running sum of the inner BRANCHES: a trunk read is not one (review 11-09)
       _eg = None if edge_gates is None else edge_gates[j]
+      _prb = piece_relation_bias
+      if self.tmix is not None and not self.tmix_block:
+        # this layer's own mix, from the state its attention reads (the layer's pre-attention norm; pre-norm layers)
+        tb = self.tmix[j](layer.ln1(h))
+        _prb = tb if _prb is None else _prb + tb.to(_prb.dtype)
       if hc is not None:
         hc_a, hc_b = hc[j].coeffs(h)
         streams, h = h, hc[j].read(h, hc_a)  # the layer sees one mid_dim-wide input
       if want_logits and j == len(self.inner) - 1:
-        logits = self._raw_logits(layer, h, piece_relation_bias, edge_scales, _eg)
+        logits = self._raw_logits(layer, h, _prb, edge_scales, _eg)
       if want_v_first and j == 0:
-        h, v_first = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
+        h, v_first = layer(h, piece_relation_bias=_prb, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
                            edge_scales=edge_scales, edge_gate=_eg, return_v=True, return_branch=hc is not None)
       elif bt6 is not None and getattr(layer.attention, 'bt6t', None) is not None:
-        h = layer(h, piece_relation_bias=piece_relation_bias, bt6_terms=bt6)
+        h = layer(h, piece_relation_bias=_prb, bt6_terms=bt6)
       else:
-        h = layer(h, piece_relation_bias=piece_relation_bias, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
+        h = layer(h, piece_relation_bias=_prb, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge,
                   edge_scales=edge_scales, edge_gate=_eg, v_first=v_first, return_branch=hc is not None)
       if hc is not None:
         h = hc[j].write(streams, h, hc_b, hc_res[j])   # h was the layer's branch

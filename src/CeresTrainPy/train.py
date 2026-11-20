@@ -767,6 +767,7 @@ def Train():
     def _use_muon_final_only(n, p):
       if p.ndim != 2: return False              # Muon handles exactly-2-D matrices (its ctor asserts); norms/biases and any >=3-D exotic go AdamW
       if _bt6_no_muon(n): return False          # BT6 hybrid reader tables / output gate / bt6h.* container: AdamW
+      if '.tmix.' in n: return False            # AttnTemplates mixers: coupling partner of the zero-init tables (gradient ~0 while the tables are ~0), AdamW
       if 'embedding' in n: return False         # lookup-table-like: AdamW
       if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
       if 'smol_basis_bank' in n or 'smol_static_bank' in n: return False  # raa logit-tabeller, ikke vektmatriser (review-funn 3)
@@ -797,6 +798,7 @@ def Train():
       # the NBT down/up projections (its zero-init out included, as NBT up). The MoD router [1, D] is a 1-row scorer: AdamW.
       return (p.ndim == 2 and 'embedding' not in n and ('transformer_layer' in n or 'pt_decompress.' in n)
               and 'mod_router' not in n and 'head_mix' not in n and 'hyper_conn' not in n and 'lora' not in n.lower()
+              and '.tmix.' not in n      # AttnTemplates mixers (attn_templates.py): AdamW, see _use_muon_final_only
               and not _bt6_no_muon(n))
     def _use_muon_ffn_only(n, p):
       # Kovax-partisjon (2026-08-20, "Nadam for Attention and muon for FFN",

@@ -1582,6 +1582,36 @@ class CeresNet(nn.Module):
                                  reread=config.NetDef_NBTReRead)
            for i in range(self.NUM_DISTINCT_LAYERS)])
       self.nbt_carry = config.NetDef_NBTCarry
+      _n_tpl = int(getattr(config, 'NetDef_AttnTemplates', 0) or 0)
+      if _n_tpl:
+        # AttnTemplates (attn_templates.py): T shared zero-init 64x64 logit tables at the net root; every site mixes
+        # them per query square and head. Scope 'layer' = one mixer per inner layer on its own pre-attention norm
+        # output; 'block' = one per block on the normalised block input (bias to every inner layer of the block).
+        from attn_templates import AttnTemplateBank, AttnTemplateMixer
+        assert not (self.bt6h is not None and not self.bt6_native), 'AttnTemplates: not wired for BT6Layer inner layers'
+        self.attn_templates = AttnTemplateBank(_n_tpl, NUM_TOKENS_NET)
+        _tpl_block = config.NetDef_AttnTemplateScope == 'block'
+        for _tpl_blk in self.transformer_layer:
+          _tpl_blk.tmix_block = _tpl_block
+          _tpl_blk.tmix = torch.nn.ModuleList(
+            [AttnTemplateMixer(self.EMBEDDING_DIM, _nbt_heads, self.attn_templates)] if _tpl_block else
+            [AttnTemplateMixer(self.NBT_MID_DIM, _nbt_heads, self.attn_templates) for _ in range(_k)])
+          assert _tpl_block or all(l.pre_norm for l in _tpl_blk.inner), "AttnTemplateScope 'layer' needs pre-norm inner layers"
+        _n_mix = sum(p.numel() for blk in self.transformer_layer for p in blk.tmix.parameters())
+        print(f'[ceres_net] ATTENTION TEMPLATES: {_n_tpl} shared zero-init 64x64 logit tables '
+              f'({self.attn_templates.table.numel():,} params), mixed per query square and head ({_nbt_heads}) by '
+              + (f'one mixer per NBT block on the normalised block input ({self.EMBEDDING_DIM} -> {_nbt_heads * _n_tpl})'
+                 if _tpl_block else
+                 f'one mixer per inner layer on its pre-attention norm output ({self.NBT_MID_DIM} -> {_nbt_heads * _n_tpl})')
+              + f'; {_n_mix:,} mixer params; bias added to the inner attention logits; identity at init')
+      if bool(getattr(config, 'NetDef_NBTInputSkip', False)):
+        # NBTInputSkip (2026-11-20, after Fry's per-layer input skip): block i >= 1 reads
+        #   input_skip_a[i] * stream + input_skip_b[i] * (post-embedding state),   a = 1, b = 0 at init (identity),
+        # two learned scalars per block; the scaled sum is also the block's residual base.
+        self.input_skip_a = torch.nn.Parameter(torch.ones(self.NUM_DISTINCT_LAYERS))
+        self.input_skip_b = torch.nn.Parameter(torch.zeros(self.NUM_DISTINCT_LAYERS))
+        print(f'[ceres_net] NBT INPUT SKIP: blocks 1..{self.NUM_DISTINCT_LAYERS - 1} read a * stream + b * embedding '
+              f'(2 learned scalars per block, a = 1 / b = 0 at init)')
       if self.bt6_native:
         # our own encoder layers; the term positions get BT6's reader tensors on their attention (identity at init)
         from bt6_native_terms import BT6NativeTerms
@@ -2399,6 +2429,9 @@ class CeresNet(nn.Module):
       _egt_E = (vis_edge_E if (vis_edge_E is not None and self.vis_channels_module.families == self.egt_vis_module.families)
                 else self.egt_vis_module(squares[:, :, 0:13]))
       _egt_e = self.egt.init_state(_egt_E.to(flow.dtype))   # [B, 64, 64, d_e]
+    # NBTInputSkip: blocks >= 1 read a_i * stream + b_i * (post-embedding state); identity at init
+    _skip_a = getattr(self, 'input_skip_a', None)
+    _skip_e = flow if _skip_a is not None else None
     _bt6_E = _bt6_S = _bt6_e = None
     if self.bt6h is not None:
       # NBT-BT6 hybrid trunk (bt6_hybrid.py). E: 34 relation channels of the record (float32, no gradient); S: pair
@@ -2421,6 +2454,8 @@ class CeresNet(nn.Module):
         # logits of the block's last inner layer (nbt_layer._raw_logits: q.k / sqrt(hd) + the block's smolgen bias)
         if _bt6_rs is None:
           _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
+        if _skip_a is not None and i > 0:
+          flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
         if self.bt6h.is_site(i):
           flow, _bt6_H = self.transformer_layer[i](flow, bt6=(_bt6_E, _bt6_e, _bt6_rs), want_logits=True)
           _bt6_e = self.bt6h.site(i, _bt6_e, _bt6_H)
@@ -2461,6 +2496,8 @@ class CeresNet(nn.Module):
           flow = self.pt_decompress(flow64, flow[:, :flow.shape[1] - _R] if _R else flow, pt_idx)
           if _regs is not None:
             flow = torch.cat([flow, _regs], dim=1)
+        if _skip_a is not None and i > 0:
+          flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
           _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]

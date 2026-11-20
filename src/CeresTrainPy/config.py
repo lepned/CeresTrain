@@ -1310,6 +1310,45 @@ class Configuration:
       if not (1 <= self.NetDef_NBTReRead <= self.NetDef_NBTInnerLayers - 1):
         raise ValueError(f'NBTReRead must be an inner-layer index in [1, {self.NetDef_NBTInnerLayers - 1}] '
                          f'(0 = off; index 0 would duplicate the block entry read), got {self.NetDef_NBTReRead}')
+    # AttnTemplates (2026-11-20, attn_templates.py; after W. Gong's "Fry"): T shared zero-init 64x64 logit tables,
+    # mixed per QUERY SQUARE and head by one small Linear per site; the bias is added to the inner attentions'
+    # logits on the smolgen path. 0 = off. Meant as a REPLACEMENT for the shared smolgen (set SmolgenDimPerSquare 0,
+    # SmolgenDim 0, NBTSharedSmolgen false), but the two may be combined (the biases add).
+    # AttnTemplateScope: 'layer' (default; one mixer per inner layer on its pre-attention norm output, Fry's form)
+    #                    'block' (one mixer per NBT block on the normalised block input, bias to all its inner layers).
+    self.NetDef_AttnTemplates = int(config_net_def.get('AttnTemplates', 0) or 0)
+    self.NetDef_AttnTemplateScope = str(config_net_def.get('AttnTemplateScope', 'layer') or 'layer')
+    if self.NetDef_AttnTemplates:
+      def _tpl_refuse(cond, what):
+        if cond:
+          raise ValueError(f'AttnTemplates: {what}')
+      _tpl_refuse(self.NetDef_AttnTemplates < 0, 'must be >= 0')
+      _tpl_refuse(self.NetDef_AttnTemplateScope not in ('layer', 'block'),
+                  f"AttnTemplateScope must be 'layer' or 'block' (got {self.NetDef_AttnTemplateScope!r})")
+      _tpl_refuse(self.NetDef_NBTInnerLayers < 1, 'needs an NBT trunk (NBTInnerLayers >= 1)')
+      _tpl_refuse(self.NetDef_AttnTemplateScope == 'layer' and not self.NetDef_NBTInnerPreNorm,
+                  "AttnTemplateScope 'layer' needs NBTInnerPreNorm (the mixer reads the layer's pre-attention norm)")
+      _tpl_refuse(self.NetDef_AttnTemplateScope == 'block' and self.NetDef_NBTProjNorm != 'Norm',
+                  "AttnTemplateScope 'block' needs NBTProjNorm Norm (the mixer reads the normalised block input)")
+      _tpl_refuse(self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0 or self.NetDef_NBTMoDCapacity > 0
+                  or self.NetDef_NBTHyperConnInner > 0,
+                  'no piece tokens / register tokens / MoD routing / inner hyper-connections (the tables are 64 x 64)')
+      _tpl_refuse(bool(config_net_def.get('BT6Hybrid', False)) and not bool(config_net_def.get('BT6NativeLayers', False)),
+                  'not wired for BT6Layer inner layers (use BT6NativeLayers)')
+    elif 'AttnTemplateScope' in config_net_def:
+      raise ValueError('AttnTemplateScope set but AttnTemplates is 0 (silent no-op refused)')
+    # NBTInputSkip (2026-11-20; Fry's per-layer input skip at block level): NBT block i >= 1 reads
+    # a_i * stream + b_i * (post-embedding state), two learned scalars per block (1 / 0 at init = identity).
+    self.NetDef_NBTInputSkip = bool(config_net_def.get('NBTInputSkip', False))
+    if self.NetDef_NBTInputSkip:
+      if self.NetDef_NBTInnerLayers < 1:
+        raise ValueError('NBTInputSkip needs an NBT trunk (NBTInnerLayers >= 1)')
+      if (self.NetDef_LoopCount != 1 or self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0
+          or self.NetDef_NBTHyperConn > 0 or bool(config_net_def.get('DenseFormer', False))):
+        raise ValueError('NBTInputSkip: LoopCount 1, no piece / register tokens, no hyper-connections, no DenseFormer '
+                         '(the post-embedding state must have the shape of the stream at every block)')
+      if bool(config_net_def.get('BT6Hybrid', False)) and not bool(config_net_def.get('BT6NativeLayers', False)):
+        raise ValueError('NBTInputSkip is not wired for BT6Layer inner layers (use BT6NativeLayers)')
     if (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner) and self.NetDef_NBTHyperConnSinkhornIters < 1:
       raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
     if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:

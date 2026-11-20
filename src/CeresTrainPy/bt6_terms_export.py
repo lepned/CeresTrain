@@ -98,6 +98,9 @@ def export_served_terms(net) -> dict:
     raise NotImplementedError("export_served_terms: only the linear embedding (BT6Embedding 'linear') is exported")
   if hybrid.share_readers:
     raise NotImplementedError("export_served_terms: BT6ShareReadersPerBlock is not exported")
+  if getattr(net, "attn_templates", None) is not None or getattr(net, "input_skip_a", None) is not None:
+    raise NotImplementedError("export_served_terms: AttnTemplates / NBTInputSkip have no lc0ex front end yet "
+                              "(read these nets through the ONNX export)")
   cfg = hybrid.layer_config
   blocks = list(net.transformer_layer)
   K = len(blocks[0].inner)

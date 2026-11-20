@@ -96,6 +96,13 @@ def partition_weight_decay(model):
                   pass   # reached through the owning module's own iteration
               elif '.' not in pn:
                   no_decay.add(fpn)
+          elif fpn.endswith('attn_templates.table') or fpn.endswith('input_skip_a') or fpn.endswith('input_skip_b'):
+              # AttnTemplates (2026-11-20, attn_templates.py): the shared zero-init 64x64 logit tables [T, 64, 64] at
+              # the net root -- raw logit tables, the class of the BT6 reader tables / smol_*_bank -> no_decay.
+              # NBTInputSkip: per-block mixing scalars (a = 1, b = 0 at init), never decayed (a decay on `a` would
+              # pull the residual stream toward 0). The mixers' Linear kernels (transformer_layer.N.tmix.J.mix.weight)
+              # are ordinary weight matrices and take the "transformer_layer" catch-all -> decay.
+              no_decay.add(fpn)
           elif fpn.endswith('.rope.freqs'):
               # Learnable 2D RoPE frequencies (rope.LearnableRope2D, 2026-09-30): a 3-D
               # (H, pairs, 2) table of rotation rates, not a weight matrix. KataGo trains
