@@ -141,6 +141,22 @@ class CeresNet(nn.Module):
 
     # When CERES_AUX_FEATURES_PER_SQUARE > 0, TOTAL_INPUT_FEATURES_PER_SQUARE
     # = NUM_INPUT_BYTES_PER_SQUARE + NUM_AUX_FEATURES_PER_SQUARE (e.g. 140 vs 137).
+    # InputHistoryKeep (config.py): fewer real history boards, applied to `squares` at the top of forward so every
+    # consumer (embedding, BT6 relation channels, decoder) sees the same reduced input. Channel c of the reduced
+    # input reads channel hist_idx[c]; hist_mask zeroes the repetition flags of the dropped boards. Non-persistent
+    # buffers: checkpoints of nets without the key are unchanged, the export bakes them in as constants.
+    self.history_keep = int(getattr(config, 'NetDef_InputHistoryKeep', -1))
+    if self.history_keep >= 0:
+      _hk = self.history_keep
+      _hidx = torch.arange(TOTAL_INPUT_FEATURES_PER_SQUARE)
+      for _h in range(_hk + 1, 8):
+        _hidx[_h * 13:(_h + 1) * 13] = torch.arange(_hk * 13, _hk * 13 + 13)
+      _hmask = torch.ones(TOTAL_INPUT_FEATURES_PER_SQUARE)
+      _hmask[104 + _hk + 1:112] = 0
+      self.register_buffer('hist_idx', _hidx, persistent=False)
+      self.register_buffer('hist_mask', _hmask, persistent=False)
+      print(f'[ceres_net] INPUT HISTORY KEEP {_hk}: history boards {_hk + 1}..7 := board {_hk}, '
+            f'repetition flags {104 + _hk + 1}..111 := 0 (inside forward)')
     # NBT-BT6 HYBRID (config BT6Hybrid; bt6_hybrid.py): everything of BT6 outside the inner layers -- relation
     # channels from our record, prologue (pair stream + edge seed), edge sites, BT6's attention policy head, the
     # optional soft-policy head and the optional BT6-form embedding. The inner layers are built in the NBT section.
@@ -2218,6 +2234,10 @@ class CeresNet(nn.Module):
     if isinstance(squares, list):
       # when saving/restoring from ONNX the input will appear as a list instead of sequence of arguments
       squares = squares[0]
+
+    if self.history_keep >= 0:
+      # InputHistoryKeep: history boards beyond `history_keep` := the nearest kept board, their repetition flags := 0
+      squares = torch.index_select(squares, 2, self.hist_idx) * self.hist_mask.to(squares.dtype)
 
     flow = squares
 

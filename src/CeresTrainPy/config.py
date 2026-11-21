@@ -1349,6 +1349,14 @@ class Configuration:
                          '(the post-embedding state must have the shape of the stream at every block)')
       if bool(config_net_def.get('BT6Hybrid', False)) and not bool(config_net_def.get('BT6NativeLayers', False)):
         raise ValueError('NBTInputSkip is not wired for BT6Layer inner layers (use BT6NativeLayers)')
+    # InputHistoryKeep (2026-11-22; Fry trains without history): number of REAL history boards the net sees besides the
+    # current one. -1 = off (all 7). k in 0..6: history boards k+1..7 are replaced by board k (the input convention
+    # for missing history) and their repetition flags (104+k+1..111) are zeroed, inside forward (so the exported
+    # graph carries the reduction and the serving input is unchanged). 0 = no history (BT6 gained / lost = 0),
+    # 1 = previous move only.
+    self.NetDef_InputHistoryKeep = int(config_net_def.get('InputHistoryKeep', -1))
+    if not -1 <= self.NetDef_InputHistoryKeep <= 6:
+      raise ValueError(f'InputHistoryKeep must be -1 (off) or 0..6, got {self.NetDef_InputHistoryKeep}')
     if (self.NetDef_NBTHyperConn or self.NetDef_NBTHyperConnInner) and self.NetDef_NBTHyperConnSinkhornIters < 1:
       raise ValueError('NBTHyperConnSinkhornIters must be >= 1')
     if self.NetDef_NBTHyperConn and self.NetDef_PieceTokens:
