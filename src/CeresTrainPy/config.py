@@ -1352,8 +1352,8 @@ class Configuration:
     # InputHistoryKeep (2026-11-22; Fry trains without history): number of REAL history boards the net sees besides the
     # current one. -1 = off (all 7). k in 0..6: history boards k+1..7 are replaced by board k (the input convention
     # for missing history) and their repetition flags (104+k+1..111) are zeroed, inside forward (so the exported
-    # graph carries the reduction and the serving input is unchanged). 0 = no history (BT6 gained / lost = 0),
-    # 1 = previous move only.
+    # graph carries the reduction and the serving input is unchanged). 0 = no history (BT6 gained / lost = 0) and
+    # no repetition flags at all (104..111 := 0, also the current position's), 1 = previous move only.
     self.NetDef_InputHistoryKeep = int(config_net_def.get('InputHistoryKeep', -1))
     if not -1 <= self.NetDef_InputHistoryKeep <= 6:
       raise ValueError(f'InputHistoryKeep must be -1 (off) or 0..6, got {self.NetDef_InputHistoryKeep}')

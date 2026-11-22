@@ -152,11 +152,12 @@ class CeresNet(nn.Module):
       for _h in range(_hk + 1, 8):
         _hidx[_h * 13:(_h + 1) * 13] = torch.arange(_hk * 13, _hk * 13 + 13)
       _hmask = torch.ones(TOTAL_INPUT_FEATURES_PER_SQUARE)
-      _hmask[104 + _hk + 1:112] = 0
+      _hflag0 = 104 if _hk == 0 else 104 + _hk + 1      # keep 0: no repetition information at all (Fry's input)
+      _hmask[_hflag0:112] = 0
       self.register_buffer('hist_idx', _hidx, persistent=False)
       self.register_buffer('hist_mask', _hmask, persistent=False)
       print(f'[ceres_net] INPUT HISTORY KEEP {_hk}: history boards {_hk + 1}..7 := board {_hk}, '
-            f'repetition flags {104 + _hk + 1}..111 := 0 (inside forward)')
+            f'repetition flags {_hflag0}..111 := 0 (inside forward)')
     # NBT-BT6 HYBRID (config BT6Hybrid; bt6_hybrid.py): everything of BT6 outside the inner layers -- relation
     # channels from our record, prologue (pair stream + edge seed), edge sites, BT6's attention policy head, the
     # optional soft-policy head and the optional BT6-form embedding. The inner layers are built in the NBT section.

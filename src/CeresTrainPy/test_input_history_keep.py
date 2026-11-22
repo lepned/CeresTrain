@@ -1,7 +1,7 @@
 """InputHistoryKeep (config.py / ceres_net.py): the net sees only `keep` real history boards. Small nets, CPU.
 
   (a) keep k in {0, 1}, the big run's layout with templates: net(x) == the same weights without the key fed the
-      reduced input (boards k+1..7 := board k, repetition flags 104+k+1..111 := 0); boards > k and their flags do
+      reduced input (boards k+1..7 := board k, repetition flags 104+k+1..111 := 0; keep 0 also flag 104); boards > k and their flags do
       not change the output; board 1 does change it at keep 1; state_dict keys identical to the net without the key
   (b) loss finite, gradients live; fp16 cast keeps the index buffer integral
   (c) ONNX (opset 18, fp32) == PyTorch in onnxruntime, reduction inside the graph
@@ -37,7 +37,7 @@ def reduce(x, keep):
   y = x.clone()
   for h in range(keep + 1, 8):
     y[:, :, h * 13:(h + 1) * 13] = x[:, :, keep * 13:keep * 13 + 13]
-  y[:, :, 104 + keep + 1:112] = 0
+  y[:, :, (104 if keep == 0 else 104 + keep + 1):112] = 0
   return y
 
 
@@ -53,6 +53,8 @@ def pair(keep):
 
 def test_equivalence(keep):
   net, ref = pair(keep)
+  zeroed = (net.hist_mask == 0).nonzero().flatten().tolist()
+  assert zeroed == list(range(104 if keep == 0 else 104 + keep + 1, 112)), zeroed
   sq = full_history(8)
   with torch.no_grad():
     a = net(sq, None)
@@ -61,7 +63,8 @@ def test_equivalence(keep):
     other = sq.clone()
     for h in range(keep + 1, 8):
       other[:, :, h * 13:(h + 1) * 13] = torch.roll(sq[:, :, 0:13], shifts=h + 3, dims=0)
-    other[:, :, 104 + keep + 1:112] = 1 - other[:, :, 104 + keep + 1:112]
+    f0 = 104 if keep == 0 else 104 + keep + 1
+    other[:, :, f0:112] = 1 - other[:, :, f0:112]
     d = net(other, None)
   for i in (0, 1, 4):
     assert torch.equal(a[i], b[i]), (keep, i, float((a[i] - b[i]).abs().max()))
