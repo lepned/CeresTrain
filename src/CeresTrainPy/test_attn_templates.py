@@ -11,6 +11,8 @@
   (d) ONNX (opset 18, fp32) == PyTorch in onnxruntime, and the TensorRT-11 gate fix still applies
   (e) a plain NBT net (no BT6): templates + input skip through the ordinary trunk loop, identity at init
   (f) config refusals
+  (g) a PLAIN encoder trunk (NBTInnerLayers 0, PreNorm): one mixer per encoder layer + per-layer input skip, with and
+      without per-layer smolgen
 
   python test_attn_templates.py
 """
@@ -248,6 +250,98 @@ def test_plain_nbt():
     H.NET_SMALL, H.OPT_BASE = saved_net, saved_opt
 
 
+def test_plain_encoder():
+  """PLAIN encoder trunk (NBTInnerLayers 0, PreNorm; Fry's own form): one mixer per encoder layer on its pre-attention
+  norm, + per-layer input skip; with and without per-layer smolgen. Identity at init against the same weights without
+  the options; the bias is exactly the mixer output on the layer's ln1; gradients, optimiser classes, ONNX."""
+  import onnxruntime as ort
+  from encoder_layer import EncoderLayer
+  from wd_partition import partition_weight_decay
+  saved_net, saved_opt = H.NET_SMALL, H.OPT_BASE
+  try:
+    H.NET_SMALL = {**{k: v for k, v in saved_net.items() if not k.startswith(('BT6', 'NBT'))},
+                   'NBTInnerLayers': 0, 'PreNorm': True}
+    H.OPT_BASE = {**saved_opt, 'SoftPolicyWeight': 0}
+    for smol in (False, True):
+      over = {'NumLayers': 3, **({'SmolgenDimPerSquare': 8, 'SmolgenDim': 64} if smol else {})}
+      full = {**over, 'AttnTemplates': 8, 'NBTInputSkip': True}
+      net = build(full)
+      layers = list(net.transformer_layer)
+      assert all(isinstance(l, EncoderLayer) and isinstance(l.tmix, AttnTemplateMixer) and l.tmix.bank is net.attn_templates
+                 for l in layers), 'one mixer per plain encoder layer, all on the root bank'
+      ref = build(over)
+      state = net.state_dict()
+      ref.load_state_dict({k: state[k] for k in ref.state_dict()}, strict=True)
+      sq = records(6)
+      net.eval(); ref.eval()
+      with torch.no_grad():
+        a, b = net(sq, None), ref(sq, None)
+      d_pol, d_val = float((a[0] - b[0]).abs().max()), float((a[1] - b[1]).abs().max())
+      assert d_pol < 1e-5 and d_val < 1e-6, (d_pol, d_val)
+      # the bias the layer adds == its mixer on its own ln1 output (hook the attention's incoming bias)
+      live(net)
+      seen = {}
+      def grab(mod, args, kwargs):
+        seen['prb'], seen['x'] = kwargs.get('piece_relation_bias'), args[3]
+      hk = layers[1].attention.register_forward_pre_hook(grab, with_kwargs=True)
+      with torch.no_grad():
+        moved = net(sq, None)
+      hk.remove()
+      with torch.no_grad():
+        want = layers[1].tmix(layers[1].ln1(seen['x']))
+      assert seen['prb'] is not None and float((seen['prb'] - want).abs().max()) < 1e-6
+      assert float((moved[1] - a[1]).abs().max()) > 1e-5
+      net.train()
+      loss = run_loss(net, batch_for(6), sq)
+      assert torch.isfinite(loss)
+      loss.backward()
+      new = [(n, p) for n, p in net.named_parameters() if '.tmix.' in n or n.startswith(('attn_templates', 'input_skip'))]
+      assert len(new) == 2 * len(layers) + 3, [n for n, _ in new]
+      zero = [n for n, p in new if p.grad is None or float(p.grad.abs().max()) == 0.0]
+      assert not zero, zero
+      decay, no_decay = partition_weight_decay(net)
+      for n, p in new:
+        assert (n in decay) == n.endswith('.mix.weight'), n
+      # ONNX (opset 18, fp32) == PyTorch
+      net.eval()
+      class SquaresOnly(torch.nn.Module):
+        def __init__(self, inner):
+          super().__init__(); self.inner = inner
+        def forward(self, squares):
+          out = self.inner(squares, None)
+          return out[0], out[1], out[4]
+      with torch.no_grad():
+        want = SquaresOnly(net)(sq)
+      with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'net.onnx')
+        torch.onnx.export(SquaresOnly(net), (sq[:2],), path, do_constant_folding=True, export_params=True, opset_version=18,
+                          input_names=['squares'], output_names=['policy', 'value', 'value2'],
+                          dynamic_axes={n: {0: 'batch_size'} for n in ('squares', 'policy', 'value', 'value2')})
+        so = ort.SessionOptions(); so.log_severity_level = 3
+        got = ort.InferenceSession(path, so, providers=['CPUExecutionProvider']).run(None, {'squares': sq.numpy().astype(np.float32)})
+      for name, ya, yb in zip(('policy', 'value', 'value2'), got, want):
+        ya, yb = ya.astype(np.float64), yb.numpy().astype(np.float64)
+        if name == 'policy':
+          k = yb > -1e3
+          assert (k == (ya > -1e3)).all()
+          ya, yb = ya[k], yb[k]
+        err = np.abs(ya - yb).max() / (np.abs(yb).max() + 1e-12)
+        assert err < 1e-4, (name, err)
+      print(f'(g) plain encoder trunk{" + per-layer smolgen" if smol else ""}: {len(layers)} mixers, identity at init '
+            f'(policy {d_pol:.1e}, value {d_val:.1e}); bias == mixer(ln1 x); gradients live; classes OK; ONNX == PyTorch')
+    for bad, what in (({'NumLayers': 2, 'AttnTemplates': 8, 'PreNorm': False}, 'PreNorm'),
+                      ({'NumLayers': 2, 'AttnTemplates': 8, 'AttnTemplateScope': 'block'}, "'layer'")):
+      try:
+        build(bad)
+      except ValueError as e:
+        assert what in str(e), (what, str(e))
+      else:
+        raise AssertionError(f'{bad} was not refused')
+    print('(g) plain encoder refusals OK (post-norm, block scope)')
+  finally:
+    H.NET_SMALL, H.OPT_BASE = saved_net, saved_opt
+
+
 def test_refusals():
   base = {**BIG, 'AttnTemplates': 8}
   for over, what in (({**BIG, 'AttnTemplateScope': 'block'}, 'silent no-op'),
@@ -273,5 +367,6 @@ if __name__ == '__main__':
       net = test_big_layout(scope, skip)
   test_onnx(test_big_layout('layer', True))
   test_plain_nbt()
+  test_plain_encoder()
   test_refusals()
   print('test_attn_templates: all OK')

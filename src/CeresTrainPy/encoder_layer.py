@@ -138,6 +138,11 @@ class EncoderLayer(torch.nn.Module):
     else:
       self.tsb = None
 
+    # AttnTemplates on a PLAIN encoder trunk (attn_templates.py; set by ceres_net, None otherwise and always None for
+    # NBT inner layers, whose block owns the mixers): this layer's per-square mix of the shared tables, read from its
+    # own pre-attention norm output, added to the per-head logit bias.
+    self.tmix = None
+
 
   def forward(self, x: torch.Tensor, piece_relation_bias: torch.Tensor = None,
               film: Tuple[torch.Tensor, torch.Tensor] = None,
@@ -155,8 +160,12 @@ class EncoderLayer(torch.nn.Module):
     # same in both. Pre-norm: y = x + Sub(norm(x)). Post-norm: y = norm(x + Sub(x)).
     if self.pre_norm:
       attn_input = self.ln1(x)
+      if self.tmix is not None:
+        tb = self.tmix(attn_input)
+        piece_relation_bias = tb if piece_relation_bias is None else piece_relation_bias + tb.to(piece_relation_bias.dtype)
       attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     else:
+      assert self.tmix is None, 'AttnTemplates on a plain encoder layer need pre-norm'
       attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     v_out = None
     if return_v:

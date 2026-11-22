@@ -1325,8 +1325,15 @@ class Configuration:
       _tpl_refuse(self.NetDef_AttnTemplates < 0, 'must be >= 0')
       _tpl_refuse(self.NetDef_AttnTemplateScope not in ('layer', 'block'),
                   f"AttnTemplateScope must be 'layer' or 'block' (got {self.NetDef_AttnTemplateScope!r})")
-      _tpl_refuse(self.NetDef_NBTInnerLayers < 1, 'needs an NBT trunk (NBTInnerLayers >= 1)')
-      _tpl_refuse(self.NetDef_AttnTemplateScope == 'layer' and not self.NetDef_NBTInnerPreNorm,
+      # Plain encoder trunk (NBTInnerLayers 0, 2026-11-22): one mixer per encoder layer on its pre-attention norm
+      # output (Fry's own form); needs PreNorm, scope 'layer' only (there are no blocks), 64 tokens.
+      _tpl_plain = self.NetDef_NBTInnerLayers < 1
+      _tpl_refuse(_tpl_plain and self.NetDef_AttnTemplateScope != 'layer',
+                  "plain encoder trunk: AttnTemplateScope must be 'layer' (there are no NBT blocks)")
+      _tpl_refuse(_tpl_plain and not self.NetDef_PreNorm,
+                  'plain encoder trunk needs PreNorm (the mixer reads the layer\'s pre-attention norm)')
+      _tpl_refuse(_tpl_plain and bool(self.NetDef_TrainOn4BoardSequences), 'TrainOn4BoardSequences (the tables are 64 x 64)')
+      _tpl_refuse(not _tpl_plain and self.NetDef_AttnTemplateScope == 'layer' and not self.NetDef_NBTInnerPreNorm,
                   "AttnTemplateScope 'layer' needs NBTInnerPreNorm (the mixer reads the layer's pre-attention norm)")
       _tpl_refuse(self.NetDef_AttnTemplateScope == 'block' and self.NetDef_NBTProjNorm != 'Norm',
                   "AttnTemplateScope 'block' needs NBTProjNorm Norm (the mixer reads the normalised block input)")
@@ -1339,10 +1346,9 @@ class Configuration:
       raise ValueError('AttnTemplateScope set but AttnTemplates is 0 (silent no-op refused)')
     # NBTInputSkip (2026-11-20; Fry's per-layer input skip at block level): NBT block i >= 1 reads
     # a_i * stream + b_i * (post-embedding state), two learned scalars per block (1 / 0 at init = identity).
+    # On a plain encoder trunk (NBTInnerLayers 0, 2026-11-22) the same per encoder layer = Fry's form.
     self.NetDef_NBTInputSkip = bool(config_net_def.get('NBTInputSkip', False))
     if self.NetDef_NBTInputSkip:
-      if self.NetDef_NBTInnerLayers < 1:
-        raise ValueError('NBTInputSkip needs an NBT trunk (NBTInnerLayers >= 1)')
       if (self.NetDef_LoopCount != 1 or self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0
           or self.NetDef_NBTHyperConn > 0 or bool(config_net_def.get('DenseFormer', False))):
         raise ValueError('NBTInputSkip: LoopCount 1, no piece / register tokens, no hyper-connections, no DenseFormer '

@@ -1711,6 +1711,26 @@ class CeresNet(nn.Module):
       assert not int(getattr(config, 'NetDef_NBTMoDCapacity', 0) or 0), 'NBTMoDCapacity needs an NBT trunk'
       self.transformer_layer = torch.nn.Sequential(
          *[_make_encoder_layer(i, self.EMBEDDING_DIM, self.NUM_LAYERS) for i in range(self.NUM_DISTINCT_LAYERS)])
+      _n_tpl = int(getattr(config, 'NetDef_AttnTemplates', 0) or 0)
+      if _n_tpl:
+        # AttnTemplates on the plain encoder trunk (Fry's own form): one mixer per (distinct) encoder layer on its
+        # pre-attention norm output; the bias goes to that layer's attention logits (encoder_layer.EncoderLayer.tmix).
+        from attn_templates import AttnTemplateBank, AttnTemplateMixer
+        assert num_tokens_q == num_tokens_kv == NUM_TOKENS_NET == 64, 'AttnTemplates: 64 square tokens'
+        self.attn_templates = AttnTemplateBank(_n_tpl, NUM_TOKENS_NET)
+        for _tpl_l in self.transformer_layer:
+          assert _tpl_l.pre_norm, 'AttnTemplates on a plain encoder trunk need PreNorm'
+          _tpl_l.tmix = AttnTemplateMixer(self.EMBEDDING_DIM, self.NUM_HEADS, self.attn_templates)
+        _n_mix = sum(p.numel() for l in self.transformer_layer for p in l.tmix.parameters())
+        print(f'[ceres_net] ATTENTION TEMPLATES (plain encoder): {_n_tpl} shared zero-init 64x64 logit tables '
+              f'({self.attn_templates.table.numel():,} params), one mixer per encoder layer on its pre-attention norm '
+              f'output ({self.EMBEDDING_DIM} -> {self.NUM_HEADS * _n_tpl}); {_n_mix:,} mixer params; identity at init')
+      if bool(getattr(config, 'NetDef_NBTInputSkip', False)):
+        # NBTInputSkip on the plain trunk = Fry's per-layer input skip: layer i >= 1 reads a_i * stream + b_i * embedding
+        self.input_skip_a = torch.nn.Parameter(torch.ones(self.NUM_DISTINCT_LAYERS))
+        self.input_skip_b = torch.nn.Parameter(torch.zeros(self.NUM_DISTINCT_LAYERS))
+        print(f'[ceres_net] INPUT SKIP (plain encoder): layers 1..{self.NUM_DISTINCT_LAYERS - 1} read a * stream + '
+              f'b * embedding (2 learned scalars per layer, a = 1 / b = 0 at init)')
 
     # Piece tokens (piece_tokens.py; config PieceTokens): the trunk runs on PieceTokens of the 64 squares and a narrow
     # cross-attention rebuilds the 64 square states before the heads.
