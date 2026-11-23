@@ -465,6 +465,9 @@ def save_model(NAME : str,
             _isl_env = os.environ.get('CERES_EXPORT_FP32_ISLANDS')
             _isl = (tuple(x for x in _isl_env.replace(' ', '').lower().split(',') if x and x != 'none') if _isl_env is not None
                     else tuple(getattr(config, 'NetDef_ExportFP32Islands', ('norms',))))
+            if getattr(getattr(model_nocompile, 'core', model_nocompile), 'hlg_serve', False) and 'value_tail' not in _isl:
+              # ValueHLGaussServe (2026-11-23 review): the served-WDL assembly always in fp32, whatever the island set
+              _isl = tuple(_isl) + ('value_tail',)
             _bad = [x for x in _isl if x not in ISLAND_KINDS]
             if _bad:
               raise ValueError(f'CERES_EXPORT_FP32_ISLANDS: unknown island kind(s) {_bad}; use {ISLAND_KINDS} or none')
@@ -480,10 +483,12 @@ def save_model(NAME : str,
                 _rep = inspect_precision(_m_try)
                 print(f'INFO: ONNX_FP32_ISLANDS {",".join(_isl)}: {_st["nodes"]} nodes, casts in/out {_st["casts_in"]}/{_st["casts_out"]}, '
                       f'norm chains fp32 {_rep["norm_chains_fp32"]}/{_rep["norm_chains"]} (incomplete {_rep["norm_chains_incomplete"]}), '
-                      f'softmax fp32 {_rep["softmax_fp32"]}/{_rep["softmax"]}, '
+                      f'softmax fp32 {_rep["softmax_fp32"]}/{_rep["softmax"]}, value tail {_st.get("value_tail", 0)} nodes, '
                       f'attention patterns with fusion blockers {_rep["attention_patterns_with_blockers"]}/{_rep["attention_patterns"]}')
                 onnx_model_16 = _m_try   # adopt only after every check and the report succeeded (the except below says "WITHOUT islands")
               except Exception as _e:
+                if 'value_tail' in _isl and getattr(getattr(model_nocompile, 'core', model_nocompile), 'hlg_serve', False):
+                  raise RuntimeError(f'ONNX_FP32_ISLANDS failed on a ValueHLGaussServe net (its served-WDL tail must be fp32): {_e}') from _e
                 print(f'ERROR: ONNX_FP32_ISLANDS FAILED ({type(_e).__name__}: {_e}) -- saving the plain fp16 graph WITHOUT '
                       f'fp32 islands; a strongly-typed build of this file runs the norms in fp16', flush=True)
             else:

@@ -336,6 +336,9 @@ def export_served_hybrid(net) -> dict:
   from bt6_net import BT6Net  # the per-part folds are BT6Net.export_served's; a shell BT6Net carries the parts
 
   hybrid = net.bt6h
+  if getattr(net, 'hlg_serve', False):
+    raise NotImplementedError('export_served_hybrid: ValueHLGaussServe is wired only in the terms / flat carrier '
+                              '(bt6_terms_export)')
   if getattr(net, 'bt6_native', False):
     raise NotImplementedError('export_served_hybrid: BT6NativeLayers (term reads on our own encoder layers) has no '
                               'kernel-builder carrier yet; serve it through the ONNX export')
@@ -431,7 +434,7 @@ def served_meta(net) -> dict:
     "embedding": "bt6" if hybrid.embed is not None else "linear", "embedding_eps": cfg.norm_eps,
     "heads_activation": config.NetDef_HeadsActivationType, "head_front_act": bool(net.head_front_act),
     "premap_per_square": net.HEAD_PREMAP_PER_SQUARE, "value2": net.value2_loss_weight > 0,
-    "mlh": net.moves_left_loss_weight > 0,
+    "mlh": net.moves_left_loss_weight > 0, "hlg_serve": bool(getattr(net, "hlg_serve", False)),
     "terms_inner_layers": tuple(hybrid.terms_inner_layers),
     "smolgen": getattr(blocks[0], "shared_smolgen", None) is not None,
     "smolgen_activation": getattr(config, "NetDef_BT6SmolgenActivation", "Swish"),

@@ -68,7 +68,12 @@ from onnx import TensorProto, helper, numpy_helper
 F32, F16 = TensorProto.FLOAT, TensorProto.FLOAT16
 ELEMENTWISE_IN_NORM = ('Add', 'Sqrt', 'Reciprocal', 'Div', 'Mul', 'Sub')
 NORM_OPS = ('RMSNormalization', 'LayerNormalization', 'SimplifiedLayerNormalization', 'SkipSimplifiedLayerNormalization')
-ISLAND_KINDS = ('norms', 'softmax')
+ISLAND_KINDS = ('norms', 'softmax', 'value_tail')
+# 'value_tail' (2026-11-23, ValueHLGaussServe): every node between the value heads' last MatMul/Gemm and the graph
+# outputs value / value2 (softmax over the HL-Gauss buckets, Q, the draw clamp, log) -- the served-WDL assembly must
+# not run in fp16 (its probability clamp is subnormal there; log(0) risk). save_model adds it automatically.
+VALUE_TAIL_OUTPUTS = ('value', 'value2')
+VALUE_TAIL_STOP = ('MatMul', 'Gemm')
 
 
 def _maps(graph):
@@ -188,6 +193,22 @@ def find_rmsnorm_chains(graph, return_incomplete=False):
 
 def find_softmax_nodes(graph):
   return [[n.name] for n in graph.node if n.op_type == 'Softmax']
+
+
+def find_value_tail_nodes(graph, outputs=VALUE_TAIL_OUTPUTS):
+  """Names of the nodes on every path from the last MatMul/Gemm of the value heads to the graph outputs `outputs`
+  (backward walk from the outputs, stopping at MatMul/Gemm, constants and graph inputs)."""
+  _ensure_unique_names(graph, 'fp32isl')
+  prod, _, inits = _maps(graph)
+  names, stack = set(), [o.name for o in graph.output if o.name in outputs]
+  while stack:
+    t = stack.pop()
+    p = prod.get(t)
+    if p is None or t in inits or p.name in names or p.op_type in VALUE_TAIL_STOP or p.op_type == 'Constant':
+      continue
+    names.add(p.name)
+    stack.extend(i for i in p.input if i)
+  return names
 
 
 def insert_fp32_islands(model, node_names, tag='fp32isl'):
@@ -337,7 +358,14 @@ def apply_fp32_islands(model, islands=('norms',), tag='fp32isl', require_chains=
   if 'softmax' in islands:
     for ch in find_softmax_nodes(model.graph):
       names.update(ch)
+  tail = set()
+  if 'value_tail' in islands:
+    tail = find_value_tail_nodes(model.graph)
+    if not tail:
+      raise RuntimeError('fp32_islands: value_tail requested but no node feeds the value outputs')
+    names.update(tail)
   stats = insert_fp32_islands(model, names, tag)
+  stats['value_tail'] = len(tail)
   stats['chains'] = len(chains)
   stats['chains_incomplete'] = len(incomplete)
   stats['softmax'] = len(find_softmax_nodes(model.graph)) if 'softmax' in islands else 0

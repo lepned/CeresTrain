@@ -921,6 +921,10 @@ def Train():
                     # 2026-11-13 NBT-BT6 hybrid: the policy is BT6's attention head (embedding, Q, K, promotion, pair
                     # read) and its training-only soft-policy twin; the flat policy_head is not built there.
                     'bt6h.policy.', 'bt6h.soft_policy.')
+    if bool(getattr(config, 'NetDef_ValueHLGaussServe', False)):
+      # 2026-11-23 (review): with ValueHLGaussServe the HL-Gauss head IS the served Q -> same family as value_head and
+      # v_inject (an aux HL-Gauss head keeps the base rate, as before)
+      _HEAD_FAMILY = _HEAD_FAMILY + ('hlg_head.',)
     _COUPLING_FAMILY = ('dual_plane.', 'dp_value_inject.', 'dp_value2_inject.',
                         'dp_pol_q.', 'dp_pol_p.', 'dpva_', 'dpcv_', 'dpc_', 'dpch_', 'dpgi_', 'dp_surv_head.',
                         # runde-3: listedrift — disse var med i freeze/aux-listene men ikke her
@@ -2050,6 +2054,10 @@ def Train():
                           'cq_abs_head.', 'cq_gap_head.', 'grill_head.',
                           # EGT edge stream: zero-init readers => fresh-init on warm start reproduces the base net
                           'egt.')
+    if bool(getattr(config, 'NetDef_ValueHLGaussServe', False)):
+      # 2026-11-23 (review): the served Q head is not an aux head. A checkpoint without hlg_head.* is a hard resume
+      # mismatch (missing key), never a silent fresh init of the served value; there is no opt-in.
+      _AUX_HEAD_PREFIXES = tuple(x for x in _AUX_HEAD_PREFIXES if x != 'hlg_head.')
     # Private value front-end, 'inject' mode ONLY: new modules that can legitimately
     # exist on one side of a resume — they are zero-init, so the net is bit-identical
     # to the base at step 0 and fresh-initializing them is exactly right.

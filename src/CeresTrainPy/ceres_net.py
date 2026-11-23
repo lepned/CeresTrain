@@ -745,6 +745,15 @@ class CeresNet(nn.Module):
             f'(training-only; target = v7 OppPlayedIndex, -1 masked)')
 
     self.hlg_weight = float(getattr(config, 'Opt_HLGaussWeight', 0) or 0)
+    # ValueHLGaussServe (net key, 2026-11-23; Fry's value head, variant B): the HL-Gauss head IS the served Q.
+    # The exported `value` = WDL from Q = sum_i p_i c_i (bucket centres) and D = the WDL value head's draw
+    # probability, clamped to D <= 1 - |Q|: W = (1 - D + Q) / 2, L = (1 - D - Q) / 2 (sums to 1, all >= 0), as
+    # log-probabilities so softmax(value) is that WDL. The WDL head is trained only for D (its own CE at
+    # LossValueMultiplier, kept low); `value2` exports the same served WDL (config refuses a trained value2). The
+    # HL-Gauss head reads exactly the value head's input (pool channels and the decoder value inject included).
+    self.hlg_serve = bool(getattr(config, 'NetDef_ValueHLGaussServe', False))
+    assert not self.hlg_serve or (self.hlg_weight > 0 and self.value2_loss_weight == 0), \
+      'ValueHLGaussServe needs HLGaussWeight > 0 and LossValue2Multiplier 0 (value2 exports the served WDL)'
     if self.hlg_weight > 0:
       self.hlg_buckets = int(getattr(config, 'Opt_HLGaussBuckets', 32) or 32)
       # Runde-2-funn: 'or 0.75' sluket eksplisitt 0 (one-hot-bucket-kontrakten
@@ -752,10 +761,16 @@ class CeresNet(nn.Module):
       _hlg_ss = getattr(config, 'Opt_HLGaussSigmaScale', None)
       _hlg_sigma_scale = 0.75 if _hlg_ss is None else float(_hlg_ss)
       self.hlg_sigma = _hlg_sigma_scale * (2.0 / self.hlg_buckets)
-      self.hlg_head = Head(self.Activation, self.VALUE_IN_SIZE, 64 * HEAD_MULT, self.hlg_buckets, 0)
+      _hlg_in = self.VALUE_IN_SIZE + (_v_extra if self.hlg_serve else 0)
+      self.hlg_head = Head(self.Activation, _hlg_in, 64 * HEAD_MULT, self.hlg_buckets, 0)
       self.register_buffer('hlg_edges', torch.linspace(-1.0, 1.0, self.hlg_buckets + 1), persistent=False)
+      self.register_buffer('hlg_centers', (torch.arange(self.hlg_buckets, dtype=torch.float32) + 0.5)
+                           * (2.0 / self.hlg_buckets) - 1.0, persistent=False)
       print(f'[ceres_net] HL-GAUSS categorical value head enabled: w={self.hlg_weight}, '
-            f'buckets={self.hlg_buckets}, sigma={self.hlg_sigma:.4f} (training-only)')
+            f'buckets={self.hlg_buckets}, sigma={self.hlg_sigma:.4f} '
+            + ('(SERVED: exported value = WDL from HL-Gauss Q + the WDL head\'s draw probability; console value loss / acc = '
+               'the WDL (D) head, the served WDL is logged as value_served_loss / value_served_acc)'
+               if self.hlg_serve else '(training-only)'))
 
     # Placement value head (AUXILIARY, training-only). Env-gated: CERES_PLACEMENT_VALUE_WEIGHT
     # (default 0 = fully off, exactly current behavior). Additive per-square WDL decomposition:
@@ -2987,7 +3002,7 @@ class CeresNet(nn.Module):
       self._last_sp_out = self.sp_head(fS_policy)
 
     # HL-Gauss categorical value head (see __init__): training-only stash.
-    if self.hlg_weight > 0 and self.training:
+    if self.hlg_weight > 0 and self.training and not self.hlg_serve:
       self._last_hlg_out = self.hlg_head(fS_value)
 
     # Optimistic-policy aux head (see __init__): training-only stash.
@@ -3258,7 +3273,14 @@ class CeresNet(nn.Module):
     value_out = self.value_head(fS_value_v, _v_inject)
     if _mt_out is not None and getattr(self, 'mt_expected_value', False) and _mt_out[6] is not None:
       value_out = value_out + (_mt_out[6].to(torch.float32).unsqueeze(-1) * self.mt_ev_dir.to(torch.float32)).to(value_out.dtype)
-    value2_out = self.value2_head(torch.cat((fS_value_v, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
+    if self.hlg_serve:
+      # ValueHLGaussServe (see __init__): Q from the HL-Gauss head, D from the WDL head, served as log-WDL.
+      _hlg_logits = self.hlg_head(fS_value_v, _v_inject)
+      if self.training:
+        self._last_hlg_out = _hlg_logits
+        self._last_value_raw = value_out          # the WDL head's own logits: trained (for D) by the value CE
+      value_out = self.served_wdl_logits(_hlg_logits, value_out)
+    value2_out =self.value2_head(torch.cat((fS_value_v, qblunders_negative_positive), -1), _v2_inject) if self.value2_loss_weight > 0 else value_out
     unc_out = self.unc_head(fS_value if self.value_priv_replace else fS_others)
     unc_policy_out = self.unc_policy(fS_others) if self.uncertainty_policy_weight > 0 else unc_out # unc_out is just a dummy so not None
 
@@ -3285,6 +3307,17 @@ class CeresNet(nn.Module):
     ret = policy_out, value_out, moves_left_out, unc_out, value2_out, q_deviation_lower_out, q_deviation_upper_out, unc_policy_out, action_out, state_out, action_uncertainty_out
 
     return ret
+
+
+  def served_wdl_logits(self, hlg_logits: torch.Tensor, wdl_logits: torch.Tensor) -> torch.Tensor:
+    """ValueHLGaussServe: [B, buckets] HL-Gauss logits + [B, 3] WDL logits -> [B, 3] log-WDL (float32), with
+    Q = sum_i softmax(hlg)_i c_i, D = min(softmax(wdl)_1, 1 - |Q|), W = (1 - D + Q) / 2, L = (1 - D - Q) / 2."""
+    q = (torch.softmax(hlg_logits.float(), dim=-1) * self.hlg_centers.float()).sum(dim=-1, keepdim=True)
+    d = torch.softmax(wdl_logits.float(), dim=-1)[:, 1:2]
+    d = torch.minimum(d, 1.0 - q.abs())
+    w = 0.5 * (1.0 - d + q)
+    l = 0.5 * (1.0 - d - q)
+    return torch.log(torch.cat([w, d, l], dim=-1).clamp_min(1e-7))
 
 
   def compute_loss(self, loss_calc : LossCalculator, batch, policy_out, value_out, moves_left_out, unc_out,
@@ -3421,7 +3454,22 @@ class CeresNet(nn.Module):
           _pt = policy_target.float(); _pt = _pt / _pt.sum(dim=1, keepdim=True).clamp_min(1e-9)
           _pw_log['pw_qpol_plain_ce'] = torch.nn.functional.cross_entropy(_pm, _pt) + (_pt * _pt.clamp_min(1e-12).log()).sum(-1).mean()
     p_loss = 0 if policy_out is None else loss_calc.policy_loss(_pt_pl, policy_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.policy_loss_weight, row_weights=_prow)
-    v_loss = 0 if value_out is None else loss_calc.value_loss(value_target, value_out, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_loss_weight, provenance=z_provenance)
+    # ValueHLGaussServe: the WDL CE trains the WDL head's own logits (its D is what is served), not the served WDL
+    # (review 11-23) consumed only by the real pass: grad-norm probe steps run this twice on the same forward
+    _v_raw = getattr(self, '_last_value_raw', None) if self.hlg_serve else None
+    if self.hlg_serve and self.training and value_out is not None:
+      assert _v_raw is not None, 'ValueHLGaussServe: the WDL head logits were not stashed (no fallback to the served WDL)'
+    if _v_raw is not None and not gradient_norm_logging_mode:
+      self._last_value_raw = None
+    v_loss = 0 if value_out is None else loss_calc.value_loss(value_target, value_out if _v_raw is None else _v_raw, SUBTRACT_ENTROPY, gradient_norm_logging_mode, self.value_loss_weight, provenance=z_provenance)
+    _served_v = None
+    if _v_raw is not None and not gradient_norm_logging_mode:
+      # metrics only (review 11-23): the console value loss / accuracy are the D head's; log the served WDL too
+      with torch.no_grad():
+        _st = value_target.float()
+        _ce = -(_st * torch.log_softmax(value_out.float(), dim=-1)).sum(-1).mean()
+        _ent = -(_st * _st.clamp_min(1e-12).log()).sum(-1).mean()
+        _served_v = (_ce - _ent, (value_out.argmax(-1) == _st.argmax(-1)).float().mean() * 100)
 
     # Value RANK loss (see __init__): calibration-free in-batch ordering of
     # E[V] = p(w) - p(l) against the target margin. Only pairs whose targets
@@ -4356,6 +4404,9 @@ class CeresNet(nn.Module):
         self._log("value_contrast_loss" + stat_suffix, vc_loss, step=num_pos)
       if not isinstance(hlg_loss, int):
         self._log("hlgauss_value_loss" + stat_suffix, hlg_loss, step=num_pos)
+      if _served_v is not None:
+        self._log("value_served_loss" + stat_suffix, _served_v[0], step=num_pos)
+        self._log("value_served_acc" + stat_suffix, _served_v[1], step=num_pos)
       if not isinstance(opt_loss, int):
         self._log("optimistic_policy_loss" + stat_suffix, opt_loss, step=num_pos)
       if not isinstance(oppp_loss, int) and not _oppp_participation_only:

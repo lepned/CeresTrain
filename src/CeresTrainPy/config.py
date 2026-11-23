@@ -1107,6 +1107,32 @@ class Configuration:
     # Zero-init no-op add-on (the 'inject' class).
     self.NetDef_ValueHeadMinMaxPool = config_net_def.get('ValueHeadMinMaxPool', False)
     self.NetDef_ValueHeadPoolChannels = config_net_def.get('ValueHeadPoolChannels', False)
+    # ValueHLGaussServe (2026-11-23; Fry's value head, variant B; ceres_net.served_wdl_logits): the HL-Gauss head
+    # (HLGaussWeight / HLGaussBuckets) is THE served Q; the WDL value head is trained only for the draw probability
+    # (LossValueMultiplier, keep it low) and value2 exports the same served WDL (LossValue2Multiplier must be 0).
+    self.NetDef_ValueHLGaussServe = bool(config_net_def.get('ValueHLGaussServe', False))
+    if self.NetDef_ValueHLGaussServe:
+      for _cond, _what in (
+          (float(self.Opt_HLGaussWeight) <= 0, 'needs HLGaussWeight > 0 (the HL-Gauss head is the served Q)'),
+          (float(self.Opt_LossValue2Multiplier or 0) != 0,
+           'needs LossValue2Multiplier 0 (value2 exports the served WDL; a trained value2 head would not be served)'),
+          (float(self.Opt_LossValueMultiplier or 0) <= 0,
+           'needs LossValueMultiplier > 0 (the WDL head supplies the served draw probability)'),
+          (bool(self.NetDef_MoveTokenExpectedValue), 'MoveTokenExpectedValue adds to the WDL logits: not wired with it'),
+          (bool(self.NetDef_TrainOn4BoardSequences), 'TrainOn4BoardSequences (value-diff losses) is not wired with it'),
+          # review 11-23: sigma 0 = one-hot buckets -> NaN in the HL-Gauss target; the Mycel / lc0ex kernel needs a
+          # power-of-two bucket count; value losses that would train through the served log-WDL are refused
+          (self.Opt_HLGaussSigmaScale is not None and float(self.Opt_HLGaussSigmaScale) <= 0,
+           'needs HLGaussSigmaScale > 0 (one-hot buckets are not supported for the served head)'),
+          (int(self.Opt_HLGaussBuckets) < 2 or int(self.Opt_HLGaussBuckets) & (int(self.Opt_HLGaussBuckets) - 1),
+           f'HLGaussBuckets must be a power of two >= 2 (got {self.Opt_HLGaussBuckets}; the lc0ex kernel needs it)'),
+          (float(os.environ.get('CERES_VALUE_RANK_WEIGHT', '0') or 0) > 0, 'CERES_VALUE_RANK_WEIGHT > 0 is not wired with it'),
+          (float(self.Opt_MirrorConsWeight or 0) > 0 or float(os.environ.get('CERES_VALUE_MIRROR_CONS_WEIGHT', '0') or 0) > 0,
+           'MirrorConsistencyWeight > 0 is not wired with it'),
+          (float(self.Opt_KLAnchorValueWeight or 0) > 0, 'KLAnchorValueWeight > 0 is not wired with it'),
+      ):
+        if _cond:
+          raise ValueError(f'ValueHLGaussServe: {_what}')
     # Iterated tactic refiner (see tactical_refiner.py): 0 = off.
     self.NetDef_RefinerIters = config_net_def.get('RefinerIters', 0)
     self.NetDef_RefinerDim = config_net_def.get('RefinerDim', 128)

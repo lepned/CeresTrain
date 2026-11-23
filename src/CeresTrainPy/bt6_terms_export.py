@@ -259,6 +259,12 @@ def _export_heads_decoder(net, put, dense, scale, edge_channels: int) -> None:
     if head is not None and (name != "value2" or net.value2_loss_weight > 0):
       dense(f"/head/{name}/fc", head.fc)
       dense(f"/head/{name}/out", head.fcFinal)
+  if getattr(net, "hlg_serve", False):
+    # ValueHLGaussServe: the HL-Gauss head (same input and decoder value inject as /head/value) and its bucket centres;
+    # served value = log-WDL from Q = sum softmax(hlg) * centres and D = the WDL head's draw prob (served_wdl_logits)
+    dense("/head/hlg/fc", net.hlg_head.fc)
+    dense("/head/hlg/out", net.hlg_head.fcFinal)
+    put("/head/hlg/centers", net.hlg_centers, np.float32)
 
   # ---- move-token decoder (the folds of the builder's ceres/carrier.py decoder_tensors_from_state_dict)
   mt = net.move_tokens
@@ -492,7 +498,7 @@ def _flat_meta(net) -> dict:
     "outer_norm": config.NetDef_NormType, "outer_norm_eps": 1e-6, "embedding": "linear",
     "heads_activation": config.NetDef_HeadsActivationType, "head_front_act": bool(net.head_front_act),
     "premap_per_square": net.HEAD_PREMAP_PER_SQUARE, "value2": net.value2_loss_weight > 0,
-    "mlh": net.moves_left_loss_weight > 0,
+    "mlh": net.moves_left_loss_weight > 0, "hlg_serve": bool(getattr(net, "hlg_serve", False)),
   }
 
 
@@ -539,6 +545,14 @@ def served_flat_layer(t: dict, index: int, x, E, S, e, meta: dict, terms: bool):
 
 
 @torch.no_grad()
+def served_hlg_value(t: dict, front, pooled, act, wdl_logits):
+  """ValueHLGaussServe (ceres_net.served_wdl_logits): log-WDL from the HL-Gauss Q and the WDL head's draw probability."""
+  hlg = _dense(act(_dense(front, t, "/head/hlg/fc") + pooled @ t[f"{MT}/v_inject/w"]), t, "/head/hlg/out")
+  q = (torch.softmax(hlg.double(), dim=-1) * t["/head/hlg/centers"].double()).sum(dim=-1, keepdim=True)
+  d = torch.minimum(torch.softmax(wdl_logits.double(), dim=-1)[:, 1:2], 1.0 - q.abs())
+  return torch.log(torch.cat([0.5 * (1.0 - d + q), d, 0.5 * (1.0 - d - q)], dim=-1).clamp_min(1e-7)).to(wdl_logits.dtype)
+
+
 def forward_served_flat(t: dict, squares: torch.Tensor, meta: dict, tokens: torch.Tensor, taps: dict | None = None) -> dict:
   from activation_functions import to_activation
   batch = squares.shape[0]
@@ -580,9 +594,13 @@ def forward_served_flat(t: dict, squares: torch.Tensor, meta: dict, tokens: torc
   front = _dense(front.reshape(batch, -1), t, "/head/shared")
   front = keep("head_shared", act(front) if meta["head_front_act"] else front)
   out["value"] = _dense(act(_dense(front, t, "/head/value/fc") + pooled @ t[f"{MT}/v_inject/w"]), t, "/head/value/out")
+  if meta.get("hlg_serve", False):
+    out["value"] = served_hlg_value(t, front, pooled, act, out["value"])
   if meta["value2"]:
     hidden = _dense(torch.cat((front, blunders), dim=-1), t, "/head/value2/fc") + pooled @ t[f"{MT}/v2_inject/w"]
     out["value2"] = _dense(act(hidden), t, "/head/value2/out")
+  elif meta.get("hlg_serve", False):
+    out["value2"] = out["value"]          # ValueHLGaussServe: value2 exports the served WDL (as the trainer aliases)
   return out
 
 
@@ -819,7 +837,11 @@ def forward_served_terms(t: dict, squares: torch.Tensor, meta: dict, tokens: tor
   front = _dense(front.reshape(batch, -1), t, "/head/shared")
   front = keep("head_shared", act(front) if meta["head_front_act"] else front)
   out["value"] = _dense(act(_dense(front, t, "/head/value/fc") + pooled @ t[f"{MT}/v_inject/w"]), t, "/head/value/out")
+  if meta.get("hlg_serve", False):
+    out["value"] = served_hlg_value(t, front, pooled, act, out["value"])
   if meta["value2"]:
     hidden = _dense(torch.cat((front, blunders), dim=-1), t, "/head/value2/fc") + pooled @ t[f"{MT}/v2_inject/w"]
     out["value2"] = _dense(act(hidden), t, "/head/value2/out")
+  elif meta.get("hlg_serve", False):
+    out["value2"] = out["value"]          # ValueHLGaussServe: value2 exports the served WDL (as the trainer aliases)
   return out
