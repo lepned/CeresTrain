@@ -25,13 +25,20 @@ import torch
 BT6_READER_SUFFIXES = (".t_node", ".t_edge", ".C1", ".C2", ".We", ".Wm", ".Wg", ".bg", ".Pk", ".Pq")
 
 
+def _is_reader_key(key: str) -> bool:
+  """A BT6 reader parameter: an NBT inner layer's (transformer_layer.B.inner.J.<...>) or, on the flat trunk
+  (2026-11-23, BT6TermsLayers widened), a layer's term reads (transformer_layer.L.attention.bt6t.<reader>)."""
+  return (".inner." in key or ".attention.bt6t." in key) and key.endswith(BT6_READER_SUFFIXES)
+
+
 def is_switch_parameter(key: str, config) -> bool:
   """True for a state_dict key that an NBT-BT6 hybrid switch may ADD on resume:
      * the reader parameters of an inner layer (BT6TermsInnerLayers widened): transformer_layer.B.inner.J.<reader>
+     * on the flat trunk, a layer's term reads (BT6TermsLayers widened): transformer_layer.L.attention.bt6t.<reader>
      * the shared smolgen (BT6SharedSmolgen): transformer_layer.B.shared_smolgen.* and smolgenPrepLayer.*"""
   if not getattr(config, 'NetDef_BT6Hybrid', False):
     return False
-  if ".inner." in key and key.endswith(BT6_READER_SUFFIXES):
+  if _is_reader_key(key):
     return True
   if getattr(config, 'NetDef_BT6SharedSmolgen', False):
     return ".shared_smolgen." in key or key.startswith("smolgenPrepLayer.")
@@ -74,7 +81,7 @@ def check_identity(model, new_keys) -> dict:
   bad, readers, smolgen = [], 0, 0
   for key in new_keys:
     value = sd[key].detach().float()
-    if ".inner." in key and key.endswith(BT6_READER_SUFFIXES):
+    if _is_reader_key(key):
       readers += 1
       if key.endswith(".We"):
         continue

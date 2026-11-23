@@ -47,7 +47,10 @@ BT6_HYBRID_PREFIX = "bt6h."
 
 def is_bt6_layer_reader(name: str) -> bool:
   """True for the reader tables / scales of a BT6 inner layer (name as in named_parameters, any wrapper prefix)."""
-  return (".inner." in name or ".bt6_readers." in name) and name.endswith(BT6_LAYER_READER_SUFFIXES)
+  # ".attention.bt6t." = the reader tensors of BT6NativeTerms, on an NBT inner layer or (2026-11-23) on a plain
+  # encoder layer of a flat trunk (transformer_layer.<i>.attention.bt6t.*, no ".inner.")
+  return ((".inner." in name or ".bt6_readers." in name or ".attention.bt6t." in name)
+          and name.endswith(BT6_LAYER_READER_SUFFIXES))
 
 
 def is_bt6_output_gate(name: str) -> bool:

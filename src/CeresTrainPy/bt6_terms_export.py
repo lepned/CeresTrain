@@ -65,8 +65,17 @@ MT_FLOOR = -30.0
 ONE = "/const/one"
 
 
+def is_flat(net) -> bool:
+  """A plain (flat) encoder trunk: NBTInnerLayers 0, with or without the BT6 parts (BT6TermsLayers)."""
+  return bool(getattr(net, "bt6_flat", False)) or (getattr(net, "bt6h", None) is None
+                                                   and int(getattr(net.config, "NetDef_NBTInnerLayers", 0) or 0) == 0)
+
+
 def variant_of(net) -> str:
-  """'nt' (our own layers with BT6 term reads) or 'bt' (BT6 layers)."""
+  """'nt' (our own layers with BT6 term reads), 'bt' (BT6 layers) or 'flat' (a flat trunk of our own layers, with or
+  without BT6 term reads; 2026-11-23)."""
+  if is_flat(net):
+    return "flat"
   assert getattr(net, "bt6h", None) is not None, "not a BT6Hybrid net"
   return "nt" if getattr(net, "bt6_native", False) else "bt"
 
@@ -88,7 +97,10 @@ def qkv_permutation(heads: int, head_depth: int) -> np.ndarray:
 # ====================================================================================================================
 @torch.no_grad()
 def export_served_terms(net) -> dict:
-  """Served tensors of a BT6-hybrid CeresNet of variant "bt" or "nt" with the move-token decoder."""
+  """Served tensors of a BT6-hybrid CeresNet of variant "bt" or "nt" with the move-token decoder, or of a flat
+  trunk (variant "flat", `export_served_flat`)."""
+  if is_flat(net):
+    return export_served_flat(net)
   hybrid = net.bt6h
   variant = variant_of(net)
   if hybrid.policy is not None or getattr(net, "move_tokens", None) is None:
@@ -98,6 +110,9 @@ def export_served_terms(net) -> dict:
     raise NotImplementedError("export_served_terms: only the linear embedding (BT6Embedding 'linear') is exported")
   if hybrid.share_readers:
     raise NotImplementedError("export_served_terms: BT6ShareReadersPerBlock is not exported")
+  if getattr(net, "bt6_flat", False):
+    raise NotImplementedError("export_served_terms: BT6 parts on a flat trunk (BT6TermsLayers) have no lc0ex front end "
+                              "yet (read these nets through the ONNX export)")
   if getattr(net, "attn_templates", None) is not None or getattr(net, "input_skip_a", None) is not None:
     raise NotImplementedError("export_served_terms: AttnTemplates / NBTInputSkip have no lc0ex front end yet "
                               "(read these nets through the ONNX export)")
@@ -227,6 +242,15 @@ def export_served_terms(net) -> dict:
       put(f"{s}/ffn/dense1_rev/w", site.ffn_rev, np.float32)
       put(f"{s}/ffn/dense2/w", site.ffn_out, np.float32)
 
+  _export_heads_decoder(net, put, dense, scale, cfg.edge_channels)
+  return out
+
+
+def _export_heads_decoder(net, put, dense, scale, edge_channels: int) -> None:
+  """The heads and the move-token decoder (shared by every variant)."""
+  def f64(tensor):
+    return tensor.detach().double().cpu()
+
   # ---- heads
   dense("/head/premap", net.headPremap)
   dense("/head/shared", net.headSharedLinear)
@@ -251,7 +275,7 @@ def export_served_terms(net) -> dict:
   put(f"{MT}/w_in/b", mt.w_in.bias)
   if mt.w_edge is not None:
     # MoveTokenEdgeInput: each token adds rms(e_final[:, from, to]) @ w_edge to its input embedding (FP32 table)
-    assert tuple(mt.w_edge.shape) == (cfg.edge_channels, dm), f"move_tokens.w_edge is {tuple(mt.w_edge.shape)}"
+    assert tuple(mt.w_edge.shape) == (edge_channels, dm), f"move_tokens.w_edge is {tuple(mt.w_edge.shape)}"
     put(f"{MT}/w_edge/w", mt.w_edge, np.float32)
   put(f"{MT}/kv/norm/scale", torch.ones(d))
   cross, post = [], []
@@ -289,13 +313,288 @@ def export_served_terms(net) -> dict:
   put(f"{MT}/v_inject/w", mt.v_inject.weight.T)
   if net.value2_loss_weight > 0:
     put(f"{MT}/v2_inject/w", mt.v2_inject.weight.T)
+
+
+# ====================================================================================================================
+# Flat trunk (2026-11-23): NBTInnerLayers 0, pre-norm encoder layers of our own, optional QK-norm, AttnTemplates
+# (scope 'layer'), optional BT6 term reads (BT6TermsLayers) and edge sites after layers (BT6EdgeSites)
+# ====================================================================================================================
+#
+# NAME PLAN (in addition to / instead of the NBT names above):
+#   no /nbt{b}/*, no smolgen tensors
+#   /embed/linear/{w,b}, /embed/norm/scale     InputHistoryKeep >= 0 is FOLDED into /embed/linear/w (the reduced input
+#                                              is a fixed channel gather + mask of the record, a linear map; BT6 nets
+#                                              with InputHistoryKeep are refused: their relations read the history)
+#   /encoder{i}/ln{1,2}/scale, mha/qkv/w, mha/out/{w,b}, ffn/*          as variant nt, i = the layer
+#   /encoder{i}/mha/qk_norm/{q,k}/scale [hd]   UseQKNorm: per-head RMSNorm (eps 1e-6) of Q and K, one gain shared by
+#                                              the heads, applied before q.k and before the term reads
+#   /encoder{i}/tpl/mix/{w [D, heads * T], b}  AttnTemplates: c[b, i, h, t] = ln1(x)[b, i] @ w + b (column h * T + t)
+#   /tpl/table [T, 64, 64] FP32                bias[b, h, i, j] = sum_t c[b, i, h, t] table[t, i, j]  (joins L before
+#                                              the door, unscaled -- the per-head bias of the layer)
+#   /encoder{i}/mha/egt/qk_scale [heads]       every layer: t_node / sqrt(hd) on a term layer, 1 / sqrt(hd) otherwise
+#   /encoder{i}/mha/egt/*                      the other term tables on the term layers only (folds as variant nt)
+#   /encoder{i}/edge_site/*                    for every i in BT6EdgeSites; the site reads the layer's RAW logits
+#                                              q.k / sqrt(hd) + bias (no terms, no t_node, no door: the trainer's
+#                                              nbt_layer._raw_logits), with QK-norm applied
+#   /prologue/*                                BT6 nets only
+@torch.no_grad()
+def export_served_flat(net) -> dict:
+  hybrid = getattr(net, "bt6h", None)
+  config = net.config
+  if getattr(net, "move_tokens", None) is None:
+    raise NotImplementedError("export_served_flat: the net must have the move-token decoder")
+  if hybrid is not None and (hybrid.policy is not None or hybrid.embed is not None):
+    raise NotImplementedError("export_served_flat: BT6 policy head / BT6Embedding 'bt6' are not exported")
+  if getattr(net, "input_skip_a", None) is not None:
+    raise NotImplementedError("export_served_flat: NBTInputSkip is not exported")
+  templates = getattr(net, "attn_templates", None)
+  history_keep = int(getattr(net, "history_keep", -1))
+  if hybrid is not None and history_keep >= 0:
+    raise NotImplementedError("export_served_flat: InputHistoryKeep with BT6 parts (the relations read the history)")
+  layers = list(net.transformer_layer)
+  att0 = layers[0].attention
+  heads, hd = att0.num_heads, att0.d_k
+  out = {}
+  if hybrid is not None:
+    cfg = hybrid.layer_config
+    assert cfg.heads == heads and cfg.head_dim == hd, (cfg.heads, cfg.head_dim, heads, hd)
+    shell = BT6Net.__new__(BT6Net)
+    nn.Module.__init__(shell)
+    shell.config = BT6Config(**{**cfg.__dict__, "layers": len(layers), "edge_sites": tuple(hybrid.site_blocks)})
+    shell.relations = hybrid.relations
+    shell.prologue = hybrid.prologue
+    out = shell.export_served(parts=())
+    out.pop("/policy/qk_scale", None)
+
+  def f64(tensor):
+    return tensor.detach().double().cpu()
+
+  def put(name, tensor, dtype=np.float16):
+    array = (tensor if isinstance(tensor, np.ndarray) else f64(tensor).numpy()).astype(np.float64)
+    with np.errstate(over="ignore"):
+      converted = array.astype(dtype)
+    if not np.isfinite(converted).all():
+      raise ValueError(f"{name}: a value does not fit {np.dtype(dtype).name}")
+    out[name] = np.ascontiguousarray(converted)
+
+  def dense(prefix, linear, bias=True):
+    put(f"{prefix}/w", linear.weight.T)
+    if linear.bias is not None:
+      assert bias, f"{prefix}: unexpected bias"
+      put(f"{prefix}/b", linear.bias)
+    else:
+      assert not bias, f"{prefix}: the plan has a bias, the module has none"
+
+  def scale(prefix, module):
+    assert getattr(module, "bias", None) is None and hasattr(module, "scale"), f"{prefix}: an RMSNorm is expected"
+    assert not getattr(module, "_scale_folded", False)
+    put(f"{prefix}/scale", module.scale)
+
+  put(ONE, torch.ones(1))
+  # the 1 / sqrt(hd) of the raw logits an edge site reads after a TERM layer (whose qk_scale carries t_node)
+  put("/flat/raw_qk_scale", torch.full((heads,), 1.0 / math.sqrt(hd), dtype=torch.float64), np.float32)
+  emb_w = f64(net.embedding_layer.weight)                                     # [D, F]
+  if history_keep >= 0:
+    # reduced[c] = record[hist_idx[c]] * hist_mask[c]  =>  W' [:, j] = sum_{c: hist_idx[c] = j} hist_mask[c] W[:, c]
+    idx, mask = net.hist_idx.cpu().long(), f64(net.hist_mask)
+    folded = torch.zeros_like(emb_w)
+    folded.index_add_(1, idx, emb_w * mask[None, :])
+    emb_w = folded
+  put("/embed/linear/w", emb_w.T)
+  put("/embed/linear/b", net.embedding_layer.bias)
+  scale("/embed/norm", net.embedding_norm)
+  if templates is not None:
+    put("/tpl/table", templates.table, np.float32)
+  order = qkv_permutation(heads, hd)
+  term_layers = set() if hybrid is None else set(net.bt6_terms_layers)
+  if hybrid is not None:
+    pro = hybrid.prologue
+    D, T = f64(pro.D), f64(pro.T)
+    offsets = T.T[:, pro.relidx.cpu()]
+  for i, layer in enumerate(layers):
+    p = f"/encoder{i}"
+    att = layer.attention
+    assert layer.pre_norm and layer.alpha == 1 and att.use_qkv and att.qkv.bias is None
+    assert att.num_heads == heads and att.d_k == hd and att.attention_multiplier == 1
+    assert not att.use_smolgen and not att.use_rpe and not att.use_rope and att.softcap_cutoff == 0
+    assert not getattr(att, "use_gated_attn_out", False) and not getattr(att, "use_diff_attention", False)
+    assert not getattr(att, "use_head_logit_temp", False) and getattr(att, "head_mix", None) is None
+    assert getattr(layer, "tsb", None) is None and getattr(layer, "moe", None) is None
+    scale(f"{p}/ln1", layer.ln1)
+    put(f"{p}/mha/qkv/w", f64(att.qkv.weight)[torch.from_numpy(order)].T)
+    dense(f"{p}/mha/out", att.W_h)
+    if att.use_qk_norm:
+      scale(f"{p}/mha/qk_norm/q", att.qLN)
+      scale(f"{p}/mha/qk_norm/k", att.kLN)
+    tmix = getattr(layer, "tmix", None)
+    if tmix is not None:
+      assert templates is not None and tmix.bank is templates and tmix.heads == heads
+      dense(f"{p}/tpl/mix", tmix.mix)
+    scale(f"{p}/ln2", layer.ln2)
+    mlp = layer.mlp
+    assert mlp.linear3.bias is None
+    put(f"{p}/ffn/dense1/w", torch.cat((f64(mlp.linear1.weight).T, f64(mlp.linear3.weight).T), dim=1))
+    put(f"{p}/ffn/dense1/b", torch.cat((f64(mlp.linear1.bias), torch.zeros_like(f64(mlp.linear1.bias)))))
+    dense(f"{p}/ffn/dense2", mlp.linear2)
+    g = f"{p}/mha/egt"
+    terms = getattr(att, "bt6t", None)
+    assert (terms is not None) == (i in term_layers), f"layer {i}: term reads {terms is not None}, plan {i in term_layers}"
+    if terms is None:
+      put(f"{g}/qk_scale", torch.full((heads,), 1.0 / math.sqrt(hd), dtype=torch.float64), np.float32)
+    else:
+      t_node, t_edge, C2 = f64(terms.t_node), f64(terms.t_edge), f64(terms.C2)
+      put(f"{g}/qk_scale", t_node * (1.0 / math.sqrt(hd)), np.float32)
+      put(f"{g}/attack", t_node[:, None] * f64(terms.C1), np.float32)
+      put(f"{g}/key", t_node[:, None, None] * f64(terms.Pk), np.float32)
+      put(f"{g}/query", t_node[:, None, None] * f64(terms.Pq), np.float32)
+      put(f"{g}/scaled_coefficients", t_node[:, None] * (C2 @ D.T), np.float32)
+      put(f"{g}/constant_bias", t_node[:, None, None] * torch.einsum("ht,trc->hrc", C2, offsets), np.float32)
+      put(f"{g}/edge_read/w", t_edge[:, None] * f64(terms.We), np.float32)
+      put(f"{g}/door/w", terms.Wm, np.float32)
+      put(f"{g}/gate/w", terms.Wg, np.float32)
+      put(f"{g}/gate/b", terms.bg, np.float32)
+  edge_channels = 16
+  if hybrid is not None:
+    cfg = hybrid.layer_config
+    edge_channels = cfg.edge_channels
+    assert cfg.rev_edge, "the edge-site export expects the reverse edge"
+    for i in hybrid.site_blocks:
+      site, s = hybrid.sites[str(i)], f"/encoder{i}/edge_site"
+      put(f"{s}/readback/w", site.readback, np.float32)
+      if cfg.triplet:
+        put(f"{s}/triplet/value/w", site.triplet_value, np.float32)
+        put(f"{s}/triplet/gate/w", site.triplet_gate, np.float32)
+        put(f"{s}/triplet/gate/b", site.triplet_gate_bias, np.float32)
+        put(f"{s}/triplet/out/w", site.triplet_out, np.float32)
+      put(f"{s}/ffn/dense1/w", site.ffn_in, np.float32)
+      put(f"{s}/ffn/dense1/b", site.ffn_in_bias, np.float32)
+      put(f"{s}/ffn/dense1_rev/w", site.ffn_rev, np.float32)
+      put(f"{s}/ffn/dense2/w", site.ffn_out, np.float32)
+  scale("/trunk/final_norm", net.trunk_end_norm)
+  _export_heads_decoder(net, put, dense, scale, edge_channels)
+  return out
+
+
+def _flat_meta(net) -> dict:
+  hybrid = getattr(net, "bt6h", None)
+  config = net.config
+  att0 = net.transformer_layer[0].attention
+  cfg = None
+  if hybrid is not None:
+    cfg = BT6Config(**{**hybrid.layer_config.__dict__, "layers": len(net.transformer_layer),
+                       "edge_sites": tuple(hybrid.site_blocks)})
+  return {
+    "variant": "flat", "layer_config": cfg, "layers": len(net.transformer_layer), "heads": att0.num_heads,
+    "head_dim": att0.d_k, "bt6": hybrid is not None,
+    "term_layers": tuple(sorted(net.bt6_terms_layers)) if hybrid is not None else (),
+    "site_layers": tuple(hybrid.site_blocks) if hybrid is not None else (),
+    "qk_norm": bool(att0.use_qk_norm), "templates": getattr(net, "attn_templates", None) is not None,
+    "outer_norm": config.NetDef_NormType, "outer_norm_eps": 1e-6, "embedding": "linear",
+    "heads_activation": config.NetDef_HeadsActivationType, "head_front_act": bool(net.head_front_act),
+    "premap_per_square": net.HEAD_PREMAP_PER_SQUARE, "value2": net.value2_loss_weight > 0,
+    "mlh": net.moves_left_loss_weight > 0,
+  }
+
+
+def served_flat_layer(t: dict, index: int, x, E, S, e, meta: dict, terms: bool):
+  """One flat layer from /encoder{index}/... : x [B, 64, D] -> (x, raw logits q.k / sqrt(hd) + bias)."""
+  batch, heads, hd = x.shape[0], meta["heads"], meta["head_dim"]
+  width = heads * hd
+  p = f"/encoder{index}"
+  g = f"{p}/mha/egt"
+  y = _rms_norm(x, t[f"{p}/ln1/scale"])
+  lanes = (y @ t[f"{p}/mha/qkv/w"]).view(batch, 64, 3, heads, hd)
+  q, k, v = lanes[:, :, 0], lanes[:, :, 1], lanes[:, :, 2]
+  if f"{p}/mha/qk_norm/q/scale" in t:
+    q = _rms_norm(q, t[f"{p}/mha/qk_norm/q/scale"])
+    k = _rms_norm(k, t[f"{p}/mha/qk_norm/k/scale"])
+  bias = None
+  if f"{p}/tpl/mix/w" in t:
+    c = (_dense(y, t, f"{p}/tpl/mix")).view(batch, 64, heads, -1)               # [B, i, h, T]
+    bias = torch.einsum("biht,tij->bhij", c, t["/tpl/table"])
+  qk = torch.einsum("bihd,bjhd->bhij", q, k)
+  raw = qk / math.sqrt(hd) + (bias if bias is not None else 0.0)
+  scores = qk * t[f"{g}/qk_scale"].view(1, heads, 1, 1)
+  if terms:
+    row = torch.einsum("bihd,hcd->bhic", q, t[f"{g}/query"]) + t[f"{g}/attack"][None, :, None, :]
+    column = torch.einsum("bjhd,hcd->bhjc", k, t[f"{g}/key"])
+    scores = scores + torch.einsum("bhic,bcij->bhij", row, E) + torch.einsum("bhjc,bcij->bhij", column, E)
+    scores = scores + S[:, None] * (torch.einsum("hc,bcij->bhij", t[f"{g}/scaled_coefficients"], E)
+                                    + t[f"{g}/constant_bias"])
+  if bias is not None:
+    scores = scores + bias
+  if terms:
+    read = torch.einsum("hc,bcij->bhij", t[f"{g}/edge_read/w"], e)
+    door = torch.einsum("hc,bcij->bhij", t[f"{g}/door/w"], e)
+    gate = torch.einsum("hc,bcij->bhij", t[f"{g}/gate/w"], e) + t[f"{g}/gate/b"].view(1, heads, 1, 1)
+    A = torch.softmax((scores + read) * (1.0 + door), dim=-1) * (2.0 * torch.sigmoid(gate))
+  else:
+    A = torch.softmax(scores, dim=-1)
+  attended = torch.einsum("bhij,bjhd->bihd", A, v).reshape(batch, 64, width)
+  x = x + _dense(attended, t, f"{p}/mha/out")
+  f = _rms_norm(x, t[f"{p}/ln2/scale"])
+  gate, up = _dense(f, t, f"{p}/ffn/dense1").chunk(2, dim=-1)
+  x = x + _dense(F.silu(gate) * up, t, f"{p}/ffn/dense2")
+  return x, raw
+
+
+@torch.no_grad()
+def forward_served_flat(t: dict, squares: torch.Tensor, meta: dict, tokens: torch.Tensor, taps: dict | None = None) -> dict:
+  from activation_functions import to_activation
+  batch = squares.shape[0]
+  squares = squares.float()
+  assert meta["outer_norm"] == "RMSNorm" and meta["embedding"] == "linear"
+  eps = meta["outer_norm_eps"]
+
+  def keep(name, value):
+    if taps is not None:
+      taps[name] = value
+    return value
+
+  E = S = e = None
+  cfg = meta["layer_config"]
+  if meta["bt6"]:
+    pieces, previous = pieces_from_squares(squares)
+    E_bool = BT6Relations().to(squares.device)(pieces, previous)
+    E = E_bool.float()
+    S, e = served_prologue(t, E_bool, cfg)
+    keep("edge_norm", S)
+    keep("state_seed", e)
+  blunders = squares[:, 0, 119:121]
+  record = torch.cat((squares[:, :, :119], torch.zeros_like(squares[:, :, 119:121]), squares[:, :, 121:]), dim=2)
+  x = keep("embedding", _rms_norm(_dense(record, t, "/embed/linear"), t["/embed/norm/scale"], eps))
+  for i in range(meta["layers"]):
+    x, raw = served_flat_layer(t, i, x, E, S, e, meta, i in meta["term_layers"])
+    keep(f"layer{i}", x)
+    if i in meta["site_layers"]:
+      keep(f"logits{i}", raw)
+      e = keep(f"state{i}", served_site(t, i, e, raw, cfg))
+  x = keep("trunk_norm", _rms_norm(x, t["/trunk/final_norm/scale"], eps))
+  token_logits, pooled = served_decoder(t, x, tokens, meta, edge=e)
+  keep("mt_pooled", pooled)
+  out = {"policy_tokens": token_logits,
+         "policy": policy_from_tokens(t, token_logits, tokens, meta["mv_pair_slot"])}
+  act = to_activation(meta["heads_activation"])
+  front = _dense(x, t, "/head/premap")
+  front = act(front) if meta["head_front_act"] else front
+  front = _dense(front.reshape(batch, -1), t, "/head/shared")
+  front = keep("head_shared", act(front) if meta["head_front_act"] else front)
+  out["value"] = _dense(act(_dense(front, t, "/head/value/fc") + pooled @ t[f"{MT}/v_inject/w"]), t, "/head/value/out")
+  if meta["value2"]:
+    hidden = _dense(torch.cat((front, blunders), dim=-1), t, "/head/value2/fc") + pooled @ t[f"{MT}/v2_inject/w"]
+    out["value2"] = _dense(act(hidden), t, "/head/value2/out")
   return out
 
 
 def served_terms_meta(net) -> dict:
   """bt6_hybrid.served_meta plus the variant and the decoder facts."""
-  meta = served_meta(net)
   mt = net.move_tokens
+  if is_flat(net):
+    meta = _flat_meta(net)
+    meta.update({"mt_layers": len(mt.blocks), "mt_heads": mt.blocks[0].h,
+                 "mv_pair_slot": mt.mv_pair_slot.detach().cpu().long()})
+    return meta
+  meta = served_meta(net)
   meta.update({
     "variant": variant_of(net), "mt_layers": len(mt.blocks), "mt_heads": mt.blocks[0].h,
     "mv_pair_slot": mt.mv_pair_slot.detach().cpu().long(),
@@ -459,6 +758,8 @@ def forward_served_terms(t: dict, squares: torch.Tensor, meta: dict, tokens: tor
   output layout), policy_tokens [B, M, 4], value, value2 [B, 3] (WDL logits, decoder injects included)."""
   from activation_functions import to_activation
 
+  if meta["variant"] == "flat":
+    return forward_served_flat(t, squares, meta, tokens, taps)
   cfg = meta["layer_config"]
   variant = meta["variant"]
   batch = squares.shape[0]

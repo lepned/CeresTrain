@@ -20,6 +20,7 @@ from rms_norm import RMSNorm, make_norm
 from soft_moe_batched_dual import SoftMoEBatchedDual
 from mlp2_layer import MLP2Layer, TSBSwiGLU
 from dot_product_attention import DotProductAttention
+from nbt_layer import NestedBottleneckLayer   # its _raw_logits: the q.k + bias an edge site reads (want_logits)
 
 
 class EncoderLayer(torch.nn.Module):
@@ -150,7 +151,11 @@ class EncoderLayer(torch.nn.Module):
               rpe_precomputed: bool = False,
               vis_edge: torch.Tensor = None,
               edge_scales = None, edge_gate = None, v_first: torch.Tensor = None,
-              return_v: bool = False, return_branch: bool = False, bt6_terms = None) -> Tuple[torch.Tensor, torch.Tensor]:
+              return_v: bool = False, return_branch: bool = False, bt6_terms = None,
+              want_logits: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    # want_logits (BT6 edge site after this layer on a FLAT trunk, ceres_net BT6TermsLayers): also return the layer's
+    # pre-softmax q.k / sqrt(hd) + per-head bias (templates included), exactly what a site reads from an NBT block's
+    # last inner layer (nbt_layer.NestedBottleneckLayer._raw_logits). Returns (out, logits).
     # return_branch (NBTHyperConnInner, nbt_layer.py): return the layer's residual branch attn + ffn instead of x + branch,
     # so the caller can add it to its own residual streams. Pre-norm, alpha 1 only (the branch is then well defined:
     # y = x + attn(ln1 x) + ffn(ln2(x + attn(ln1 x)))); the FFN still reads x + attn exactly as in the plain layer.
@@ -221,6 +226,11 @@ class EncoderLayer(torch.nn.Module):
     else:
       out2 = out1
 
+    if want_logits:
+      assert not (return_branch or return_v or edge_scales is not None or edge_gate is not None),           'want_logits: not combined with return_branch / return_v / EGT edge scales or gates'
+      # _raw_logits recomputes Q / K from x through this layer's own ln1 (pre-norm) and qkv / QK-norm (one extra qkv
+      # GEMM per site, as on NBT): the attention's fused score path and its signature stay unchanged
+      return out2, NestedBottleneckLayer._raw_logits(self, x, piece_relation_bias, None)
     if return_branch:
       br = attn_output + mlp_output if self.ffn_hidden_size > 0 else attn_output
       return (br, v_out) if return_v else br

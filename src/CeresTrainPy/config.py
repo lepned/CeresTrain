@@ -1662,6 +1662,14 @@ class Configuration:
     if isinstance(_bt6_terms, str):
       _bt6_terms = [int(t) for t in _bt6_terms.strip('[]').split(',') if t.strip()]
     self.NetDef_BT6TermsInnerLayers = None if _bt6_terms is None else [int(t) for t in _bt6_terms]
+    # BT6TermsLayers (2026-11-23; FLAT trunk only, NBTInnerLayers 0 + BT6NativeLayers): the plain encoder layers
+    #   (0-based) whose attention carries BT6's term reads. None = every layer. On a flat trunk BT6EdgeSites are
+    #   LAYER indices (a site after layer i, read by the layers after it); a site reads the layer's q.k / sqrt(hd)
+    #   plus its per-head bias (templates), as a site on an NBT block reads its last inner layer.
+    _bt6_terms_l = config_net_def.get('BT6TermsLayers', None)
+    if isinstance(_bt6_terms_l, str):
+      _bt6_terms_l = [int(t) for t in _bt6_terms_l.strip('[]').split(',') if t.strip()]
+    self.NetDef_BT6TermsLayers = None if _bt6_terms_l is None else [int(t) for t in _bt6_terms_l]
     # BT6ShareReadersPerBlock: ONE set of reader parameters per block (t_node, t_edge, C1, C2, We, Wm, Wg, bg),
     #   used by all its inner layers that carry terms; the tensors that depend only on E, Z0 and the edge state are
     #   computed once per block. Pk / Pq stay per layer.
@@ -1725,10 +1733,36 @@ class Configuration:
       def _bt6_refuse(cond, what):
         if cond:
           raise ValueError(f'BT6Hybrid: {what}')
-      _bt6_refuse(self.NetDef_NBTInnerLayers < 1, 'needs an NBT trunk (NBTInnerLayers >= 1): the BT6 layers are the inner layers')
+      # FLAT trunk (2026-11-23, NBTInnerLayers 0): the BT6 parts on the plain encoder layers. Only the BT6NativeLayers
+      # form exists there (BT6Layer inner layers are an NBT construction); blocks = layers for the site indices.
+      _bt6_flat = self.NetDef_NBTInnerLayers < 1
+      _bt6_refuse(_bt6_flat and not bool(config_net_def.get('BT6NativeLayers', False)),
+                  'a flat trunk (NBTInnerLayers 0) needs BT6NativeLayers true (BT6Layer inner layers need an NBT trunk)')
+      _bt6_refuse(_bt6_flat and self.NetDef_BT6TermsInnerLayers is not None,
+                  'BT6TermsInnerLayers is for NBT blocks; on a flat trunk use BT6TermsLayers')
+      _bt6_refuse(not _bt6_flat and self.NetDef_BT6TermsLayers is not None,
+                  'BT6TermsLayers is for a flat trunk (NBTInnerLayers 0); on an NBT trunk use BT6TermsInnerLayers')
       _bt6_refuse(self.NetDef_LoopCount != 1, 'requires LoopCount 1')
       _nb = int(self.NetDef_NumLayers)
-      _bt6_refuse(self.NetDef_NBTMidDim % int(self.NetDef_NBTInnerHeads) != 0, 'NBTInnerHeads must divide the inner width')
+      if _bt6_flat:
+        _bt6_refuse(int(self.NetDef_ModelDim) % int(self.NetDef_NumHeads) != 0, 'NumHeads must divide ModelDim')
+        _bt6_fl = self.NetDef_BT6TermsLayers
+        _bt6_refuse(_bt6_fl is not None and (len(set(_bt6_fl)) != len(_bt6_fl) or any(not (0 <= t < _nb) for t in _bt6_fl)),
+                    f'BT6TermsLayers {_bt6_fl} must be distinct layer indices in 0..{_nb - 1}')
+        _bt6_refuse(_bt6_fl is not None and len(_bt6_fl) == 0, 'BT6TermsLayers is empty (no layer reads the BT6 terms)')
+        # every edge state a site writes must be read (otherwise its parameters get no gradient: DDP fails): the last
+        # site needs a term layer after it, or the decoder reading the final edge state (MoveTokenEdgeInput)
+        _bt6_terms_all = list(range(_nb)) if _bt6_fl is None else _bt6_fl
+        _bt6_refuse(bool(self.NetDef_BT6EdgeSites) and not bool(config_net_def.get('MoveTokenEdgeInput', False))
+                    and not any(t > max(self.NetDef_BT6EdgeSites) for t in _bt6_terms_all),
+                    f'BT6EdgeSites {self.NetDef_BT6EdgeSites}: no term layer after the last site reads its edge state '
+                    '(add one to BT6TermsLayers or set MoveTokenEdgeInput)')
+        _bt6_refuse(self.NetDef_BT6SharedSmolgen or self.NetDef_BT6CheckpointBlocks or self.NetDef_BT6ShareReadersPerBlock
+                    or self.NetDef_BT6StackReadsPerBlock or bool(config_net_def.get('NBTSharedSmolgen', False)),
+                    'flat trunk: BT6SharedSmolgen / BT6CheckpointBlocks / BT6ShareReadersPerBlock / BT6StackReadsPerBlock '
+                    '/ NBTSharedSmolgen are NBT-block levers')
+      else:
+        _bt6_refuse(self.NetDef_NBTMidDim % int(self.NetDef_NBTInnerHeads) != 0, 'NBTInnerHeads must divide the inner width')
       _bt6_refuse(sorted(set(self.NetDef_BT6EdgeSites)) != sorted(self.NetDef_BT6EdgeSites)
                   or any(not (0 <= s < _nb - 1) for s in self.NetDef_BT6EdgeSites),
                   f'BT6EdgeSites {self.NetDef_BT6EdgeSites} must be distinct block indices in 0..{_nb - 2} '
@@ -1783,16 +1817,26 @@ class Configuration:
             (self.NetDef_BT6CheckpointBlocks or self.NetDef_BT6ShareReadersPerBlock or self.NetDef_BT6StackReadsPerBlock,
              'BT6NativeLayers: BT6CheckpointBlocks / BT6ShareReadersPerBlock / BT6StackReadsPerBlock are not wired'),
             (_smolgen_on and not self.NetDef_NBTSharedSmolgen,
-             'BT6NativeLayers: per-layer smolgen is not supported in a term layer; use NBTSharedSmolgen'),
-            (bool(self.NetDef_UseQKNorm) or bool(self.NetDef_UseDiffAttention) or float(self.NetDef_SoftCapCutoff or 0) > 0
+             'BT6NativeLayers: per-layer smolgen is not supported in a term layer; '
+             + ('a flat trunk has no smolgen option with BT6 (set SmolgenDimPerSquare 0 and SmolgenDim 0)'
+                if int(self.NetDef_NBTInnerLayers) < 1 else 'use NBTSharedSmolgen')),
+            # QK-norm is allowed (2026-11-23): the term reads take the layer's Q / K after qLN / kLN, i.e. the same
+            # Q / K its own q.k uses. QK-clip is inert on QK-norm layers (apply_qk_clip returns before scaling), so
+            # Pq / Pk are not scaled there either -- the same rule as for the layer's own Q / K rows.
+            (bool(self.NetDef_UseDiffAttention) or float(self.NetDef_SoftCapCutoff or 0) > 0
              or bool(self.NetDef_NonLinearAttention) or not bool(self.NetDef_UseQKV),
-             'BT6NativeLayers: plain QKV attention only (no QK-norm, diff attention, soft cap, nonlinear attention)'),
+             'BT6NativeLayers: plain QKV attention only (no diff attention, soft cap, nonlinear attention)'),
         ):
           _bt6_refuse(_cond, _what)
       for _cond, _what in (
           ((_smolgen_on or self.NetDef_NBTSharedSmolgen) and not _bt6_native,
            'no smolgen (set SmolgenDimPerSquare 0 and SmolgenDim 0, NBTSharedSmolgen off)'),
           (self.NetDef_UseRPE or self.NetDef_UseRoPE, 'no RPE / RoPE'),
+          # 2026-11-23 (review): the BT6 trunk loops (NBT-native and flat) call the layers without these inputs, so
+          # their parameters would get no gradient (silent no-op, DDP unused-parameter error) -- refuse them.
+          (bool(self.NetDef_UseVisEdgeBias) or bool(self.NetDef_UseRayAttentionBias) or bool(self.NetDef_UseGraphRouteHeads),
+           'UseVisEdgeBias / UseRayAttentionBias / UseGraphRouteHeads are not wired for the BT6 trunk'),
+          (int(os.environ.get('CERES_PHASE_FILM', '0') or 0) > 0, 'CERES_PHASE_FILM is not wired for the BT6 trunk'),
           (self.NetDef_EGTEdgeStream, 'EGTEdgeStream must be off (BT6\'s own edge stream replaces it)'),
           (bool(self.NetDef_UsePieceRelationBias), 'UsePieceRelationBias must be off'),
           (bool(self.NetDef_UseDualPlane), 'UseDualPlane must be off'),

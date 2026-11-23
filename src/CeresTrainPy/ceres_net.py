@@ -162,17 +162,27 @@ class CeresNet(nn.Module):
     # channels from our record, prologue (pair stream + edge seed), edge sites, BT6's attention policy head, the
     # optional soft-policy head and the optional BT6-form embedding. The inner layers are built in the NBT section.
     self.bt6h = None
+    self.bt6_flat = False          # BT6 parts on a plain encoder trunk (set below with BT6Hybrid)
+    self.bt6_terms_layers = ()
     if getattr(config, 'NetDef_BT6Hybrid', False):
       from bt6_hybrid import BT6Hybrid
       _bt6_soft_w = (float(getattr(config, 'Opt_SoftPolicyWeight', 0) or 0)
                      or float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0))
       # with the move-token decoder (UseMoveTokens) the decoder owns the policy: no BT6 policy / soft-policy head
       _bt6_pol = not bool(getattr(config, 'NetDef_UseMoveTokens', False))
+      # FLAT trunk (NBTInnerLayers 0, BT6NativeLayers): every encoder layer is a "block" of one layer at ModelDim with
+      # NumHeads heads; the layers in BT6TermsLayers carry the term reads, sites follow the layers in BT6EdgeSites.
+      self.bt6_flat = int(config.NetDef_NBTInnerLayers) < 1
+      _bt6_w = self.EMBEDDING_DIM if self.bt6_flat else config.NetDef_NBTMidDim
+      _bt6_heads = config.NetDef_NumHeads if self.bt6_flat else config.NetDef_NBTInnerHeads
+      self.bt6_terms_layers = (tuple(range(self.NUM_DISTINCT_LAYERS)) if getattr(config, 'NetDef_BT6TermsLayers', None) is None
+                               else tuple(sorted(int(t) for t in config.NetDef_BT6TermsLayers))) if self.bt6_flat else ()
       self.bt6h = BT6Hybrid(
-        self.EMBEDDING_DIM, config.NetDef_NBTMidDim, config.NetDef_NBTInnerHeads, self.NUM_DISTINCT_LAYERS,
-        config.NetDef_NBTInnerLayers, config.NetDef_BT6EdgeSites, policy_width=config.NetDef_BT6PolicyWidth,
+        self.EMBEDDING_DIM, _bt6_w, _bt6_heads, self.NUM_DISTINCT_LAYERS,
+        1 if self.bt6_flat else config.NetDef_NBTInnerLayers, config.NetDef_BT6EdgeSites,
+        policy_width=config.NetDef_BT6PolicyWidth,
         policy_head=_bt6_pol, site_autocast=getattr(config, 'NetDef_BT6SiteDtype', 'float32') == 'autocast',
-        ffn_hidden=int(round(float(getattr(config, 'NetDef_BT6FFNMultiplier', 1) or 1) * config.NetDef_NBTMidDim)),
+        ffn_hidden=int(round(float(getattr(config, 'NetDef_BT6FFNMultiplier', 1) or 1) * _bt6_w)),
         # the soft-policy head exists only when its loss is on: an unused head would get no gradient (DDP)
         soft_policy_width=config.NetDef_BT6SoftPolicyWidth if (_bt6_soft_w > 0 and _bt6_pol) else 0,
         pair_channels=config.NetDef_BT6PairChannels, edge_channels=config.NetDef_BT6EdgeDim,
@@ -181,7 +191,8 @@ class CeresNet(nn.Module):
         rev_edge=config.NetDef_BT6RevEdge, gate_cap=config.NetDef_BT6GateCap,
         output_gate_scale=config.NetDef_BT6OutputGateScale, inner_norm_eps=config.NetDef_BT6InnerNormEps,
         assembly_autocast=config.NetDef_BT6LogitAssembly == 'autocast',
-        terms_inner_layers=config.NetDef_BT6TermsInnerLayers, share_readers=config.NetDef_BT6ShareReadersPerBlock,
+        terms_inner_layers=(0,) if self.bt6_flat else config.NetDef_BT6TermsInnerLayers,
+        share_readers=config.NetDef_BT6ShareReadersPerBlock,
         stack_reads=config.NetDef_BT6StackReadsPerBlock, pair_autocast=config.NetDef_BT6PairDtype == 'autocast',
         embedding=config.NetDef_BT6Embedding, embedding_features=TOTAL_INPUT_FEATURES_PER_SQUARE,
         embedding_dense=config.NetDef_BT6EmbeddingDense, embedding_ffn_hidden=config.NetDef_BT6EmbeddingFFNHidden)
@@ -1731,6 +1742,26 @@ class CeresNet(nn.Module):
         self.input_skip_b = torch.nn.Parameter(torch.zeros(self.NUM_DISTINCT_LAYERS))
         print(f'[ceres_net] INPUT SKIP (plain encoder): layers 1..{self.NUM_DISTINCT_LAYERS - 1} read a * stream + '
               f'b * embedding (2 learned scalars per layer, a = 1 / b = 0 at init)')
+      if self.bt6h is not None:
+        # FLAT trunk + BT6 term reads (BT6NativeLayers on the plain encoder, 2026-11-23): the layers in BT6TermsLayers
+        # get BT6's reader tensors on their attention (identity at init); sites after the layers in BT6EdgeSites read
+        # that layer's q.k / sqrt(hd) + its per-head bias (templates), as on an NBT block's last inner layer.
+        assert self.bt6_native and self.bt6_flat, 'BT6Hybrid on a plain encoder trunk needs BT6NativeLayers'
+        from bt6_native_terms import BT6NativeTerms
+        _bt6_lc = self.bt6h.layer_config
+        for _j in self.bt6_terms_layers:
+          _att = self.transformer_layer[_j].attention
+          assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim,               'BT6 flat: attention heads / head width do not match the hybrid layer config'
+          _att.bt6t = BT6NativeTerms(_bt6_lc)
+        _bc = self.bt6h.parameter_counts()
+        _n_terms = sum(p.numel() for n, p in self.transformer_layer.named_parameters() if '.bt6t.' in n)
+        print(f'[ceres_net] BT6 TERM READS ON A FLAT TRUNK: {self.NUM_DISTINCT_LAYERS} encoder layers at {self.EMBEDDING_DIM} '
+              f'({_bt6_lc.heads} heads x {_bt6_lc.head_dim}); relation / pair / edge terms, door and post-softmax gate on '
+              f'layers {list(self.bt6_terms_layers)} ({_n_terms:,} reader params, identity at init); edge state '
+              f'{config.NetDef_BT6EdgeDim} ch, sites after layers {list(self.bt6h.site_blocks)}; policy = '
+              + (f'BT6 attention head width {config.NetDef_BT6PolicyWidth}' if self.bt6h.policy is not None
+                 else 'the move-token decoder')
+              + '; ' + ', '.join(f'{k} {v:,}' for k, v in _bc.items() if v))
 
     # Piece tokens (piece_tokens.py; config PieceTokens): the trunk runs on PieceTokens of the 64 squares and a narrow
     # cross-attention rebuilds the 64 square states before the heads.
@@ -2497,7 +2528,17 @@ class CeresNet(nn.Module):
           _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
         if _skip_a is not None and i > 0:
           flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
-        if self.bt6h.is_site(i):
+        if self.bt6_flat:
+          # flat trunk: an encoder layer; only the term layers get (E, e, [e | Z0])
+          _bt6_l = self.transformer_layer[i]
+          _bt6_kw = {'bt6_terms': (_bt6_E, _bt6_e, _bt6_rs)} if getattr(_bt6_l.attention, 'bt6t', None) is not None else {}
+          if self.bt6h.is_site(i):
+            flow, _bt6_H = _bt6_l(flow, want_logits=True, **_bt6_kw)
+            _bt6_e = self.bt6h.site(i, _bt6_e, _bt6_H)
+            _bt6_rs = None
+          else:
+            flow = _bt6_l(flow, **_bt6_kw)
+        elif self.bt6h.is_site(i):
           flow, _bt6_H = self.transformer_layer[i](flow, bt6=(_bt6_E, _bt6_e, _bt6_rs), want_logits=True)
           _bt6_e = self.bt6h.site(i, _bt6_e, _bt6_H)
           _bt6_rs = None
