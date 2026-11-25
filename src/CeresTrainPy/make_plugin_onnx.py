@@ -1,17 +1,17 @@
 """One command: a trained 768x16 flat BT6 net (served m80 ONNX + .ts / checkpoint) -> the round-4 TensorRT plugin ONNX
-(bt6_trt_plugin_r4 library), FP16 or INT8, optionally gated against PyTorch. Runs the existing bt6_trt_plugin_* scripts
-unchanged, in the same order and with the same arguments as the hand-made 200M / 400M nets (trt_bt6_plugin/REPORT.md).
+(bt6_trt_plugin library), FP16 or INT8, optionally gated against PyTorch. The graph steps are the functions of
+bt6_trt_plugin_export.py, run in this process; the steps that need torch / ONNX Runtime run in WSL.
 
 USAGE (Windows, from the TensorRT 11.3 venv that has onnx + numpy + tensorrt + polygraphy):
-    C:/Dev/Chess/lc0ex_work/terms/trt113_venv/Scripts/python.exe make_plugin_onnx.py \
-        <served_m80.onnx> <net.ts | checkpoint.pt> <out_dir> (--fp16 | --int8) [--calib DIR] [--gate] [--keep]
+    C:/Dev/Chess/lc0ex_work/terms/trt113_venv/Scripts/python.exe make_plugin_onnx.py         <served_m80.onnx> <net.ts | checkpoint.pt> <out_dir> (--fp16 | --int8) [--calib DIR] [--qdq F] [--gate] [--keep]
 
-  --fp16    params -> bt6_trt_plugin_onnx -> onnx_r2 --site -> merge --coef --ffn -> dec_r4   => <stem>_bt6r4.onnx
-  --int8    params -> bt6_trt_plugin_onnx -> onnx_r2 --site, and in parallel the plain INT8 QDQ ONNX of the served net:
+  --fp16    dump_params -> terms_attention -> prologue_sites -> merge_gemms(coef, ffn) -> decoder  => <stem>_bt6r4.onnx
+  --int8    dump_params -> terms_attention -> prologue_sites, and the plain INT8 QDQ ONNX of the served net:
             qdq_export.py (percentile 99.9999, 8 calibration batches, shape allowlist 768x2304,768x768,768x1536,1536x768,
-            ONNX Runtime calibration on the CPU) -> qdq_to_fp16.py (fp32 islands); then port_qdq --exclude 1536x768 ->
-            merge --coef -> glu_r3 -> i8out_r3 -> dec_r4                                          => <stem>_bt6r4_int8.onnx
+            ONNX Runtime calibration on the CPU) -> qdq_to_fp16.py (fp32 islands); then port_qdq(exclude 1536x768) ->
+            merge_gemms(coef) -> glu_quant -> attn_int8_out -> decoder                       => <stem>_bt6r4_int8.onnx
   --calib DIR      TPG shard folder for the INT8 calibration, Windows or WSL path (default D:/t91_skip1_v2_surv)
+  --qdq F          use this plain INT8 QDQ ONNX (<stem>.int8f16isl.onnx of the same net) instead of calibrating again
   --run-config DIR / --run-id ID   training config the calibration reader takes the record layout from
                    (defaults: lc0ex_work/terms/configs_notripei, prod_768_16_fry_hlg_tpl8qkbt6Ant135notripei_t80t91_4B)
   --gate    three-set gate with the plugin library loaded (TensorRT strongly typed), against PyTorch FP32 references made
@@ -20,13 +20,13 @@ USAGE (Windows, from the TensorRT 11.3 venv that has onnx + numpy + tensorrt + p
             limits FP16: W-L mean <= 0.0003 on all sets, policy KL mean <= 3e-6 on [256]
                    INT8: W-L mean <= 0.0025 on all sets, top-1 >= 63/64 and >= 253/256 ([x4], [256]), KL <= 3e-4 on [256]
             prints PASS / FAIL, exit code 3 on FAIL. The GPU must be free (no EngineBattle / Mycel / Ceres running).
-  --keep    keep the intermediates in <out_dir>/work (default: deleted after a successful run)
+  --keep    keep the intermediates in <out_dir>/work (each graph step's result is saved there too)
   --plugin DLL    library for the gate (default C:/Dev/Chess/trt_bt6_plugin/build_r4/bt6_trt_plugin_r4.dll)
 
 Writes <out_dir>/<stem>_bt6r4[_int8].onnx, <out_dir>/params.npz and <out_dir>/make_plugin_onnx.log (every step with its
-command line, duration and the step's last output lines; gate lines). Any failing step stops the run with exit code 2.
-Steps needing torch / onnxruntime run in WSL (/home/lep/cerestrain-env, qdq_to_fp16 in /home/lep/modelopt-env); the
-graph steps run with this interpreter. --_ref is internal (the reference maker, run by WSL python).
+duration and summary; gate lines). Any failing step stops the run with exit code 2. WSL steps use
+/home/lep/cerestrain-env (qdq_to_fp16 /home/lep/modelopt-env). --_ref is internal (the reference maker, run by WSL
+python).
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WSL_PY = "/home/lep/cerestrain-env/bin/python"
@@ -62,11 +63,28 @@ def wsl_path(p: str) -> str:
 
 
 class Run:
-  def __init__(self, log_path):
-    self.log = open(log_path, "w", encoding="utf-8")
+  def __init__(self, log_path, wk):
+    self.log = open(log_path, "w", encoding="utf-8"); self.wk = wk
 
   def say(self, s):
     print(s, flush=True); self.log.write(s + "\n"); self.log.flush()
+
+  def graph(self, name, m, fn, keep_name, keep):
+    """One graph step in this process: fn(m) changes m in place and returns its summary; with --keep the result is
+    also saved to work/<keep_name>. Any exception stops the run with exit code 2."""
+    self.say(f"== {time.strftime('%H:%M:%S')} {name}")
+    t0 = time.time()
+    try:
+      msg = fn(m)
+      if keep and keep_name:
+        onnx.save(m, os.path.join(self.wk, keep_name))
+    except Exception:
+      self.say(f"FAILED: {name}")
+      for l in traceback.format_exc().splitlines():
+        self.say("   ! " + l)
+      sys.exit(2)
+    self.say(f"   | {msg}\n   ({time.time() - t0:.0f} s)")
+    return m
 
   def step(self, name, cmd, wsl=False, cwd=None, tail=4):
     """Runs one step; stops the whole run with exit code 2 when it fails."""
@@ -143,10 +161,15 @@ def main(argv=None) -> int:
   ap.add_argument("--run-id", default=DEF_RUN_ID)
   ap.add_argument("--gate", action="store_true"); ap.add_argument("--keep", action="store_true")
   ap.add_argument("--plugin", default=DEF_PLUGIN)
+  ap.add_argument("--qdq", default="")
   ap.add_argument("--_ref", nargs=3, metavar=("TS", "POSITIONS", "OUT"), help=argparse.SUPPRESS)
   a = ap.parse_args(argv)
   if a._ref:
     make_ref(*a._ref); return 0
+  global np, onnx, X
+  import numpy as np
+  import onnx
+  import bt6_trt_plugin_export as X
   if not (a.onnx and a.net and a.out_dir) or not (a.fp16 or a.int8):
     ap.error("need <served_m80.onnx> <net.ts|ckpt> <out_dir> and --fp16 or --int8")
   for f in (a.onnx, a.net):
@@ -158,47 +181,48 @@ def main(argv=None) -> int:
   out = os.path.abspath(a.out_dir); wk = os.path.join(out, "work"); os.makedirs(wk, exist_ok=True)
   stem = os.path.splitext(os.path.basename(a.onnx))[0]
   final = os.path.join(out, f"{stem}_bt6r4{'_int8' if a.int8 else ''}.onnx")
-  R = Run(os.path.join(out, "make_plugin_onnx.log"))
+  R = Run(os.path.join(out, "make_plugin_onnx.log"), wk)
   R.say(f"make_plugin_onnx {'INT8' if a.int8 else 'FP16'}  {time.strftime('%Y-%m-%d %H:%M')}\n  onnx {a.onnx}\n  net  {a.net}\n"
         f"  out  {final}")
   py = sys.executable
-  S = lambda n: os.path.join(HERE, n)
   W = lambda n: os.path.join(wk, n)
   params = os.path.join(out, "params.npz")
 
-  R.step("params (bt6_trt_plugin_params.py, WSL torch)",
-         [WSL_PY, wsl_path(S("bt6_trt_plugin_params.py")), wsl_path(a.net), wsl_path(params)], wsl=True, cwd=HERE)
-  R.step("round 1 (bt6_trt_plugin_onnx.py)", [py, S("bt6_trt_plugin_onnx.py"), a.onnx, params, W("r1_bt6p.onnx")], cwd=HERE)
-  R.step("round 2 (bt6_trt_plugin_onnx_r2.py --site)",
-         [py, S("bt6_trt_plugin_onnx_r2.py"), W("r1_bt6p.onnx"), params, W("r2_site.onnx"), "--site"], cwd=HERE)
+  R.step("params (dump_params, WSL torch)",
+         [WSL_PY, wsl_path(os.path.join(HERE, "bt6_trt_plugin_export.py")), "params", wsl_path(a.net), wsl_path(params)],
+         wsl=True, cwd=HERE)
+  P = dict(np.load(params))
+  m = R.graph("round 1: terms_attention", onnx.load(a.onnx), lambda m: X.terms_attention(m, P), "r1_bt6p.onnx", a.keep)
+  m = R.graph("round 2: prologue_sites", m, lambda m: X.prologue_sites(m, P), "r2_site.onnx", a.keep)
   if a.fp16:
-    R.step("merge --coef --ffn", [py, S("bt6_trt_plugin_merge.py"), W("r2_site.onnx"), W("r2_sitem.onnx"), "--coef",
-                                  "--ffn"], cwd=HERE)
-    R.step("decoder plugins (bt6_trt_plugin_dec_r4.py)", [py, S("bt6_trt_plugin_dec_r4.py"), W("r2_sitem.onnx"), final],
-           cwd=HERE)
+    m = R.graph("merge_gemms coef ffn", m, lambda m: X.merge_gemms(m, coef=True, ffn=True), "r2_sitem.onnx", a.keep)
   else:
-    q = W(os.path.basename(a.onnx)); shutil.copyfile(a.onnx, q)
-    qn = os.path.basename(a.onnx); qs = os.path.splitext(qn)[0]
-    calib = a.calib if a.calib.startswith("/") else wsl_path(a.calib)
-    R.step("qdq_export (WSL, ONNX Runtime calibration on the CPU, percentile 99.9999, shape allowlist)",
-           [WSL_PY, wsl_path(os.path.join(QDQ_SCRIPTS, "qdq_export.py")), qn, calib, "--run_config",
-            wsl_path(a.run_config), "--run_id", a.run_id, "--precision", "int8", "--method", "percentile", "--percentile",
-            "99.9999", "--calib_batches", "8", "--no_verify", "--out", f"{qs}.qdq.fp16io.onnx", "--include_shapes",
-            SHAPES], wsl=True, cwd=wk, tail=6)
-    R.step("qdq_to_fp16 (WSL modelopt-env, fp32 islands)",
-           [WSL_MO_PY, wsl_path(os.path.join(QDQ_SCRIPTS, "qdq_to_fp16.py")), f"{qs}.qdq.fp16io.onnx",
-            f"{qs}.int8f16isl.onnx"], wsl=True, cwd=wk, tail=3)
-    R.step("port_qdq --exclude 1536x768", [py, S("bt6_trt_plugin_port_qdq.py"), W("r2_site.onnx"),
-                                           W(f"{qs}.int8f16isl.onnx"), W("r2_site_int8nd.onnx"), "--exclude", "1536x768"],
-           cwd=HERE)
-    R.step("merge --coef", [py, S("bt6_trt_plugin_merge.py"), W("r2_site_int8nd.onnx"), W("i8nd_coefonly.onnx"), "--coef"],
-           cwd=HERE)
-    R.step("BT6GluQuant (bt6_trt_plugin_glu_r3.py)", [py, S("bt6_trt_plugin_glu_r3.py"), W("i8nd_coefonly.onnx"),
-                                                      W("i8g_glu.onnx")], cwd=HERE)
-    R.step("INT8 attention output (bt6_trt_plugin_i8out_r3.py)", [py, S("bt6_trt_plugin_i8out_r3.py"), W("i8g_glu.onnx"),
-                                                                  W("r3_int8.onnx")], cwd=HERE)
-    R.step("decoder plugins (bt6_trt_plugin_dec_r4.py)", [py, S("bt6_trt_plugin_dec_r4.py"), W("r3_int8.onnx"), final],
-           cwd=HERE)
+    if a.qdq:
+      qisl = a.qdq
+      R.say(f"== plain INT8 QDQ ONNX given: {qisl}")
+    else:
+      qn = os.path.basename(a.onnx); qs = os.path.splitext(qn)[0]
+      shutil.copyfile(a.onnx, W(qn))
+      calib = a.calib if a.calib.startswith("/") else wsl_path(a.calib)
+      R.step("qdq_export (WSL, ONNX Runtime calibration on the CPU, percentile 99.9999, shape allowlist)",
+             [WSL_PY, wsl_path(os.path.join(QDQ_SCRIPTS, "qdq_export.py")), qn, calib, "--run_config",
+              wsl_path(a.run_config), "--run_id", a.run_id, "--precision", "int8", "--method", "percentile",
+              "--percentile", "99.9999", "--calib_batches", "8", "--no_verify", "--out", f"{qs}.qdq.fp16io.onnx",
+              "--include_shapes", SHAPES], wsl=True, cwd=wk, tail=6)
+      R.step("qdq_to_fp16 (WSL modelopt-env, fp32 islands)",
+             [WSL_MO_PY, wsl_path(os.path.join(QDQ_SCRIPTS, "qdq_to_fp16.py")), f"{qs}.qdq.fp16io.onnx",
+              f"{qs}.int8f16isl.onnx"], wsl=True, cwd=wk, tail=3)
+      qisl = W(f"{qs}.int8f16isl.onnx")
+    q = onnx.load(qisl)
+    m = R.graph("port_qdq exclude 1536x768", m, lambda m: X.port_qdq(m, q, exclude="1536x768"), "r2_site_int8nd.onnx",
+                a.keep)
+    del q
+    m = R.graph("merge_gemms coef", m, lambda m: X.merge_gemms(m, coef=True, ffn=False), "i8nd_coefonly.onnx", a.keep)
+    m = R.graph("round 3: glu_quant (BT6GluQuant)", m, X.glu_quant, "i8g_glu.onnx", a.keep)
+    m = R.graph("round 3: attn_int8_out", m, X.attn_int8_out, "r3_int8.onnx", a.keep)
+  m = R.graph("round 4: decoder (BT6DecAttn, BT6DecHead)", m, X.decoder, None, False)
+  onnx.save(m, final)
+  del m
   R.say(f"== final {final} ({os.path.getsize(final) / 1e6:.1f} MB)")
 
   rc = 0
