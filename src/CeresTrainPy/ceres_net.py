@@ -1665,6 +1665,7 @@ class CeresNet(nn.Module):
             assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim, \
                 'BT6NativeLayers: inner attention heads / head width do not match the hybrid layer config'
             _att.bt6t = BT6NativeTerms(_bt6_lc)
+            _att.bt6t.fused = bool(getattr(config, 'NetDef_BT6FusedAttention', False))
             if getattr(config, 'NetDef_BT6EdgeValues', False):
               _att.bt6t.enable_edge_values()
       elif self.bt6h is not None:
@@ -1770,6 +1771,7 @@ class CeresNet(nn.Module):
           _att = self.transformer_layer[_j].attention
           assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim,               'BT6 flat: attention heads / head width do not match the hybrid layer config'
           _att.bt6t = BT6NativeTerms(_bt6_lc)
+          _att.bt6t.fused = bool(getattr(config, 'NetDef_BT6FusedAttention', False))
           if getattr(config, 'NetDef_BT6EdgeValues', False):
             _att.bt6t.enable_edge_values()
         _bc = self.bt6h.parameter_counts()

@@ -37,6 +37,7 @@ class BT6NativeTerms(nn.Module):
   def __init__(self, cfg: BT6Config) -> None:
     super().__init__()
     self.cfg = cfg
+    self.fused = False                       # BT6FusedAttention (set by ceres_net): the Triton kernel in attend
     _make_reader_parameters(self, cfg)       # t_node, t_edge, C1, C2, We, Wm, Wg, bg (We is the only random draw)
     self.Ue = None                           # BT6EdgeValues: edge message projection (enable_edge_values)
     self.Pk = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, cfg.head_dim))   # (k_j . Pk[h, c]) E[c, i, j]
@@ -79,7 +80,14 @@ class BT6NativeTerms(nn.Module):
 
   def attend(self, Q, K, V, bias, ctx: RelationContext, e: torch.Tensor, read_state: torch.Tensor):
     """The whole attention of a term layer: (A @ V [B, heads, 64, hd] in V's dtype, H [B, heads, 64, 64]); with
-    BT6EdgeValues the edge message m Ue is added to A @ V."""
+    BT6EdgeValues the edge message m Ue is added to A @ V.
+    With `fused` (config BT6FusedAttention) on CUDA outside ONNX export: the Triton kernel of bt6_fused_attn.py, which
+    returns instead of H its per-(position, head) maximum [B, heads, 1, 1] (all the caller reads of H). The kernel has
+    no edge message: with BT6EdgeValues (refused together in config.py) the reference path runs."""
+    if self.fused and self.Ue is None and Q.is_cuda and not torch.onnx.is_in_onnx_export():
+      from bt6_fused_attn import fused_attend, supported
+      if supported(self.cfg):
+        return fused_attend(self, Q, K, V, bias, ctx, e, read_state)
     L, door, gate_logits = self.logits(Q, K, ctx, e, read_state)
     if bias is not None:
       L = L + bias.to(L.dtype)

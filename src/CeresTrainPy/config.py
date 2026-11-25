@@ -1757,6 +1757,17 @@ class Configuration:
     self.NetDef_BT6NativeLayers = bool(config_net_def.get('BT6NativeLayers', False))
     if self.NetDef_BT6EdgeValues and not self.NetDef_BT6NativeLayers:
       raise ValueError('BT6EdgeValues needs BT6NativeLayers (the edge message is added in the native term layers)')
+    # BT6FusedAttention (2026-11-23; bt6_fused_attn.py): the term layers' attention (relation terms, edge / pair read,
+    # door, softmax, post-softmax gate, A.v) as ONE Triton kernel per (position, head), forward and backward, on CUDA.
+    # Same function; CPU and ONNX export use the reference path. Needs BT6NativeLayers, no gate cap, no pair autocast.
+    self.NetDef_BT6FusedAttention = bool(config_net_def.get('BT6FusedAttention', False))
+    if self.NetDef_BT6FusedAttention and not self.NetDef_BT6NativeLayers:
+      raise ValueError('BT6FusedAttention needs BT6NativeLayers (the kernel is the attention of the native term layers)')
+    if self.NetDef_BT6FusedAttention and (bool(config_net_def.get('BT6GateCap', False))
+                                          or str(config_net_def.get('BT6PairDtype', 'float32')) == 'autocast'):
+      raise ValueError('BT6FusedAttention: BT6GateCap and BT6PairDtype autocast are not supported by the kernel')
+    if self.NetDef_BT6FusedAttention and self.NetDef_BT6EdgeValues:
+      raise ValueError('BT6FusedAttention and BT6EdgeValues together: the Triton kernel has no edge message')
     _bt6_keys = [k for k in config_net_def if k.startswith('BT6') and k != 'BT6Hybrid']
     if not self.NetDef_BT6Hybrid:
       if _bt6_keys:
