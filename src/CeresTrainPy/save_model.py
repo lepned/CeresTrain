@@ -507,6 +507,11 @@ def save_model(NAME : str,
                   _onnx.checker.check_model(_m_try)
                   onnx_model_16 = _m_try   # adopt only after the checker passed
                   print(f'INFO: ONNX_TRT_GATE_FIX {_ngf} gated attention(s) rewritten')
+                elif any(getattr(_mod, 'bt6t', None) is not None for _mod in model_nocompile.modules()):
+                  # BT6EdgeValues: the gated product has a second consumer (the edge message), the pattern does not
+                  # match; gate the TensorRT reading against PyTorch before trusting it
+                  print('WARNING: ONNX_TRT_GATE_FIX 0 gated attentions rewritten in a net with BT6 term layers '
+                        '(BT6EdgeValues?): check TensorRT against PyTorch before serving', flush=True)
               except Exception as _e:
                 print(f'ERROR: ONNX_TRT_GATE_FIX FAILED ({type(_e).__name__}: {_e}) -- saving the graph WITHOUT the gate fix; '
                       f'TensorRT 11 will compute its gated attentions wrong (rewrite the file with trt_gate_fix.py)', flush=True)

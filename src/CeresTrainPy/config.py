@@ -1667,6 +1667,10 @@ class Configuration:
     self.NetDef_BT6Triplet = bool(config_net_def.get('BT6Triplet', True))
     self.NetDef_BT6RevEdge = bool(config_net_def.get('BT6RevEdge', True))
     self.NetDef_BT6GateCap = bool(config_net_def.get('BT6GateCap', False))
+    # BT6EdgeValues (2026-11-25): the term layers add the attention-weighted edge state to A @ V (edge message,
+    # bt6_native_terms.BT6NativeTerms.enable_edge_values; zero-init projection Ue = identity at init). Needs
+    # BT6NativeLayers. Not in the TensorRT plugin yet (plain ONNX serves it).
+    self.NetDef_BT6EdgeValues = bool(config_net_def.get('BT6EdgeValues', False))
     self.NetDef_BT6OutputGateScale = float(config_net_def.get('BT6OutputGateScale', 2.0))
     self.NetDef_BT6InnerNormEps = float(config_net_def.get('BT6InnerNormEps', 1e-3))
     # BT6LogitAssembly (2026-11-13, speed work): precision of the attention LOGIT ASSEMBLY of the BT6 inner layers
@@ -1751,6 +1755,8 @@ class Configuration:
     # sites read the logits of the block's last inner layer. Identity at initialisation. Prologue, sites, relation
     # channels and (without UseMoveTokens) BT6's policy head are the hybrid's.
     self.NetDef_BT6NativeLayers = bool(config_net_def.get('BT6NativeLayers', False))
+    if self.NetDef_BT6EdgeValues and not self.NetDef_BT6NativeLayers:
+      raise ValueError('BT6EdgeValues needs BT6NativeLayers (the edge message is added in the native term layers)')
     _bt6_keys = [k for k in config_net_def if k.startswith('BT6') and k != 'BT6Hybrid']
     if not self.NetDef_BT6Hybrid:
       if _bt6_keys:

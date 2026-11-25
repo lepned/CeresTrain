@@ -22,7 +22,8 @@ state tensor and Muon's per-parameter routing flag must agree, else the resume i
 import torch
 
 # Reader parameters of a BT6 inner layer (bt6_net.BT6Layer): what a term-free layer gains when it becomes a term layer.
-BT6_READER_SUFFIXES = (".t_node", ".t_edge", ".C1", ".C2", ".We", ".Wm", ".Wg", ".bg", ".Pk", ".Pq")
+BT6_READER_SUFFIXES = (".t_node", ".t_edge", ".C1", ".C2", ".We", ".Wm", ".Wg", ".bg", ".Pk", ".Pq",
+                       ".Ue")    # Ue: BT6EdgeValues (zero = identity), may be added on resume like the other readers
 
 
 def _is_reader_key(key: str) -> bool:

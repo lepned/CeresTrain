@@ -39,8 +39,9 @@ from bt6_net import (BT6Config, BT6EdgeSite, BT6GLU, BT6Layer, BT6PolicyHead, BT
 from bt6_relations import BT6Relations
 
 # Names (suffixes of parameter names) of the raw relation / pair / edge reader tables and scales inside a BT6 inner
-# layer: never weight-decayed, never under Muon (wd_partition.py, train.py). 2-D: C1, C2, We, Wm, Wg; 3-D: Pk, Pq.
-BT6_LAYER_READER_SUFFIXES = (".t_node", ".t_edge", ".C1", ".Pk", ".Pq", ".C2", ".We", ".Wm", ".Wg", ".bg")
+# layer: never weight-decayed, never under Muon (wd_partition.py, train.py). 2-D: C1, C2, We, Wm, Wg; 3-D: Pk, Pq, Ue
+# (BT6EdgeValues).
+BT6_LAYER_READER_SUFFIXES = (".t_node", ".t_edge", ".C1", ".Pk", ".Pq", ".C2", ".We", ".Wm", ".Wg", ".bg", ".Ue")
 # Attribute name of the hybrid container on CeresNet, i.e. the prefix of its parameter names.
 BT6_HYBRID_PREFIX = "bt6h."
 

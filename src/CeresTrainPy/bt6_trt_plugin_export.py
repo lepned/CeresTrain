@@ -145,6 +145,9 @@ def fold_tables(P: dict, layer: int):
   """(tab16 FP16, tab32 FP32) of one term layer: bt6_terms_export.py's served folds, in float64. Layout in
   trt_bt6_plugin/src/bt6_attn_kernels.cu."""
   g = f"transformer_layer.{layer}.attention"
+  if f"{g}.bt6t.Ue" in P:
+    raise NotImplementedError(f"layer {layer}: BT6EdgeValues (edge message Ue) is not in the TensorRT plugin yet; "
+                              "serve the plain ONNX")
   f = lambda n: np.asarray(P[n], dtype=np.float64)
   t, te = f(f"{g}.bt6t.t_node"), f(f"{g}.bt6t.t_edge")
   C1, C2 = f(f"{g}.bt6t.C1"), f(f"{g}.bt6t.C2")

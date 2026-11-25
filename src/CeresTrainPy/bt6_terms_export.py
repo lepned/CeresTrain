@@ -203,6 +203,8 @@ def export_served_terms(net) -> dict:
         dense(f"{p}/ffn/dense2", mlp.linear2)
         g = f"{p}/mha/egt"
         terms = getattr(att, "bt6t", None)
+        if terms is not None and getattr(terms, "Ue", None) is not None:
+          raise NotImplementedError("BT6EdgeValues (edge message Ue) has no lc0ex front end; serve the plain ONNX")
         if terms is None:
           z = lambda *shape: torch.zeros(*shape, dtype=torch.float64)
           put(f"{g}/qk_scale", torch.full((heads,), 1.0 / math.sqrt(hd), dtype=torch.float64), np.float32)
@@ -444,6 +446,8 @@ def export_served_flat(net) -> dict:
     dense(f"{p}/ffn/dense2", mlp.linear2)
     g = f"{p}/mha/egt"
     terms = getattr(att, "bt6t", None)
+    if terms is not None and getattr(terms, "Ue", None) is not None:
+      raise NotImplementedError("BT6EdgeValues (edge message Ue) has no lc0ex front end; serve the plain ONNX")
     assert (terms is not None) == (i in term_layers), f"layer {i}: term reads {terms is not None}, plan {i in term_layers}"
     if terms is None:
       put(f"{g}/qk_scale", torch.full((heads,), 1.0 / math.sqrt(hd), dtype=torch.float64), np.float32)

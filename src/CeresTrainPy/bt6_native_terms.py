@@ -38,6 +38,7 @@ class BT6NativeTerms(nn.Module):
     super().__init__()
     self.cfg = cfg
     _make_reader_parameters(self, cfg)       # t_node, t_edge, C1, C2, We, Wm, Wg, bg (We is the only random draw)
+    self.Ue = None                           # BT6EdgeValues: edge message projection (enable_edge_values)
     self.Pk = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, cfg.head_dim))   # (k_j . Pk[h, c]) E[c, i, j]
     self.Pq = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, cfg.head_dim))   # (q_i . Pq[h, c]) E[c, i, j]
 
@@ -66,14 +67,29 @@ class BT6NativeTerms(nn.Module):
     L = L + rel_q.permute(0, 2, 1, 3) + rel_k.permute(0, 2, 3, 1)
     return L, door, gate_logits
 
+  def enable_edge_values(self) -> None:
+    """BT6EdgeValues (2026-11-25): the edge state also carries CONTENT, not only the weights. Per head h and query
+    square i the edge message m[h, i] = sum_j A[h, i, j] e[:, i, j] (the attention-weighted edge state of the pairs
+    it reads, C = edge channels) is projected to the head width and added to A @ V:
+        out[h, i] = sum_j A[h, i, j] v[h, j] + m[h, i] Ue[h]          Ue [heads, C, head_dim], zero at init
+    so the layer is unchanged at initialisation. Without it the relations steer only where a square looks (logits,
+    door, gate); "j attacks i" can reach i only through the choice of j. Ue is a reader table (no weight decay,
+    no Muon) and follows QK-clip like nothing else (it is on the value side)."""
+    self.Ue = nn.Parameter(torch.zeros(self.cfg.heads, self.cfg.edge_channels, self.cfg.head_dim))
+
   def attend(self, Q, K, V, bias, ctx: RelationContext, e: torch.Tensor, read_state: torch.Tensor):
-    """The whole attention of a term layer: (A @ V [B, heads, 64, hd] in V's dtype, H [B, heads, 64, 64])."""
+    """The whole attention of a term layer: (A @ V [B, heads, 64, hd] in V's dtype, H [B, heads, 64, 64]); with
+    BT6EdgeValues the edge message m Ue is added to A @ V."""
     L, door, gate_logits = self.logits(Q, K, ctx, e, read_state)
     if bias is not None:
       L = L + bias.to(L.dtype)
     cfg = self.cfg
     low = cfg.pair_autocast and L.dtype in (torch.bfloat16, torch.float16)
-    return attention_core(L, door, gate_logits, V, cfg.gate_cap, None, cfg.output_gate_scale, low=low)
+    if self.Ue is None:
+      return attention_core(L, door, gate_logits, V, cfg.gate_cap, None, cfg.output_gate_scale, low=low)
+    edge = ctx.edge_channels_last(e, V.dtype)                      # channels-last [B, 64 i, 64 j, C], one per state
+    out, H, m = attention_core(L, door, gate_logits, V, cfg.gate_cap, None, cfg.output_gate_scale, low=low, edge=edge)
+    return out + torch.matmul(m, self.Ue.to(m.dtype)[None]), H
 
   @torch.no_grad()
   def scale_heads(self, s: torch.Tensor) -> None:

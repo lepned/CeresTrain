@@ -1665,6 +1665,8 @@ class CeresNet(nn.Module):
             assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim, \
                 'BT6NativeLayers: inner attention heads / head width do not match the hybrid layer config'
             _att.bt6t = BT6NativeTerms(_bt6_lc)
+            if getattr(config, 'NetDef_BT6EdgeValues', False):
+              _att.bt6t.enable_edge_values()
       elif self.bt6h is not None:
         for _bt6_blk in self.transformer_layer:
           self.bt6h.finish_block(_bt6_blk)      # shared / stacked reader arrangement of the block (config levers)
@@ -1768,6 +1770,8 @@ class CeresNet(nn.Module):
           _att = self.transformer_layer[_j].attention
           assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim,               'BT6 flat: attention heads / head width do not match the hybrid layer config'
           _att.bt6t = BT6NativeTerms(_bt6_lc)
+          if getattr(config, 'NetDef_BT6EdgeValues', False):
+            _att.bt6t.enable_edge_values()
         _bc = self.bt6h.parameter_counts()
         _n_terms = sum(p.numel() for n, p in self.transformer_layer.named_parameters() if '.bt6t.' in n)
         print(f'[ceres_net] BT6 TERM READS ON A FLAT TRUNK: {self.NUM_DISTINCT_LAYERS} encoder layers at {self.EMBEDDING_DIM} '

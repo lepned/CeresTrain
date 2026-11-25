@@ -42,6 +42,15 @@ model = CeresNet(None, config,
                  action_uncertainty_loss_weight=config.Opt_LossActionUncertaintyMultiplier,
                  q_ratio=config.Data_FractionQ).to(device)
 model.eval()
+# CERES_UNTRAINED_JITTER=<std>: add N(0, std) to every parameter. Zero-initialised tables (BT6 readers, ...) are
+# identical across layers at init, and the ONNX optimiser then merges the layers' identical computations, so the
+# graph no longer has one subgraph per layer (the TensorRT plugin rewrite needs them). 0.01 is plenty.
+_jit = float(os.environ.get('CERES_UNTRAINED_JITTER', '0') or 0)
+if _jit > 0:
+  with torch.no_grad():
+    for _p in model.parameters():
+      _p.add_(torch.randn_like(_p) * _jit)
+  print(f'INFO: UNTRAINED_JITTER {_jit}')
 print(f'INFO: UNTRAINED {TRAINING_ID}: {sum(p.numel() for p in model.parameters()):,} params')
 
 state = {'optimizer': None}

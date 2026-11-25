@@ -455,20 +455,30 @@ def _wide(dtype):
   return torch.float32 if dtype in (torch.bfloat16, torch.float16, torch.float32) else dtype
 
 
-def _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low=False):
+def _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low=False, edge=None):
   """The statements of the attention core, out of place (differentiable by plain autograd). `low`: softmax and
-  post-softmax gate in the dtype of L (the pair_autocast lever) instead of float32."""
+  post-softmax gate in the dtype of L (the pair_autocast lever) instead of float32. `edge` (channels-last edge state
+  [B, 64, 64, C] in the compute dtype, BT6EdgeValues): also the edge message m[b, h, i, c] = sum_j A[b, h, i, j]
+  e[b, i, j, c], returned as a fifth value."""
   wide = L.dtype if low else _wide(L.dtype)
   H = torch.addcmul(L, L, door)                                              # (F + read) (1 + door)
   gate = torch.sigmoid(gate_logits.to(wide)) * 2.0
   if cap:
     gate = gate.clamp(max=1.0)
   A = torch.softmax(H, dim=-1, dtype=wide) * gate                            # float32; rows no longer sum to 1
-  attended = torch.matmul(A.to(values.dtype), values)                        # A.v in the compute dtype
+  Ac = A.to(values.dtype)
+  attended = torch.matmul(Ac, values)                                        # A.v in the compute dtype
+  m = None if edge is None else _edge_message(Ac, edge)
   if out_logits is None:
-    return attended, H, gate, attended
+    return attended, H, gate, attended, m
   out_gate = (torch.sigmoid(out_logits.to(_wide(L.dtype))) * out_scale).to(attended.dtype)
-  return attended * out_gate, H, gate, attended
+  return attended * out_gate, H, gate, attended, m
+
+
+def _edge_message(A, edge):
+  """A [B, heads, 64, 64], edge [B, 64, 64, C] (both in the compute dtype) -> m [B, heads, 64, C]: per (b, i) one
+  [heads, 64] x [64, C] matmul."""
+  return torch.matmul(A.transpose(1, 2), edge).transpose(1, 2)
 
 
 class _AttentionCoreFunction(torch.autograd.Function):
@@ -476,43 +486,56 @@ class _AttentionCoreFunction(torch.autograd.Function):
 
   forward saves only L, door, the gate values, v and (with an output gate) A.v and its logits; backward recomputes
   H and the softmax. Plain autograd on the same statements keeps H, the softmax output, the sigmoid output, the
-  gate, A and their casts alive per layer."""
+  gate, A and their casts alive per layer. With `edge` (BT6EdgeValues) the edge message m is a third output; edge is
+  saved too (one channels-last copy per edge-state version, RelationContext.edge_channels_last, shared by the layers
+  that read it)."""
 
   @staticmethod
-  def forward(ctx, L, door, gate_logits, values, out_logits, cap, out_scale, low=False):
+  def forward(ctx, L, door, gate_logits, values, out_logits, cap, out_scale, low=False, edge=None):
     values = values.contiguous()
-    out, H, gate, attended = _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low)
+    out, H, gate, attended, m = _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low, edge)
     ctx.cap, ctx.out_scale = cap, out_scale
+    ctx.has_out_gate, ctx.has_edge = out_logits is not None, edge is not None
     # an output nobody differentiates arrives as None in backward (not a zero tensor): H is read only by the edge
     # sites, so in every other layer backward skips the [B, heads, 64, 64] cast-and-add of a zero gradient
     ctx.set_materialize_grads(False)
-    if out_logits is None:
-      ctx.save_for_backward(L, door, gate, values)
-    else:
-      ctx.save_for_backward(L, door, gate, values, attended, out_logits)
-    return out, H
+    extra = ((attended, out_logits) if out_logits is not None else ()) + ((edge,) if edge is not None else ())
+    ctx.save_for_backward(L, door, gate, values, *extra)
+    return (out, H) if edge is None else (out, H, m)
 
   @staticmethod
-  def backward(ctx, d_out, d_H):
+  def backward(ctx, d_out, d_H, d_m=None):
     saved = ctx.saved_tensors
     L, door, gate, values = saved[:4]
+    rest = list(saved[4:])
+    attended, out_logits = (rest.pop(0), rest.pop(0)) if ctx.has_out_gate else (None, None)
+    edge = rest.pop(0) if ctx.has_edge else None
     wide = gate.dtype
-    d_L = d_door = d_gate_logits = d_values = d_out_logits = None
+    d_L = d_door = d_gate_logits = d_values = d_out_logits = d_edge = None
     d_Hw = None
-    if d_out is not None:
-      if len(saved) > 4:
-        attended, out_logits = saved[4], saved[5]
-        wide_out = _wide(L.dtype)                                              # the output gate is float32 always
-        sig = torch.sigmoid(out_logits.to(wide_out))
-        if ctx.needs_input_grad[4]:
-          # d(scale * sigmoid(z)) / dz = scale * sig * (1 - sig)
-          d_out_logits = (d_out.to(wide_out) * attended.to(wide_out) * sig * (1.0 - sig) * ctx.out_scale).to(out_logits.dtype)
-        d_out = d_out * sig.mul_(ctx.out_scale).to(d_out.dtype)
-      d_out = d_out.to(values.dtype)
+    if d_out is not None or d_m is not None:
       P = torch.softmax(torch.addcmul(L, L, door), dim=-1, dtype=wide)
-      d_A = torch.matmul(d_out, values.transpose(-1, -2)).to(wide)           # [B, heads, 64, 64]
-      if ctx.needs_input_grad[3]:
-        d_values = torch.matmul((P * gate).to(values.dtype).transpose(-1, -2), d_out)
+      d_A = None
+      if d_out is not None:
+        if ctx.has_out_gate:
+          wide_out = _wide(L.dtype)                                            # the output gate is float32 always
+          sig = torch.sigmoid(out_logits.to(wide_out))
+          if ctx.needs_input_grad[4]:
+            # d(scale * sigmoid(z)) / dz = scale * sig * (1 - sig)
+            d_out_logits = (d_out.to(wide_out) * attended.to(wide_out) * sig * (1.0 - sig) * ctx.out_scale).to(out_logits.dtype)
+          d_out = d_out * sig.mul_(ctx.out_scale).to(d_out.dtype)
+        d_out = d_out.to(values.dtype)
+        d_A = torch.matmul(d_out, values.transpose(-1, -2)).to(wide)         # [B, heads, 64, 64]
+        if ctx.needs_input_grad[3]:
+          d_values = torch.matmul((P * gate).to(values.dtype).transpose(-1, -2), d_out)
+      if d_m is not None:
+        d_m = d_m.to(edge.dtype)
+        # m[b, h, i, c] = sum_j A[b, h, i, j] e[b, i, j, c]
+        d_Ae = torch.matmul(d_m.transpose(1, 2), edge.transpose(-1, -2)).transpose(1, 2).to(wide)   # [B, heads, 64, 64]
+        d_A = d_Ae if d_A is None else d_A.add_(d_Ae)
+        if ctx.needs_input_grad[8]:
+          A = (P * gate).to(edge.dtype)
+          d_edge = torch.matmul(A.permute(0, 2, 3, 1), d_m.transpose(1, 2))   # [B, 64 i, 64 j, C]
       if ctx.needs_input_grad[2]:
         d_gate_logits = d_A * P * gate * (1.0 - 0.5 * gate)                  # d(2 sigmoid)/dz = g (1 - g / 2)
         if ctx.cap:
@@ -527,25 +550,28 @@ class _AttentionCoreFunction(torch.autograd.Function):
         d_L = torch.addcmul(d_Hl, d_Hl, door)                                # dH (1 + door)
       if ctx.needs_input_grad[1]:
         d_door = d_Hl * L
-    return d_L, d_door, d_gate_logits, d_values, d_out_logits, None, None, None
+    return d_L, d_door, d_gate_logits, d_values, d_out_logits, None, None, None, d_edge
 
 
 def attention_core(L, door, gate_logits, values, cap: bool = False, out_logits=None, out_scale: float = 2.0,
-                   custom: bool | None = None, low: bool = False):
+                   custom: bool | None = None, low: bool = False, edge=None):
   """H = L (1 + door);  A = softmax_j(H) * 2 sigmoid(gate_logits) [capped at 1 if `cap`];
   out = (A @ values) * out_scale * sigmoid(out_logits)   (the output gate; skipped when out_logits is None).
 
   L, door [B, heads, 64, 64] in the assembly dtype; gate_logits float32; values, out_logits [B, heads, 64, head_dim]
-  in the compute dtype. Returns (out [B, heads, 64, head_dim] in the compute dtype, H in the assembly dtype).
+  in the compute dtype. Returns (out [B, heads, 64, head_dim] in the compute dtype, H in the assembly dtype), and
+  with `edge` (channels-last edge state [B, 64, 64, C], compute dtype) also the edge message
+  m [B, heads, 64, C] = sum_j A[., i, j] edge[., i, j, :].
   The softmax and both sigmoids are float32; A is cast to the compute dtype for A.v and the gate product (as the
   original training code does). `custom` (default: when gradients are recorded) selects the memory-saving autograd
   function; otherwise the same statements run under plain autograd (export, eval, reference for the tests)."""
   if custom is None:
-    custom = torch.is_grad_enabled() and (L.requires_grad or door.requires_grad or values.requires_grad)
+    custom = torch.is_grad_enabled() and (L.requires_grad or door.requires_grad or values.requires_grad
+                                          or (edge is not None and edge.requires_grad))
   if custom:
-    return _AttentionCoreFunction.apply(L, door, gate_logits, values, out_logits, cap, out_scale, low)
-  out, H, _, _ = _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low)
-  return out, H
+    return _AttentionCoreFunction.apply(L, door, gate_logits, values, out_logits, cap, out_scale, low, edge)
+  out, H, _, _, m = _core_forward(L, door, gate_logits, values, cap, out_logits, out_scale, low, edge)
+  return (out, H) if edge is None else (out, H, m)
 
 
 def _make_reader_parameters(module: nn.Module, cfg: "BT6Config") -> None:
@@ -622,6 +648,7 @@ class RelationContext:
   def __init__(self, E: torch.Tensor, S: torch.Tensor, Z0: torch.Tensor | None = None) -> None:
     self.E, self.S, self.Z0 = E, S, Z0      # Z0: the pair stream S * (D.E + T[relidx]), float32 [B, P, 64, 64]
     self._Ei, self._Ei_dtype = None, None
+    self._edge_cl = None                   # (e, dtype, channels-last copy) for BT6EdgeValues
 
   def Ei(self, dtype):
     if self._Ei is None or self._Ei_dtype != dtype:
@@ -634,6 +661,14 @@ class RelationContext:
     layers that read that state."""
     batch = e.shape[0]
     return torch.cat((e.to(dtype).reshape(batch, -1, 4096), self.Z0.to(dtype).reshape(batch, -1, 4096)), dim=1)
+
+  def edge_channels_last(self, e: torch.Tensor, dtype):
+    """e [B, C, 64, 64] -> [B, 64, 64, C] in `dtype` (BT6EdgeValues), cached per state version: every term layer
+    that reads the same e shares one copy (each saves it for backward)."""
+    c = self._edge_cl
+    if c is None or c[0] is not e or c[1] != dtype:
+      c = self._edge_cl = (e, dtype, e.permute(0, 2, 3, 1).to(dtype))
+    return c[2]
 
   def prepare(self, dtype):
     """Build the relation layout for `dtype` NOW. Callers that run layers inside torch.utils.checkpoint must call
