@@ -362,7 +362,10 @@ def prologue_sites(m, P: dict) -> str:
     parts = _scope(x).split(", ")
     return parts[-2] if len(parts) >= 2 else ""
 
-  site_scopes = sorted({site_scope(x) for x in nodes if site_scope(x).startswith("'inner.bt6h.sites.")})
+  # numeric order of the site index ('inner.bt6h.sites.13'): a text sort puts 11, 13 before 3 and wires the sites to
+  # the wrong state versions (a cycle) as soon as a site index has two digits
+  site_scopes = sorted({site_scope(x) for x in nodes if site_scope(x).startswith("'inner.bt6h.sites.")},
+                       key=lambda sc: int(sc.strip("'").rsplit(".", 1)[1]))
   for k, sc in enumerate(site_scopes, start=1):
     sn = [x for x in nodes if site_scope(x) == sc]
     mms = [x for x in sn if x.op_type == "MatMul"]
