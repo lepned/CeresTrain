@@ -49,9 +49,12 @@ MLP_GLOBAL_LN_EPS = 1e-6
 
 
 class MLP2Layer(torch.nn.Module):
-  def __init__(self, model_dim: int, ffn_inner_dim: int, out_dim : int, activation_type : str, norm_type : str, use_global : bool, use_te : bool = False, layer_num : int = None) -> None:
+  def __init__(self, model_dim: int, ffn_inner_dim: int, out_dim : int, activation_type : str, norm_type : str, use_global : bool, use_te : bool = False, layer_num : int = None,
+               bias : bool = None) -> None:
     super().__init__()
 
+    # bias (config FFNNoBias, 2026-11-26): None = the historical USE_BIAS on linear1 / linear2; False = no FFN biases (Fry's form)
+    _ffn_bias = USE_BIAS if bias is None else bool(bias)
     self.activation_type = activation_type
     self.use_te = use_te
     self.use_global = use_global
@@ -75,8 +78,8 @@ class MLP2Layer(torch.nn.Module):
         self.mlpGlobalReduce = torch.nn.Linear(mlpGlobalDim, model_dim // MLP_GLOBAL_DIVISOR, bias=USE_BIAS)
         self.mlpGlobalLN = make_norm(norm_type, model_dim // MLP_GLOBAL_DIVISOR, eps=MLP_GLOBAL_LN_EPS)
 
-      self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=USE_BIAS), self.layer_num)
-      self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=USE_BIAS), self.layer_num)
+      self.linear1 = _maybe_wrap_lora(torch.nn.Linear(model_dim + (model_dim // MLP_GLOBAL_DIVISOR if self.use_global else 0), ffn_inner_dim, bias=_ffn_bias), self.layer_num)
+      self.linear2 = _maybe_wrap_lora(torch.nn.Linear(ffn_inner_dim, out_dim, bias=_ffn_bias), self.layer_num)
       if activation_type == 'SwiGLU':
         # SwiGLU multiplicative gate: y = linear2(act(linear1(x)) * linear3(x))
         # Wrap with CERES_LORA_FFN_RANK_DIV (same gate as linear1/linear2) so

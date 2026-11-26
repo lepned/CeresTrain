@@ -34,21 +34,24 @@ from bt6_net import BASE_RELATION_CHANNELS, BT6Config, RelationContext, _make_re
 class BT6NativeTerms(nn.Module):
   """The ten reader tensors of one BT6 layer, for one DotProductAttention with cfg.heads heads of cfg.head_dim."""
 
-  def __init__(self, cfg: BT6Config) -> None:
+  def __init__(self, cfg: BT6Config, head_dim: int = None) -> None:
     super().__init__()
     self.cfg = cfg
+    # head_dim: the per-head QUERY / KEY width of the attention the terms sit on, when it is not cfg.head_dim
+    # (grouped-query / narrow-QK attention, config AttnQKDims: the width may differ per layer). None = cfg.head_dim.
+    self.head_dim = int(head_dim) if head_dim else cfg.head_dim
     self.fused = False                       # BT6FusedAttention (set by ceres_net): the Triton kernel in attend
     _make_reader_parameters(self, cfg)       # t_node, t_edge, C1, C2, We, Wm, Wg, bg (We is the only random draw)
     self.Ue = None                           # BT6EdgeValues: edge message projection (enable_edge_values)
-    self.Pk = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, cfg.head_dim))   # (k_j . Pk[h, c]) E[c, i, j]
-    self.Pq = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, cfg.head_dim))   # (q_i . Pq[h, c]) E[c, i, j]
+    self.Pk = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, self.head_dim))   # (k_j . Pk[h, c]) E[c, i, j]
+    self.Pq = nn.Parameter(torch.zeros(cfg.heads, cfg.relation_channels, self.head_dim))   # (q_i . Pq[h, c]) E[c, i, j]
 
   def logits(self, Q: torch.Tensor, K: torch.Tensor, ctx: RelationContext, e: torch.Tensor, read_state: torch.Tensor):
     """Q, K [B, heads, 64, hd] -> (L without our bias [B, heads, 64, 64], door, gate logits). L and door are in the
     dtype of `read_state` (the assembly dtype the trunk chose: the autocast dtype or float32), the gate logits as
     stacked_reads returns them (float32 unless cfg.pair_autocast)."""
     cfg = self.cfg
-    batch, heads, hd = Q.shape[0], cfg.heads, cfg.head_dim
+    batch, heads, hd = Q.shape[0], cfg.heads, self.head_dim
     pd = read_state.dtype
     t = self.t_node.float()
     Qp, Kp = Q.to(pd), K.to(pd)
@@ -76,6 +79,7 @@ class BT6NativeTerms(nn.Module):
     so the layer is unchanged at initialisation. Without it the relations steer only where a square looks (logits,
     door, gate); "j attacks i" can reach i only through the choice of j. Ue is a reader table (no weight decay,
     no Muon) and follows QK-clip like nothing else (it is on the value side)."""
+    assert self.head_dim == self.cfg.head_dim, 'BT6EdgeValues: not with a q/k width other than the head width (grouped-query attention)'
     self.Ue = nn.Parameter(torch.zeros(self.cfg.heads, self.cfg.edge_channels, self.cfg.head_dim))
 
   def attend(self, Q, K, V, bias, ctx: RelationContext, e: torch.Tensor, read_state: torch.Tensor):

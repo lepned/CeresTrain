@@ -702,6 +702,15 @@ def Train():
   from wd_partition import partition_weight_decay, norm_owned_param_names
   decay, no_decay = partition_weight_decay(model)
   param_dict = {pn: p for pn, p in model.named_parameters()}
+  _wd_scheme_fry = str(getattr(config, 'Opt_WeightDecayScheme', 'default') or 'default') == 'fry'
+  if _wd_scheme_fry:
+    # WeightDecayScheme 'fry' (2026-11-26, after W. Gong's "Fry"): decay EVERYTHING -- norm gains, biases, embeddings,
+    # template and square-feature tables included -- except the QK-norm gains and the input-skip scalars. Substring
+    # matching (compiled / DDP name prefixes). Applies to the AdamW-family groups below and, through wd scales, to Muon.
+    no_decay = {pn for pn in param_dict if '.qLN.' in pn or '.kLN.' in pn or pn.endswith('input_skip_a') or pn.endswith('input_skip_b')}
+    decay = set(param_dict) - no_decay
+    print(f"[train] WeightDecayScheme 'fry': decay on {len(decay)} params incl. norm gains / biases / embeddings / tables; "
+          f"no decay on {len(no_decay)} (QK-norm gains, input-skip scalars)", flush=True)
   _norm_gains = sorted(norm_owned_param_names(model))
   print(f"[train] wd partition: decay {len(decay)} / no_decay {len(no_decay)} params; "
         f"{len(_norm_gains)} norm gains ({sum(param_dict[n].numel() for n in _norm_gains):,} elements) in no_decay "
@@ -769,6 +778,9 @@ def Train():
       if _bt6_no_muon(n): return False          # BT6 hybrid reader tables / output gate / bt6h.* container: AdamW
       if '.tmix.' in n: return False            # AttnTemplates mixers: coupling partner of the zero-init tables (gradient ~0 while the tables are ~0), AdamW
       if 'embedding' in n: return False         # lookup-table-like: AdamW
+      if 'square_features.' in n: return False  # SquareFeatures table [1735, D]: zero-init lookup table, AdamW
+      if 'fry_policy.' in n: return False       # PolicyHeadFry: from / to / promotion projections ARE the final policy layer, AdamW
+      if 'hlg_head.out.' in n: return False     # ValueHeadFry: the bucket layer is the head's final layer, AdamW
       if 'cbk_keys' in n or 'cbk_vals' in n: return False  # codebook motif tables: embedding-like rows, AdamW
       if 'smol_basis_bank' in n or 'smol_static_bank' in n: return False  # raa logit-tabeller, ikke vektmatriser (review-funn 3)
       if 'fcFinal' in n: return False           # each Head's final output layer: AdamW
@@ -820,12 +832,19 @@ def Train():
         return False   # post-move: zero-init proj + raw [7,dm] tables (review 2026-09-04 finding 5)
       return (p.ndim == 2 and ('move_tokens.blocks.' in n or n.endswith('move_tokens.w_in.weight')
                                or 'move_tokens.wb.wq' in n or 'move_tokens.wb.wkv' in n))
+    def _use_muon_fry(n, p):
+      # Fry's partition (2026-11-26; plain encoder trunk, config.py refuses it elsewhere): Muon on EVERY 2-D tensor
+      # inside the trunk layers -- Q / K / V (or the fused qkv), the attention output projection, the FFN matrices AND
+      # the template mixers (which every other scope keeps in AdamW); AdamW on everything else (embeddings, tables,
+      # norm gains, biases, heads, decoder).
+      return p.ndim == 2 and 'transformer_layer' in n and 'lora' not in n.lower()
     _SCOPE_PREDS = {'final-only': _use_muon_final_only,
                     'all-non-trunk': _use_muon_all_non_trunk,
                     'ffn-only': _use_muon_ffn_only,
-                    'all-non-trunk+decoder': _use_muon_all_non_trunk_decoder}
+                    'all-non-trunk+decoder': _use_muon_all_non_trunk_decoder,
+                    'fry': _use_muon_fry}
     if _muon_scope not in _SCOPE_PREDS:
-      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only', 'ffn-only' or 'all-non-trunk+decoder')")
+      raise ValueError(f"Unsupported MuonAdamWScope: {_muon_scope!r} (use 'all-non-trunk', 'final-only', 'ffn-only', 'all-non-trunk+decoder' or 'fry')")
     if _muon_scope == 'all-non-trunk+decoder' and getattr(model, 'move_tokens', None) is None:
       raise ValueError("MuonAdamWScope 'all-non-trunk+decoder' but the model has no move-token decoder (silent no-op refused)")
     _use_muon = _SCOPE_PREDS[_muon_scope]
@@ -920,7 +939,9 @@ def Train():
                     'move_tokens.act.', 'move_tokens.rq_head.',
                     # 2026-11-13 NBT-BT6 hybrid: the policy is BT6's attention head (embedding, Q, K, promotion, pair
                     # read) and its training-only soft-policy twin; the flat policy_head is not built there.
-                    'bt6h.policy.', 'bt6h.soft_policy.')
+                    'bt6h.policy.', 'bt6h.soft_policy.',
+                    # 2026-11-26 PolicyHeadFry: the from / to / promotion projections are the policy readout
+                    'fry_policy.')
     if bool(getattr(config, 'NetDef_ValueHLGaussServe', False)):
       # 2026-11-23 (review): with ValueHLGaussServe the HL-Gauss head IS the served Q -> same family as value_head and
       # v_inject (an aux HL-Gauss head keeps the base rate, as before)
@@ -1006,6 +1027,11 @@ def Train():
     # MuonHonorNoDecay: the no_decay set from wd_partition.py gets wd scale 0 in
     # both Muon branches (it was INERT under Muon: the group wd hit every param).
     _wd_scales = None
+    if _wd_scheme_fry:
+      # WeightDecayScheme 'fry': the group wd on everything except the scheme's own no-decay set (see above)
+      _wd_scales = {param_dict[pn]: 0.0 for pn in sorted(no_decay) if param_dict[pn].requires_grad}
+      if not _wd_scales and any('.qLN.' in pn or 'input_skip' in pn for pn in param_dict):
+        raise ValueError("WeightDecayScheme 'fry': the no-decay set matched no trainable parameter (name-matching bug?)")
     if getattr(config, 'Opt_MuonHonorNoDecay', False):
       _hnd_scope = getattr(config, 'Opt_MuonHonorNoDecayScope', 'all')
       # 'trunk' = honour no_decay everywhere EXCEPT the move-token decoder, so the

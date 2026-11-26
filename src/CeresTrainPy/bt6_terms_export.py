@@ -96,9 +96,32 @@ def qkv_permutation(heads: int, head_depth: int) -> np.ndarray:
 # Export
 # ====================================================================================================================
 @torch.no_grad()
+def _refuse_unexported_blocks(net, who: str) -> None:
+  """The served programs know none of these parts: exporting such a net would succeed and then serve a DIFFERENT
+  net (e.g. without its square-feature table), so refuse. The ordinary ONNX export handles all of them."""
+  found = []
+  if getattr(net, "square_features", None) is not None:
+    found.append("SquareFeatures")
+  if getattr(net, "fry_input", None) is not None:
+    found.append("FryInput")
+  if getattr(net, "fry_policy", None) is not None:
+    found.append("PolicyHeadFry")
+  if bool(getattr(net, "hlg_fry", False)):
+    found.append("ValueHeadFry")
+  if any(bool(getattr(getattr(layer, "attention", None), "gqa", False)) for layer in getattr(net, "transformer_layer", [])):
+    found.append("grouped-query attention (AttnKVHeads / AttnQKDims / AttnValueDim)")
+  if float(getattr(net.config, "NetDef_NormEps", 0.0) or 0.0) > 0.0:
+    found.append("NormEps")
+  if bool(getattr(net.config, "NetDef_InputSkipLayer0", False)):
+    found.append("InputSkipLayer0")
+  if found:
+    raise NotImplementedError(f"{who}: not exported: {', '.join(found)}")
+
+
 def export_served_terms(net) -> dict:
   """Served tensors of a BT6-hybrid CeresNet of variant "bt" or "nt" with the move-token decoder, or of a flat
   trunk (variant "flat", `export_served_flat`)."""
+  _refuse_unexported_blocks(net, "export_served_terms")
   if is_flat(net):
     return export_served_flat(net)
   hybrid = net.bt6h
@@ -347,6 +370,7 @@ def _export_heads_decoder(net, put, dense, scale, edge_channels: int) -> None:
 #   /prologue/*                                BT6 nets only
 @torch.no_grad()
 def export_served_flat(net) -> dict:
+  _refuse_unexported_blocks(net, "export_served_flat")
   hybrid = getattr(net, "bt6h", None)
   config = net.config
   if getattr(net, "move_tokens", None) is None:

@@ -199,13 +199,37 @@ class CeresNet(nn.Module):
       self.bt6_checkpoint_blocks = bool(config.NetDef_BT6CheckpointBlocks)
     # BT6NativeLayers: our own inner layers, BT6's term reads attached to the term positions (bt6_native_terms.py)
     self.bt6_native = self.bt6h is not None and bool(getattr(config, 'NetDef_BT6NativeLayers', False))
+    # FRY BLOCKS (2026-11-26; config.py "Fry building blocks", FRY_BLOCKS_NOTES.md). All off by default.
+    #   FryInput: 70 tokens (64 squares + 6 metadata tokens) with a token + position embedding in place of the Linear
+    #   embedding and its norm; fry_extra metadata tokens ride at the END of the token axis through the trunk.
+    #   SquareFeatures: 23 summed rows of a zero-init table per square, added to the (64-square part of the) embedding.
+    self.fry_input = None
+    self.fry_extra = 0
+    self._fry_tokens_override = None      # tests / weight-parity only: feed the 70 token ids directly
+    if bool(getattr(config, 'NetDef_FryInput', False)):
+      from fry_input import FryInput, NUM_META
+      self.fry_extra = NUM_META
     if self.bt6h is not None and self.bt6h.embed is not None:
       # BT6-form embedding (bt6h.embed) replaces the Linear + norm; they are not built (no unused parameters)
       self.embedding_layer = None
       self.embedding_norm = None
+    elif self.fry_extra:
+      self.embedding_layer = None
+      self.embedding_norm = None
+      self.fry_input = FryInput(self.EMBEDDING_DIM)
+      print(f'[ceres_net] FRY INPUT: 70 tokens (64 squares + colour, 4 castling rights, en passant) built from the record '
+            f'inside forward; token [81] + position [70] embedding, no Linear embedding / embedding norm; the 6 metadata '
+            f'tokens run through the trunk (templates 0 on their rows / columns), heads read the 64 square states')
     else:
       self.embedding_layer = nn.Linear(TOTAL_INPUT_FEATURES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
       self.embedding_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+    self.square_features = None
+    if bool(getattr(config, 'NetDef_SquareFeatures', False)):
+      from square_features import SquareFeatures, NUM_ROWS, NUM_SLOTS
+      self.square_features = SquareFeatures(self.EMBEDDING_DIM)
+      print(f'[ceres_net] SQUARE FEATURES: per square the sum of {NUM_SLOTS} rows of one zero-init [{NUM_ROWS}, '
+            f'{self.EMBEDDING_DIM}] table ({self.square_features.table.numel():,} params), indices computed in forward '
+            f'from record bytes 0..12; added to the embedding (identity at init)')
 
     HEAD_MULT = config.NetDef_HeadWidthMultiplier
 
@@ -308,7 +332,17 @@ class CeresNet(nn.Module):
 
     # BT6 hybrid: the policy is BT6's attention head on the trunk-end state (bt6h.policy); the flat MLP head is
     # not built (it would be an unused parameter set).
-    self.policy_head = (None if self.bt6h is not None
+    # PolicyHeadFry (fry_heads.py): the from x to bilinear head with the promotion term owns the policy; the flat MLP
+    # head is not built.
+    self.fry_policy = None
+    if bool(getattr(config, 'NetDef_PolicyHeadFry', False)):
+      from fry_heads import FryPolicyHead
+      self.fry_policy = FryPolicyHead(self.EMBEDDING_DIM, bool(getattr(config, 'NetDef_PolicyHeadFryKingCastling', False)))
+      print(f'[ceres_net] FRY POLICY HEAD: from x to bilinear ({self.EMBEDDING_DIM} -> {self.EMBEDDING_DIM} each, '
+            f'/ sqrt(width)) + promotion term, gathered to the 1858 moves '
+            f'({sum(p.numel() for p in self.fry_policy.parameters()):,} params; MLP policy head not built)'
+            + ('; castling read at the king two-square pairs (Fry weights)' if self.fry_policy.king_castling else ''))
+    self.policy_head = (None if (self.bt6h is not None or self.fry_policy is not None)
                         else Head(self.Activation, self.HEAD_IN_SIZE, 128 * HEAD_MULT, 1858, _pol_rd))
 
     if self.prior_state_dim > 0:
@@ -752,6 +786,9 @@ class CeresNet(nn.Module):
     # LossValueMultiplier, kept low); `value2` exports the same served WDL (config refuses a trained value2). The
     # HL-Gauss head reads exactly the value head's input (pool channels and the decoder value inject included).
     self.hlg_serve = bool(getattr(config, 'NetDef_ValueHLGaussServe', False))
+    self.hlg_fry = False
+    # ValueHLGaussServeDraw 'none' (Fry's head alone): the served D is 0; the WDL head is built but neither served nor trained
+    self.hlg_serve_no_draw = self.hlg_serve and str(getattr(config, 'NetDef_ValueHLGaussServeDraw', 'wdl') or 'wdl') == 'none'
     assert not self.hlg_serve or (self.hlg_weight > 0 and self.value2_loss_weight == 0), \
       'ValueHLGaussServe needs HLGaussWeight > 0 and LossValue2Multiplier 0 (value2 exports the served WDL)'
     if self.hlg_weight > 0:
@@ -762,7 +799,18 @@ class CeresNet(nn.Module):
       _hlg_sigma_scale = 0.75 if _hlg_ss is None else float(_hlg_ss)
       self.hlg_sigma = _hlg_sigma_scale * (2.0 / self.hlg_buckets)
       _hlg_in = self.VALUE_IN_SIZE + (_v_extra if self.hlg_serve else 0)
-      self.hlg_head = Head(self.Activation, _hlg_in, 64 * HEAD_MULT, self.hlg_buckets, 0)
+      self.hlg_fry = bool(getattr(config, 'NetDef_ValueHeadFry', False))
+      if self.hlg_fry:
+        # ValueHeadFry (fry_heads.py): the head reads the token states after the trunk-end norm (70 with FryInput),
+        # not the shared head front-end; decoder / pool value injects do not reach it.
+        from fry_heads import FryValueHead
+        self.hlg_head = FryValueHead(self.EMBEDDING_DIM, 64 + self.fry_extra, self.hlg_buckets,
+                                     hidden=int(getattr(config, 'NetDef_ValueHeadFryHidden', 0) or 0))
+        print(f'[ceres_net] FRY VALUE HEAD body for the HL-Gauss head: per token {self.EMBEDDING_DIM} -> 16, GELU, flatten '
+              f'{(64 + self.fry_extra) * 16} -> {self.hlg_head.fc.out_features}, GELU, -> {self.hlg_buckets} buckets '
+              f'({sum(p.numel() for p in self.hlg_head.parameters()):,} params)')
+      else:
+        self.hlg_head = Head(self.Activation, _hlg_in, 64 * HEAD_MULT, self.hlg_buckets, 0)
       self.register_buffer('hlg_edges', torch.linspace(-1.0, 1.0, self.hlg_buckets + 1), persistent=False)
       self.register_buffer('hlg_centers', (torch.arange(self.hlg_buckets, dtype=torch.float32) + 0.5)
                            * (2.0 / self.hlg_buckets) - 1.0, persistent=False)
@@ -875,7 +923,9 @@ class CeresNet(nn.Module):
       assert config.NetDef_SoftMoE_UseNormalization == False
       assert config.NetDef_SoftMoE_OnlyForAlternatingLayers == True
       
-    EPS = 1E-6
+    # NormEps (config): epsilon of the trunk norms; None = the historical 1e-6
+    EPS = float(config.NetDef_NormEps) if getattr(config, 'NetDef_NormEps', None) is not None else 1E-6
+    self._norm_eps = EPS
     
     # SMOLBASIS (Kovax-idé 2026-08-31): erstatt hele smolgen-generatoren
     # (~8,4M params paa 256x10 = ~40 %% av nettet!) med K statiske laerte
@@ -1528,6 +1578,21 @@ class CeresNet(nn.Module):
     # odd layers, FFNUseGlobalEveryNLayers, CERES_LORA layer ranges, print-once logs) is
     # per layer, not repeated per block. num_heads / pre_norm: the NBT inner layers may differ
     # from the trunk (NBTInnerHeads, NBTInnerPreNorm).
+    # Grouped-query attention with its own q/k width (config AttnKVHeads / AttnQKDims / AttnValueDim; plain trunk)
+    _gqa_on = bool(getattr(config, 'NetDef_AttnGQA', False))
+    _gqa_qk = getattr(config, 'NetDef_AttnQKDims', 0)
+    def _fry_layer_kwargs(i):
+      kw = {}
+      if _gqa_on:
+        kw.update(gqa_kv_heads=int(config.NetDef_AttnKVHeads or 0) or self.NUM_HEADS,
+                  gqa_qk_dim=int(_gqa_qk[i] if isinstance(_gqa_qk, list) else _gqa_qk),
+                  gqa_v_dim=int(config.NetDef_AttnValueDim or 0),
+                  qkv_bias=bool(config.NetDef_AttnQKVBias), qk_norm_eps=EPS)
+      if self.fry_extra:
+        kw.update(extra_tokens=self.fry_extra)
+      if bool(getattr(config, 'NetDef_FFNNoBias', False)):
+        kw.update(ffn_bias=False)
+      return kw
     def _make_encoder_layer(i, hidden, num_layers, num_heads=None, pre_norm=None, smolgen_off=False):
       # smolgen_off: NBT inner layers under NBTSharedSmolgen get the block's bias instead of their own generator.
       return EncoderLayer('T', num_tokens_q, num_tokens_kv,
@@ -1580,7 +1645,8 @@ class CeresNet(nn.Module):
                       softmax_agg_heads = self.softmax_agg_heads,
                       use_head_logit_temp = self.use_head_logit_temp,
                       attention_norm = config.NetDef_AttentionNorm,
-                      pre_norm = config.NetDef_PreNorm if pre_norm is None else pre_norm)
+                      pre_norm = config.NetDef_PreNorm if pre_norm is None else pre_norm,
+                      **_fry_layer_kwargs(i))
 
     if self.NBT_INNER_LAYERS > 0:
       _k = self.NBT_INNER_LAYERS
@@ -1758,8 +1824,14 @@ class CeresNet(nn.Module):
         # NBTInputSkip on the plain trunk = Fry's per-layer input skip: layer i >= 1 reads a_i * stream + b_i * embedding
         self.input_skip_a = torch.nn.Parameter(torch.ones(self.NUM_DISTINCT_LAYERS))
         self.input_skip_b = torch.nn.Parameter(torch.zeros(self.NUM_DISTINCT_LAYERS))
-        print(f'[ceres_net] INPUT SKIP (plain encoder): layers 1..{self.NUM_DISTINCT_LAYERS - 1} read a * stream + '
+        self.input_skip_layer0 = bool(getattr(config, 'NetDef_InputSkipLayer0', False))
+        print(f'[ceres_net] INPUT SKIP (plain encoder): layers {0 if self.input_skip_layer0 else 1}..{self.NUM_DISTINCT_LAYERS - 1} read a * stream + '
               f'b * embedding (2 learned scalars per layer, a = 1 / b = 0 at init)')
+      if _gqa_on:
+        _a0 = self.transformer_layer[0].attention
+        print(f'[ceres_net] GROUPED-QUERY ATTENTION: {self.NUM_HEADS} query heads on {_a0.kv_heads} key/value heads, q/k width per head '
+              f'{[l.attention.qk_width for l in self.transformer_layer]} by layer, value width {_a0.v_width}, '
+              f'QKV bias {bool(config.NetDef_AttnQKVBias)}; separate q_proj / k_proj / v_proj (no fused qkv)')
       if self.bt6h is not None:
         # FLAT trunk + BT6 term reads (BT6NativeLayers on the plain encoder, 2026-11-23): the layers in BT6TermsLayers
         # get BT6's reader tensors on their attention (identity at init); sites after the layers in BT6EdgeSites read
@@ -1770,7 +1842,13 @@ class CeresNet(nn.Module):
         for _j in self.bt6_terms_layers:
           _att = self.transformer_layer[_j].attention
           assert _att.num_heads == _bt6_lc.heads and _att.d_k * _att.attention_multiplier == _bt6_lc.head_dim,               'BT6 flat: attention heads / head width do not match the hybrid layer config'
-          _att.bt6t = BT6NativeTerms(_bt6_lc)
+          if _att.gqa:
+            # grouped-query / narrow-QK attention (config AttnQKDims): the q- and k-side relation tables take the
+            # layer's own q/k width; the value side (A @ V) is untouched by the terms
+            assert not getattr(config, 'NetDef_BT6FusedAttention', False) and not getattr(config, 'NetDef_BT6EdgeValues', False), 'grouped-query attention: not with BT6FusedAttention / BT6EdgeValues'
+            _att.bt6t = BT6NativeTerms(_bt6_lc, head_dim=_att.qk_width)
+          else:
+            _att.bt6t = BT6NativeTerms(_bt6_lc)
           _att.bt6t.fused = bool(getattr(config, 'NetDef_BT6FusedAttention', False))
           if getattr(config, 'NetDef_BT6EdgeValues', False):
             _att.bt6t.enable_edge_values()
@@ -1905,7 +1983,7 @@ class CeresNet(nn.Module):
     # init scale and can blow up. Standard pattern in LLaMA, GPT-NeoX, etc.
     # An NBT trunk has the same un-normalized outer residual, whatever PreNorm says.
     if config.NetDef_PreNorm or self.NBT_INNER_LAYERS > 0:
-      self.trunk_end_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
+      self.trunk_end_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=self._norm_eps)
     else:
       self.trunk_end_norm = None
 
@@ -2432,11 +2510,28 @@ class CeresNet(nn.Module):
       append_tensor = append_tensor.reshape(squares.shape[0], NUM_TOKENS_INPUT, self.prior_state_dim)
       flow_squares = torch.cat((flow_squares, append_tensor), dim=-1)
 
+    _fry_codes = None
+    if self.fry_input is not None or self.square_features is not None or self.fry_policy is not None:
+      # piece codes of the current board [B, 64] int64 (0 empty, 1..6 ours, 7..12 theirs): record bytes 0..12
+      from square_features import codes_from_record
+      _fry_codes = codes_from_record(squares)
     if self.bt6h is not None and self.bt6h.embed is not None:
       flow = self.bt6h.embed(flow_squares)      # BT6-form embedding on our record (ends in its own LayerNorm)
+    elif self.fry_input is not None:
+      # FryInput: 70 token ids from the record (or handed in directly: tests / weight parity), token + position embedding
+      if self._fry_tokens_override is not None:
+        _fry_tok = self._fry_tokens_override
+        _fry_codes = _fry_tok[:, :64]
+      else:
+        from fry_input import tokens_from_record
+        _fry_tok = tokens_from_record(squares, _fry_codes)
+      flow = self.fry_input(_fry_tok)
     else:
       flow = self.embedding_layer(flow_squares)
       flow = self.embedding_norm(flow)
+    if self.square_features is not None:
+      _sqf = self.square_features(_fry_codes).to(flow.dtype)
+      flow = flow + (torch.nn.functional.pad(_sqf, (0, 0, 0, self.fry_extra)) if self.fry_extra else _sqf)
 
     # King-centric distance channels (see __init__): king one-hot planes
     # (6 = STM king, 12 = opponent king, STM-relative encoding) against the
@@ -2484,8 +2579,16 @@ class CeresNet(nn.Module):
                        or bool(self.mt_mix_layers) or (bool(self.mid_dec_blocks) and self.training))
     # depth probes mean-pool each state over its tokens, so 32-token states are fine; the others index 64 squares
     assert not (pt_idx is not None and (self.use_value_depth_attention or self.pda_mode or self.mt_mix_layers)),       'PieceTokens: depth states for vda / pda / MoveTokenTrunkMix are 64-token; turn them off'
+    _X = self.fry_extra     # FryInput: the metadata tokens at the end of the token axis; depth states are the 64 squares
+    if _X:
+      assert (not self.use_piece_relation_bias and not self.use_ray_bias and not self.use_vis_edge_bias and not self.use_phase_film
+              and not self.use_king_dist and not self.use_spectral_pe and not self.use_gtab and not self.denseformer
+              and not self.piece_tokens and not self.num_registers and self.hyper_conn is None and self.egt is None
+              and self.bt6h is None and not self.rpe_from_embedding and self.refiner_iters == 0
+              and not self.use_tactical_codebook and not self.use_dual_plane and self.LOOP_COUNT == 1), \
+        'FryInput (70 tokens): an option that assumes 64 tokens in the trunk is on (see config.py Fry blocks)'
     if _collect_states:
-      vda_states = [flow]  # post-embedding state
+      vda_states = [flow[:, :64] if _X else flow]  # post-embedding state
     rpe_src_tensor = flow if (self.rpe_from_embedding and not self.rpe_genphase) else None  # post-embedding, pre-layer-1
     rpe_gen_biases = self._rpe_genphase_biases(flow) if (self.rpe_from_embedding and self.rpe_genphase) else None
     # Register tokens ride at the end of the token axis through the trunk; the depth states exclude them.
@@ -2525,6 +2628,7 @@ class CeresNet(nn.Module):
     # NBTInputSkip: blocks >= 1 read a_i * stream + b_i * (post-embedding state); identity at init
     _skip_a = getattr(self, 'input_skip_a', None)
     _skip_e = flow if _skip_a is not None else None
+    _skip0 = bool(getattr(self, 'input_skip_layer0', False))    # InputSkipLayer0 (plain trunk): layer 0 has the scalars too
     _bt6_E = _bt6_S = _bt6_e = None
     if self.bt6h is not None:
       # NBT-BT6 hybrid trunk (bt6_hybrid.py). E: 34 relation channels of the record (float32, no gradient); S: pair
@@ -2547,7 +2651,7 @@ class CeresNet(nn.Module):
         # logits of the block's last inner layer (nbt_layer._raw_logits: q.k / sqrt(hd) + the block's smolgen bias)
         if _bt6_rs is None:
           _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
-        if _skip_a is not None and i > 0:
+        if _skip_a is not None and (i > 0 or _skip0):
           flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
         if self.bt6_flat:
           # flat trunk: an encoder layer; only the term layers get (E, e, [e | Z0])
@@ -2599,7 +2703,7 @@ class CeresNet(nn.Module):
           flow = self.pt_decompress(flow64, flow[:, :flow.shape[1] - _R] if _R else flow, pt_idx)
           if _regs is not None:
             flow = torch.cat([flow, _regs], dim=1)
-        if _skip_a is not None and i > 0:
+        if _skip_a is not None and (i > 0 or _skip0):
           flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
@@ -2651,7 +2755,7 @@ class CeresNet(nn.Module):
           flow = self.dwa_modules[eff_idx](all_previous_x)
         if _collect_states:
           _st = self.hyper_conn_out(flow) if _hc is not None else flow   # mean of the streams (== the plain state at init)
-          vda_states.append(_st[:, :_st.shape[1] - _R] if _R else _st)  # post-layer (post-DWA if denseformer)
+          vda_states.append(_st[:, :_st.shape[1] - _R] if _R else (_st[:, :64] if _X else _st))  # post-layer (post-DWA if denseformer)
 
     if _hc is not None:
       flow = self.hyper_conn_out(flow)
@@ -2664,7 +2768,12 @@ class CeresNet(nn.Module):
       flow = self.pt_decompress(flow64, flow, pt_idx)
 
     # Pre-norm: final norm before the heads (see __init__ comment).
-    if self.trunk_end_norm is not None:
+    _fry_all = None
+    if _X:
+      # FryInput: norm all 70 token states once; the heads read the 64 squares, ValueHeadFry reads all 70
+      _fry_all = self.trunk_end_norm(flow) if self.trunk_end_norm is not None else flow
+      flow = _fry_all[:, :64]
+    elif self.trunk_end_norm is not None:
       flow = self.trunk_end_norm(flow)
       if _reg_out is not None:
         _reg_out = self.trunk_end_norm(_reg_out)
@@ -3009,7 +3118,7 @@ class CeresNet(nn.Module):
 
     # HL-Gauss categorical value head (see __init__): training-only stash.
     if self.hlg_weight > 0 and self.training and not self.hlg_serve:
-      self._last_hlg_out = self.hlg_head(fS_value)
+      self._last_hlg_out = self.hlg_head(_fry_all if _fry_all is not None else flow) if self.hlg_fry else self.hlg_head(fS_value)
 
     # Optimistic-policy aux head (see __init__): training-only stash.
     if self.opt_policy_weight > 0 and self.training:
@@ -3024,6 +3133,9 @@ class CeresNet(nn.Module):
       # BT6 hybrid: logits in our 1858 move order (bt6_net.policy_gather_index is built from MOVES_1858)
       # kept float32 under autocast (the logits were assembled in float32; a bf16 cast would round them to 8 bits)
       policy_out = _bt6_policy
+    elif self.fry_policy is not None:
+      # PolicyHeadFry: from x to bilinear + promotion term on the trunk-end square states, in our 1858 order (float32)
+      policy_out = self.fry_policy(flow, _fry_codes)
     elif getattr(self, 'policy_head_form', 'mlp') == 'fromto':
       # MLP head bypassed (see __init__): the from-to bilinear below is the head.
       # Zeros keep every downstream additive term (plane decode, ray-context)
@@ -3281,7 +3393,8 @@ class CeresNet(nn.Module):
       value_out = value_out + (_mt_out[6].to(torch.float32).unsqueeze(-1) * self.mt_ev_dir.to(torch.float32)).to(value_out.dtype)
     if self.hlg_serve:
       # ValueHLGaussServe (see __init__): Q from the HL-Gauss head, D from the WDL head, served as log-WDL.
-      _hlg_logits = self.hlg_head(fS_value_v, _v_inject)
+      _hlg_logits = (self.hlg_head(_fry_all if _fry_all is not None else flow) if self.hlg_fry
+                     else self.hlg_head(fS_value_v, _v_inject))
       if self.training:
         self._last_hlg_out = _hlg_logits
         self._last_value_raw = value_out          # the WDL head's own logits: trained (for D) by the value CE
@@ -3319,8 +3432,11 @@ class CeresNet(nn.Module):
     """ValueHLGaussServe: [B, buckets] HL-Gauss logits + [B, 3] WDL logits -> [B, 3] log-WDL (float32), with
     Q = sum_i softmax(hlg)_i c_i, D = min(softmax(wdl)_1, 1 - |Q|), W = (1 - D + Q) / 2, L = (1 - D - Q) / 2."""
     q = (torch.softmax(hlg_logits.float(), dim=-1) * self.hlg_centers.float()).sum(dim=-1, keepdim=True)
-    d = torch.softmax(wdl_logits.float(), dim=-1)[:, 1:2]
-    d = torch.minimum(d, 1.0 - q.abs())
+    if self.hlg_serve_no_draw:
+      d = torch.zeros_like(q)        # ValueHLGaussServeDraw 'none': W = (1 + Q) / 2, D = 0, L = (1 - Q) / 2
+    else:
+      d = torch.softmax(wdl_logits.float(), dim=-1)[:, 1:2]
+      d = torch.minimum(d, 1.0 - q.abs())
     w = 0.5 * (1.0 - d + q)
     l = 0.5 * (1.0 - d - q)
     return torch.log(torch.cat([w, d, l], dim=-1).clamp_min(1e-7))

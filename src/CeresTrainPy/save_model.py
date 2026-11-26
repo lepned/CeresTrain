@@ -268,6 +268,12 @@ def save_model(NAME : str,
     # below simpler method fails, probably due to use of .compile
     sample_inputs = [torch.rand(256, 64, TOTAL_INPUT_FEATURES_PER_SQUARE).to(convert_type).to(_model_device),
                      torch.rand(256, 64, config.NetDef_PriorStateDim).to(convert_type).to(_model_device)]
+    if getattr(model_nocompile, 'square_features', None) is not None or getattr(model_nocompile, 'fry_input', None) is not None:
+      # SquareFeatures / FryInput read the piece one-hot as codes: a random record gives codes outside the tables
+      # ("index out of range" in the trace). Trace with a valid record instead: every square empty, nothing else set.
+      _valid = torch.zeros_like(sample_inputs[0])
+      _valid[..., 0] = 1
+      sample_inputs[0] = _valid
 
     if False:
       try:

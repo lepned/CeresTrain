@@ -1,0 +1,6 @@
+{
+  "SourceType": "DirectFromPositionGenerator",
+  "TrainingFilesDirectory": "/none",
+  "FractionQ": 0.8,
+  "WDLLabelSmoothing": 0
+}

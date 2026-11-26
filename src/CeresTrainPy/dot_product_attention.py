@@ -205,7 +205,9 @@ class DotProductAttention(torch.nn.Module):
                use_head_logit_temp : bool = False,
                attention_norm : str = 'softmax',
                smol_basis_k : int = 0, smol_basis_bank = None,
-               smol_static_mode : int = 0, smol_static_bank = None, smol_rel_bins = None) -> None:
+               smol_static_mode : int = 0, smol_static_bank = None, smol_rel_bins = None,
+               gqa_kv_heads : int = 0, gqa_qk_dim : int = 0, gqa_v_dim : int = 0,
+               qkv_bias : bool = False, qk_norm_eps : float = 1e-6) -> None:
     super().__init__()
 
     self.num_tokens_q = num_tokens_q
@@ -215,6 +217,18 @@ class DotProductAttention(torch.nn.Module):
     self.d_model = num_attention_heads * kv_channels
     self.d_output = num_attention_heads * kv_channels
     self.d_k = kv_channels
+    # GROUPED-QUERY ATTENTION with its own query/key width (config AttnKVHeads / AttnQKDims / AttnValueDim,
+    # 2026-11-26; after W. Gong's "Fry"): num_heads QUERY heads share kv_heads KEY/VALUE heads (query head h reads
+    # key/value head h // (num_heads / kv_heads)); queries and keys are qk_width wide per head, values v_width,
+    # independently. Separate q_proj / k_proj / v_proj Linears replace the fused `qkv` (each is its own matrix for
+    # Muon). qk_width is also what the logit scale 1 / sqrt(.) and the QK-norm use. Off (all three 0): the module is
+    # exactly its earlier self.
+    self.gqa = bool(gqa_kv_heads or gqa_qk_dim or gqa_v_dim)
+    self.kv_heads = int(gqa_kv_heads) or num_attention_heads
+    self.qk_width = (int(gqa_qk_dim) or kv_channels * attention_multiplier) if self.gqa else kv_channels * attention_multiplier
+    self.v_width = (int(gqa_v_dim) or kv_channels) if self.gqa else kv_channels * attention_multiplier
+    self.d_hcat = num_attention_heads * self.v_width if self.gqa else self.d_output * attention_multiplier
+    self.qk_div = math.sqrt(self.qk_width)     # the logit divisor sqrt(per-head q/k width)
     # SINK LOGIT (2026-09-02, config AttentionSinkLogit -> CERES_ATTENTION_SINK_LOGIT):
     # every softmax row gets one extra constant-0 logit that is dropped after
     # normalisation ("softmax-off-by-one"), so a head can attend NOWHERE for
@@ -354,7 +368,20 @@ class DotProductAttention(torch.nn.Module):
         self.qkv_multiplier = 4  # Q1, Q2, K, V (works in both linear and nonlinear QKV paths)
     else:
       self.qkv_multiplier = 3 if self.use_qkv else 1 # only contains V if not using QKV
-    self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS), self.layer_num)
+    if self.gqa:
+      assert num_attention_heads % self.kv_heads == 0, f'AttnKVHeads {self.kv_heads} must divide NumHeads {num_attention_heads}'
+      assert (self.use_qkv and use_qk_norm and not use_nonlinear_attention and not use_diff_attention and attention_multiplier == 1
+              and not use_rpe and not use_rope and vis_gate_channels == 0 and graph_route_channels == 0
+              and softmin_heads == 0 and softmax_agg_heads == 0 and not use_head_logit_temp
+              and int(os.environ.get('CERES_GATED_ATTENTION_OUTPUT', '0') or 0) == 0),         ('grouped-query / narrow-QK attention: plain QKV attention with UseQKNorm only (no nonlinear / diff attention, '
+         'AttentionMultiplier 1, no RPE / RoPE / vis gates / graph-route / soft-agg heads / head temperature / gated output)')
+      self.qkv = None            # readers of the fused projection (exports, per-head Muon, edge readback) fail loudly
+      self.q_proj = torch.nn.Linear(self.d_model, num_attention_heads * self.qk_width, bias=bool(qkv_bias))
+      self.k_proj = torch.nn.Linear(self.d_model, self.kv_heads * self.qk_width, bias=bool(qkv_bias))
+      self.v_proj = torch.nn.Linear(self.d_model, self.kv_heads * self.v_width, bias=bool(qkv_bias))
+    else:
+      assert not qkv_bias, 'AttnQKVBias: grouped-query / narrow-QK attention only (the fused qkv keeps its historical no-bias form)'
+      self.qkv = _maybe_wrap_lora(torch.nn.Linear(self.d_model, self.qkv_multiplier * self.d_model * self.attention_multiplier, bias = True if self.use_nonlinear_attention else USE_BIAS), self.layer_num)
     if self.use_diff_attention:
       # Per-token per-head lambda gate. Sigmoid output gives lambda in [0,1].
       # Bias init -2.2 → sigmoid ≈ 0.1 at start → small differential subtraction
@@ -380,7 +407,10 @@ class DotProductAttention(torch.nn.Module):
         if not self.layer_num:
           print(f'[dot_product_attention] DIFF++ enabled: lambda-init-plan per lag (l0 p=0.2 -> l9 p~0.76) '
                 f'+ per-hode RMSNorm * (1-lambda_init) paa differansen')
-    self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
+    if self.gqa:
+      self.W_h = torch.nn.Linear(self.d_hcat, self.d_output)
+    else:
+      self.W_h = _maybe_wrap_lora(torch.nn.Linear(self.d_model * self.attention_multiplier, self.d_output), self.layer_num)
 
     # Gated attention output (Kimi K3 "Gated MLA" / Qwen gated-attention family).
     # Env-gated: CERES_GATED_ATTENTION_OUTPUT=1 (default 0 = exactly current behavior).
@@ -568,8 +598,13 @@ class DotProductAttention(torch.nn.Module):
 
     if self.use_qk_norm:
       # extra layernorm for enahnced training stability
-      self.qLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
-      self.kLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
+      if self.gqa:
+        # per-head norm over the qk_width channels; one gain vector shared by all heads (as the plain form)
+        self.qLN = make_norm(norm_type, self.qk_width, eps=qk_norm_eps)
+        self.kLN = make_norm(norm_type, self.qk_width, eps=qk_norm_eps)
+      else:
+        self.qLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
+        self.kLN = make_norm(norm_type, self.d_k * self.attention_multiplier)
 
     RPE_INNER_DIM = 16 # rounded up to power of 2 (there are only 15 possible values of a -  b where a and b are 0...7)
 
@@ -617,6 +652,7 @@ class DotProductAttention(torch.nn.Module):
   # (1 - lambda_l) * V_first, V_first = the V of the trunk's first inner layer (passed down by ceres_net / nbt_layer).
   # lambda init 1 => exact identity at step 0. Elementwise on V: the score path and the AV MatMul stay unchanged.
   def enable_value_residual(self, first: bool):
+    assert not self.gqa, 'NBTValueResidual: not with grouped-query / narrow-QK attention'
     assert self.use_qkv and not self.use_nonlinear_attention and not self.use_diff_attention,       'NBTValueResidual: standard QKV attention only'
     self.value_residual = True
     self.vr_first = first
@@ -629,6 +665,7 @@ class DotProductAttention(torch.nn.Module):
   # one ordinary QK^T with c-times-wider heads (Q~_g = concat_h' M[g,h'] Q_h', K~_g = concat_h' K_h', elementwise ops in
   # front of the score MatMul), identical in training and export. M = I per group => exact identity at step 0.
   def enable_head_mix(self, group: int):
+    assert not self.gqa, 'NBTHeadMix: not with grouped-query / narrow-QK attention'
     c = group or self.num_heads
     assert self.num_heads % c == 0, f'NBTHeadMixGroup {c} must divide the {self.num_heads} heads'
     # the mixed heads are c times wider (Q/K activations c x, QK^T GEMM c x); TensorRT's fused MHA takes head sizes
@@ -870,7 +907,7 @@ class DotProductAttention(torch.nn.Module):
     if self.use_qkv:
       # Runde-3-fiks: per-hode Q/K-dim er d_k*attention_multiplier — gammel
       # sqrt(d_k) kjoerte logits sqrt(mult) varme for multiplier > 1.
-      scores = scores / math.sqrt(self.d_k * self.attention_multiplier)
+      scores = scores / self.qk_div
 
     if not self.use_qkv:
       scores = smolgen / math.sqrt(self.d_k)
@@ -1004,6 +1041,22 @@ class DotProductAttention(torch.nn.Module):
     return smolgen
 
 
+  def project_gqa(self, x: torch.Tensor):
+    """Grouped-query projections of the (normalised) layer input x [B, T, d_model] -> Q, K [B, heads, T, qk_width]
+    (QK-normalised) and V [B, heads, T, v_width], heads on the left; the kv_heads key / value heads are repeated so
+    that query head h reads key / value head h // (heads / kv_heads)."""
+    B, T = x.shape[0], x.shape[1]
+    H, G = self.num_heads, self.kv_heads
+    Q = self.qLN(self.q_proj(x).reshape(B, T, H, self.qk_width).permute(0, 2, 1, 3))
+    K = self.kLN(self.k_proj(x).reshape(B, T, G, self.qk_width).permute(0, 2, 1, 3))
+    V = self.v_proj(x).reshape(B, T, G, self.v_width).permute(0, 2, 1, 3)
+    if G != H:
+      r = H // G
+      K = K.unsqueeze(2).expand(B, G, r, T, self.qk_width).reshape(B, H, T, self.qk_width)
+      V = V.unsqueeze(2).expand(B, G, r, T, self.v_width).reshape(B, H, T, self.v_width)
+    return Q, K, V
+
+
   def forward(self, x:torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
               piece_relation_bias: torch.Tensor = None, rpe_src: torch.Tensor = None,
               rpe_precomputed: bool = False, vis_edge: torch.Tensor = None,
@@ -1016,9 +1069,11 @@ class DotProductAttention(torch.nn.Module):
     qkv_x = query    
 
     # Linear projections (Q, K, V jointly).
-    qkv = self.qkv(qkv_x)
+    qkv = None if self.gqa else self.qkv(qkv_x)
 
-    if not self.use_qkv:
+    if self.gqa:
+      Q, K, V = self.project_gqa(qkv_x)
+    elif not self.use_qkv:
       Q = None
       K = None
       V = qkv.reshape(batch_size, -1, self.num_heads, self.d_k * self.attention_multiplier)
@@ -1070,7 +1125,7 @@ class DotProductAttention(torch.nn.Module):
         lam = self.vr_lambda.to(V.dtype)
         V = lam * V + (1.0 - lam) * v_first.to(V.dtype)
 
-    if self.use_qk_norm:
+    if self.use_qk_norm and not self.gqa:     # (grouped-query: normalised in project_gqa, before the key heads are repeated)
       # Diff-attention baerer Q som tuple (Q1, Q2) — normer begge grenene med
       # samme qLN; delt K normeres en gang. Uten dette faar qLN en tuple og
       # krasjer (funnet 2026-08-26 ved QK-norm + diff++-stabilisering).
@@ -1083,7 +1138,7 @@ class DotProductAttention(torch.nn.Module):
     # EGT edge stream (egt_edge.py): separable premult as per-(head, square) scales on Q (rows) and K (columns).
     # Elementwise on Q/K, so the score path stays a plain QK^T (+ additive bias) that TRT can fuse.
     if edge_scales is not None:
-      assert not isinstance(Q, tuple), 'EGT edge stream: standard (non-diff) attention only'
+      assert not isinstance(Q, tuple) and not self.gqa, 'EGT edge stream: standard (non-diff, non-grouped) attention only'
       Q = Q * edge_scales[0].unsqueeze(-1).to(Q.dtype)
       K = K * edge_scales[1].unsqueeze(-1).to(K.dtype)
     if edge_gate is not None:
@@ -1257,7 +1312,7 @@ class DotProductAttention(torch.nn.Module):
       H_cat = H_cat * torch.sigmoid(self.attn_out_gate(qkv_x)).transpose(1, 2).unsqueeze(-1).to(H_cat.dtype)
 
     # Put all the heads back together by concat (with heads moved back to the right)
-    H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_output * self.attention_multiplier)
+    H_cat =  H_cat.transpose(1, 2).contiguous().view(batch_size, -1, self.d_hcat)
 
     # Gated attention output (see __init__): per-channel sigmoid gate from the
     # attention input scales head outputs before the final projection.

@@ -1116,8 +1116,10 @@ class Configuration:
           (float(self.Opt_HLGaussWeight) <= 0, 'needs HLGaussWeight > 0 (the HL-Gauss head is the served Q)'),
           (float(self.Opt_LossValue2Multiplier or 0) != 0,
            'needs LossValue2Multiplier 0 (value2 exports the served WDL; a trained value2 head would not be served)'),
-          (float(self.Opt_LossValueMultiplier or 0) <= 0,
+          (float(self.Opt_LossValueMultiplier or 0) <= 0 and str(config_net_def.get('ValueHLGaussServeDraw', 'wdl') or 'wdl') != 'none',
            'needs LossValueMultiplier > 0 (the WDL head supplies the served draw probability)'),
+          (float(self.Opt_LossValueMultiplier or 0) != 0 and str(config_net_def.get('ValueHLGaussServeDraw', 'wdl') or 'wdl') == 'none',
+           "with ValueHLGaussServeDraw 'none' the WDL head is not served: LossValueMultiplier must be 0"),
           (bool(self.NetDef_MoveTokenExpectedValue), 'MoveTokenExpectedValue adds to the WDL logits: not wired with it'),
           (bool(self.NetDef_TrainOn4BoardSequences), 'TrainOn4BoardSequences (value-diff losses) is not wired with it'),
           # review 11-23: sigma 0 = one-hot buckets -> NaN in the HL-Gauss target; the Mycel / lc0ex kernel needs a
@@ -1896,6 +1898,165 @@ class Configuration:
           (float(getattr(self, 'Opt_SoftPolicyServeBlend', 0) or 0) != 0, 'SoftPolicyServeBlend must be 0'),
       ):
         _bt6_refuse(_cond, _what)
+
+    # ------------------------------------------------------------------ Fry building blocks (2026-11-26)
+    # Four blocks after W. Gong's "Fry" chess transformer, each behind its own key, all off by default
+    # (FRY_BLOCKS_NOTES.md; square_features.py, fry_input.py, fry_heads.py, dot_product_attention.project_gqa).
+    #
+    # SquareFeatures: per square the sum of 23 rows of one zero-init [1735, ModelDim] table (offsets to the kings and
+    #   queens, the 8 neighbours, first piece and distance on 8 rays, knight-attack counts, nearest pawn up / down the
+    #   file), computed inside forward from record bytes 0..12 and added to the embedding (after its norm). Works on
+    #   every trunk and every embedding (Linear, BT6-form, FryInput).
+    self.NetDef_SquareFeatures = bool(config_net_def.get('SquareFeatures', False))
+    # FryInput: 70 tokens = 64 squares + 6 metadata tokens (colour, 4 castling rights, en passant), token + position
+    #   embedding INSTEAD of the Linear embedding and its norm; the metadata tokens run through the trunk, attention
+    #   templates are 0 on their rows / columns, the heads read the 64 square states (ValueHeadFry reads all 70).
+    #   Plain pre-norm encoder trunk only.
+    self.NetDef_FryInput = bool(config_net_def.get('FryInput', False))
+    # Grouped-query attention with its own query / key width:
+    #   AttnKVHeads   number of key / value heads shared by the NumHeads query heads (0 = off = NumHeads)
+    #   AttnQKDims    per-head query / key width: one int for all layers or a list with one int per layer (0 / absent
+    #                 = ModelDim / NumHeads)
+    #   AttnValueDim  per-head value width (0 = ModelDim / NumHeads)
+    #   AttnQKVBias   bias on the three projections (Fry has it; our fused qkv has none)
+    #   Needs UseQKNorm (per-head RMSNorm of q and k over the q/k width, one gain vector for all heads, then 1 / sqrt(width)).
+    self.NetDef_AttnKVHeads = int(config_net_def.get('AttnKVHeads', 0) or 0)
+    _qkd = config_net_def.get('AttnQKDims', 0) or 0
+    self.NetDef_AttnQKDims = [int(v) for v in _qkd] if isinstance(_qkd, (list, tuple)) else int(_qkd)
+    self.NetDef_AttnValueDim = int(config_net_def.get('AttnValueDim', 0) or 0)
+    self.NetDef_AttnQKVBias = bool(config_net_def.get('AttnQKVBias', False))
+    self.NetDef_AttnGQA = bool(self.NetDef_AttnKVHeads or self.NetDef_AttnQKDims or self.NetDef_AttnValueDim)
+    # PolicyHeadFry: from-square x to-square bilinear head with the promotion term, on our 1858 moves (fry_heads.py).
+    #   PolicyHeadFryKingCastling: e1h1 / e1a1 read the king's two-square pairs (for loading Fry's own weights only).
+    self.NetDef_PolicyHeadFry = bool(config_net_def.get('PolicyHeadFry', False))
+    self.NetDef_PolicyHeadFryKingCastling = bool(config_net_def.get('PolicyHeadFryKingCastling', False))
+    # ValueHeadFry: the HL-Gauss head's body becomes Fry's (per token ModelDim -> 16, GELU, flatten, -> ValueHeadFryHidden
+    #   (0 = ModelDim), GELU, -> HLGaussBuckets). With ValueHLGaussServe it is the served Q and the WDL head supplies D
+    #   (the engines need W/D/L). ValueHLGaussServeDraw 'none': served D := 0, W = (1 + Q) / 2, L = (1 - Q) / 2 -- his
+    #   head alone; the WDL head is then not trained (LossValueMultiplier must be 0).
+    self.NetDef_ValueHeadFry = bool(config_net_def.get('ValueHeadFry', False))
+    self.NetDef_ValueHeadFryHidden = int(config_net_def.get('ValueHeadFryHidden', 0) or 0)
+    self.NetDef_ValueHLGaussServeDraw = str(config_net_def.get('ValueHLGaussServeDraw', 'wdl') or 'wdl')
+    # InputSkipLayer0: with NBTInputSkip on a plain trunk, layer 0 gets the two scalars as well (Fry: every layer;
+    #   layer 0 then reads (a_0 + b_0) * embedding). a = 1, b = 0 at init: the function at init is unchanged.
+    self.NetDef_InputSkipLayer0 = bool(config_net_def.get('InputSkipLayer0', False))
+    # NormEps: epsilon of every trunk norm (ln1 / ln2, trunk-end norm) and of the grouped-query QK-norm. None = the
+    #   historical 1e-6 (Fry: 1e-5).
+    # FFNNoBias: no bias on the FFN's first and last Linear (Fry's SwiGLU has none; ours has them by default).
+    self.NetDef_FFNNoBias = bool(config_net_def.get('FFNNoBias', False))
+    _neps = config_net_def.get('NormEps', None)
+    self.NetDef_NormEps = None if _neps is None else float(_neps)
+    # Opt: WeightDecayScheme 'fry' = decay EVERYTHING (norm gains, biases, embeddings, tables included) except the
+    #   QK-norm gains and the input-skip scalars, in both optimizers. WeightDecayFromSchedule c (Fry: 0.17):
+    #   WeightDecay := 1 / (c * LearningRateBase * steps), steps = NumTrainingPositions / BatchSizeBackwardPass.
+    #   MuonAdamWScope 'fry' (train.py): Muon on every 2-D tensor inside the trunk layers, template mixers included.
+    self.Opt_WeightDecayScheme = str(config_opt.get('WeightDecayScheme', 'default') or 'default')
+    _wdc = config_opt.get('WeightDecayFromSchedule', None)
+    self.Opt_WeightDecayFromSchedule = None if _wdc is None else float(_wdc)
+
+    def _fry_refuse(cond, what):
+      if cond:
+        raise ValueError(f'Fry blocks: {what}')
+    _plain = int(self.NetDef_NBTInnerLayers) < 1
+    _bt6 = bool(config_net_def.get('BT6Hybrid', False))
+    _lora = int(config_net_def.get('LoRARankDivisor', 0) or 0) > 0 or int(config_opt.get('LoRARankDivisor', 0) or 0) > 0
+    _fry_refuse(self.Opt_WeightDecayScheme not in ('default', 'fry'), f"WeightDecayScheme must be 'default' or 'fry' (got {self.Opt_WeightDecayScheme!r})")
+    _fry_refuse(self.Opt_WeightDecayScheme == 'fry' and bool(self.Opt_MuonHonorNoDecay),
+                "WeightDecayScheme 'fry' defines the no-decay set itself: MuonHonorNoDecay must be off")
+    _fry_refuse(self.Opt_WeightDecayFromSchedule is not None and self.Opt_WeightDecayFromSchedule <= 0, 'WeightDecayFromSchedule must be > 0')
+    if self.Opt_WeightDecayFromSchedule is not None:
+      _fry_refuse('WeightDecay' in config_opt and config_opt['WeightDecay'] is not None,
+                  'WeightDecayFromSchedule computes WeightDecay: remove the WeightDecay key (or set it to null)')
+      _steps = float(self.Opt_NumTrainingPositions) / float(self.Opt_BatchSizeBackwardPass)
+      self.Opt_WeightDecay = 1.0 / (self.Opt_WeightDecayFromSchedule * float(self.Opt_LearningRateBase) * _steps)
+      _fry_refuse(self.Opt_WeightDecay >= 0.5, f'WeightDecayFromSchedule gives WeightDecay {self.Opt_WeightDecay:.4g} for {_steps:,.0f} steps '
+                  f'(the rule is for full-length runs; set WeightDecay explicitly for a short one)')
+      print(f'[config] WeightDecayFromSchedule {self.Opt_WeightDecayFromSchedule}: WeightDecay = 1 / (c * lr {self.Opt_LearningRateBase} '
+            f'* {_steps:,.0f} steps) = {self.Opt_WeightDecay:.6g}')
+    _fry_refuse(self.Opt_MuonAdamWScope == 'fry' and not _plain, "MuonAdamWScope 'fry' is defined for the plain encoder trunk (NBTInnerLayers 0)")
+    _fry_refuse(self.Opt_MuonAdamWScope == 'fry' and _bt6, "MuonAdamWScope 'fry': not with BT6Hybrid (its reader tables must stay out of Muon)")
+    _fry_refuse(self.NetDef_NormEps is not None and not (0 < self.NetDef_NormEps < 1e-2), 'NormEps must be in (0, 1e-2)')
+    _fry_refuse(self.NetDef_InputSkipLayer0 and not (self.NetDef_NBTInputSkip and _plain),
+                'InputSkipLayer0 needs NBTInputSkip on a plain encoder trunk (NBTInnerLayers 0)')
+    _fry_refuse(self.NetDef_PolicyHeadFryKingCastling and not self.NetDef_PolicyHeadFry, 'PolicyHeadFryKingCastling set without PolicyHeadFry (silent no-op refused)')
+    _fry_refuse(self.NetDef_ValueHeadFryHidden and not self.NetDef_ValueHeadFry, 'ValueHeadFryHidden set without ValueHeadFry (silent no-op refused)')
+    _fry_refuse(self.NetDef_ValueHLGaussServeDraw not in ('wdl', 'none'), "ValueHLGaussServeDraw must be 'wdl' or 'none'")
+    _fry_refuse(self.NetDef_ValueHLGaussServeDraw == 'none' and not self.NetDef_ValueHLGaussServe,
+                "ValueHLGaussServeDraw 'none' set without ValueHLGaussServe (silent no-op refused)")
+    _fry_refuse(self.NetDef_FFNNoBias and (not _plain or bool(self.NetDef_TSB_Enabled) or int(self.NetDef_SoftMoE_NumExperts or 0) > 0),
+                'FFNNoBias: plain encoder trunk, no TSB / SoftMoE')
+    if self.NetDef_SquareFeatures:
+      _fry_refuse(int(self.NetDef_PriorStateDim or 0) > 0, 'SquareFeatures: PriorStateDim must be 0')
+      _fry_refuse(self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0, 'SquareFeatures: not wired with PieceTokens / RegisterTokens')
+    if self.NetDef_AttnGQA:
+      _heads = int(self.NetDef_NumHeads)
+      _kvh = self.NetDef_AttnKVHeads or _heads
+      _nl = int(self.NetDef_NumLayers) // int(self.NetDef_LoopCount)
+      _fry_refuse(not _plain, 'grouped-query / narrow-QK attention is wired for the plain encoder trunk (NBTInnerLayers 0)')
+      _fry_refuse(_kvh < 1 or _heads % _kvh != 0, f'AttnKVHeads {_kvh} must divide NumHeads {_heads}')
+      _fry_refuse(not self.NetDef_UseQKNorm, 'grouped-query / narrow-QK attention needs UseQKNorm')
+      _fry_refuse(isinstance(self.NetDef_AttnQKDims, list) and len(self.NetDef_AttnQKDims) != _nl,
+                  f'AttnQKDims as a list needs one entry per (distinct) layer ({_nl})')
+      _fry_refuse(any(int(v) < 1 for v in (self.NetDef_AttnQKDims if isinstance(self.NetDef_AttnQKDims, list) else [self.NetDef_AttnQKDims or 1])),
+                  'AttnQKDims entries must be >= 1')
+      for _key, _on in (('BT6Hybrid without BT6NativeLayers (BT6Layer inner layers have their own attention)',
+                         _bt6 and not bool(config_net_def.get('BT6NativeLayers', False))),
+                        ('BT6FusedAttention (the Triton kernel assumes the fused q, k)', bool(config_net_def.get('BT6FusedAttention', False))),
+                        ('BT6EdgeValues', bool(config_net_def.get('BT6EdgeValues', False))),
+                        ('EGTEdgeStream', bool(config_net_def.get('EGTEdgeStream', False))),
+                        ('UseRPE', bool(config_net_def.get('UseRPE', False))), ('UseRoPE', bool(config_net_def.get('UseRoPE', False))),
+                        ('NonLinearAttention', bool(config_net_def.get('NonLinearAttention', False))),
+                        ('UseDiffAttention', bool(config_net_def.get('UseDiffAttention', False))),
+                        ('AttentionMultiplier != 1', int(config_net_def.get('AttentionMultiplier', 1) or 1) != 1),
+                        ('VisEdgeGates', bool(config_net_def.get('VisEdgeGates', ''))),
+                        ('UseGraphRouteHeads', bool(config_net_def.get('UseGraphRouteHeads', False))),
+                        ('UseQKV false', not bool(config_net_def.get('UseQKV', True))),
+                        ('MuonPerHeadAttention', bool(config_opt.get('MuonPerHeadAttention', False))),
+                        ('GatedAttentionOutput', bool(config_opt.get('GatedAttentionOutput', 0))),
+                        ('LoRA (LoRARankDivisor)', _lora)):
+        _fry_refuse(_on, f'grouped-query / narrow-QK attention does not combine with {_key}')
+    elif self.NetDef_AttnQKVBias:
+      _fry_refuse(True, 'AttnQKVBias set without AttnKVHeads / AttnQKDims / AttnValueDim (silent no-op refused)')
+    if self.NetDef_FryInput:
+      _fry_refuse(not _plain or not self.NetDef_PreNorm, 'FryInput needs the plain pre-norm encoder trunk (NBTInnerLayers 0, PreNorm true)')
+      _fry_refuse(int(self.NetDef_LoopCount) != 1, 'FryInput: LoopCount 1')
+      _smol = int(config_net_def.get('SmolgenDimPerSquare', 0) or 0) > 0 and int(config_net_def.get('SmolgenDim', 0) or 0) > 0
+      for _key, _on in (('BT6Hybrid (relations, pair stream, edge sites and its embedding are 64-token)', _bt6),
+                        ('EGTEdgeStream (64 x 64 edge state)', bool(config_net_def.get('EGTEdgeStream', False))),
+                        ('smolgen (SmolgenDimPerSquare / SmolgenDim; 64-token generator)', _smol),
+                        ('SmolBasisK / SmolStaticMode', bool(config_net_def.get('SmolBasisK', 0)) or bool(config_net_def.get('SmolStaticMode', 0))),
+                        ('UseRPE', bool(config_net_def.get('UseRPE', False))), ('UseRoPE', bool(config_net_def.get('UseRoPE', False))),
+                        ('UseRelBias', bool(config_net_def.get('UseRelBias', False))),
+                        ('DenseFormer', bool(config_net_def.get('DenseFormer', False))),
+                        ('PieceTokens', self.NetDef_PieceTokens > 0), ('RegisterTokens', self.NetDef_RegisterTokens > 0),
+                        ('UsePieceRelationBias', bool(config_net_def.get('UsePieceRelationBias', False))),
+                        ('UseRayAttentionBias', bool(config_net_def.get('UseRayAttentionBias', False))),
+                        ('UseVisEdgeBias', bool(config_net_def.get('UseVisEdgeBias', False))),
+                        ('UseGraphRouteHeads', bool(config_net_def.get('UseGraphRouteHeads', False))),
+                        ('UseKingDistChannels', bool(config_net_def.get('UseKingDistChannels', False))),
+                        ('UseSpectralPE', bool(config_net_def.get('UseSpectralPE', False))),
+                        ('UseDualPlane', bool(config_net_def.get('UseDualPlane', False))),
+                        ('UseTacticalCodebook', bool(config_net_def.get('UseTacticalCodebook', False))),
+                        ('UsePhaseFiLM', bool(config_net_def.get('UsePhaseFiLM', False))),
+                        ('RefinerIters', int(config_net_def.get('RefinerIters', 0) or 0) > 0),
+                        ('PriorStateDim', int(self.NetDef_PriorStateDim or 0) > 0),
+                        ('MoveTokenEdgeInput (needs an edge stream)', bool(config_net_def.get('MoveTokenEdgeInput', False))),
+                        ('TSBConfig.Enabled', bool(self.NetDef_TSB_Enabled)),
+                        ('SoftMoE', int(self.NetDef_SoftMoE_NumExperts or 0) > 0),
+                        ('FFNUseGlobalEveryNLayers', int(config_net_def.get('FFNUseGlobalEveryNLayers', 0) or 0) > 0),
+                        ('LoRA (LoRARankDivisor)', _lora)):
+        _fry_refuse(_on, f'FryInput (70 tokens) does not combine with {_key}')
+    if self.NetDef_PolicyHeadFry:
+      for _key, _on in (('UseMoveTokens (the decoder owns the policy)', self.NetDef_UseMoveTokens),
+                        ('BT6Hybrid (its attention head owns the policy)', _bt6),
+                        ('UseDualPlane', bool(config_net_def.get('UseDualPlane', False))),
+                        ('RefinerIters', int(config_net_def.get('RefinerIters', 0) or 0) > 0),
+                        ('PolicyDepthAttention', bool(self.NetDef_PolicyDepthAttention)),
+                        ('LoRA (LoRARankDivisor)', _lora)):
+        _fry_refuse(_on, f'PolicyHeadFry does not combine with {_key}')
+    if self.NetDef_ValueHeadFry:
+      _fry_refuse(float(self.Opt_HLGaussWeight or 0) <= 0, 'ValueHeadFry is the body of the HL-Gauss head: needs HLGaussWeight > 0')
+      _fry_refuse(_lora, 'ValueHeadFry does not combine with LoRA')
 
 
   def pretty_print(self):

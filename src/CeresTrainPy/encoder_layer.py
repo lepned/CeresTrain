@@ -57,7 +57,9 @@ class EncoderLayer(torch.nn.Module):
                 softmax_agg_heads : int = 0,
                 use_head_logit_temp : bool = False,
                 attention_norm : str = 'softmax',
-                pre_norm : bool = False):
+                pre_norm : bool = False,
+                gqa_kv_heads : int = 0, gqa_qk_dim : int = 0, gqa_v_dim : int = 0, qkv_bias : bool = False,
+                qk_norm_eps : float = 1e-6, extra_tokens : int = 0, ffn_bias : bool = None):
     super().__init__()
 
     assert ffn_activation_type in ('ReLUSquared', 'ReLU', 'SwiGLU', 'Swish', 'Mish')
@@ -94,7 +96,13 @@ class EncoderLayer(torch.nn.Module):
                                          attention_norm=attention_norm,
                                          smol_basis_k=smol_basis_k, smol_basis_bank=smol_basis_bank,
                                          smol_static_mode=smol_static_mode, smol_static_bank=smol_static_bank,
-                                         smol_rel_bins=smol_rel_bins)
+                                         smol_rel_bins=smol_rel_bins,
+                                         **({'gqa_kv_heads': gqa_kv_heads, 'gqa_qk_dim': gqa_qk_dim, 'gqa_v_dim': gqa_v_dim,
+                                             'qkv_bias': qkv_bias, 'qk_norm_eps': qk_norm_eps}
+                                            if (gqa_kv_heads or gqa_qk_dim or gqa_v_dim) else {}))
+    # FryInput (ceres_net): the last `extra_tokens` tokens of x are metadata tokens. They take part in the attention
+    # and the FFN like any token; the per-square template bias is 0 on their rows and columns.
+    self.extra_tokens = int(extra_tokens)
     if self.ffn_hidden_size > 0:
       self.ln2 = make_norm(norm_type, hidden_size, eps=layernorm_eps)
 
@@ -119,7 +127,8 @@ class EncoderLayer(torch.nn.Module):
       self.moe = None
 
     if ffn_hidden_size > 0:
-      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum)
+      self.mlp = MLP2Layer(model_dim=hidden_size, ffn_inner_dim=ffn_hidden_size, out_dim = hidden_size, activation_type=ffn_activation_type, norm_type=norm_type, use_global=use_global, use_te = False, layer_num=layerNum,
+                           **({} if ffn_bias is None else {'bias': ffn_bias}))
 
     # Tactical SwiGLU Bypass (TSB): parallel frozen-base + tactical-branch design.
     # Per-block parallel SwiGLU FFN (smaller than the SP FFN by tsb_ffn_multiplier)
@@ -166,7 +175,11 @@ class EncoderLayer(torch.nn.Module):
     if self.pre_norm:
       attn_input = self.ln1(x)
       if self.tmix is not None:
-        tb = self.tmix(attn_input)
+        if self.extra_tokens:
+          _nsq = attn_input.shape[1] - self.extra_tokens
+          tb = torch.nn.functional.pad(self.tmix(attn_input[:, :_nsq]), (0, self.extra_tokens, 0, self.extra_tokens))
+        else:
+          tb = self.tmix(attn_input)
         piece_relation_bias = tb if piece_relation_bias is None else piece_relation_bias + tb.to(piece_relation_bias.dtype)
       attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     else:
@@ -227,6 +240,7 @@ class EncoderLayer(torch.nn.Module):
       out2 = out1
 
     if want_logits:
+      assert not self.extra_tokens, 'want_logits (edge-site readback): not with FryInput (the edge state is 64 x 64)'
       assert not (return_branch or return_v or edge_scales is not None or edge_gate is not None),           'want_logits: not combined with return_branch / return_v / EGT edge scales or gates'
       # _raw_logits recomputes Q / K from x through this layer's own ln1 (pre-norm) and qkv / QK-norm (one extra qkv
       # GEMM per site, as on NBT): the attention's fused score path and its signature stay unchanged

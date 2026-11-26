@@ -456,10 +456,15 @@ class NestedBottleneckLayer(torch.nn.Module):
     inp = layer.ln1(h) if layer.pre_norm else h
     B = inp.shape[0]
     dk = att.d_k * att.attention_multiplier
-    qkv = att.qkv(inp).reshape(B, -1, att.num_heads, 3 * dk).permute(0, 2, 1, 3)
-    Q, K, _ = qkv.chunk(3, dim=-1)
-    if att.use_qk_norm:
-      Q, K = att.qLN(Q), att.kLN(K)
+    if getattr(att, 'gqa', False):
+      # grouped-query / narrow-QK attention (flat trunk): its own projections, QK-normalised, key heads repeated
+      Q, K, _ = att.project_gqa(inp)
+      dk = att.qk_width
+    else:
+      qkv = att.qkv(inp).reshape(B, -1, att.num_heads, 3 * dk).permute(0, 2, 1, 3)
+      Q, K, _ = qkv.chunk(3, dim=-1)
+      if att.use_qk_norm:
+        Q, K = att.qLN(Q), att.kLN(K)
     if edge_scales is not None:
       Q = Q * edge_scales[0].unsqueeze(-1).to(Q.dtype)
       K = K * edge_scales[1].unsqueeze(-1).to(K.dtype)

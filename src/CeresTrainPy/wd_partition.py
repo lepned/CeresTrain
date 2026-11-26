@@ -96,7 +96,10 @@ def partition_weight_decay(model):
                   pass   # reached through the owning module's own iteration
               elif '.' not in pn:
                   no_decay.add(fpn)
-          elif fpn.endswith('attn_templates.table') or fpn.endswith('input_skip_a') or fpn.endswith('input_skip_b'):
+          elif (fpn.endswith('attn_templates.table') or fpn.endswith('input_skip_a') or fpn.endswith('input_skip_b')
+                or fpn.endswith('square_features.table')):
+              # (square_features.table, 2026-11-26: SquareFeatures' zero-init [1735, D] lookup table -- embedding class.
+              #  Fry's own partition decays it: Opt WeightDecayScheme 'fry', applied in train.py.)
               # AttnTemplates (2026-11-20, attn_templates.py): the shared zero-init 64x64 logit tables [T, 64, 64] at
               # the net root -- raw logit tables, the class of the BT6 reader tables / smol_*_bank -> no_decay.
               # NBTInputSkip: per-block mixing scalars (a = 1, b = 0 at init), never decayed (a decay on `a` would
