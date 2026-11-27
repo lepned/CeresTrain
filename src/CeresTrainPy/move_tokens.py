@@ -332,9 +332,20 @@ class MoveTokenDecoder(nn.Module):
                action_head: bool = False,
                reply_sup: bool = False,
                rel_bias: bool = False,
-               edge_dim: int = 0):
+               edge_dim: int = 0,
+               gives_check: bool = False):
     super().__init__()
     self.dm, self.M = dm, max_tokens
+    # GIVES CHECK (2026-11-27, NetDef MoveTokenGivesCheck): per token 0 none / 1 direct / 2 discovered / 3 both
+    # (gives_check.py), a zero-init row of w_gc [4, dm] added to the token input (row 0 masked). No RNG draw.
+    self.gives_check = bool(gives_check)
+    if self.gives_check:
+      from gives_check import GivesCheck
+      self.gc = GivesCheck()
+      self.w_gc = nn.Parameter(torch.zeros(4, dm))
+    else:
+      self.gc = None
+      self.w_gc = None
     # EDGE INPUT (2026-10-08, NetDef MoveTokenEdgeInput): a move token IS a (from, to) pair, and the EGT edge stream
     # keeps a learned d_e state per pair. Each token (own and opponent) adds w_edge . rms(e_final[from, to]) to its input
     # embedding: one gather per token, zero-init (plain zeros: no RNG draw, so every other init is unchanged).
@@ -761,6 +772,10 @@ class MoveTokenDecoder(nn.Module):
     if self.w_edge is not None:
       assert edge is not None, 'MoveTokenEdgeInput: the decoder needs the EGT edge state'
       x = x + self._edge_tokens(edge, sel, x.dtype)
+    if self.w_gc is not None:
+      _codes = (squares13[:, :, 0:13] * torch.arange(13, device=squares13.device, dtype=squares13.dtype)).sum(-1).round().to(torch.long)
+      _gi = self.gc(_codes, fr, to)                                            # [B,M] 0..3
+      x = x + F.embedding(_gi, self.w_gc).to(x.dtype) * (_gi > 0).unsqueeze(-1).to(x.dtype)
     # Relations in the TOKEN-STREAM dtype (bf16 under autocast, not the fp32 residual dtype of
     # `flow`): one tensor shared by every block's bias matmul, no per-block autocast copies.
     rel = self.relations(fr, to, x.dtype) if self.rel_bias else None        # [B,M,M,NREL], computed once

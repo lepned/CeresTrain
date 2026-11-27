@@ -217,6 +217,7 @@ def terms_attention(m, P: dict) -> str:
     helper.make_node("Cast", ["bt6p_bits"], ["bt6p_edges"], to=TensorProto.INT32, name="bt6p_edges_i32"),
   ]
   tpl = np.asarray(P["attn_templates.table"], np.float32).astype(np.float16)
+  assert not any(k.startswith("attn_templates.piece_") for k in P),     "TemplatesPieceQuery / TemplatesPieceKey: the plugin takes fixed template tables (not wired)"
   assert tpl.shape == (TEMPLATES, 64, 64), tpl.shape
   new_inits.append(numpy_helper.from_array(tpl, "bt6p_tpl"))
   new_inits.append(numpy_helper.from_array(np.array([-1, 16, 64, 64], np.int64), "bt6p_state_shape"))

@@ -161,7 +161,9 @@ class EncoderLayer(torch.nn.Module):
               vis_edge: torch.Tensor = None,
               edge_scales = None, edge_gate = None, v_first: torch.Tensor = None,
               return_v: bool = False, return_branch: bool = False, bt6_terms = None,
-              want_logits: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+              want_logits: bool = False, tpl_pos: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    # tpl_pos (TemplatesPieceQuery / TemplatesPieceKey, attn_templates.py): the position's piece maps [B, 64, T, 64],
+    # gathered once per forward by the net; None = plain templates (the control path, unchanged).
     # want_logits (BT6 edge site after this layer on a FLAT trunk, ceres_net BT6TermsLayers): also return the layer's
     # pre-softmax q.k / sqrt(hd) + per-head bias (templates included), exactly what a site reads from an NBT block's
     # last inner layer (nbt_layer.NestedBottleneckLayer._raw_logits). Returns (out, logits).
@@ -177,13 +179,14 @@ class EncoderLayer(torch.nn.Module):
       if self.tmix is not None:
         if self.extra_tokens:
           _nsq = attn_input.shape[1] - self.extra_tokens
-          tb = torch.nn.functional.pad(self.tmix(attn_input[:, :_nsq]), (0, self.extra_tokens, 0, self.extra_tokens))
+          tb = torch.nn.functional.pad(self.tmix(attn_input[:, :_nsq], tpl_pos), (0, self.extra_tokens, 0, self.extra_tokens))
         else:
-          tb = self.tmix(attn_input)
+          tb = self.tmix(attn_input, tpl_pos)
         piece_relation_bias = tb if piece_relation_bias is None else piece_relation_bias + tb.to(piece_relation_bias.dtype)
       attn_output = self.attention(attn_input, attn_input, attn_input, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     else:
       assert self.tmix is None, 'AttnTemplates on a plain encoder layer need pre-norm'
+      assert tpl_pos is None, 'TemplatesPiece*: pre-norm only'
       attn_output = self.attention(x, x, x, x, piece_relation_bias=piece_relation_bias, rpe_src=rpe_src, rpe_precomputed=rpe_precomputed, vis_edge=vis_edge, edge_scales=edge_scales, edge_gate=edge_gate, v_first=v_first, return_v=return_v, bt6_terms=bt6_terms)
     v_out = None
     if return_v:

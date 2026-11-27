@@ -96,10 +96,13 @@ def partition_weight_decay(model):
                   pass   # reached through the owning module's own iteration
               elif '.' not in pn:
                   no_decay.add(fpn)
-          elif (fpn.endswith('attn_templates.table') or fpn.endswith('input_skip_a') or fpn.endswith('input_skip_b')
-                or fpn.endswith('square_features.table')):
+          elif (fpn.endswith('attn_templates.table') or fpn.endswith('attn_templates.piece_query')
+                or fpn.endswith('attn_templates.piece_key') or fpn.endswith('input_skip_a') or fpn.endswith('input_skip_b')
+                or fpn.endswith('square_features.table') or fpn.endswith('position_outcome.table')
+                or fpn.endswith('position_outcome.vh_table') or fpn.endswith('sqf_reinject_gain')):
               # (square_features.table, 2026-11-26: SquareFeatures' zero-init [1735, D] lookup table -- embedding class.
               #  Fry's own partition decays it: Opt WeightDecayScheme 'fry', applied in train.py.)
+              # (attn_templates.piece_query / piece_key, 2026-11-27: the piece-dependent [T, 13, 64, 64] parts, same class.)
               # AttnTemplates (2026-11-20, attn_templates.py): the shared zero-init 64x64 logit tables [T, 64, 64] at
               # the net root -- raw logit tables, the class of the BT6 reader tables / smol_*_bank -> no_decay.
               # NBTInputSkip: per-block mixing scalars (a = 1, b = 0 at init), never decayed (a decay on `a` would
@@ -149,7 +152,7 @@ def partition_weight_decay(model):
               no_decay.add(fpn)
           elif "move_tokens." in fpn and (fpn.endswith(".pm_dk") or fpn.endswith(".pm_dv") or fpn.endswith("vq_block.vq")
                                            or fpn.endswith(".opp_side") or fpn.endswith(".rel_w")
-                                           or fpn.endswith(".w_edge")):
+                                           or fpn.endswith(".w_edge") or fpn.endswith(".w_gc")):
               # (.w_edge, 2026-10-08: zero-init EGT edge -> token input coupling, MoveTokenEdgeInput; same class)
               # Move-token post-move deltas (per-piece key/value edits) and the learned value
               # query token (2026-09-03): raw nn.Parameters, embedding-like -> no_decay.

@@ -170,6 +170,8 @@ class CeresNet(nn.Module):
                      or float(os.environ.get('CERES_SOFT_POLICY_WEIGHT', '0') or 0))
       # with the move-token decoder (UseMoveTokens) the decoder owns the policy: no BT6 policy / soft-policy head
       _bt6_pol = not bool(getattr(config, 'NetDef_UseMoveTokens', False))
+      # 2026-11-27 (pz ladder, fryph arm): with PolicyHeadFry, Fry's from x to head owns the policy -> no BT6 policy head
+      _bt6_pol = _bt6_pol and not bool(getattr(config, 'NetDef_PolicyHeadFry', False))
       # FLAT trunk (NBTInnerLayers 0, BT6NativeLayers): every encoder layer is a "block" of one layer at ModelDim with
       # NumHeads heads; the layers in BT6TermsLayers carry the term reads, sites follow the layers in BT6EdgeSites.
       self.bt6_flat = int(config.NetDef_NBTInnerLayers) < 1
@@ -224,7 +226,20 @@ class CeresNet(nn.Module):
       self.embedding_layer = nn.Linear(TOTAL_INPUT_FEATURES_PER_SQUARE + self.prior_state_dim, self.EMBEDDING_DIM)
       self.embedding_norm = make_norm(config.NetDef_NormType, self.EMBEDDING_DIM, eps=1E-6)
     self.square_features = None
-    if bool(getattr(config, 'NetDef_SquareFeatures', False)):
+    _sqf_plus = {k: bool(getattr(config, 'NetDef_SquareFeatures' + k, False))
+                 for k in ('DropNeighbours', 'LinePairs', 'CheapestAttackers', 'AttackCounts', 'KingSafety', 'Ray2')}
+    if any(_sqf_plus.values()):
+      # extended square features (2026-11-27, square_features_plus.py): one zero-init table, same name / class
+      from square_features_plus import SquareFeaturesPlus
+      self.square_features = SquareFeaturesPlus(self.EMBEDDING_DIM, fry=bool(getattr(config, 'NetDef_SquareFeatures', False)),
+                                                drop_neighbours=_sqf_plus['DropNeighbours'], line_pairs=_sqf_plus['LinePairs'],
+                                                cheapest_attackers=_sqf_plus['CheapestAttackers'],
+                                                attack_counts=_sqf_plus['AttackCounts'], king_safety=_sqf_plus['KingSafety'],
+                                                ray2=_sqf_plus['Ray2'])
+      print(f'[ceres_net] SQUARE FEATURES PLUS: {_sqf_plus}, Fry slots {bool(getattr(config, "NetDef_SquareFeatures", False))}: '
+            f'{self.square_features.num_slots} slots, zero-init [{self.square_features.num_rows}, {self.EMBEDDING_DIM}] table '
+            f'({self.square_features.table.numel():,} params)')
+    elif bool(getattr(config, 'NetDef_SquareFeatures', False)):
       from square_features import SquareFeatures, NUM_ROWS, NUM_SLOTS
       self.square_features = SquareFeatures(self.EMBEDDING_DIM)
       print(f'[ceres_net] SQUARE FEATURES: per square the sum of {NUM_SLOTS} rows of one zero-init [{NUM_ROWS}, '
@@ -232,6 +247,18 @@ class CeresNet(nn.Module):
             f'from record bytes 0..12; added to the embedding (identity at init)')
 
     HEAD_MULT = config.NetDef_HeadWidthMultiplier
+    # SquareFeaturesReinject (2026-11-27b): per listed layer a learned scalar (init 1) times the table sum, added before
+    # that layer. No RNG draw (constant init), so every other tensor is unchanged.
+    self.sqf_reinject_layers = list(getattr(config, 'NetDef_SquareFeaturesReinject', []) or [])
+    self.sqf_reinject_gain = (nn.Parameter(torch.ones(len(self.sqf_reinject_layers))) if self.sqf_reinject_layers else None)
+    # PositionOutcomeFeatures / PositionOutcomeToValueHead (2026-11-27b, position_outcome.py): zero-init tables.
+    self.position_outcome = None
+    _po_sq = bool(getattr(config, 'NetDef_PositionOutcomeFeatures', False))
+    _po_vh = bool(getattr(config, 'NetDef_PositionOutcomeToValueHead', False))
+    if _po_sq or _po_vh:
+      from position_outcome import PositionOutcome
+      self.position_outcome = PositionOutcome(self.EMBEDDING_DIM, 64 * HEAD_MULT, _po_sq, _po_vh)
+      print(f'[ceres_net] POSITION OUTCOME: 6 position facts -> squares {_po_sq}, value-head input {_po_vh} (zero-init tables)')
 
     HEAD_PREMAP_DIVISOR = 64
     self.HEAD_PREMAP_PER_SQUARE = (HEAD_MULT * self.EMBEDDING_DIM) // HEAD_PREMAP_DIVISOR
@@ -1812,7 +1839,13 @@ class CeresNet(nn.Module):
         # pre-attention norm output; the bias goes to that layer's attention logits (encoder_layer.EncoderLayer.tmix).
         from attn_templates import AttnTemplateBank, AttnTemplateMixer
         assert num_tokens_q == num_tokens_kv == NUM_TOKENS_NET == 64, 'AttnTemplates: 64 square tokens'
-        self.attn_templates = AttnTemplateBank(_n_tpl, NUM_TOKENS_NET)
+        _tpl_pq = bool(getattr(config, 'NetDef_TemplatesPieceQuery', False))
+        _tpl_pk = bool(getattr(config, 'NetDef_TemplatesPieceKey', False))
+        self.attn_templates = AttnTemplateBank(_n_tpl, NUM_TOKENS_NET, piece_query=_tpl_pq, piece_key=_tpl_pk)
+        if _tpl_pq or _tpl_pk:
+          print(f'[ceres_net] PIECE TEMPLATES: query {_tpl_pq}, key {_tpl_pk}: zero-init [{_n_tpl}, 13, 64, 64] table(s) '
+                f'shared by all layers ({sum(p.numel() for n, p in self.attn_templates.named_parameters() if n != "table"):,} '
+                f'params); the position maps gathered once per forward on the piece codes')
         for _tpl_l in self.transformer_layer:
           assert _tpl_l.pre_norm, 'AttnTemplates on a plain encoder trunk need PreNorm'
           _tpl_l.tmix = AttnTemplateMixer(self.EMBEDDING_DIM, self.NUM_HEADS, self.attn_templates)
@@ -2273,6 +2306,7 @@ class CeresNet(nn.Module):
           value_query=_mt_vq, value_order=(self.mt_vord_w > 0 or self.mt_qreg_w > 0), soft_policy=self.mt_spol_w > 0,
           opp_max=_mt_opp, opp_pool=_mt_opp_pool, write_back=_mt_wb,
           expected_value=_mt_ev, square_update=_mt_su, trunk_mix=len(_mt_mix), rel_bias=_mt_rel,
+          gives_check=bool(getattr(config, 'NetDef_MoveTokenGivesCheck', False)),
           minimax=self.mt_minimax, action_head=self.mt_action, reply_sup=self.mt_reply,
           edge_dim=_mt_edge_dim)
       if _mt_ev:
@@ -2511,7 +2545,9 @@ class CeresNet(nn.Module):
       flow_squares = torch.cat((flow_squares, append_tensor), dim=-1)
 
     _fry_codes = None
-    if self.fry_input is not None or self.square_features is not None or self.fry_policy is not None:
+    _tpl_bank = getattr(self, 'attn_templates', None)
+    _tpl_piece = _tpl_bank is not None and _tpl_bank.has_piece
+    if self.fry_input is not None or self.square_features is not None or self.fry_policy is not None or _tpl_piece:
       # piece codes of the current board [B, 64] int64 (0 empty, 1..6 ours, 7..12 theirs): record bytes 0..12
       from square_features import codes_from_record
       _fry_codes = codes_from_record(squares)
@@ -2529,9 +2565,26 @@ class CeresNet(nn.Module):
     else:
       flow = self.embedding_layer(flow_squares)
       flow = self.embedding_norm(flow)
+    _tpl_pos = None
+    if _tpl_piece:
+      # TemplatesPieceQuery / TemplatesPieceKey (attn_templates.py): the position's piece maps [B, 64, T, 64], gathered
+      # once here (shared tables) and handed to every layer's mixer; in the autocast dtype when autocast is on
+      _tpl_dev = flow.device.type
+      _tpl_dt = (torch.get_autocast_dtype(_tpl_dev) if torch.is_autocast_enabled(_tpl_dev) else torch.float32)
+      _tpl_pos = _tpl_bank.position_tables(_fry_codes[:, :64], _tpl_dt)
+    _tpl_kw = {} if _tpl_pos is None else {'tpl_pos': _tpl_pos}
+    _sqf = None
     if self.square_features is not None:
       _sqf = self.square_features(_fry_codes).to(flow.dtype)
       flow = flow + (torch.nn.functional.pad(_sqf, (0, 0, 0, self.fry_extra)) if self.fry_extra else _sqf)
+      if self.fry_extra:
+        _sqf = torch.nn.functional.pad(_sqf, (0, 0, 0, self.fry_extra))
+    _po_rows = None
+    if self.position_outcome is not None:
+      from square_features import codes_from_record as _cfr
+      _po_rows = self.position_outcome.rows(_fry_codes if _fry_codes is not None else _cfr(squares))
+      if self.position_outcome.table is not None:
+        flow = flow + self.position_outcome.square_add(_po_rows).to(flow.dtype)
 
     # King-centric distance channels (see __init__): king one-hot planes
     # (6 = STM king, 12 = opponent king, STM-relative encoding) against the
@@ -2653,10 +2706,13 @@ class CeresNet(nn.Module):
           _bt6_rs = _bt6_E.read_state(_bt6_e, _bt6_pd)
         if _skip_a is not None and (i > 0 or _skip0):
           flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
+        if self.sqf_reinject_gain is not None and i in self.sqf_reinject_layers:
+          flow = flow + self.sqf_reinject_gain[self.sqf_reinject_layers.index(i)].to(flow.dtype) * _sqf.to(flow.dtype)
         if self.bt6_flat:
           # flat trunk: an encoder layer; only the term layers get (E, e, [e | Z0])
           _bt6_l = self.transformer_layer[i]
           _bt6_kw = {'bt6_terms': (_bt6_E, _bt6_e, _bt6_rs)} if getattr(_bt6_l.attention, 'bt6t', None) is not None else {}
+          _bt6_kw.update(_tpl_kw)
           if self.bt6h.is_site(i):
             flow, _bt6_H = _bt6_l(flow, want_logits=True, **_bt6_kw)
             _bt6_e = self.bt6h.site(i, _bt6_e, _bt6_H)
@@ -2705,6 +2761,8 @@ class CeresNet(nn.Module):
             flow = torch.cat([flow, _regs], dim=1)
         if _skip_a is not None and (i > 0 or _skip0):
           flow = _skip_a[i].to(flow.dtype) * flow + self.input_skip_b[i].to(flow.dtype) * _skip_e.to(flow.dtype)
+        if self.sqf_reinject_gain is not None and i in self.sqf_reinject_layers:
+          flow = flow + self.sqf_reinject_gain[self.sqf_reinject_layers.index(i)].to(flow.dtype) * _sqf.to(flow.dtype)
         _prb_l = piece_relation_bias_tensor
         if rpe_gen_biases is not None:
           _prb_l = rpe_gen_biases[i] if _prb_l is None else _prb_l + rpe_gen_biases[i]
@@ -2725,7 +2783,7 @@ class CeresNet(nn.Module):
           _prb_l = _egt_bias if _prb_l is None else _prb_l + _egt_bias.to(_prb_l.dtype)
           _egt_site = self.egt.is_site(i)
           _egt_kw = {'edge_scales': _egt_scales, 'want_logits': _egt_site, 'edge_gates': self.egt.gate_args(i, _egt_e)}
-        flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l,
+        flow = self.transformer_layer[i](flow, piece_relation_bias=_prb_l, **_tpl_kw,
                                          film=None if phase_film_tensor is None else
                                               (phase_film_tensor[:, i, 0].unsqueeze(1),
                                                phase_film_tensor[:, i, 1].unsqueeze(1)),
@@ -3388,6 +3446,9 @@ class CeresNet(nn.Module):
       if self.value2_loss_weight > 0:
         _cvi2 = self.dpcv_out2(_csum).to(fS_value.dtype)
         _v2_inject = _cvi2 if _v2_inject is None else _v2_inject + _cvi2
+    if _po_rows is not None and self.position_outcome.vh_table is not None:
+      _pov = self.position_outcome.value_add(_po_rows).to(fS_value_v.dtype)
+      _v_inject = _pov if _v_inject is None else _v_inject + _pov
     value_out = self.value_head(fS_value_v, _v_inject)
     if _mt_out is not None and getattr(self, 'mt_expected_value', False) and _mt_out[6] is not None:
       value_out = value_out + (_mt_out[6].to(torch.float32).unsqueeze(-1) * self.mt_ev_dir.to(torch.float32)).to(value_out.dtype)

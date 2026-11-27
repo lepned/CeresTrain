@@ -380,6 +380,9 @@ def export_served_flat(net) -> dict:
   if getattr(net, "input_skip_a", None) is not None:
     raise NotImplementedError("export_served_flat: NBTInputSkip is not exported")
   templates = getattr(net, "attn_templates", None)
+  if templates is not None and getattr(templates, "has_piece", False):
+    raise NotImplementedError("export_served_flat: TemplatesPieceQuery / TemplatesPieceKey are not exported "
+                              "(read these nets through the ONNX export)")
   history_keep = int(getattr(net, "history_keep", -1))
   if hybrid is not None and history_keep >= 0:
     raise NotImplementedError("export_served_flat: InputHistoryKeep with BT6 parts (the relations read the history)")

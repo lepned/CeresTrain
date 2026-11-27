@@ -1372,6 +1372,18 @@ class Configuration:
                   'not wired for BT6Layer inner layers (use BT6NativeLayers)')
     elif 'AttnTemplateScope' in config_net_def:
       raise ValueError('AttnTemplateScope set but AttnTemplates is 0 (silent no-op refused)')
+    # TemplatesPieceQuery / TemplatesPieceKey (2026-11-27, attn_templates.py): piece-dependent template maps,
+    # table[t, i, j] + D[t, code(i), i, j] (query) / + D[t, code(j), i, j] (key), D a full zero-init [T, 13, 64, 64]
+    # table shared by all layers like the templates. Off by default; plain encoder trunk only (NBTInnerLayers 0).
+    self.NetDef_TemplatesPieceQuery = bool(config_net_def.get('TemplatesPieceQuery', False))
+    self.NetDef_TemplatesPieceKey = bool(config_net_def.get('TemplatesPieceKey', False))
+    if self.NetDef_TemplatesPieceQuery or self.NetDef_TemplatesPieceKey:
+      if not self.NetDef_AttnTemplates:
+        raise ValueError('TemplatesPieceQuery / TemplatesPieceKey need AttnTemplates > 0')
+      if self.NetDef_NBTInnerLayers >= 1:
+        raise ValueError('TemplatesPieceQuery / TemplatesPieceKey: plain encoder trunk only (NBTInnerLayers 0)')
+      if int(self.NetDef_LoopCount) != 1:
+        raise ValueError('TemplatesPieceQuery / TemplatesPieceKey: LoopCount 1 only')
     # NBTInputSkip (2026-11-20; Fry's per-layer input skip at block level): NBT block i >= 1 reads
     # a_i * stream + b_i * (post-embedding state), two learned scalars per block (1 / 0 at init = identity).
     # On a plain encoder trunk (NBTInnerLayers 0, 2026-11-22) the same per encoder layer = Fry's form.
@@ -1908,6 +1920,27 @@ class Configuration:
     #   file), computed inside forward from record bytes 0..12 and added to the embedding (after its norm). Works on
     #   every trunk and every embedding (Linear, BT6-form, FryInput).
     self.NetDef_SquareFeatures = bool(config_net_def.get('SquareFeatures', False))
+    # Extended square features (2026-11-27, square_features_plus.py; puzzle-only ladder). Each its own key, all off.
+    for _k in ('DropNeighbours', 'LinePairs', 'CheapestAttackers', 'AttackCounts', 'KingSafety', 'Ray2'):
+      setattr(self, 'NetDef_SquareFeatures' + _k, bool(config_net_def.get('SquareFeatures' + _k, False)))
+    if self.NetDef_SquareFeaturesDropNeighbours and not self.NetDef_SquareFeatures:
+      raise ValueError('SquareFeaturesDropNeighbours needs SquareFeatures (silent no-op refused)')
+    # SquareFeaturesReinject (2026-11-27b): list of layer indices; before each, the square-feature table sum is added
+    # to the stream again, times a learned per-layer scalar (init 1; the table is zero-init, so step 0 is unchanged).
+    self.NetDef_SquareFeaturesReinject = [int(i) for i in (config_net_def.get('SquareFeaturesReinject', None) or [])]
+    if self.NetDef_SquareFeaturesReinject:
+      _sqf_any = bool(config_net_def.get('SquareFeatures', False)) or any(
+          bool(config_net_def.get('SquareFeatures' + _k, False)) for _k in ('LinePairs', 'CheapestAttackers', 'AttackCounts', 'KingSafety', 'Ray2'))
+      if not _sqf_any:
+        raise ValueError('SquareFeaturesReinject needs a square-feature table (silent no-op refused)')
+      _nl = int(config_net_def.get('NumLayers', 0))
+      if any(i < 1 or i >= _nl for i in self.NetDef_SquareFeaturesReinject) or len(set(self.NetDef_SquareFeaturesReinject)) != len(self.NetDef_SquareFeaturesReinject):
+        raise ValueError(f'SquareFeaturesReinject {self.NetDef_SquareFeaturesReinject}: distinct layer indices in 1..NumLayers-1')
+    # Position-level outcome facts (2026-11-27b, position_outcome.py): to every square / to the value heads' input.
+    self.NetDef_PositionOutcomeFeatures = bool(config_net_def.get('PositionOutcomeFeatures', False))
+    self.NetDef_PositionOutcomeToValueHead = bool(config_net_def.get('PositionOutcomeToValueHead', False))
+    # Gives-check row on every move token (2026-11-27, gives_check.py); needs UseMoveTokens.
+    self.NetDef_MoveTokenGivesCheck = bool(config_net_def.get('MoveTokenGivesCheck', False))
     # FryInput: 70 tokens = 64 squares + 6 metadata tokens (colour, 4 castling rights, en passant), token + position
     #   embedding INSTEAD of the Linear embedding and its norm; the metadata tokens run through the trunk, attention
     #   templates are 0 on their rows / columns, the heads read the 64 square states (ValueHeadFry reads all 70).
@@ -1985,7 +2018,9 @@ class Configuration:
                 "ValueHLGaussServeDraw 'none' set without ValueHLGaussServe (silent no-op refused)")
     _fry_refuse(self.NetDef_FFNNoBias and (not _plain or bool(self.NetDef_TSB_Enabled) or int(self.NetDef_SoftMoE_NumExperts or 0) > 0),
                 'FFNNoBias: plain encoder trunk, no TSB / SoftMoE')
-    if self.NetDef_SquareFeatures:
+    if self.NetDef_MoveTokenGivesCheck and not bool(getattr(self, 'NetDef_UseMoveTokens', False)):
+      raise ValueError('MoveTokenGivesCheck needs UseMoveTokens (silent no-op refused)')
+    if self.NetDef_SquareFeatures or any(getattr(self, 'NetDef_SquareFeatures' + _k) for _k in ('LinePairs', 'CheapestAttackers', 'AttackCounts', 'KingSafety', 'Ray2')):
       _fry_refuse(int(self.NetDef_PriorStateDim or 0) > 0, 'SquareFeatures: PriorStateDim must be 0')
       _fry_refuse(self.NetDef_PieceTokens > 0 or self.NetDef_RegisterTokens > 0, 'SquareFeatures: not wired with PieceTokens / RegisterTokens')
     if self.NetDef_AttnGQA:
@@ -2048,7 +2083,7 @@ class Configuration:
         _fry_refuse(_on, f'FryInput (70 tokens) does not combine with {_key}')
     if self.NetDef_PolicyHeadFry:
       for _key, _on in (('UseMoveTokens (the decoder owns the policy)', self.NetDef_UseMoveTokens),
-                        ('BT6Hybrid (its attention head owns the policy)', _bt6),
+                        # BT6Hybrid allowed since 2026-11-27: ceres_net then builds no BT6 policy head (Fry's head owns it)
                         ('UseDualPlane', bool(config_net_def.get('UseDualPlane', False))),
                         ('RefinerIters', int(config_net_def.get('RefinerIters', 0) or 0) > 0),
                         ('PolicyDepthAttention', bool(self.NetDef_PolicyDepthAttention)),
